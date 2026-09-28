@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32008,
+    "data": {
+      "kind": "rateLimited"
+    },
+    "message": "example rateLimited"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

@@ -1,0 +1,30 @@
+{
+  "data": {
+    "item": {
+      "completedAt": 1790000003006,
+      "entries": [
+        {
+          "status": "completed",
+          "text": "Reproduce"
+        },
+        {
+          "status": "inProgress",
+          "text": "Fix"
+        },
+        {
+          "status": "pending",
+          "text": "Verify"
+        }
+      ],
+      "id": "itm_01K6A00000000000000000IT06",
+      "kind": "plan",
+      "startedAt": 1790000002006,
+      "status": "completed",
+      "threadId": "thr_01K6A0000000000000000THR01",
+      "turnId": "trn_01K6A0000000000000000TRN01"
+    }
+  },
+  "seq": 115,
+  "ts": 1790000000115,
+  "type": "item/updated"
+}

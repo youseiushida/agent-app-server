@@ -1,0 +1,14 @@
+{
+  "id": 39,
+  "jsonrpc": "2.0",
+  "result": {
+    "sessions": [
+      {
+        "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+        "nativeSessionId": "0199a5f0-1111-7000-8000-000000000001",
+        "title": "Refactor supervisor",
+        "updatedAt": 1789913600000
+      }
+    ]
+  }
+}

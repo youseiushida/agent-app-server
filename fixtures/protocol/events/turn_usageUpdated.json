@@ -1,0 +1,19 @@
+{
+  "data": {
+    "turnId": "trn_01K6A0000000000000000TRN01",
+    "usage": {
+      "cachedInputTokens": 8000,
+      "context": {
+        "usedTokens": 84000,
+        "windowTokens": 200000
+      },
+      "costUsd": 0.12,
+      "inputTokens": 12000,
+      "outputTokens": 900,
+      "reasoningTokens": 300
+    }
+  },
+  "seq": 113,
+  "ts": 1790000000113,
+  "type": "turn/usageUpdated"
+}

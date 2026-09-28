@@ -1,0 +1,18 @@
+{
+  "id": 2,
+  "jsonrpc": "2.0",
+  "result": {
+    "subscriptions": [
+      {
+        "head": 400,
+        "status": "ok",
+        "stream": "workspace"
+      },
+      {
+        "head": 1850,
+        "status": "ok",
+        "stream": "thread:thr_01K6A0000000000000000THR01"
+      }
+    ]
+  }
+}

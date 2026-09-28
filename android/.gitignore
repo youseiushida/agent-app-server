@@ -1,0 +1,4 @@
+# Gradle's output of every module (:app, :protocol, :sync, :e2e and any added later): classes,
+# intermediates, test reports, and the device-test results of scripts/run-device-tests.ps1
+# (JUnit XML, logcat, Gradle logs, screenshots) under e2e/build/.
+build/

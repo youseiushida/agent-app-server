@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "method": "heartbeat",
+  "params": {
+    "heads": {
+      "thread:thr_01K6A0000000000000000THR01": 1850,
+      "workspace": 400
+    },
+    "serverTime": 1790000099000
+  }
+}

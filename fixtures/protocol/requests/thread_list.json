@@ -1,0 +1,14 @@
+{
+  "id": 21,
+  "jsonrpc": "2.0",
+  "method": "thread/list",
+  "params": {
+    "before": {
+      "id": "thr_01K6A0000000000000000THR01",
+      "lastActivityAt": 1790000009000
+    },
+    "includeArchived": false,
+    "limit": 50,
+    "projectId": "prj_01K6A0000000000000000PRJ01"
+  }
+}

@@ -1,0 +1,102 @@
+[workspace]
+resolver = "3"
+# Listed explicitly so a crate being created cannot break the workspace for everyone else.
+members = [
+    "crates/aas-protocol",
+    "crates/aas-stdio",
+    "crates/aas-harness",
+    "crates/aas-supervisor",
+    "crates/aas-eventlog",
+    "crates/aas-core",
+    "crates/aas-adapter-fake",
+    "crates/aas-adapter-codex",
+    "crates/aas-adapter-claude",
+    "crates/aas-adapter-pi",
+    "crates/aas-adapter-acp",
+    "crates/aas-server",
+    "crates/aas-daemon",
+    "crates/aas-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# internal crates
+aas-protocol = { path = "crates/aas-protocol" }
+aas-stdio = { path = "crates/aas-stdio" }
+aas-harness = { path = "crates/aas-harness" }
+aas-supervisor = { path = "crates/aas-supervisor" }
+aas-eventlog = { path = "crates/aas-eventlog" }
+aas-core = { path = "crates/aas-core" }
+aas-adapter-fake = { path = "crates/aas-adapter-fake" }
+aas-adapter-codex = { path = "crates/aas-adapter-codex" }
+aas-adapter-claude = { path = "crates/aas-adapter-claude" }
+aas-adapter-pi = { path = "crates/aas-adapter-pi" }
+aas-adapter-acp = { path = "crates/aas-adapter-acp" }
+aas-server = { path = "crates/aas-server" }
+aas-testkit = { path = "crates/aas-testkit" }
+
+# external crates
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+schemars = "1.2.2"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["io", "codec", "rt"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+futures = "0.3.34"
+async-trait = "0.1.92"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2.5"
+uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
+ulid = "3.0.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+axum = { version = "0.8.9", features = ["ws"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["limit", "trace"] }
+clap = { version = "4.6.7", features = ["derive"] }
+toml = "1.1.6"
+humantime-serde = "1.1.1"
+humantime = "2.4.0"
+dirs = "7.0.0"
+which = "8.0.6"
+dunce = "1.0.5"
+process-wrap = { version = "10.0.1", features = ["tokio1"] }
+windows = "0.62.2"
+sha2 = "0.11.0"
+base64 = "0.23.1"
+getrandom = "0.4.3"
+subtle = "2.6.1"
+qrcode = "0.14.1"
+ignore = "0.4.33"
+nucleo-matcher = "0.3.1"
+tokio-tungstenite = "0.30.0"
+# The WebSocket library inside axum 0.8 (used to recognise a "message too big" read error);
+# keep it at the version axum depends on.
+tungstenite = { version = "0.29.0", default-features = false }
+bytes = "1.12.1"
+parking_lot = "0.12.5"
+hex = "0.4.3"
+url = "2.5.8"
+percent-encoding = "2.3.2"
+rand = "0.10.3"
+tempfile = "3.27.0"
+pretty_assertions = "1.4.1"
+
+[profile.dev]
+# Keep debug builds reasonably fast while still getting line info in backtraces.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

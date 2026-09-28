@@ -1,0 +1,11 @@
+{
+  "data": {
+    "field": "text",
+    "itemId": "itm_01K6A00000000000000000IT07",
+    "text": " races the ack"
+  },
+  "seq": 130,
+  "seqFrom": 122,
+  "ts": 1790000000130,
+  "type": "item/delta"
+}

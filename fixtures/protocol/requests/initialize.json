@@ -1,0 +1,14 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "method": "initialize",
+  "params": {
+    "client": {
+      "name": "aas-android",
+      "platform": "android",
+      "version": "0.1.0"
+    },
+    "lastKnownEpoch": "01K6A0000000000000000EPOCH",
+    "protocolVersion": 1
+  }
+}

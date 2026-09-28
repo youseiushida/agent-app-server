@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The device tests (docs/android.md 23.1) instrument this package itself and drive the app from
+    outside: UI Automator, intents and shell commands.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The control channel to the host script (adb reverse) and the local HTTP server. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+        Package visibility (Android 11+): open the app and read its string resources, and see
+        the home screen app (UiDevice.getLauncherPackageName resolves the HOME intent; without
+        this it resolves to the Settings app's fallback home, AppDriver.goHome).
+    -->
+    <queries>
+        <package android:name="dev.aas.android" />
+        <package android:name="dev.aas.android.staging" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
+    </queries>
+</manifest>

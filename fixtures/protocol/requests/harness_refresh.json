@@ -1,0 +1,8 @@
+{
+  "id": 9,
+  "jsonrpc": "2.0",
+  "method": "harness/refresh",
+  "params": {
+    "harnessId": "claude"
+  }
+}

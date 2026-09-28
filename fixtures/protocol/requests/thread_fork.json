@@ -1,0 +1,10 @@
+{
+  "id": 27,
+  "jsonrpc": "2.0",
+  "method": "thread/fork",
+  "params": {
+    "atTurnId": "trn_01K6A0000000000000000TRN01",
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000011",
+    "threadId": "thr_01K6A0000000000000000THR01"
+  }
+}

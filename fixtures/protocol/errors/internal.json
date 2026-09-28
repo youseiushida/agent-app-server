@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32603,
+    "data": {
+      "kind": "internal"
+    },
+    "message": "example internal"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

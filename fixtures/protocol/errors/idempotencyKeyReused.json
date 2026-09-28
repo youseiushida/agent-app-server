@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32006,
+    "data": {
+      "kind": "idempotencyKeyReused"
+    },
+    "message": "example idempotencyKeyReused"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

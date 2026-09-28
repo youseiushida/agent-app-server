@@ -1,0 +1,12 @@
+{
+  "name": "aas-pi-gate-tests",
+  "private": true,
+  "description": "Tests of the approval gate extension agent-app-server installs into pi (the extension itself is embedded in the adapter)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "test": "node --test aas-gate.test.ts"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": 13,
+  "jsonrpc": "2.0",
+  "method": "project/open",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000003",
+    "path": "C:\\Users\\me\\Documents\\agent-app-server"
+  }
+}

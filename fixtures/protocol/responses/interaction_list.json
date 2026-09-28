@@ -1,0 +1,75 @@
+{
+  "id": 37,
+  "jsonrpc": "2.0",
+  "result": {
+    "interactions": [
+      {
+        "createdAt": 1790000002500,
+        "id": "int_01K6A00000000000000000IN01",
+        "itemId": "itm_01K6A00000000000000000IT03",
+        "request": {
+          "detail": "The agent wants to run a shell command.",
+          "kind": "approval",
+          "options": [
+            {
+              "id": "allow",
+              "kind": "allowOnce",
+              "label": "Allow"
+            },
+            {
+              "id": "allow_session",
+              "kind": "allowForSession",
+              "label": "Allow for this session"
+            },
+            {
+              "id": "deny",
+              "kind": "deny",
+              "label": "Deny"
+            }
+          ],
+          "subject": {
+            "command": "cargo test -p aas-server",
+            "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+            "type": "command"
+          },
+          "title": "Run command?"
+        },
+        "status": "pending",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "createdAt": 1790000002600,
+        "id": "int_01K6A00000000000000000IN02",
+        "request": {
+          "kind": "question",
+          "questions": [
+            {
+              "allowFreeText": true,
+              "choices": [
+                {
+                  "id": "sqlite",
+                  "label": "SQLite"
+                },
+                {
+                  "description": "Production",
+                  "id": "pg",
+                  "label": "PostgreSQL"
+                }
+              ],
+              "header": "DB",
+              "id": "q1",
+              "multiSelect": false,
+              "placeholder": "Other…",
+              "prompt": "Which database should the migration target?"
+            }
+          ],
+          "title": "Which database?"
+        },
+        "status": "pending",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      }
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "data": {
+    "operation": {
+      "id": "op_01K6A00000000000000000OP01",
+      "kind": "gitClone",
+      "message": "Cloning https://github.com/example/new-app.git",
+      "progress": "Receiving objects:  42% (420/1000), 1.20 MiB | 2.40 MiB/s",
+      "startedAt": 1790000000000,
+      "status": "running"
+    }
+  },
+  "seq": 108,
+  "ts": 1790000000108,
+  "type": "operation/updated"
+}

@@ -1,0 +1,16 @@
+{
+  "id": 30,
+  "jsonrpc": "2.0",
+  "method": "turn/start",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000013",
+    "delivery": "queue",
+    "input": [
+      {
+        "text": "Also update the docs",
+        "type": "text"
+      }
+    ],
+    "threadId": "thr_01K6A0000000000000000THR01"
+  }
+}

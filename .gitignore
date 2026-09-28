@@ -1,0 +1,27 @@
+# Rust
+/target/
+
+# Android
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.idea/
+/android/*.iml
+/android/captures/
+/android/.kotlin/
+*.apk
+*.aab
+
+# Secrets — never commit
+*.keystore
+*.jks
+keystore.properties
+admin-token
+*.token
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

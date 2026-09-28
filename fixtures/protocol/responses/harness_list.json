@@ -1,0 +1,74 @@
+{
+  "id": 8,
+  "jsonrpc": "2.0",
+  "result": {
+    "harnesses": [
+      {
+        "available": true,
+        "capabilities": {
+          "approvals": true,
+          "fork": true,
+          "images": true,
+          "interrupt": true,
+          "modelSwitchLive": true,
+          "nativeSessions": true,
+          "questions": true,
+          "resume": true,
+          "steer": false
+        },
+        "defaultModel": "opus",
+        "defaultPermissionMode": "default",
+        "displayName": "Claude Code",
+        "effortLevels": [
+          {
+            "id": "low",
+            "label": "Low"
+          },
+          {
+            "id": "medium",
+            "label": "Medium"
+          },
+          {
+            "id": "high",
+            "label": "High"
+          }
+        ],
+        "executable": "C:\\nvm4w\\nodejs\\claude.cmd",
+        "id": "claude",
+        "kind": "claude",
+        "models": [
+          {
+            "displayName": "Opus",
+            "id": "opus",
+            "isDefault": true
+          },
+          {
+            "description": "Fast",
+            "displayName": "Sonnet",
+            "effortLevels": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "id": "sonnet",
+            "isDefault": false
+          }
+        ],
+        "permissionModes": [
+          {
+            "description": "Ask before edits and commands",
+            "id": "default",
+            "isDefault": true,
+            "label": "Ask"
+          },
+          {
+            "id": "acceptEdits",
+            "isDefault": false,
+            "label": "Accept edits"
+          }
+        ],
+        "version": "2.1.283"
+      }
+    ]
+  }
+}

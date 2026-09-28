@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Release: TLS only. The daemon is reached through `tailscale serve` (HTTPS with a certificate
+    for the tailnet name), so there is never a reason for cleartext.
+    Debug builds replace this file (src/debug/res/xml) to allow the emulator host and loopback.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

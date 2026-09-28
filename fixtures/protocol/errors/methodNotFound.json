@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32601,
+    "data": {
+      "kind": "methodNotFound"
+    },
+    "message": "example methodNotFound"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

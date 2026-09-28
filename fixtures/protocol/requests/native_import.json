@@ -1,0 +1,11 @@
+{
+  "id": 40,
+  "jsonrpc": "2.0",
+  "method": "native/import",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000017",
+    "harnessId": "codex",
+    "nativeSessionId": "0199a5f0-1111-7000-8000-000000000001",
+    "projectId": "prj_01K6A0000000000000000PRJ01"
+  }
+}

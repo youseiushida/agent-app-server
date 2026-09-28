@@ -1,0 +1,6 @@
+{
+  "id": 6,
+  "jsonrpc": "2.0",
+  "method": "device/list",
+  "params": {}
+}

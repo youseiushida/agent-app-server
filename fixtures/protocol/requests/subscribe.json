@@ -1,0 +1,17 @@
+{
+  "id": 2,
+  "jsonrpc": "2.0",
+  "method": "subscribe",
+  "params": {
+    "subscriptions": [
+      {
+        "after": 311,
+        "stream": "workspace"
+      },
+      {
+        "after": 1842,
+        "stream": "thread:thr_01K6A0000000000000000THR01"
+      }
+    ]
+  }
+}

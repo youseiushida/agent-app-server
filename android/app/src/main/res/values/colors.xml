@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand colour: notification accents and the launcher icon background. -->
+    <color name="brand">#FF00696B</color>
+    <color name="launcher_background">#FF00696B</color>
+    <color name="window_background">#FFF4FBFA</color>
+</resources>

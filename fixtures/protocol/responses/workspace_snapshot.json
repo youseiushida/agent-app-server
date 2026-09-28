@@ -1,0 +1,193 @@
+{
+  "id": 4,
+  "jsonrpc": "2.0",
+  "result": {
+    "harnesses": [
+      {
+        "available": true,
+        "capabilities": {
+          "approvals": true,
+          "fork": true,
+          "images": true,
+          "interrupt": true,
+          "modelSwitchLive": true,
+          "nativeSessions": true,
+          "questions": true,
+          "resume": true,
+          "steer": false
+        },
+        "defaultModel": "opus",
+        "defaultPermissionMode": "default",
+        "displayName": "Claude Code",
+        "effortLevels": [
+          {
+            "id": "low",
+            "label": "Low"
+          },
+          {
+            "id": "medium",
+            "label": "Medium"
+          },
+          {
+            "id": "high",
+            "label": "High"
+          }
+        ],
+        "executable": "C:\\nvm4w\\nodejs\\claude.cmd",
+        "id": "claude",
+        "kind": "claude",
+        "models": [
+          {
+            "displayName": "Opus",
+            "id": "opus",
+            "isDefault": true
+          },
+          {
+            "description": "Fast",
+            "displayName": "Sonnet",
+            "effortLevels": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "id": "sonnet",
+            "isDefault": false
+          }
+        ],
+        "permissionModes": [
+          {
+            "description": "Ask before edits and commands",
+            "id": "default",
+            "isDefault": true,
+            "label": "Ask"
+          },
+          {
+            "id": "acceptEdits",
+            "isDefault": false,
+            "label": "Accept edits"
+          }
+        ],
+        "version": "2.1.283"
+      }
+    ],
+    "head": 400,
+    "operations": [
+      {
+        "id": "op_01K6A00000000000000000OP01",
+        "kind": "gitClone",
+        "message": "Cloning https://github.com/example/new-app.git",
+        "progress": "Receiving objects:  42% (420/1000), 1.20 MiB | 2.40 MiB/s",
+        "startedAt": 1790000000000,
+        "status": "running"
+      }
+    ],
+    "pendingInteractions": [
+      {
+        "createdAt": 1790000002500,
+        "id": "int_01K6A00000000000000000IN01",
+        "itemId": "itm_01K6A00000000000000000IT03",
+        "request": {
+          "detail": "The agent wants to run a shell command.",
+          "kind": "approval",
+          "options": [
+            {
+              "id": "allow",
+              "kind": "allowOnce",
+              "label": "Allow"
+            },
+            {
+              "id": "allow_session",
+              "kind": "allowForSession",
+              "label": "Allow for this session"
+            },
+            {
+              "id": "deny",
+              "kind": "deny",
+              "label": "Deny"
+            }
+          ],
+          "subject": {
+            "command": "cargo test -p aas-server",
+            "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+            "type": "command"
+          },
+          "title": "Run command?"
+        },
+        "status": "pending",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      }
+    ],
+    "projects": [
+      {
+        "archived": false,
+        "createdAt": 1790000000000,
+        "defaults": {
+          "harnessId": "claude",
+          "model": "opus",
+          "permissionMode": "default"
+        },
+        "git": {
+          "branch": "main",
+          "isRepo": true,
+          "root": "C:\\Users\\me\\Documents\\agent-app-server"
+        },
+        "id": "prj_01K6A0000000000000000PRJ01",
+        "name": "agent-app-server",
+        "path": "C:\\Users\\me\\Documents\\agent-app-server",
+        "updatedAt": 1790000001000
+      }
+    ],
+    "threads": [
+      {
+        "archived": false,
+        "createdAt": 1790000000000,
+        "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+        "diffAvailable": true,
+        "harnessId": "claude",
+        "head": 42,
+        "id": "thr_01K6A0000000000000000THR01",
+        "lastActivityAt": 1790000002000,
+        "lastError": {
+          "at": 1790000001500,
+          "kind": "agentExited",
+          "message": "agent exited with code 1"
+        },
+        "lastTurn": {
+          "id": "trn_01K6A0000000000000000TRN01",
+          "index": 0,
+          "startedAt": 1790000002000,
+          "status": "running"
+        },
+        "nativeSessionId": "7c2d1c1e-5b0e-4a51-9b1e-2f0c3a1b9d10",
+        "pendingInteractions": 1,
+        "pinned": true,
+        "projectId": "prj_01K6A0000000000000000PRJ01",
+        "queuePaused": false,
+        "queuedInputs": 1,
+        "settings": {
+          "effort": "high",
+          "model": "opus",
+          "permissionMode": "default"
+        },
+        "status": "running",
+        "title": "Fix the flaky reconnect test",
+        "updatedAt": 1790000002000,
+        "usage": {
+          "cachedInputTokens": 8000,
+          "context": {
+            "usedTokens": 84000,
+            "windowTokens": 200000
+          },
+          "costUsd": 0.12,
+          "inputTokens": 12000,
+          "outputTokens": 900,
+          "reasoningTokens": 300
+        },
+        "workspace": {
+          "kind": "local"
+        }
+      }
+    ]
+  }
+}

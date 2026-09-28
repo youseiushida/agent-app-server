@@ -1,0 +1,9 @@
+{
+  "id": 39,
+  "jsonrpc": "2.0",
+  "method": "native/list",
+  "params": {
+    "harnessId": "codex",
+    "projectId": "prj_01K6A0000000000000000PRJ01"
+  }
+}

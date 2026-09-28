@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "method": "stream/batch",
+  "params": {
+    "events": [],
+    "head": 400,
+    "stream": "workspace"
+  }
+}

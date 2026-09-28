@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32011,
+    "data": {
+      "kind": "adapterError"
+    },
+    "message": "example adapterError"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

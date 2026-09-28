@@ -1,0 +1,33 @@
+[package]
+name = "aas-server"
+description = "HTTP/WebSocket transport of agent-app-server: auth, subscriptions (log tailing), heartbeats, priorities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aas-core.workspace = true
+aas-protocol.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+humantime-serde.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tungstenite.workspace = true
+
+[dev-dependencies]
+aas-adapter-fake.workspace = true
+aas-harness.workspace = true
+aas-supervisor.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite.workspace = true
+dunce.workspace = true

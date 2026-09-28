@@ -1,0 +1,9 @@
+{
+  "id": 18,
+  "jsonrpc": "2.0",
+  "method": "fs/list",
+  "params": {
+    "includeFiles": false,
+    "path": "C:\\Users\\me\\Documents"
+  }
+}

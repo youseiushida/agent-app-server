@@ -1,0 +1,24 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "device": {
+      "id": "dev_01K6A0000000000000000DEV01",
+      "name": "Pixel"
+    },
+    "epochChanged": false,
+    "policy": {
+      "clientTimeoutMs": 45000,
+      "heartbeatIntervalMs": 15000,
+      "maxBlobBytes": 26214400,
+      "maxClientFrameBytes": 1048576
+    },
+    "protocolVersion": 1,
+    "server": {
+      "epoch": "01K6A0000000000000000EPOCH",
+      "hostname": "DESKTOP-1",
+      "name": "home-pc",
+      "version": "0.1.0"
+    }
+  }
+}

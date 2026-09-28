@@ -1,0 +1,14 @@
+{
+  "id": 12,
+  "jsonrpc": "2.0",
+  "method": "project/create",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000002",
+    "init": {
+      "kind": "gitClone",
+      "url": "https://github.com/example/new-app.git"
+    },
+    "name": "new-app",
+    "parentPath": "C:\\Users\\me\\Documents"
+  }
+}

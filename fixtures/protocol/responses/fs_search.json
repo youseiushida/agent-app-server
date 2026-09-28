@@ -1,0 +1,13 @@
+{
+  "id": 20,
+  "jsonrpc": "2.0",
+  "result": {
+    "ranking": "heuristic:H1",
+    "results": [
+      {
+        "isDir": false,
+        "path": "crates/aas-server/tests/reconnect.rs"
+      }
+    ]
+  }
+}

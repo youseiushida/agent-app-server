@@ -1,0 +1,8 @@
+{
+  "id": 37,
+  "jsonrpc": "2.0",
+  "method": "interaction/list",
+  "params": {
+    "status": "pending"
+  }
+}

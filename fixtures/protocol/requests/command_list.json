@@ -1,0 +1,8 @@
+{
+  "id": 38,
+  "jsonrpc": "2.0",
+  "method": "command/list",
+  "params": {
+    "threadId": "thr_01K6A0000000000000000THR01"
+  }
+}

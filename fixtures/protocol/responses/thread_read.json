@@ -1,0 +1,297 @@
+{
+  "id": 24,
+  "jsonrpc": "2.0",
+  "result": {
+    "hasMoreBefore": false,
+    "head": 1850,
+    "interactions": [
+      {
+        "createdAt": 1790000002500,
+        "id": "int_01K6A00000000000000000IN01",
+        "itemId": "itm_01K6A00000000000000000IT03",
+        "request": {
+          "detail": "The agent wants to run a shell command.",
+          "kind": "approval",
+          "options": [
+            {
+              "id": "allow",
+              "kind": "allowOnce",
+              "label": "Allow"
+            },
+            {
+              "id": "allow_session",
+              "kind": "allowForSession",
+              "label": "Allow for this session"
+            },
+            {
+              "id": "deny",
+              "kind": "deny",
+              "label": "Deny"
+            }
+          ],
+          "subject": {
+            "command": "cargo test -p aas-server",
+            "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+            "type": "command"
+          },
+          "title": "Run command?"
+        },
+        "status": "pending",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "createdAt": 1790000002600,
+        "id": "int_01K6A00000000000000000IN02",
+        "request": {
+          "kind": "question",
+          "questions": [
+            {
+              "allowFreeText": true,
+              "choices": [
+                {
+                  "id": "sqlite",
+                  "label": "SQLite"
+                },
+                {
+                  "description": "Production",
+                  "id": "pg",
+                  "label": "PostgreSQL"
+                }
+              ],
+              "header": "DB",
+              "id": "q1",
+              "multiSelect": false,
+              "placeholder": "Other…",
+              "prompt": "Which database should the migration target?"
+            }
+          ],
+          "title": "Which database?"
+        },
+        "status": "pending",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      }
+    ],
+    "items": [
+      {
+        "attachments": [
+          {
+            "blobId": "blb_9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "mime": "image/png",
+            "type": "image"
+          }
+        ],
+        "completedAt": 1790000003001,
+        "delivery": "normal",
+        "id": "itm_01K6A00000000000000000IT01",
+        "kind": "userMessage",
+        "mentions": [
+          {
+            "path": "crates/aas-server/tests/reconnect.rs"
+          }
+        ],
+        "startedAt": 1790000002001,
+        "status": "completed",
+        "text": "Fix the flaky test in @crates/aas-server/tests/reconnect.rs",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "completedAt": 1790000003002,
+        "id": "itm_01K6A00000000000000000IT02",
+        "kind": "reasoning",
+        "startedAt": 1790000002002,
+        "status": "completed",
+        "text": "The test races the heartbeat.",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "command": "cargo test -p aas-server reconnect",
+        "completedAt": 1790000003003,
+        "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+        "durationMs": 5400,
+        "exitCode": 0,
+        "id": "itm_01K6A00000000000000000IT03",
+        "kind": "commandExecution",
+        "output": "running 3 tests\ntest ok\n",
+        "outputTruncated": false,
+        "startedAt": 1790000002003,
+        "status": "completed",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "changes": [
+          {
+            "added": 1,
+            "diff": "@@ -1,3 +1,3 @@\n-let t = 1;\n+let t = 2;\n",
+            "kind": "update",
+            "path": "crates/aas-server/tests/reconnect.rs",
+            "removed": 1
+          }
+        ],
+        "completedAt": 1790000003004,
+        "id": "itm_01K6A00000000000000000IT04",
+        "kind": "fileChange",
+        "startedAt": 1790000002004,
+        "status": "completed",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "category": "mcp",
+        "completedAt": 1790000003005,
+        "id": "itm_01K6A00000000000000000IT05",
+        "input": {
+          "query": "tokio watch"
+        },
+        "kind": "toolCall",
+        "name": "search_docs",
+        "output": "3 results",
+        "outputTruncated": false,
+        "server": "docs",
+        "startedAt": 1790000002005,
+        "status": "completed",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "title": "docs: search_docs",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "completedAt": 1790000003006,
+        "entries": [
+          {
+            "status": "completed",
+            "text": "Reproduce"
+          },
+          {
+            "status": "inProgress",
+            "text": "Fix"
+          },
+          {
+            "status": "pending",
+            "text": "Verify"
+          }
+        ],
+        "id": "itm_01K6A00000000000000000IT06",
+        "kind": "plan",
+        "startedAt": 1790000002006,
+        "status": "completed",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "id": "itm_01K6A00000000000000000IT07",
+        "kind": "agentMessage",
+        "startedAt": 1790000002007,
+        "status": "inProgress",
+        "text": "I found the race: the heartbeat",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "code": "compacted",
+        "completedAt": 1790000003008,
+        "id": "itm_01K6A00000000000000000IT08",
+        "kind": "notice",
+        "level": "warning",
+        "message": "Context compacted",
+        "startedAt": 1790000002008,
+        "status": "completed",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      }
+    ],
+    "queued": [
+      {
+        "createdAt": 1790000003000,
+        "id": "que_01K6A0000000000000000QUE01",
+        "input": [
+          {
+            "text": "Also update the docs",
+            "type": "text"
+          }
+        ],
+        "preview": "Also update the docs",
+        "threadId": "thr_01K6A0000000000000000THR01"
+      }
+    ],
+    "thread": {
+      "archived": false,
+      "createdAt": 1790000000000,
+      "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+      "diffAvailable": true,
+      "harnessId": "claude",
+      "head": 42,
+      "id": "thr_01K6A0000000000000000THR01",
+      "lastActivityAt": 1790000002000,
+      "lastError": {
+        "at": 1790000001500,
+        "kind": "agentExited",
+        "message": "agent exited with code 1"
+      },
+      "lastTurn": {
+        "id": "trn_01K6A0000000000000000TRN01",
+        "index": 0,
+        "startedAt": 1790000002000,
+        "status": "running"
+      },
+      "nativeSessionId": "7c2d1c1e-5b0e-4a51-9b1e-2f0c3a1b9d10",
+      "pendingInteractions": 1,
+      "pinned": true,
+      "projectId": "prj_01K6A0000000000000000PRJ01",
+      "queuePaused": false,
+      "queuedInputs": 1,
+      "settings": {
+        "effort": "high",
+        "model": "opus",
+        "permissionMode": "default"
+      },
+      "status": "running",
+      "title": "Fix the flaky reconnect test",
+      "updatedAt": 1790000002000,
+      "usage": {
+        "cachedInputTokens": 8000,
+        "context": {
+          "usedTokens": 84000,
+          "windowTokens": 200000
+        },
+        "costUsd": 0.12,
+        "inputTokens": 12000,
+        "outputTokens": 900,
+        "reasoningTokens": 300
+      },
+      "workspace": {
+        "kind": "local"
+      }
+    },
+    "turns": [
+      {
+        "completedAt": 1790000060000,
+        "diff": {
+          "deletions": 3,
+          "files": 2,
+          "insertions": 40
+        },
+        "id": "trn_01K6A0000000000000000TRN01",
+        "index": 0,
+        "model": "opus",
+        "startedAt": 1790000002000,
+        "status": "completed",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "usage": {
+          "cachedInputTokens": 8000,
+          "context": {
+            "usedTokens": 84000,
+            "windowTokens": 200000
+          },
+          "costUsd": 0.12,
+          "inputTokens": 12000,
+          "outputTokens": 900,
+          "reasoningTokens": 300
+        }
+      }
+    ]
+  }
+}

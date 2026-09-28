@@ -1,0 +1,11 @@
+{
+  "id": 5,
+  "jsonrpc": "2.0",
+  "result": {
+    "draining": false,
+    "preventSleepWhileRunning": true,
+    "runningProcesses": 2,
+    "runningTurns": 1,
+    "uptimeMs": 3600000
+  }
+}

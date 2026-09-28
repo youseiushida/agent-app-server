@@ -1,0 +1,16 @@
+{
+  "id": 6,
+  "jsonrpc": "2.0",
+  "result": {
+    "devices": [
+      {
+        "createdAt": 1790000000000,
+        "current": true,
+        "id": "dev_01K6A0000000000000000DEV01",
+        "lastSeenAt": 1790000010000,
+        "name": "Pixel",
+        "platform": "android"
+      }
+    ]
+  }
+}

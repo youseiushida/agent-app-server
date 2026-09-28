@@ -1,0 +1,13 @@
+{
+  "id": 14,
+  "jsonrpc": "2.0",
+  "method": "project/update",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000004",
+    "defaults": {
+      "harnessId": "codex"
+    },
+    "name": "aas",
+    "projectId": "prj_01K6A0000000000000000PRJ01"
+  }
+}

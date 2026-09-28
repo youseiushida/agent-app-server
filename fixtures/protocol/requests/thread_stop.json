@@ -1,0 +1,9 @@
+{
+  "id": 28,
+  "jsonrpc": "2.0",
+  "method": "thread/stop",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000012",
+    "threadId": "thr_01K6A0000000000000000THR01"
+  }
+}

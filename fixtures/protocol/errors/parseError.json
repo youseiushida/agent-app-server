@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32700,
+    "data": {
+      "kind": "parseError"
+    },
+    "message": "example parseError"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

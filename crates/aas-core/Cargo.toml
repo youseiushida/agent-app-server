@@ -1,0 +1,39 @@
+[package]
+name = "aas-core"
+description = "agent-app-server engine: threads, turns, interactions, idempotency, git diffs, persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aas-eventlog.workspace = true
+aas-harness.workspace = true
+aas-protocol.workspace = true
+aas-supervisor.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+dunce.workspace = true
+futures.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+humantime-serde.workspace = true
+ignore.workspace = true
+nucleo-matcher.workspace = true
+parking_lot.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+aas-adapter-fake.workspace = true
+pretty_assertions.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

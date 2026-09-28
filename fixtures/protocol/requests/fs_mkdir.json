@@ -1,0 +1,9 @@
+{
+  "id": 19,
+  "jsonrpc": "2.0",
+  "method": "fs/mkdir",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000007",
+    "path": "C:\\Users\\me\\Documents\\new-app"
+  }
+}

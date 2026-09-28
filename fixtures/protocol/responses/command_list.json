@@ -1,0 +1,36 @@
+{
+  "id": 38,
+  "jsonrpc": "2.0",
+  "result": {
+    "commands": [
+      {
+        "action": {
+          "picker": "model",
+          "type": "picker"
+        },
+        "description": "Change the model",
+        "name": "model",
+        "source": "app"
+      },
+      {
+        "action": {
+          "method": "thread/fork",
+          "type": "method"
+        },
+        "description": "Fork this thread",
+        "name": "fork",
+        "source": "app"
+      },
+      {
+        "action": {
+          "text": "/compact ",
+          "type": "insertText"
+        },
+        "argumentHint": "[instructions]",
+        "description": "Compact the conversation",
+        "name": "compact",
+        "source": "harness"
+      }
+    ]
+  }
+}

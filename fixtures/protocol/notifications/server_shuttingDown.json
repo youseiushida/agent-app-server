@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "method": "server/shuttingDown",
+  "params": {
+    "reason": "drain",
+    "restartExpected": true
+  }
+}

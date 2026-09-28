@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32013,
+    "data": {
+      "kind": "draining"
+    },
+    "message": "example draining"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

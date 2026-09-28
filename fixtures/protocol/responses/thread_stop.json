@@ -1,0 +1,55 @@
+{
+  "id": 28,
+  "jsonrpc": "2.0",
+  "result": {
+    "thread": {
+      "archived": false,
+      "createdAt": 1790000000000,
+      "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+      "diffAvailable": true,
+      "harnessId": "claude",
+      "head": 42,
+      "id": "thr_01K6A0000000000000000THR01",
+      "lastActivityAt": 1790000002000,
+      "lastError": {
+        "at": 1790000001500,
+        "kind": "agentExited",
+        "message": "agent exited with code 1"
+      },
+      "lastTurn": {
+        "id": "trn_01K6A0000000000000000TRN01",
+        "index": 0,
+        "startedAt": 1790000002000,
+        "status": "running"
+      },
+      "nativeSessionId": "7c2d1c1e-5b0e-4a51-9b1e-2f0c3a1b9d10",
+      "pendingInteractions": 1,
+      "pinned": true,
+      "projectId": "prj_01K6A0000000000000000PRJ01",
+      "queuePaused": false,
+      "queuedInputs": 1,
+      "settings": {
+        "effort": "high",
+        "model": "opus",
+        "permissionMode": "default"
+      },
+      "status": "idle",
+      "title": "Fix the flaky reconnect test",
+      "updatedAt": 1790000002000,
+      "usage": {
+        "cachedInputTokens": 8000,
+        "context": {
+          "usedTokens": 84000,
+          "windowTokens": 200000
+        },
+        "costUsd": 0.12,
+        "inputTokens": 12000,
+        "outputTokens": 900,
+        "reasoningTokens": 300
+      },
+      "workspace": {
+        "kind": "local"
+      }
+    }
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "data": {
+    "interaction": {
+      "createdAt": 1790000002600,
+      "expireReason": "processExited",
+      "id": "int_01K6A00000000000000000IN02",
+      "request": {
+        "kind": "question",
+        "questions": [
+          {
+            "allowFreeText": true,
+            "choices": [
+              {
+                "id": "sqlite",
+                "label": "SQLite"
+              },
+              {
+                "description": "Production",
+                "id": "pg",
+                "label": "PostgreSQL"
+              }
+            ],
+            "header": "DB",
+            "id": "q1",
+            "multiSelect": false,
+            "placeholder": "Other…",
+            "prompt": "Which database should the migration target?"
+          }
+        ],
+        "title": "Which database?"
+      },
+      "resolvedAt": 1790000009000,
+      "resolvedBy": "system",
+      "status": "expired",
+      "threadId": "thr_01K6A0000000000000000THR01",
+      "turnId": "trn_01K6A0000000000000000TRN01"
+    }
+  },
+  "seq": 119,
+  "ts": 1790000000119,
+  "type": "interaction/expired"
+}

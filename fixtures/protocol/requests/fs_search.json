@@ -1,0 +1,10 @@
+{
+  "id": 20,
+  "jsonrpc": "2.0",
+  "method": "fs/search",
+  "params": {
+    "limit": 20,
+    "projectId": "prj_01K6A0000000000000000PRJ01",
+    "query": "reconn"
+  }
+}

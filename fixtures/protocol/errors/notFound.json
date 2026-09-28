@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32002,
+    "data": {
+      "kind": "notFound"
+    },
+    "message": "example notFound"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

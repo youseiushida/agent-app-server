@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Rust, pi gate and real-server sync tests (windows-latest)
+    # Job Objects, PATHEXT resolution and the Task Scheduler XML are Windows-specific paths of
+    # the daemon, and the Kotlin real-server tests start aas-test-server.exe, so this job runs on
+    # Windows.
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      # The pi approval gate is a TypeScript extension; Node.js runs its tests with built-in type
+      # stripping (22.18 or later, see crates/aas-adapter-pi/extension/package.json).
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: pi gate extension tests
+        working-directory: crates/aas-adapter-pi/extension
+        run: npm test
+
+      - name: Build aas-test-server and aas-dummy-agent into target/aas-test-bin
+        run: |
+          cargo build -p aas-testkit --bins
+          mkdir -p target/aas-test-bin
+          cp target/debug/aas-test-server.exe target/debug/aas-dummy-agent.exe target/aas-test-bin/
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: gradlew :sync:test (against aas-test-server)
+        working-directory: android
+        env:
+          AAS_TEST_SERVER: ${{ github.workspace }}\target\aas-test-bin\aas-test-server.exe
+          # The runner image ships an Android SDK; blank it so only the JVM modules (:protocol,
+          # :sync) are configured here. The ubuntu job builds and tests :app.
+          ANDROID_HOME: ""
+          ANDROID_SDK_ROOT: ""
+        run: ./gradlew :sync:test
+
+      # RealServerTest skips itself (Assume) when it cannot find the server; make sure it ran.
+      - name: Check that the real-server tests ran
+        run: |
+          report=android/sync/build/test-results/test/TEST-dev.aas.android.sync.RealServerTest.xml
+          test -f "$report" || { echo "::error::$report is missing"; exit 1; }
+          header=$(grep -o '<testsuite [^>]*>' "$report")
+          echo "$header"
+          tests=$(echo "$header" | sed -E 's/.* tests="([0-9]+)".*/\1/')
+          skipped=$(echo "$header" | sed -E 's/.* skipped="([0-9]+)".*/\1/')
+          if [ "$tests" -eq 0 ] || [ "$skipped" -ne 0 ]; then
+            echo "::error::RealServerTest: $tests tests, $skipped skipped"
+            exit 1
+          fi
+
+      - name: Upload sync test reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-sync-test-reports
+          path: android/sync/build/reports/tests/
+          if-no-files-found: ignore
+
+  android:
+    name: Android build, lint and unit tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # compileSdk 36 (design.md §15); AGP 9.4 builds with build-tools 36.0.0 by default.
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools platforms;android-36 build-tools;36.0.0
+
+      - name: gradlew test, assemble and lint
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :protocol:test :sync:test :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-app-server-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload test and lint reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-reports
+          path: |
+            android/protocol/build/reports/
+            android/sync/build/reports/
+            android/app/build/reports/
+          if-no-files-found: ignore

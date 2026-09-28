@@ -1,0 +1,31 @@
+{
+  "data": {
+    "turn": {
+      "diff": {
+        "deletions": 3,
+        "files": 2,
+        "insertions": 40
+      },
+      "id": "trn_01K6A0000000000000000TRN01",
+      "index": 0,
+      "model": "opus",
+      "startedAt": 1790000002000,
+      "status": "running",
+      "threadId": "thr_01K6A0000000000000000THR01",
+      "usage": {
+        "cachedInputTokens": 8000,
+        "context": {
+          "usedTokens": 84000,
+          "windowTokens": 200000
+        },
+        "costUsd": 0.12,
+        "inputTokens": 12000,
+        "outputTokens": 900,
+        "reasoningTokens": 300
+      }
+    }
+  },
+  "seq": 110,
+  "ts": 1790000000110,
+  "type": "turn/started"
+}

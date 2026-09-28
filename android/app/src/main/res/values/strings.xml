@@ -1,0 +1,383 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Agent App</string>
+
+    <!-- Common -->
+    <string name="back">戻る</string>
+    <string name="cancel">キャンセル</string>
+    <string name="done">完了</string>
+    <string name="next">次へ</string>
+    <string name="refresh">更新</string>
+    <string name="loading">読み込み中…</string>
+    <string name="unknown">不明</string>
+    <string name="none">なし</string>
+    <string name="never">まだありません</string>
+    <string name="on">オン</string>
+    <string name="off">オフ</string>
+    <string name="unread">未読</string>
+    <string name="mark_read">既読にする</string>
+    <string name="pinned">ピン留め</string>
+    <string name="open_settings">設定を開く</string>
+    <string name="open_thread">スレッドを開く</string>
+    <string name="open_diagnostics">診断を開く</string>
+
+    <!-- Tabs -->
+    <string name="tab_projects">プロジェクト</string>
+    <string name="tab_inbox">要対応</string>
+    <string name="tab_settings">設定</string>
+    <!-- The accessible name of a tab with a badge: its label and the count on the badge. -->
+    <string name="tab_badge">%1$s（%2$d 件）</string>
+
+    <!-- Actions -->
+    <string name="action_allow_once">許可（一度だけ）</string>
+    <string name="action_deny">拒否</string>
+    <string name="action_reconnect">再接続</string>
+    <string name="action_reconnect_now">今すぐ再接続</string>
+    <string name="action_connect_here">この端末で接続</string>
+    <string name="action_pair_again">ペアリング</string>
+    <string name="action_retry">再試行</string>
+
+    <!-- Status vocabulary (docs/ux/codex-desktop.md §1.3) -->
+    <string name="activity_running">実行中</string>
+    <string name="activity_needs_approval">承認が必要</string>
+    <string name="activity_needs_input">入力が必要</string>
+    <string name="activity_error">エラー</string>
+    <string name="activity_idle">待機中</string>
+
+    <!-- Connection -->
+    <string name="connection_connected">接続済み</string>
+    <string name="connection_connecting">接続しています…</string>
+    <string name="connection_reconnecting">再接続中…</string>
+    <string name="connection_unreachable">PC に接続できません</string>
+    <string name="connection_server_restarting">サーバが再起動しています</string>
+    <string name="connection_server_stopped">サーバが停止しています</string>
+    <string name="connection_server_stopped_detail">PC でサーバが起動されたら再接続します</string>
+    <string name="connection_protocol_error">プロトコルエラー。しばらくして再接続します</string>
+    <string name="connection_phone_offline">スマホがオフラインです</string>
+    <string name="connection_elsewhere">別の場所で接続中</string>
+    <string name="connection_not_paired">ペアリングされていません</string>
+    <string name="connection_revoked">アクセスが取り消されました</string>
+    <string name="connection_token_rejected">ペアリングし直す必要があります</string>
+    <string name="connection_invalid_url">サーバの URL が無効です</string>
+    <string name="connection_incompatible">サーバのバージョンが合いません</string>
+    <string name="connection_stopped">停止中</string>
+    <string name="connection_attempt">%1$d 回目の再試行</string>
+    <string name="connection_server_shutting_down">サーバが停止しました</string>
+    <string name="connection_server_storage_failure">サーバがデータを保存できなくなったため再起動しています</string>
+    <string name="connection_keystore_unavailable">端末のキーストアを使えません（再試行します）</string>
+    <string name="connection_pending">送信待ち %1$d 件</string>
+    <string name="connection_last_sync">最終同期 %1$s</string>
+
+    <string name="banner_connected_elsewhere">このデバイスは別の場所で接続中です（同じデバイスの新しい接続に置き換えられました）。</string>
+    <string name="banner_revoked">このデバイスのアクセスが取り消されました。ペアリングし直してください。</string>
+    <string name="banner_token_rejected">サーバがこのデバイスを受け付けません（サーバのデータがリセットされた可能性があります）。ペアリングし直してください。</string>
+    <string name="banner_invalid_url">保存されたサーバの URL が使えません。ペアリングし直してください。</string>
+    <string name="banner_token_unreadable">保存されたトークンを復号できません。ペアリングし直してください。</string>
+    <string name="banner_not_paired">ペアリングされていません。</string>
+    <string name="banner_incompatible">サーバとアプリのプロトコルが合いません: %1$s</string>
+    <string name="banner_keystore_unavailable">端末のキーストアが一時的に使えないため、保存したトークンを読めません。自動で再試行しています（ペアリングはそのままです）。</string>
+
+    <!-- Notification channels -->
+    <string name="channel_approvals">承認</string>
+    <string name="channel_approvals_description">エージェントがコマンドの実行やファイルの変更の承認を求めたとき。許可（一度だけ）と拒否のボタン付き</string>
+    <string name="channel_questions">質問</string>
+    <string name="channel_questions_description">エージェントが質問したとき</string>
+    <string name="channel_turns">完了</string>
+    <string name="channel_turns_description">ターンの完了と中断、clone の完了</string>
+    <string name="channel_errors">エラー</string>
+    <string name="channel_errors_description">ターンや clone の失敗、サーバが受け付けなかった要求</string>
+    <string name="channel_connection">接続</string>
+    <string name="channel_connection_description">PC との接続を保つための常駐通知。接続の状態と送信待ちの件数を表示します</string>
+    <string name="channel_connection_alerts">接続の中断</string>
+    <string name="channel_connection_alerts_description">別の場所で接続されたため、この端末が承認の依頼や結果を受け取れなくなったとき</string>
+    <string name="notify_connected_elsewhere_title">別の場所で接続中です</string>
+    <string name="notify_connected_elsewhere_body">同じデバイスの新しい接続に置き換えられたため、この端末は承認の依頼や結果を受け取っていません。「再接続」でこの端末に接続を戻します。</string>
+
+    <!-- Notifications -->
+    <string name="notify_approval_title">承認が必要: %1$s</string>
+    <string name="notify_question_title">入力が必要: %1$s</string>
+    <string name="notify_approval_public">承認が必要です</string>
+    <string name="notify_question_public">エージェントから質問があります</string>
+    <string name="notify_answer_sending">回答を送信しています…</string>
+    <string name="notify_answer_rejected">回答が受け付けられませんでした: %1$s</string>
+    <string name="notify_answer_not_queued">回答を送信待ちにできませんでした（%1$s）。アプリを開いて回答してください。</string>
+    <string name="notify_answer_not_paired">ペアリングが解除されているため、回答は送られませんでした。</string>
+    <string name="notify_request_failed_title">要求に失敗しました</string>
+    <string name="notify_turn_completed">完了しました</string>
+    <string name="notify_turn_completed_after">完了しました（%1$s作業しました）</string>
+    <string name="notify_turn_interrupted">中断しました</string>
+    <string name="notify_turn_failed">失敗しました: %1$s</string>
+    <string name="notify_turn_ended">終了しました</string>
+    <string name="notify_clone_title">git clone</string>
+    <string name="notify_clone_succeeded">clone が完了しました: %1$s</string>
+    <string name="notify_clone_failed">clone に失敗しました: %1$s</string>
+
+    <!-- Durations -->
+    <string name="duration_hours_minutes">%1$d 時間 %2$d 分</string>
+    <string name="duration_minutes_seconds">%1$d 分 %2$d 秒</string>
+    <string name="duration_seconds">%1$d 秒</string>
+
+    <!-- Errors -->
+    <string name="error_unknown">不明なエラー</string>
+    <string name="error_not_connected">サーバに接続していません</string>
+    <string name="error_server">サーバがエラーを返しました: %1$s</string>
+    <string name="error_request">要求に失敗しました: %1$s</string>
+    <!-- A read whose connection ended before the answer, also after the automatic retry. -->
+    <string name="error_connection_lost">接続が切れたため、応答を受け取れませんでした</string>
+    <string name="error_no_response">サーバから時間内に応答がありませんでした</string>
+    <string name="error_local_store">端末内のデータを読み書きできませんでした: %1$s</string>
+    <string name="answer_already_resolved">この承認・質問は、ほかの端末で既に回答されていました</string>
+
+    <!-- Requests (what a queued request does) -->
+    <string name="request_failed">%1$sに失敗しました: %2$s</string>
+    <string name="request_turn_start">メッセージの送信</string>
+    <string name="request_turn_interrupt">中断</string>
+    <string name="request_interaction_respond">承認・質問への回答</string>
+    <string name="request_thread_create">スレッドの作成</string>
+    <string name="request_thread_update">スレッドの更新</string>
+    <string name="request_thread_archive">スレッドのアーカイブ</string>
+    <string name="request_thread_fork">スレッドの分岐</string>
+    <string name="request_thread_stop">スレッドの停止</string>
+    <string name="request_queue_remove">送信待ちの削除</string>
+    <string name="request_queue_resume">キューの再開</string>
+    <string name="request_queue_update">送信待ちの編集</string>
+    <string name="request_queue_steer">送信待ちの今すぐ反映</string>
+    <string name="request_project_create">プロジェクトの作成</string>
+    <string name="request_project_open">プロジェクトの登録</string>
+    <string name="request_project_update">プロジェクトの更新</string>
+    <string name="request_project_archive">プロジェクトのアーカイブ</string>
+    <string name="request_project_remove">プロジェクトの削除</string>
+    <string name="request_fs_mkdir">フォルダの作成</string>
+    <string name="request_native_import">セッションの取り込み</string>
+    <string name="request_operation_cancel">clone の取り消し</string>
+    <string name="request_device_revoke">デバイスの取り消し</string>
+    <string name="request_other">要求</string>
+
+    <!-- Interactions -->
+    <string name="approval_allow_once">許可</string>
+    <string name="approval_allow_session">この会話で許可</string>
+    <string name="approval_allow_always">常に許可</string>
+    <string name="approval_deny">拒否</string>
+    <string name="approval_abort">中止</string>
+    <string name="interaction_deny_with_feedback">理由を付けて拒否</string>
+    <string name="interaction_feedback_title">拒否の理由</string>
+    <string name="interaction_feedback_hint">エージェントに伝える理由や、代わりにしてほしいこと</string>
+    <string name="interaction_more_options">ほかの選択肢</string>
+    <string name="interaction_answer_pending">回答は送信待ちです。接続したら送られます。</string>
+    <string name="interaction_unknown_kind">このアプリが対応していない要求（%1$s）</string>
+    <string name="interaction_unknown_body">このアプリが対応していない種類の要求です。PC で確認するか、閉じてください。</string>
+    <string name="interaction_dismiss">閉じる</string>
+    <string name="subject_cwd">場所: %1$s</string>
+    <string name="subject_file_count">%1$d 個のファイル</string>
+    <string name="subject_files">%1$d 個のファイル: %2$s</string>
+    <string name="subject_files_more">%1$d 個のファイル: %2$s ほか %3$d 個</string>
+    <string name="subject_more_files">ほか %1$d 個</string>
+    <string name="subject_tool">ツール: %1$s</string>
+    <string name="subject_unknown">このアプリが対応していない内容（%1$s）</string>
+    <string name="question_answer">回答する</string>
+    <string name="question_skip">スキップ</string>
+    <string name="question_count">質問 %1$d 件</string>
+    <string name="question_page">%1$d / %2$d</string>
+    <string name="question_back">戻る</string>
+    <string name="question_next">次へ</string>
+    <string name="question_send">送信</string>
+    <string name="question_other">その他（自由記述）</string>
+    <string name="question_answer_text">回答</string>
+
+    <!-- Inbox -->
+    <string name="inbox_empty">対応が必要なものはありません</string>
+    <string name="inbox_mark_all_read">すべて既読にする</string>
+    <string name="inbox_section_waiting">回答待ち（%1$d）</string>
+    <string name="inbox_section_errors">エラー（%1$d）</string>
+    <string name="inbox_section_running">実行中（%1$d）</string>
+    <string name="inbox_section_unread">未読（%1$d）</string>
+
+    <!-- Projects -->
+    <string name="projects_empty">プロジェクトはありません</string>
+    <string name="projects_empty_body">PC でプロジェクトを開くか、新しいプロジェクトを作成してください。</string>
+    <string name="projects_not_synced">まだ同期していません</string>
+    <string name="projects_not_synced_body">サーバに接続すると、プロジェクトが表示されます。</string>
+    <string name="project_unknown">プロジェクト</string>
+    <string name="project_threads">スレッド %1$d</string>
+    <string name="project_running">実行中 %1$d</string>
+    <string name="project_unread">未読 %1$d</string>
+    <string name="threads_empty">スレッドはありません</string>
+
+    <!-- Thread -->
+    <string name="thread_unknown">スレッド</string>
+    <string name="thread_loading">読み込んでいます…</string>
+    <string name="thread_not_cached">このスレッドはまだ端末にありません。接続すると表示されます。</string>
+    <string name="thread_removed">このスレッドは削除されました</string>
+    <string name="thread_load_older">以前のターンを読み込む</string>
+    <string name="thread_older_offline">以前のターンは接続中にだけ読み込めます</string>
+    <string name="thread_older_failed">以前のターンを読み込めませんでした: %1$s</string>
+    <string name="turn_number">ターン %1$d</string>
+    <string name="turn_completed">完了</string>
+    <string name="turn_interrupted">中断</string>
+    <string name="turn_failed">失敗</string>
+    <string name="turn_ended">終了</string>
+    <string name="turn_diff">%1$d ファイル +%2$d −%3$d</string>
+    <string name="item_steered">実行中に追加</string>
+    <string name="item_attachments">画像 %1$d 枚</string>
+    <string name="item_output_truncated">出力の一部だけを表示しています</string>
+    <string name="item_plan">プラン</string>
+    <string name="item_unknown">このアプリが対応していない項目（%1$s）</string>
+    <string name="item_failed">失敗</string>
+    <string name="item_declined">拒否されました</string>
+    <string name="item_interrupted">中断されました</string>
+
+    <!-- Pairing -->
+    <string name="pairing_title">ペアリング</string>
+    <string name="pairing_title_repair">再ペアリング</string>
+    <string name="pairing_intro_title">PC とつなぎましょう</string>
+    <string name="pairing_intro_repair">もう一度ペアリングします</string>
+    <string name="pairing_intro_body">PC で次のコマンドを実行し、表示された QR コードを読み取ってください。</string>
+    <string name="pairing_intro_command">agent-app-server pair</string>
+    <string name="pairing_tailscale_note">スマホと PC の両方で Tailscale をオンにしておいてください。接続は tailnet の中だけで行われます。</string>
+    <string name="pairing_scan">QR コードを読み取る</string>
+    <string name="pairing_manual">手で入力</string>
+    <string name="pairing_manual_body">PC の agent-app-server pair が表示した URL とペアリングコードを入力してください。</string>
+    <string name="pairing_scan_hint">PC に表示された QR コードを枠に入れてください</string>
+    <string name="pairing_camera_needed">QR コードを読み取るためにカメラを使います。</string>
+    <string name="pairing_camera_denied">カメラが許可されていません。設定で許可するか、手で入力してください。</string>
+    <string name="pairing_camera_allow">カメラを許可</string>
+    <string name="pairing_server_name">サーバ</string>
+    <string name="pairing_server_url">サーバの URL</string>
+    <string name="pairing_server_url_hint">wss://my-pc.tailnet.ts.net/v1/ws</string>
+    <string name="pairing_code">ペアリングコード</string>
+    <string name="pairing_code_hint">ABCD-EFGH</string>
+    <string name="pairing_device_name">デバイス名</string>
+    <string name="pairing_device_name_hint">PC の agent-app-server devices に表示される名前</string>
+    <string name="pairing_confirm_title">このサーバとペアリングしますか？</string>
+    <string name="pairing_confirm_note">サーバからこのデバイス用のトークンを受け取り、端末の Keystore の鍵で暗号化して保存します。</string>
+    <string name="pairing_pair">ペアリング</string>
+    <string name="pairing_in_progress">%1$s とペアリングしています…</string>
+    <string name="pairing_failed">ペアリングできませんでした</string>
+    <string name="pairing_start_over">最初から</string>
+    <string name="pairing_error_not_link">agent-app-server のペアリング用の QR コードではありません。</string>
+    <string name="pairing_error_encoding">QR コードの内容を読み取れません（エンコードが不正です）。</string>
+    <string name="pairing_error_missing_url">サーバの URL がありません。</string>
+    <string name="pairing_error_invalid_url">URL が不正です: %1$s（ws:// か wss:// で始まる URL を入力してください）</string>
+    <string name="pairing_error_cleartext">このビルドでは %1$s に暗号化なし（ws://）で接続できません。wss:// の URL を使ってください。</string>
+    <string name="pairing_error_missing_code">ペアリングコードがありません。</string>
+    <string name="pairing_error_invalid_code">ペアリングコードが無効です（間違い、使用済み、または期限切れ）。PC で agent-app-server pair を実行し、新しいコードで読み取ってください。</string>
+    <string name="pairing_error_rate_limited">試行が多すぎます。1 分ほど待ってからやり直してください。</string>
+    <string name="pairing_error_unknown_host">%1$s が見つかりません。Tailscale がオンか、URL が正しいか確認してください。</string>
+    <string name="pairing_error_unreachable">サーバに接続できません（%1$s）。PC で daemon と tailscale serve が動いているか確認してください。</string>
+    <string name="pairing_error_tls">TLS の接続に失敗しました: %1$s</string>
+    <string name="pairing_error_cleartext_blocked">暗号化なしの接続はこのビルドでは使えません。wss:// の URL を使ってください。</string>
+    <string name="pairing_error_rejected">サーバが拒否しました（%1$d）: %2$s</string>
+    <string name="pairing_error_invalid_response">サーバの応答を読めません: %1$s</string>
+    <string name="pairing_error_local">ペアリングはできましたが、この端末に保存できませんでした（%1$s）。もう一度ペアリングしてください。</string>
+    <string name="pairing_outbox_title">送信待ちの要求が %1$d 件あります</string>
+    <string name="pairing_outbox_same_server">以前のペアリングで作った要求です。新しいデバイスとして送ると、以前の接続でサーバに届いていたものが二重に実行されることがあります。</string>
+    <string name="pairing_outbox_other_server">別のサーバ（またはリセットされたサーバ）で作った要求です。送ると、このサーバで実行されるか、対象がないため失敗します。</string>
+    <string name="pairing_outbox_send">送信する</string>
+    <string name="pairing_outbox_discard">破棄する</string>
+
+    <!-- Setup after pairing -->
+    <string name="setup_title">準備</string>
+    <string name="setup_body">PC からの承認の依頼や作業の完了を、すぐに受け取れるようにします。あとで設定から変えられます。</string>
+    <string name="setup_notifications_title">通知</string>
+    <string name="setup_notifications_body">承認・質問・完了・エラーを通知で知らせます。通知から許可（一度だけ）や拒否もできます。</string>
+    <string name="setup_notifications_allow">通知を許可</string>
+    <string name="setup_notifications_done">通知は許可されています</string>
+    <string name="setup_battery_title">電池の最適化から外す</string>
+    <string name="setup_battery_body">画面を消している間も PC との接続を保つためです。最適化されたままだと、Android が通信を止めて（Doze）通知が遅れたり、接続サービスを再開できなかったりします。接続は heartbeat だけのときはほとんど通信しません。</string>
+    <string name="setup_battery_allow">最適化をやめる</string>
+    <string name="setup_later">あとで</string>
+
+    <!-- Settings -->
+    <string name="settings_server">サーバ</string>
+    <string name="settings_server_name">名前</string>
+    <string name="settings_server_url">URL</string>
+    <string name="settings_connection">接続</string>
+    <string name="settings_server_version">バージョン</string>
+    <string name="settings_server_host">ホスト名</string>
+    <string name="settings_server_status">サーバの状態</string>
+    <string name="settings_uptime">稼働時間</string>
+    <string name="settings_running">実行中</string>
+    <string name="settings_running_value">ターン %1$d · プロセス %2$d</string>
+    <string name="settings_prevent_sleep">実行中は PC をスリープさせない</string>
+    <string name="settings_prevent_sleep_note">daemon の設定（policy.prevent_sleep_while_running）で変えます</string>
+    <string name="settings_draining">停止準備中</string>
+    <string name="settings_draining_value">新しいターンを受け付けていません</string>
+    <string name="settings_devices">デバイス</string>
+    <string name="settings_devices_summary">このサーバとペアリングしたデバイスの一覧と取り消し</string>
+    <string name="settings_this_device">この端末</string>
+    <string name="settings_device_name">デバイス名</string>
+    <string name="settings_device_id">デバイス ID</string>
+    <string name="settings_paired_at">ペアリングした日時</string>
+    <string name="settings_pair_again">ペアリングし直す</string>
+    <string name="settings_unpair">ペアリングを解除</string>
+    <string name="settings_notifications">通知</string>
+    <string name="settings_notifications_blocked">通知がオフになっています</string>
+    <string name="settings_notifications_blocked_body">承認や完了を知らせるには、通知を許可してください。</string>
+    <string name="settings_notify_approvals">承認</string>
+    <string name="settings_notify_questions">質問</string>
+    <string name="settings_notify_errors">エラー</string>
+    <string name="settings_notify_turns">ターンの完了</string>
+    <string name="settings_system_notifications">システムの通知設定を開く</string>
+    <string name="turns_always">常に</string>
+    <string name="turns_when_not_viewing">見ていないときだけ</string>
+    <string name="turns_never">通知しない</string>
+    <string name="settings_battery">電池</string>
+    <string name="settings_battery_optimization">電池の最適化</string>
+    <string name="settings_battery_details">電池の最適化について</string>
+    <string name="battery_exempt">最適化の対象外です</string>
+    <string name="battery_optimized">最適化されています</string>
+    <string name="battery_optimized_note">画面を消している間、接続が止まることがあります</string>
+    <string name="battery_details_title">なぜ必要か</string>
+    <string name="battery_details_body">このアプリは Firebase のプッシュ通知を使わず、PC の daemon との接続そのものから通知を出します。電池の最適化の対象のままだと、画面を消してしばらくすると Android がアプリの通信を止め（Doze）、承認の依頼や完了の通知が次にスマホを使うまで届きません。また、システムが接続サービスを止めたあと、裏で再開することを Android が許さない場合があります（その場合はアプリを開くと再開します）。</string>
+    <string name="battery_vendor_title">機種ごとの電池管理</string>
+    <string name="battery_vendor_body">一部の機種（Xiaomi、Huawei、OPPO、Samsung など）には独自の電池管理があり、Android の設定とは別にアプリを止めることがあります。その場合は、機種の設定でこのアプリの自動起動とバックグラウンドの動作を許可してください。</string>
+    <string name="battery_open_list">電池の最適化の一覧を開く</string>
+    <string name="settings_diagnostics">診断</string>
+    <string name="settings_diagnostics_open">診断を開く</string>
+    <string name="settings_diagnostics_summary">接続ログ、送信待ち、epoch、読み取り位置</string>
+    <string name="settings_app_version">アプリのバージョン</string>
+    <string name="unpair_confirm_title">ペアリングを解除しますか？</string>
+    <string name="unpair_confirm_body">接続中ならサーバ側でもこのデバイスを取り消します。端末内の同期データ、送信待ちの要求、トークンはすべて消えます。</string>
+    <string name="unpair_not_revoked">サーバに接続していなかったため、サーバではまだこのデバイスが有効です。PC で agent-app-server revoke %1$s を実行してください。</string>
+    <string name="unpair_failed">解除できませんでした: %1$s</string>
+
+    <!-- Devices -->
+    <string name="devices_empty">デバイスはありません</string>
+    <string name="devices_this_device">%1$s（この端末）</string>
+    <string name="devices_added">追加 %1$s</string>
+    <string name="devices_last_seen">最終接続 %1$s</string>
+    <string name="devices_revoke">取り消す</string>
+    <string name="devices_revoke_title">%1$s のアクセスを取り消しますか？</string>
+    <string name="devices_revoke_body">そのデバイスはすぐに切断され、もう一度ペアリングするまで接続できなくなります。</string>
+    <string name="devices_revoked">%1$s のアクセスを取り消しました</string>
+
+    <!-- Diagnostics -->
+    <string name="diagnostics_connection">接続</string>
+    <string name="diagnostics_state">状態</string>
+    <string name="diagnostics_raw_state">内部状態</string>
+    <string name="diagnostics_service">接続サービス</string>
+    <string name="diagnostics_service_running">動作中</string>
+    <string name="diagnostics_service_stopped">停止</string>
+    <string name="diagnostics_start_failure">起動できなかったとき</string>
+    <string name="diagnostics_last_sync">最終同期</string>
+    <string name="diagnostics_last_heartbeat">最後の heartbeat</string>
+    <string name="diagnostics_counters">カウンタ</string>
+    <string name="diagnostics_counters_value">再接続 %1$d 回 · 再購読 %2$d 回 · 取りこぼした通知 %3$d 件</string>
+    <string name="diagnostics_last_error">最後のエラー</string>
+    <string name="diagnostics_policy">サーバのポリシー</string>
+    <string name="diagnostics_policy_value">heartbeat %1$d ms · タイムアウト %2$d ms · 要求の上限 %3$d バイト · 画像の上限 %4$d バイト</string>
+    <string name="diagnostics_sync">同期</string>
+    <string name="diagnostics_epoch">epoch</string>
+    <string name="diagnostics_device">デバイス ID</string>
+    <string name="diagnostics_cursors">読み取り位置</string>
+    <string name="diagnostics_cursor_value">読み取り位置 %1$s / サーバ %2$s</string>
+    <string name="diagnostics_outbox">送信待ち（%1$d 件）</string>
+    <string name="diagnostics_outbox_empty">送信待ちの要求はありません</string>
+    <string name="diagnostics_outbox_created">作成 %1$s</string>
+    <string name="diagnostics_outbox_thread">スレッド %1$s</string>
+    <string name="diagnostics_outbox_failures">失敗 %1$d 回</string>
+    <string name="diagnostics_outbox_next">次の送信 %1$s</string>
+    <string name="diagnostics_log">接続ログ</string>
+    <string name="diagnostics_log_count">接続ログ（%1$d 行）</string>
+    <string name="diagnostics_copy_log">ログをコピー</string>
+</resources>

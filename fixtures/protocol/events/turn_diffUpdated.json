@@ -1,0 +1,13 @@
+{
+  "data": {
+    "diff": {
+      "deletions": 3,
+      "files": 2,
+      "insertions": 40
+    },
+    "turnId": "trn_01K6A0000000000000000TRN01"
+  },
+  "seq": 112,
+  "ts": 1790000000112,
+  "type": "turn/diffUpdated"
+}

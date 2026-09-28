@@ -1,0 +1,9 @@
+{
+  "id": 7,
+  "jsonrpc": "2.0",
+  "method": "device/revoke",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000001",
+    "deviceId": "dev_01K6A0000000000000000DEV01"
+  }
+}

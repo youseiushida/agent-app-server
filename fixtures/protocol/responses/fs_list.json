@@ -1,0 +1,16 @@
+{
+  "id": 18,
+  "jsonrpc": "2.0",
+  "result": {
+    "entries": [
+      {
+        "isDir": true,
+        "isGitRepo": true,
+        "modifiedAt": 1790000000000,
+        "name": "agent-app-server",
+        "path": "C:\\Users\\me\\Documents\\agent-app-server"
+      }
+    ],
+    "path": "C:\\Users\\me\\Documents"
+  }
+}

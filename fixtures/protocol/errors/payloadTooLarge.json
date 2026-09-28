@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32012,
+    "data": {
+      "kind": "payloadTooLarge"
+    },
+    "message": "example payloadTooLarge"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

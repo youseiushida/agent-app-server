@@ -1,0 +1,9 @@
+{
+  "id": 42,
+  "jsonrpc": "2.0",
+  "method": "operation/cancel",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000021",
+    "operationId": "op_01K6A00000000000000000OP01"
+  }
+}

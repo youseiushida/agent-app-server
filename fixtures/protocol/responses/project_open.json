@@ -1,0 +1,24 @@
+{
+  "id": 13,
+  "jsonrpc": "2.0",
+  "result": {
+    "project": {
+      "archived": false,
+      "createdAt": 1790000000000,
+      "defaults": {
+        "harnessId": "claude",
+        "model": "opus",
+        "permissionMode": "default"
+      },
+      "git": {
+        "branch": "main",
+        "isRepo": true,
+        "root": "C:\\Users\\me\\Documents\\agent-app-server"
+      },
+      "id": "prj_01K6A0000000000000000PRJ01",
+      "name": "agent-app-server",
+      "path": "C:\\Users\\me\\Documents\\agent-app-server",
+      "updatedAt": 1790000001000
+    }
+  }
+}

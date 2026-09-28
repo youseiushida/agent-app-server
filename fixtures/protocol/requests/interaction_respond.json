@@ -1,0 +1,13 @@
+{
+  "id": 36,
+  "jsonrpc": "2.0",
+  "method": "interaction/respond",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000016",
+    "interactionId": "int_01K6A00000000000000000IN01",
+    "resolution": {
+      "kind": "approval",
+      "optionId": "allow"
+    }
+  }
+}

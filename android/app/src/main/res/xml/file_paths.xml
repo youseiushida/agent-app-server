@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Files shared through the FileProvider: only photos taken for a message (CaptureFiles). -->
+<paths>
+    <cache-path
+        name="captures"
+        path="captures/" />
+</paths>

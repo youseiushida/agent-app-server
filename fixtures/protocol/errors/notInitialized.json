@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32000,
+    "data": {
+      "kind": "notInitialized"
+    },
+    "message": "example notInitialized"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

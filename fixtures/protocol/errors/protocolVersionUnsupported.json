@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32009,
+    "data": {
+      "kind": "protocolVersionUnsupported"
+    },
+    "message": "example protocolVersionUnsupported"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

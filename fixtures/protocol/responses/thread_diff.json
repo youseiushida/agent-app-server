@@ -1,0 +1,21 @@
+{
+  "id": 29,
+  "jsonrpc": "2.0",
+  "result": {
+    "files": [
+      {
+        "added": 1,
+        "binary": false,
+        "kind": "update",
+        "path": "crates/aas-server/tests/reconnect.rs",
+        "removed": 1
+      }
+    ],
+    "patch": "diff --git a/x b/x\n",
+    "summary": {
+      "deletions": 1,
+      "files": 1,
+      "insertions": 1
+    }
+  }
+}

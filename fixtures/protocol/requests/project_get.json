@@ -1,0 +1,8 @@
+{
+  "id": 11,
+  "jsonrpc": "2.0",
+  "method": "project/get",
+  "params": {
+    "projectId": "prj_01K6A0000000000000000PRJ01"
+  }
+}

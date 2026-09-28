@@ -1,0 +1,9 @@
+{
+  "id": 24,
+  "jsonrpc": "2.0",
+  "method": "thread/read",
+  "params": {
+    "limitTurns": 20,
+    "threadId": "thr_01K6A0000000000000000THR01"
+  }
+}

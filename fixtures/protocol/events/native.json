@@ -1,0 +1,11 @@
+{
+  "data": {
+    "harnessId": "codex",
+    "payload": {
+      "method": "model/rerouted"
+    }
+  },
+  "seq": 122,
+  "ts": 1790000000122,
+  "type": "native"
+}

@@ -1,0 +1,13 @@
+{
+  "error": {
+    "code": -32005,
+    "data": {
+      "harnessId": "codex",
+      "kind": "harnessUnavailable",
+      "reason": "not logged in"
+    },
+    "message": "example harnessUnavailable"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

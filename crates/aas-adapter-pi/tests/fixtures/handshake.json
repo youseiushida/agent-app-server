@@ -1,0 +1,149 @@
+{
+ "state": {
+  "model": {
+   "id": "obsidian/Qwen3.8-27B",
+   "name": "Qwen3.8 27B (OrcaRouter)",
+   "api": "openai-completions",
+   "provider": "orcarouter",
+   "baseUrl": "https://api.orcarouter.ai/v1",
+   "reasoning": true,
+   "input": [
+    "text",
+    "image"
+   ],
+   "cost": {
+    "input": 0.4,
+    "output": 4.21,
+    "cacheRead": 0,
+    "cacheWrite": 0
+   },
+   "contextWindow": 262144,
+   "maxTokens": 32768,
+   "compat": {
+    "supportsDeveloperRole": false,
+    "maxTokensField": "max_tokens",
+    "thinkingFormat": "openrouter"
+   }
+  },
+  "thinkingLevel": "medium",
+  "isStreaming": false,
+  "isCompacting": false,
+  "steeringMode": "one-at-a-time",
+  "followUpMode": "one-at-a-time",
+  "sessionFile": "C:worksessions6-09-27T03-54-01-306Z_611067bd-f742-47e9-9db7-c2a49a25ef82.jsonl",
+  "sessionId": "611067bd-f742-47e9-9db7-c2a49a25ef82",
+  "autoCompactionEnabled": true,
+  "messageCount": 0,
+  "pendingMessageCount": 0
+ },
+ "models": {
+  "models": [
+   {
+    "id": "obsidian/Qwen3.8-27B",
+    "name": "Qwen3.8 27B (OrcaRouter)",
+    "api": "openai-completions",
+    "provider": "orcarouter",
+    "baseUrl": "https://api.orcarouter.ai/v1",
+    "reasoning": true,
+    "input": [
+     "text",
+     "image"
+    ],
+    "cost": {
+     "input": 0.4,
+     "output": 4.21,
+     "cacheRead": 0,
+     "cacheWrite": 0
+    },
+    "contextWindow": 262144,
+    "maxTokens": 32768,
+    "compat": {
+     "supportsDeveloperRole": false,
+     "maxTokensField": "max_tokens",
+     "thinkingFormat": "openrouter"
+    }
+   },
+   {
+    "id": "deepseek/deepseek-v4.1-flash",
+    "name": "DeepSeek V4.1 Flash (OrcaRouter)",
+    "api": "openai-completions",
+    "provider": "orcarouter",
+    "baseUrl": "https://api.orcarouter.ai/v1",
+    "reasoning": true,
+    "thinkingLevelMap": {
+     "minimal": null,
+     "low": "low",
+     "medium": null,
+     "high": "high",
+     "xhigh": null,
+     "max": "max"
+    },
+    "input": [
+     "text",
+     "image"
+    ],
+    "cost": {
+     "input": 0.15,
+     "output": 0.6,
+     "cacheRead": 0.003,
+     "cacheWrite": 0
+    },
+    "contextWindow": 1048576,
+    "maxTokens": 65536,
+    "compat": {
+     "supportsDeveloperRole": false,
+     "maxTokensField": "max_tokens",
+     "thinkingFormat": "deepseek"
+    }
+   }
+  ]
+ },
+ "commands": {
+  "commands": [
+   {
+    "name": "llama",
+    "description": "Manage llama.cpp router models",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "<inline:llama.cpp>",
+     "source": "inline",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   }
+  ]
+ },
+ "setModel": {
+  "id": "deepseek/deepseek-v4.1-flash",
+  "name": "DeepSeek V4.1 Flash (OrcaRouter)",
+  "api": "openai-completions",
+  "provider": "orcarouter",
+  "baseUrl": "https://api.orcarouter.ai/v1",
+  "reasoning": true,
+  "thinkingLevelMap": {
+   "minimal": null,
+   "low": "low",
+   "medium": null,
+   "high": "high",
+   "xhigh": null,
+   "max": "max"
+  },
+  "input": [
+   "text",
+   "image"
+  ],
+  "cost": {
+   "input": 0.15,
+   "output": 0.6,
+   "cacheRead": 0.003,
+   "cacheWrite": 0
+  },
+  "contextWindow": 1048576,
+  "maxTokens": 65536,
+  "compat": {
+   "supportsDeveloperRole": false,
+   "maxTokensField": "max_tokens",
+   "thinkingFormat": "deepseek"
+  }
+ }
+}

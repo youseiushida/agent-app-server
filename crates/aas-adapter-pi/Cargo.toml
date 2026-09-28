@@ -1,0 +1,30 @@
+[package]
+name = "aas-adapter-pi"
+description = "agent-app-server adapter for the pi coding agent (pi --mode rpc)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aas-harness.workspace = true
+aas-protocol.workspace = true
+aas-stdio.workspace = true
+aas-supervisor.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+dirs.workspace = true
+dunce.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

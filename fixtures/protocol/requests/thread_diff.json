@@ -1,0 +1,12 @@
+{
+  "id": 29,
+  "jsonrpc": "2.0",
+  "method": "thread/diff",
+  "params": {
+    "scope": {
+      "kind": "turn",
+      "turnId": "trn_01K6A0000000000000000TRN01"
+    },
+    "threadId": "thr_01K6A0000000000000000THR01"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "id": 5,
+  "jsonrpc": "2.0",
+  "method": "server/status",
+  "params": {}
+}

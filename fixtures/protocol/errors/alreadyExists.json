@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32010,
+    "data": {
+      "kind": "alreadyExists"
+    },
+    "message": "example alreadyExists"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

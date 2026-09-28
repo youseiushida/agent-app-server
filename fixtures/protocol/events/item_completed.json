@@ -1,0 +1,22 @@
+{
+  "data": {
+    "item": {
+      "command": "cargo test -p aas-server reconnect",
+      "completedAt": 1790000003003,
+      "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+      "durationMs": 5400,
+      "exitCode": 0,
+      "id": "itm_01K6A00000000000000000IT03",
+      "kind": "commandExecution",
+      "output": "running 3 tests\ntest ok\n",
+      "outputTruncated": false,
+      "startedAt": 1790000002003,
+      "status": "completed",
+      "threadId": "thr_01K6A0000000000000000THR01",
+      "turnId": "trn_01K6A0000000000000000TRN01"
+    }
+  },
+  "seq": 116,
+  "ts": 1790000000116,
+  "type": "item/completed"
+}

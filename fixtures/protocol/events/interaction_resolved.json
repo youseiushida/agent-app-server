@@ -1,0 +1,48 @@
+{
+  "data": {
+    "interaction": {
+      "createdAt": 1790000002500,
+      "id": "int_01K6A00000000000000000IN01",
+      "itemId": "itm_01K6A00000000000000000IT03",
+      "request": {
+        "detail": "The agent wants to run a shell command.",
+        "kind": "approval",
+        "options": [
+          {
+            "id": "allow",
+            "kind": "allowOnce",
+            "label": "Allow"
+          },
+          {
+            "id": "allow_session",
+            "kind": "allowForSession",
+            "label": "Allow for this session"
+          },
+          {
+            "id": "deny",
+            "kind": "deny",
+            "label": "Deny"
+          }
+        ],
+        "subject": {
+          "command": "cargo test -p aas-server",
+          "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+          "type": "command"
+        },
+        "title": "Run command?"
+      },
+      "resolution": {
+        "kind": "approval",
+        "optionId": "allow"
+      },
+      "resolvedAt": 1790000002700,
+      "resolvedBy": "dev_01K6A0000000000000000DEV01",
+      "status": "resolved",
+      "threadId": "thr_01K6A0000000000000000THR01",
+      "turnId": "trn_01K6A0000000000000000TRN01"
+    }
+  },
+  "seq": 118,
+  "ts": 1790000000118,
+  "type": "interaction/resolved"
+}

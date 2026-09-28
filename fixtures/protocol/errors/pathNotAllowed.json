@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32007,
+    "data": {
+      "kind": "pathNotAllowed"
+    },
+    "message": "example pathNotAllowed"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

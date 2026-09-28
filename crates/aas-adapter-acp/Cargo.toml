@@ -1,0 +1,30 @@
+[package]
+name = "aas-adapter-acp"
+description = "agent-app-server adapter for Agent Client Protocol (v1) agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aas-harness.workspace = true
+aas-protocol.workspace = true
+aas-stdio.workspace = true
+aas-supervisor.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+similar = "3.2.0"
+time = { version = "0.3.55", features = ["parsing"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

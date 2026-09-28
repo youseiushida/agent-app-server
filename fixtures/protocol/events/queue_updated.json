@@ -1,0 +1,21 @@
+{
+  "data": {
+    "queued": [
+      {
+        "createdAt": 1790000003000,
+        "id": "que_01K6A0000000000000000QUE01",
+        "input": [
+          {
+            "text": "Also update the docs",
+            "type": "text"
+          }
+        ],
+        "preview": "Also update the docs",
+        "threadId": "thr_01K6A0000000000000000THR01"
+      }
+    ]
+  },
+  "seq": 120,
+  "ts": 1790000000120,
+  "type": "queue/updated"
+}

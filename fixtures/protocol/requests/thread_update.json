@@ -1,0 +1,14 @@
+{
+  "id": 25,
+  "jsonrpc": "2.0",
+  "method": "thread/update",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000009",
+    "pinned": true,
+    "settings": {
+      "model": "sonnet"
+    },
+    "threadId": "thr_01K6A0000000000000000THR01",
+    "title": "Reconnect race"
+  }
+}

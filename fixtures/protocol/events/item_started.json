@@ -1,0 +1,16 @@
+{
+  "data": {
+    "item": {
+      "id": "itm_01K6A00000000000000000IT07",
+      "kind": "agentMessage",
+      "startedAt": 1790000002007,
+      "status": "inProgress",
+      "text": "I found the race: the heartbeat",
+      "threadId": "thr_01K6A0000000000000000THR01",
+      "turnId": "trn_01K6A0000000000000000TRN01"
+    }
+  },
+  "seq": 114,
+  "ts": 1790000000114,
+  "type": "item/started"
+}

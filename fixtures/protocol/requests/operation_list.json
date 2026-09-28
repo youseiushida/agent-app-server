@@ -1,0 +1,6 @@
+{
+  "id": 41,
+  "jsonrpc": "2.0",
+  "method": "operation/list",
+  "params": {}
+}

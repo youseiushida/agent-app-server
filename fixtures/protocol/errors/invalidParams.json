@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32602,
+    "data": {
+      "kind": "invalidParams"
+    },
+    "message": "example invalidParams"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

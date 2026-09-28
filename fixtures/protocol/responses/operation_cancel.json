@@ -1,0 +1,14 @@
+{
+  "id": 42,
+  "jsonrpc": "2.0",
+  "result": {
+    "operation": {
+      "finishedAt": 1790000005000,
+      "id": "op_01K6A00000000000000000OP01",
+      "kind": "gitClone",
+      "message": "Cancelled",
+      "startedAt": 1790000000000,
+      "status": "cancelled"
+    }
+  }
+}

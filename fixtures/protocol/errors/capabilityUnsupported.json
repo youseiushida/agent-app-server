@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32004,
+    "data": {
+      "kind": "capabilityUnsupported"
+    },
+    "message": "example capabilityUnsupported"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

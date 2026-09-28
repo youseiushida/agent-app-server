@@ -1,0 +1,10 @@
+{
+  "data": {
+    "interactionId": "int_01K6A00000000000000000IN01",
+    "status": "resolved",
+    "threadId": "thr_01K6A0000000000000000THR01"
+  },
+  "seq": 106,
+  "ts": 1790000000106,
+  "type": "interaction/closed"
+}

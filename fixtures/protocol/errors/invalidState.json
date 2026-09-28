@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32003,
+    "data": {
+      "kind": "invalidState"
+    },
+    "message": "example invalidState"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

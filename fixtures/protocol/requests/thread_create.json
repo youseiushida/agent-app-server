@@ -1,0 +1,32 @@
+{
+  "id": 23,
+  "jsonrpc": "2.0",
+  "method": "thread/create",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000008",
+    "harnessId": "claude",
+    "input": [
+      {
+        "text": "Fix the flaky test",
+        "type": "text"
+      },
+      {
+        "path": "crates/aas-server/tests/reconnect.rs",
+        "type": "mention"
+      },
+      {
+        "blobId": "blb_9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "type": "image"
+      }
+    ],
+    "projectId": "prj_01K6A0000000000000000PRJ01",
+    "settings": {
+      "effort": "high",
+      "model": "opus"
+    },
+    "workspace": {
+      "baseRef": "main",
+      "kind": "worktree"
+    }
+  }
+}

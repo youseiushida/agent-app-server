@@ -1,0 +1,10 @@
+{
+  "id": 15,
+  "jsonrpc": "2.0",
+  "method": "project/archive",
+  "params": {
+    "archived": true,
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000005",
+    "projectId": "prj_01K6A0000000000000000PRJ01"
+  }
+}

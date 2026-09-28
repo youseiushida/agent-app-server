@@ -1,0 +1,9 @@
+{
+  "id": 16,
+  "jsonrpc": "2.0",
+  "method": "project/remove",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000006",
+    "projectId": "prj_01K6A0000000000000000PRJ01"
+  }
+}

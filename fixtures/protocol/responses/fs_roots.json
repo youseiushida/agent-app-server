@@ -1,0 +1,12 @@
+{
+  "id": 17,
+  "jsonrpc": "2.0",
+  "result": {
+    "roots": [
+      {
+        "name": "Documents",
+        "path": "C:\\Users\\me\\Documents"
+      }
+    ]
+  }
+}
