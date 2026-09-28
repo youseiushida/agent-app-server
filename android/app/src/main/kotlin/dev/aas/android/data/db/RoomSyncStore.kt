@@ -2,6 +2,8 @@ package dev.aas.android.data.db
 
 import androidx.room.withTransaction
 import dev.aas.android.protocol.AasJson
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskId
 import dev.aas.android.protocol.Harness
 import dev.aas.android.protocol.Interaction
 import dev.aas.android.protocol.InteractionId
@@ -109,6 +111,7 @@ class RoomSyncStore(private val db: AasDatabase) : SyncStore {
             dao.clearTurns()
             dao.clearItems()
             dao.clearInteractions()
+            dao.clearBackgroundTasks()
             dao.clearQueued()
             dao.clearOperations()
             dao.clearThreadMeta()
@@ -171,6 +174,7 @@ class RoomSyncStore(private val db: AasDatabase) : SyncStore {
             dao.deleteTurnsOf(id)
             dao.deleteItemsOf(id)
             dao.deleteInteractionsOf(id)
+            dao.deleteBackgroundTasksOf(id)
             dao.deleteQueuedOf(id)
             dao.deleteThreadMeta(id)
             dao.deleteViewState(id)
@@ -275,6 +279,21 @@ class RoomSyncStore(private val db: AasDatabase) : SyncStore {
             return dao.interactionsOf(threadId).map { decode(Interaction.serializer(), it.json) }
         }
 
+        override suspend fun backgroundTask(id: BackgroundTaskId): BackgroundTask? {
+            check()
+            return dao.backgroundTask(id)?.let { decode(BackgroundTask.serializer(), it.json) }
+        }
+
+        override suspend fun upsertBackgroundTask(task: BackgroundTask) {
+            check()
+            dao.upsertBackgroundTask(BackgroundTaskEntity(task.id, task.threadId, task.startedAt, encode(BackgroundTask.serializer(), task)))
+        }
+
+        override suspend fun backgroundTasksOf(threadId: ThreadId): List<BackgroundTask> {
+            check()
+            return dao.backgroundTasksOf(threadId).map { decode(BackgroundTask.serializer(), it.json) }
+        }
+
         override suspend fun queued(threadId: ThreadId): List<QueuedInput> {
             check()
             return dao.queuedOf(threadId).map { decode(QueuedInput.serializer(), it.json) }
@@ -292,6 +311,7 @@ class RoomSyncStore(private val db: AasDatabase) : SyncStore {
             check()
             dao.deleteTurnsOf(threadId)
             dao.deleteItemsOf(threadId)
+            dao.deleteBackgroundTasksOf(threadId)
             dao.deleteQueuedOf(threadId)
         }
 

@@ -4,6 +4,7 @@
   "result": {
     "draining": false,
     "preventSleepWhileRunning": true,
+    "runningBackgroundTasks": 1,
     "runningProcesses": 2,
     "runningTurns": 1,
     "uptimeMs": 3600000

@@ -157,6 +157,7 @@ client_requests! {
     NativeImport => "native/import", NativeImportParams, ThreadResult, true;
     OperationList => "operation/list", Empty, OperationListResult, false;
     OperationCancel => "operation/cancel", OperationCancelParams, OperationResult, true;
+    BackgroundTaskStop => "backgroundTask/stop", BackgroundTaskStopParams, BackgroundTaskResult, true;
 }
 
 with_request_id!(
@@ -181,6 +182,7 @@ with_request_id!(
     InteractionRespondParams,
     NativeImportParams,
     OperationCancelParams,
+    BackgroundTaskStopParams,
 );
 
 without_request_id!(
@@ -311,9 +313,13 @@ pub struct ServerStatusResult {
     pub running_turns: u32,
     pub draining: bool,
     /// `policy.prevent_sleep_while_running` of the daemon: the PC is kept awake while a turn
-    /// runs.
+    /// runs, and while background work keeps an agent busy.
     #[serde(default)]
     pub prevent_sleep_while_running: bool,
+    /// Background tasks that keep an agent's process alive (in the harness's live set and not
+    /// ambient), over all threads. A drain waits for them too.
+    #[serde(default)]
+    pub running_background_tasks: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -563,6 +569,10 @@ pub struct ThreadReadResult {
     pub items: Vec<Item>,
     pub interactions: Vec<Interaction>,
     pub queued: Vec<QueuedInput>,
+    /// The background tasks first reported during the returned turns, and every task that is
+    /// still running (oldest first).
+    #[serde(default)]
+    pub background_tasks: Vec<BackgroundTask>,
     pub head: u64,
     pub has_more_before: bool,
 }
@@ -826,6 +836,22 @@ pub struct OperationCancelParams {
 #[serde(rename_all = "camelCase")]
 pub struct OperationResult {
     pub operation: Operation,
+}
+
+// ----- background tasks -----
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTaskStopParams {
+    pub client_request_id: String,
+    pub thread_id: ThreadId,
+    pub task_id: BackgroundTaskId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTaskResult {
+    pub task: BackgroundTask,
 }
 
 #[cfg(test)]

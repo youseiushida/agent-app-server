@@ -50,6 +50,8 @@ class EngineFixture(
     storeOverride: SyncStore? = null,
     /** The HTTP client the engine builds its WebSocket client from (e.g. with a counting socket factory). */
     val http: OkHttpClient = OkHttpClient(),
+    /** The engine's clocks (e.g. [SleepingClock] for a phone that slept). */
+    clock: Clock = Clock.System,
 ) : AutoCloseable {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val signals = CopyOnWriteArrayList<SyncSignal>()
@@ -61,6 +63,7 @@ class EngineFixture(
         scope = scope,
         clientInfo = ClientInfo("test", "0", "jvm"),
         config = config,
+        clock = clock,
         random = random,
         logger = { level, message, error -> logs += "$level $message${error?.let { " ($it)" } ?: ""}" },
     )
@@ -89,6 +92,24 @@ class EngineFixture(
         scope.cancel()
         server.close()
     }
+}
+
+/**
+ * The JVM's clocks plus the time a phone spent in deep sleep ([sleep]): both clocks jump ahead,
+ * as `System.currentTimeMillis` and `SystemClock.elapsedRealtime` do after waking, while the
+ * coroutine timers (which stop in deep sleep on Android) do not notice.
+ */
+class SleepingClock : Clock {
+    @Volatile
+    private var slept = 0L
+
+    fun sleep(ms: Long) {
+        slept += ms
+    }
+
+    override fun nowMs(): Long = Clock.System.nowMs() + slept
+
+    override fun monotonicMs(): Long = Clock.System.monotonicMs() + slept
 }
 
 fun turnStart(threadId: String, text: String): (String) -> TurnStartParams =

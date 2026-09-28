@@ -64,6 +64,12 @@ pub(crate) async fn spawn_app_server(
 }
 
 /// `initialize` request followed by the `initialized` notification.
+///
+/// `experimentalApi` is on for `thread/backgroundTerminals/list` and `…/terminate`, which
+/// app-server refuses otherwise (-32600): the list is the only signal of which commands still
+/// run after their turn, the terminate the only way to stop one of them. With it on, Codex
+/// also sends `thread/settings/updated` (ignored); every other message keeps its shape
+/// (compared on recordings of codex-cli 0.148.0 with the flag on and off).
 pub(crate) async fn initialize(peer: &RpcPeer, timeout: Duration) -> Result<(), AdapterError> {
     let params = json!({
         "clientInfo": {
@@ -71,7 +77,7 @@ pub(crate) async fn initialize(peer: &RpcPeer, timeout: Duration) -> Result<(), 
             "title": "agent-app-server",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "capabilities": { "experimentalApi": false, "requestAttestation": false },
+        "capabilities": { "experimentalApi": true, "requestAttestation": false },
     });
     peer.request_timeout::<_, Value>("initialize", params, timeout)
         .await
@@ -130,10 +136,13 @@ where
     let drain_peer = peer.clone();
     tokio::spawn(async move {
         while let Some(message) = incoming.recv().await {
-            if let Incoming::Request(req) = message {
-                let _ = drain_peer
+            if let Incoming::Request(req) = message
+                && let Err(e) = drain_peer
                     .respond_error(req.id, RpcWireError::method_not_found(&req.method))
-                    .await;
+                    .await
+            {
+                // The short-lived app-server's stdin is closed or broken: it is ending anyway.
+                tracing::warn!(method = %req.method, error = %e, "could not refuse a request of a short-lived app-server");
             }
         }
     });

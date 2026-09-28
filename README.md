@@ -13,9 +13,10 @@ daemon は各エージェントの CLI を子プロセスとして起動・管�
    - エージェントはすべて Windows の Job Object（`KILL_ON_JOB_CLOSE`）の中で起動します。daemon がクラッシュしても、`taskkill /F` されても、子孫のプロセスまで OS がまとめて終了させます。
    - 停止は「協調的な中断 → stdin を閉じる → 猶予 → ツリーごと終了」の段階を踏みます。起動時には前回の PID 台帳を調べ、生き残りがあれば片付けます。
    - スマホの接続の有無とエージェントの寿命は切り離されています。スマホを閉じてもターンは最後まで走ります。
+   - エージェントがバックグラウンドで動かしている作業（サブエージェント、開発サーバなどのシェル、ワークフロー、予約した起床）は、ハーネスが「動いている」と報告している間、プロセスを止めません。経過時間で打ち切ることはなく、止めるのは作業が終わったときか、利用者がスマホから止めたときだけです。
 3. **ハーネスの機能を削らないアダプタ**
    - Codex（`codex app-server`）、Claude Code（stream-json + 制御プロトコル）、pi（`pi --mode rpc`）、ACP（`devin acp` ほか任意の ACP エージェント）に専用のアダプタがあります。
-   - 共通の最低限に揃えず、steer、fork、承認、質問、モデル・推論量・権限モードの切り替え、ネイティブセッションの取り込みなどを、ハーネスの能力（capabilities）として公開します。
+   - 共通の最低限に揃えず、steer、fork、承認、質問、モデル・推論量・権限モードの切り替え（Claude Code の `ultracode` を含む）、ネイティブセッションの取り込み、バックグラウンドの作業の表示と個別の停止などを、ハーネスの能力（capabilities）として公開します。
 
 ## 構成
 
@@ -126,8 +127,10 @@ agent-app-server init
 `%APPDATA%\agent-app-server\config.toml` ができ、場所と、見つかったハーネス・プロジェクトのルートが表示されます。初期値は次のとおりです。
 
 - 待ち受けは `127.0.0.1:7878`（公開 listener）と `127.0.0.1:7879`（管理 listener）。どちらもループバックだけ
+- `public_url` はコメントにした行として入る（手順 2 で書く。`agent-app-server doctor` がこの PC の値を表示する）
 - `projects.roots` はドキュメントフォルダ
 - PATH で見つかった `codex` / `claude` / `pi` / `devin` を `[[harness]]` に登録
+- `[policy]` は書かれない（すべて既定値。既定値は daemon の更新に合わせて変わるので、変えたいキーだけを足す）
 
 主なキー（すべての項目は [docs/design.md](docs/design.md) の §17）:
 
@@ -140,7 +143,7 @@ agent-app-server init
 | `[projects] roots` | アプリから閲覧・作成できるフォルダ。この外には触れない |
 | `[policy]` | タイムアウトや上限などのポリシー値（heartbeat の間隔、同時に動かすプロセス数など。既定値と理由は [docs/design.md](docs/design.md) の §13） |
 | `[heuristics] file_search_max_results` | `@` メンションの候補の件数 |
-| `[power] keep_awake` | PC をスリープさせない範囲。`"while_running"`（既定。ターンの実行中だけ）か `"always"`（daemon が動いている間ずっと）。下の「スリープについて」 |
+| `[power] keep_awake` | PC をスリープさせない範囲。`"while_running"`（既定。ターンの実行中と、バックグラウンドの作業がエージェントを動かしている間だけ）か `"always"`（daemon が動いている間ずっと）。下の「スリープについて」 |
 | `[logging] level` | ログのレベル（`info`、`info,aas_core=debug` など。`RUST_LOG` が優先） |
 | `[git] command` | `git` の場所（既定は PATH から探す） |
 | `[[harness]]` | エージェントの定義: `id`、`kind`（`codex` / `claude` / `pi` / `acp`）、`command`、`args`、`env`、`display_name`、`[harness.options]`（[docs/adapters/](docs/adapters/)） |
@@ -291,9 +294,9 @@ schtasks /Run /TN agent-app-server
 
 | コマンド | 内容 |
 |---|---|
-| `agent-app-server status` | バージョン、待ち受けアドレス、`public_url`、稼働時間、エージェントのプロセス数、実行中のターン数、接続中のデバイス数、drain 中か |
+| `agent-app-server status` | バージョン、待ち受けアドレス、`public_url`、稼働時間、エージェントのプロセス数、実行中のターン数、エージェントを動かしているバックグラウンドの作業の数、接続中のデバイス数、drain 中か |
 | `agent-app-server stop` | 実行中のターンを中断し、エージェントを段階停止してから終了する |
-| `agent-app-server stop --drain` | 新しいターンを受け付けず、実行中のターンが終わるのを待ってから終了する（更新のときに使う） |
+| `agent-app-server stop --drain` | 新しいターンを受け付けず、実行中のターンと、エージェントを動かしているバックグラウンドの作業が終わるのを待ってから終了する（更新のときに使う。終わらない作業（開発サーバなど）はアプリから止めるか、`stop` で待つのをやめる） |
 | `agent-app-server devices` | ペアリング済みのデバイスの一覧（ID、名前、最後の接続） |
 | `agent-app-server revoke <deviceId>` | デバイスを失効させる。接続中ならすぐに切断される |
 | `agent-app-server doctor` | 診断 |
@@ -316,7 +319,7 @@ schtasks /Run /TN agent-app-server
 
 **スリープ中の PC にはスマホから接続できません**（Tailscale も daemon も止まっているため）。
 
-- 既定では、daemon はターンの実行中だけ PC をスリープさせません。何もしていない間は、Windows の電源プランのとおりにスリープします。
+- 既定では、daemon はターンの実行中と、バックグラウンドの作業がエージェントを動かしている間だけ PC をスリープさせません。何もしていない間は、Windows の電源プランのとおりにスリープします。
 - いつでもスマホからつなぎたい場合は、次のどちらかにします。
   - Windows の設定 → システム → 電源 で、電源接続時（ノート PC ならバッテリー駆動時も）のスリープを「なし」にする。
   - `config.toml` に次を書いて daemon を再起動する（daemon が動いている間は、アイドルでスリープしなくなる）。
@@ -332,7 +335,7 @@ schtasks /Run /TN agent-app-server
 **更新の手順**
 
 ```powershell
-agent-app-server stop --drain          # 実行中のターンが終わるのを待って止まる
+agent-app-server stop --drain          # 実行中のターンとバックグラウンドの作業が終わるのを待って止まる
 # 新しい agent-app-server.exe と agent-app-server-daemon.exe を上書きコピー
 schtasks /Run /TN agent-app-server     # 起動し直す
 ```
@@ -352,7 +355,16 @@ cd android
 
 - アプリの主な画面: プロジェクト / 要対応（保留中の承認・質問、エラー、未読）/ 設定 の3つのタブと、スレッド、差分、新しいスレッド、新しいプロジェクト（既存のフォルダを開く、空のフォルダ、`git init`、`git clone`）。
 - 設定の画面では、通知の種類ごとのオン・オフ、実行中に送信したときの既定（キューに追加 / 今すぐ反映）、デバイスの一覧と取り消し、ペアリングの解除、電池の設定、接続の診断を扱います。
-- デバッグビルドの APK は約 80MB です（R8 をかけないため）。リリースビルド（`:app:assembleRelease`）は署名しないので、自分の鍵（リポジトリには置かない）で `apksigner` を使って署名してください（[docs/android.md](docs/android.md) の 19章）。
+- リリースビルド（`:app:assembleRelease`。R8 で縮小、約 6.5MB）は、リポジトリの外に置いた自分の鍵で署名されます（鍵の場所とパスワードは `~/.gradle/gradle.properties` に書く。足りなければビルドが理由を出して失敗する。[docs/android.md](docs/android.md) の 19.1）。デバッグビルドの APK は R8 をかけないので約 55MB です。
+
+**スマホでできること（主なもの）**
+
+- **バックグラウンドの作業**: エージェントがターンの外で動かしている作業（Claude Code のバックグラウンドのエージェント・Bash・Workflow（ultracode）・予約した起床（`CronCreate` など）、Codex のバックグラウンドのターミナルとサブエージェント、Devin のバックグラウンドのサブエージェントとシェル）が、スレッド画面の末尾の「バックグラウンド」の区域に出ます。種類、題名、経過時間、進捗（最後のツール、ツールの回数、トークン、ワークフローのエージェントごとの状態）、終わったものは結果（要約、終了コード、出力）。
+  - 1つずつ止めるには、そのタスクの「停止」を押します（ハーネスが止められる作業だけ。止まったことはハーネスの報告で表示が変わります）。すべてを止めるのはスレッドのメニューの「プロセスを停止」です。ターンの停止ボタンはターンだけを止め、バックグラウンドの作業は続きます。
+  - 作業が動いている間、daemon はそのエージェントのプロセスを止めず（時間では止めません）、PC のスリープも抑えます。スレッドとプロジェクトの一覧には「バックグラウンドで実行中 (N)」と出ます。作業が終わると通知が届き、それを受けてエージェントが自分で始めたターンは「バックグラウンド作業の完了を受けて」と示されます。
+  - 作業が求めた承認・質問は、ターンが終わった後でも届き、答えられます（答えずに作業やプロセスが終わった場合は、daemon がエージェントに辞退を返します）。
+- **ultracode**: Claude Code のスレッドでは、`ultracode` を挙げるモデル（`xhigh` を持つもの）の推論量のピッカーに `ultracode` が出ます。選ぶと daemon が CLI に適用し、CLI の設定を読み返して効いたことを確かめます（効かなければエラーとして表示されます）。既定にはなりません。アプリから送るメッセージは利用者の入力（`origin: human`）として CLI に届くので、プロンプトの `ultracode` のキーワードも CLI の端末と同じように働きます。
+- **`/resume`**: スレッドの `/` メニューの `/resume` で「PC のセッションを取り込む」画面が、そのプロジェクトとハーネスを選んだ状態で開きます。PC のターミナルで始めた会話を選ぶと、新しいスレッドとして続けられます（取り込み済みならそのスレッドを開きます）。今のスレッドの会話が別のものに替わることはありません。
 
 ## セキュリティ
 
@@ -403,18 +415,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 # pi の承認ゲート拡張（TypeScript。Node.js 22.18 以上）
 node --test crates/aas-adapter-pi/extension/aas-gate.test.ts
 # Android（SDK があれば :app も。SDK なしでは :protocol:test :sync:test だけ）
-cd android; .\gradlew.bat :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :protocol:test :sync:test; cd ..
+cd android; .\gradlew.bat :app:assembleDebug :app:assembleStaging :app:testDebugUnitTest :app:lintDebug :protocol:test :sync:test :e2e:assembleDebug; cd ..
 # Android の結合テスト用サーバのスナップショットを作り直す（サーバを変えたとき）
 cargo build -p aas-testkit --bins
 New-Item -ItemType Directory -Force target\aas-test-bin | Out-Null
 Copy-Item target\debug\aas-test-server.exe, target\debug\aas-dummy-agent.exe target\aas-test-bin\
 $env:AAS_TEST_SERVER = "$PWD\target\aas-test-bin\aas-test-server.exe"   # Kotlin のテストが使う
 cd android; .\gradlew.bat :sync:test; cd ..   # RealServerTest が本物の daemon を相手に走る（未設定なら skip）
+# Android の端末のテスト（エミュレータ emulator-5580 の上で、本物の daemon を相手に debug と R8 の staging を回す。docs/android.md 23章）
+.\android\scripts\start-emulator.ps1
+.\android\scripts\run-device-tests.ps1 -BuildType both
+.\android\scripts\stop-emulator.ps1
 ```
 
 `aas-test-server` の使い方（stdin のコマンドと stdout の JSON 行）は [docs/design.md](docs/design.md) の §16 にあります。
 
-開発規約は [CLAUDE.md](CLAUDE.md) にあります（品質の基準、ヒューリスティック方針、Windows 固有の規則）。CI は `.github/workflows/ci.yml` です。windows-latest で `cargo fmt --check`、`cargo clippy -D warnings`、`cargo test --workspace`、pi のゲート拡張のテスト、`aas-test-server` を使った `:sync:test`（`RealServerTest`）を、ubuntu-latest で Android の `:protocol:test :sync:test :app:testDebugUnitTest :app:assembleDebug :app:lintDebug` を回し、デバッグ APK を artifact として保存します（[docs/design.md](docs/design.md) の §16）。
+開発規約は [CLAUDE.md](CLAUDE.md) にあります（品質の基準、ヒューリスティック方針、Windows 固有の規則）。CI は `.github/workflows/ci.yml` です。windows-latest で `cargo fmt --check`、`cargo clippy -D warnings`、`cargo test --workspace`、pi のゲート拡張のテスト、`aas-test-server` を使った `:sync:test`（`RealServerTest`）を、ubuntu-latest で Android の `:protocol:test :sync:test :app:testDebugUnitTest :app:assembleDebug :app:assembleStaging :app:lintDebug :e2e:assembleDebug` を回し、デバッグ APK を artifact として保存します（[docs/design.md](docs/design.md) の §16）。
 
 ## ドキュメント
 

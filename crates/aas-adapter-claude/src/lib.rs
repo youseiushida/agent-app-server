@@ -6,6 +6,7 @@
 //! SDK uses (`control_request` / `control_response` / `control_cancel_request`).
 //! See `docs/adapters/claude.md` for the full mapping.
 
+mod background;
 mod mapping;
 mod native;
 mod session;
@@ -40,6 +41,10 @@ pub struct ClaudeOptions {
     /// `--allow-dangerously-skip-permissions`). Off by default.
     #[serde(default)]
     pub allow_bypass_permissions: bool,
+    /// `initialize.agentProgressSummaries`: the CLI writes a one-line progress summary for
+    /// each background agent (`task_progress.summary`). Unset leaves the CLI's own default.
+    #[serde(default)]
+    pub agent_progress_summaries: Option<bool>,
 }
 
 impl ClaudeOptions {
@@ -147,6 +152,7 @@ impl ClaudeAdapter {
             request_timeout: self.ctx.policy.handshake_timeout,
             max_line_bytes: self.ctx.policy.max_line_bytes,
             command_cache: self.commands.clone(),
+            agent_progress_summaries: self.options()?.agent_progress_summaries,
         };
         let (session, events) =
             ClaudeSession::start(stdout, stdin, ProcessLink::Child(child.handle), params);
@@ -325,6 +331,8 @@ impl HarnessAdapter for ClaudeAdapter {
             version,
             executable: Some(program),
             capabilities: HarnessCapabilities {
+                background_tasks: true,
+                background_stop: true,
                 interrupt: true,
                 steer: false,
                 approvals: true,
@@ -402,6 +410,10 @@ impl HarnessAdapter for ClaudeAdapter {
         Ok(commands)
     }
 
+    fn session_switching_commands(&self) -> &'static [&'static str] {
+        SESSION_SWITCHING_COMMANDS
+    }
+
     async fn list_native_sessions(
         &self,
         cwd: &Path,
@@ -415,7 +427,8 @@ impl HarnessAdapter for ClaudeAdapter {
     async fn scan_native_sessions(&self, cwd: &Path) -> Result<NativeSessionScan, AdapterError> {
         let dir = Self::projects_dir()?;
         let cwd = cwd.to_path_buf();
-        tokio::task::spawn_blocking(move || native::list_sessions(&dir, &cwd))
+        let policy = self.ctx.policy.clone();
+        tokio::task::spawn_blocking(move || native::list_sessions(&dir, &cwd, &policy))
             .await
             .map_err(|e| AdapterError::Other(format!("listing sessions failed: {e}")))?
     }
@@ -428,6 +441,7 @@ impl HarnessAdapter for ClaudeAdapter {
         let dir = Self::projects_dir()?;
         let cwd = cwd.to_path_buf();
         let id = native_session_id.to_owned();
+        let policy = self.ctx.policy.clone();
         tokio::task::spawn_blocking(move || {
             let path = native::find_transcript(&dir, &cwd, &id)?.ok_or_else(|| {
                 AdapterError::Other(format!(
@@ -435,16 +449,42 @@ impl HarnessAdapter for ClaudeAdapter {
                     cwd.display()
                 ))
             })?;
-            native::read_history(&path)
+            native::read_history(&path, &policy)
         })
         .await
         .map_err(|e| AdapterError::Other(format!("reading session failed: {e}")))?
     }
 }
 
+/// Claude Code's commands that leave the session the thread is bound to (never offered, see
+/// [`HarnessAdapter::session_switching_commands`]):
+/// * `clear` — "Start a new session with empty context; previous session stays on disk
+///   (resumable with /resume)" (Claude Code 2.1.283 lists it in `initialize.commands` and runs
+///   it in stream-json mode; the CLI then reports a new `session_id`);
+/// * `resume` — its session picker (interactive-only today; excluded should a version offer it
+///   in this mode).
+const SESSION_SWITCHING_COMMANDS: &[&str] = &["clear", "resume"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_switching_commands_are_named_as_claude_code_reports_them() {
+        // The shape of `initialize.commands` of Claude Code 2.1.283 (descriptions as reported).
+        let init = serde_json::json!({"commands": [
+            {"name": "clear", "description": "Start a new session with empty context; previous session stays on disk (resumable with /resume)", "argumentHint": "[name]"},
+            {"name": "compact", "description": "Free up context by summarizing the conversation so far", "argumentHint": "<optional custom summarization instructions>"},
+            {"name": "rename", "description": "Rename the current conversation", "argumentHint": "[name]"},
+            {"name": "/resume", "description": "Resume a conversation", "argumentHint": ""},
+        ]});
+        let kept: Vec<String> = mapping::commands_from_initialize(&init)
+            .into_iter()
+            .map(|c| c.name)
+            .filter(|name| !SESSION_SWITCHING_COMMANDS.contains(&name.as_str()))
+            .collect();
+        assert_eq!(kept, ["compact", "rename"]);
+    }
 
     #[test]
     fn options_parse_strictly() {
@@ -458,6 +498,23 @@ mod tests {
                 .allow_bypass_permissions
         );
         assert!(ClaudeOptions::parse(&serde_json::json!({"bogus": 1})).is_err());
+        // Unset: the CLI's own default (the field is not sent).
+        assert_eq!(ClaudeOptions::default().agent_progress_summaries, None);
+        assert_eq!(
+            ClaudeOptions::parse(&serde_json::json!({"agentProgressSummaries": true}))
+                .unwrap()
+                .agent_progress_summaries,
+            Some(true)
+        );
+        assert_eq!(
+            session::initialize_request(None),
+            serde_json::json!({"subtype": "initialize",
+                "hooks": {"Stop": [{"hookCallbackIds": ["aas_stop"]}]}, "perTaskStopAffordance": true})
+        );
+        assert_eq!(
+            session::initialize_request(Some(false))["agentProgressSummaries"],
+            false
+        );
     }
 
     #[test]

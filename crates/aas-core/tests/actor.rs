@@ -41,6 +41,10 @@ struct Script {
     interrupt_hangs: AtomicBool,
     /// `probe` reports the harness as unavailable (e.g. while its CLI is being updated).
     unavailable: AtomicBool,
+    /// What `list_native_sessions` returns (`None`: one session, `imported`).
+    native_sessions: Mutex<Option<Vec<NativeSessionSummary>>>,
+    /// What `commands` returns.
+    commands: Mutex<Vec<Command>>,
     sessions: Mutex<Vec<Arc<ScriptedSession>>>,
     log: Mutex<Vec<String>>,
 }
@@ -91,6 +95,8 @@ fn info() -> HarnessInfo {
         version: Some("1".into()),
         executable: None,
         capabilities: HarnessCapabilities {
+            background_tasks: false,
+            background_stop: false,
             interrupt: true,
             steer: false,
             approvals: true,
@@ -173,12 +179,18 @@ impl HarnessAdapter for ScriptedAdapter {
         })
     }
     async fn commands(&self, _ctx: CommandContext) -> Result<Vec<Command>, AdapterError> {
-        Ok(Vec::new())
+        Ok(self.0.commands.lock().clone())
+    }
+    fn session_switching_commands(&self) -> &'static [&'static str] {
+        &["new-session"]
     }
     async fn list_native_sessions(
         &self,
         _cwd: &Path,
     ) -> Result<Vec<NativeSessionSummary>, AdapterError> {
+        if let Some(sessions) = self.0.native_sessions.lock().clone() {
+            return Ok(sessions);
+        }
         Ok(vec![NativeSessionSummary {
             native_session_id: "imported".into(),
             title: Some("Old".into()),
@@ -243,6 +255,7 @@ impl ScriptedSession {
             status: ItemStatus::Completed,
         });
         self.emit(AdapterEvent::TurnCompleted {
+            trigger: None,
             status: TurnStatus::Completed,
             usage: None,
             error: None,
@@ -270,6 +283,7 @@ impl SessionControl for ScriptedSession {
             std::future::pending::<()>().await;
         }
         self.emit(AdapterEvent::TurnCompleted {
+            trigger: None,
             status: TurnStatus::Interrupted,
             usage: None,
             error: None,
@@ -834,6 +848,7 @@ async fn an_interaction_requested_and_withdrawn_in_one_batch_is_announced_before
     // land in the same batch.
     session.emit(AdapterEvent::TurnStarted);
     session.emit(AdapterEvent::InteractionRequested {
+        background_key: None,
         request_id: "r1".into(),
         request: InteractionRequest::Approval {
             title: "Run?".into(),
@@ -1000,6 +1015,7 @@ async fn replaced_output_is_bounded_like_streamed_output() {
         status: ItemStatus::Completed,
     });
     session.emit(AdapterEvent::TurnCompleted {
+        trigger: None,
         status: TurnStatus::Completed,
         usage: None,
         error: None,
@@ -1559,4 +1575,135 @@ async fn requests_during_a_project_removal_that_fails_are_handled_normally() {
     env.wait_turn_status(&local.id, &r.turn_id.unwrap(), TurnStatus::Completed)
         .await;
     assert!(Path::new(&path).join("untracked-0.txt").exists());
+}
+
+fn native_session(id: &str, title: &str, updated_at: Option<i64>) -> NativeSessionSummary {
+    NativeSessionSummary {
+        native_session_id: id.into(),
+        title: Some(title.into()),
+        updated_at,
+        cwd: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_list_names_each_session_once_whatever_the_adapter_returns() {
+    let env = env().await;
+    let project = env.project("p", false).await;
+    // An adapter that repeats sessions (the shape Codex's thread/list has for a resumed
+    // thread: one entry per rollout, same id), in no particular order.
+    *env.script.native_sessions.lock() = Some(vec![
+        native_session("thread-a", "Fix the parser", Some(1_000)),
+        native_session("thread-b", "Add tests", Some(2_000)),
+        native_session("thread-a", "Fix the parser (resumed)", Some(3_000)),
+        native_session("thread-c", "Docs", None),
+        native_session("thread-a", "Fix the parser (first rollout)", Some(500)),
+        native_session("thread-b", "Add tests", Some(2_000)),
+    ]);
+    // One of them is imported already: the merged entry carries its thread.
+    let imported = env
+        .call::<spec::NativeImport>(NativeImportParams {
+            client_request_id: crid(),
+            project_id: project.id.clone(),
+            harness_id: "scripted".into(),
+            native_session_id: "thread-a".into(),
+        })
+        .await
+        .unwrap()
+        .thread;
+    let listed = env
+        .call::<spec::NativeList>(NativeListParams {
+            project_id: project.id.clone(),
+            harness_id: "scripted".into(),
+        })
+        .await
+        .unwrap()
+        .sessions;
+    let summary: Vec<(&str, Option<&str>, Option<i64>)> = listed
+        .iter()
+        .map(|s| {
+            (
+                s.native_session_id.as_str(),
+                s.title.as_deref(),
+                s.updated_at,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            // First position, latest entry.
+            ("thread-a", Some("Fix the parser (resumed)"), Some(3_000)),
+            ("thread-b", Some("Add tests"), Some(2_000)),
+            ("thread-c", Some("Docs"), None),
+        ]
+    );
+    assert_eq!(listed[0].imported_thread_id.as_ref(), Some(&imported.id));
+    assert_eq!(listed[1].imported_thread_id, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_switching_harness_commands_are_never_offered() {
+    let env = env().await;
+    let project = env.project("p", false).await;
+    let harness_command = |name: &str| Command {
+        name: name.into(),
+        description: None,
+        source: CommandSource::Harness,
+        argument_hint: None,
+        action: CommandAction::InsertText {
+            text: format!("/{name} "),
+        },
+    };
+    let offered = [
+        harness_command("compact"),
+        // Reserved for every harness (the app's own /resume opens the session import).
+        harness_command("resume"),
+        // Named by this adapter (`session_switching_commands`).
+        harness_command("new-session"),
+        harness_command("review"),
+    ];
+    *env.script.commands.lock() = offered.to_vec();
+    let names = |commands: Vec<Command>| -> Vec<String> {
+        commands
+            .into_iter()
+            .filter(|c| c.source == CommandSource::Harness)
+            .map(|c| c.name)
+            .collect()
+    };
+    // Without a thread: the adapter's `commands`.
+    let listed = env
+        .call::<spec::CommandList>(CommandListParams {
+            thread_id: None,
+            project_id: Some(project.id.clone()),
+            harness_id: Some("scripted".into()),
+        })
+        .await
+        .unwrap()
+        .commands;
+    assert_eq!(names(listed), ["compact", "review"]);
+    // In a thread: the list the running session reported (`CommandsChanged`).
+    let thread = env.thread(&project, None).await;
+    let session = env.warm_up(&thread.id).await;
+    session.emit(AdapterEvent::CommandsChanged {
+        commands: vec![
+            harness_command("resume"),
+            harness_command("init"),
+            harness_command("new-session"),
+        ],
+    });
+    env.wait_for(&thread_stream(&thread.id), |e| {
+        matches!(e, Event::CommandsChanged {})
+    })
+    .await;
+    let listed = env
+        .call::<spec::CommandList>(CommandListParams {
+            thread_id: Some(thread.id.clone()),
+            project_id: None,
+            harness_id: None,
+        })
+        .await
+        .unwrap()
+        .commands;
+    assert_eq!(names(listed), ["init"]);
 }

@@ -17,6 +17,9 @@ import dev.aas.android.R
 import dev.aas.android.diagnostics.ConnectionLog
 import dev.aas.android.domain.InteractionTexts
 import dev.aas.android.domain.RequestLabels
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskEnded
+import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.Interaction
 import dev.aas.android.protocol.InteractionId
 import dev.aas.android.protocol.InteractionRequest
@@ -53,6 +56,11 @@ import java.util.concurrent.ConcurrentHashMap
  * * Questions: open the thread with the answer sheet.
  * * Finished turns: one notification per thread, replaced on the next turn; failures go to the
  *   errors channel. Both go away when the thread is shown or becomes read in the app.
+ * * Finished background tasks (the summary's `background.lastEnded` moved to a later end; ambient
+ *   work, which the harness says is not activity, is never in it): the same one
+ *   notification per thread as finished turns (tag `turn:<thread>`), so the turn the agent then
+ *   starts about it replaces it instead of adding a second one; a lost task goes to the errors
+ *   channel (tag `error:<thread>`). They follow the same settings as turns and failures.
  * * Clones: finished (turns channel) or failed (errors channel).
  * * Requests the server rejected definitively while the app is in the background: one
  *   notification per thread (or one for requests of no thread), showing the latest failure.
@@ -80,7 +88,8 @@ class Notifier(
     /** Interactions with a posted notification, so it can be rebuilt (sending, failed). */
     private val shown = ConcurrentHashMap<InteractionId, ShownInteraction>()
 
-    private data class ShownInteraction(val interaction: Interaction, val thread: Thread?)
+    /** [sending]: a notification action queued its answer (the notification says so, without buttons). */
+    private data class ShownInteraction(val interaction: Interaction, val thread: Thread?, val backgroundTaskTitle: String?, val sending: Boolean = false)
 
     // ----- signals ------------------------------------------------------------------------------
 
@@ -91,12 +100,14 @@ class Notifier(
         }
         val prefs = settings.current()
         when (signal) {
-            is SyncSignal.InteractionPending -> showInteraction(signal.interaction, signal.thread, prefs, error = null)
+            is SyncSignal.InteractionPending -> showInteraction(signal.interaction, signal.thread, signal.backgroundTask?.title, prefs, error = null)
             is SyncSignal.InteractionClosed -> {
                 shown.remove(signal.interactionId)
                 manager.cancel(interactionTag(signal.interactionId), ID_INTERACTION)
             }
             is SyncSignal.TurnFinished -> showTurnFinished(signal.thread, signal.turn, prefs)
+            is SyncSignal.BackgroundTaskFinished -> showBackgroundTaskFinished(signal.thread, signal.ended, prefs)
+            is SyncSignal.InteractionTaskKnown -> nameTheTask(signal.interaction, signal.task, prefs)
             is SyncSignal.OperationFinished -> showOperationFinished(signal.operation, prefs)
             is SyncSignal.ThreadRemoved -> cancelThread(signal.threadId)
         }
@@ -110,7 +121,7 @@ class Notifier(
             val known = id?.let { shown[it] }
             if (known != null) {
                 // The answer was rejected: offer the interaction again, with the reason.
-                showInteraction(known.interaction, known.thread, settings.current(), error = result.error.message, force = true)
+                showInteraction(known.interaction, known.thread, known.backgroundTaskTitle, settings.current(), error = result.error.message, force = true)
                 return
             }
         }
@@ -185,6 +196,7 @@ class Notifier(
             manager.cancel(interactionTag(interactionId), ID_INTERACTION)
             return
         }
+        shown[interactionId] = known.copy(sending = true)
         val builder = base(channelOf(known.interaction))
             .setContentTitle(titleOf(known.interaction, known.thread))
             .setContentText(res.getString(R.string.notify_answer_sending))
@@ -294,17 +306,34 @@ class Notifier(
 
     // ----- building -----------------------------------------------------------------------------
 
-    private fun showInteraction(interaction: Interaction, thread: Thread?, prefs: AppSettings, error: String?, force: Boolean = false) {
+    /**
+     * [backgroundTaskTitle]: the title of the background task that asked, when it is stored on
+     * this device; a request of a background task says so either way.
+     */
+    private fun showInteraction(
+        interaction: Interaction,
+        thread: Thread?,
+        backgroundTaskTitle: String?,
+        prefs: AppSettings,
+        error: String?,
+        force: Boolean = false,
+    ) {
         val request = interaction.request
         val enabled = when (request) {
             is InteractionRequest.Question -> prefs.notifyQuestions
             is InteractionRequest.Approval, is InteractionRequest.Unknown -> prefs.notifyApprovals
         }
-        shown[interaction.id] = ShownInteraction(interaction, thread)
+        shown[interaction.id] = ShownInteraction(interaction, thread, backgroundTaskTitle)
         if (!enabled && !force) return
         val threadVisible = visibility.isThreadVisible(interaction.threadId)
         val summary = InteractionTexts.summary(res, request)
         val body = buildString {
+            if (interaction.backgroundTaskId != null) {
+                append(
+                    backgroundTaskTitle?.let { res.getString(R.string.notify_from_background, it) }
+                        ?: res.getString(R.string.notify_from_background_unknown),
+                ).append("\n")
+            }
             append(summary)
             if (request is InteractionRequest.Approval) {
                 request.detail?.takeIf { it.isNotBlank() }?.let { append("\n").append(it) }
@@ -338,6 +367,20 @@ class Notifier(
             }
         }
         post(interactionTag(interaction.id), ID_INTERACTION, builder.build(), interaction.threadId)
+    }
+
+    /**
+     * The background task that asked [interaction] became known after its notification was
+     * posted without the task's title: the notification is posted again with it, without alerting
+     * (`setOnlyAlertOnce`). One the user dismissed stays dismissed; one that shows an answer on its
+     * way keeps saying so.
+     */
+    private fun nameTheTask(interaction: Interaction, task: BackgroundTask, prefs: AppSettings) {
+        val known = shown[interaction.id] ?: return
+        if (known.backgroundTaskTitle != null || known.sending) return
+        shown[interaction.id] = known.copy(backgroundTaskTitle = task.title)
+        if (interactionTag(interaction.id) !in activeTags(ID_INTERACTION)) return
+        showInteraction(known.interaction, known.thread, task.title, prefs, error = null)
     }
 
     private fun action(icon: Int, label: Int, interaction: Interaction, optionId: String): NotificationCompat.Action {
@@ -378,6 +421,45 @@ class Notifier(
             .setWhen(turn.completedAt ?: clock.nowMs())
             .setShowWhen(true)
         post(if (failed) errorTag(thread.id) else turnTag(thread.id), if (failed) ID_ERROR else ID_TURN, builder.build(), thread.id)
+    }
+
+    /**
+     * A background task ended ([ended], the summary's `lastEnded`). Completed, failed and stopped
+     * tasks follow the finished-turn setting and share the thread's turn notification (the turn
+     * the agent may start about it replaces it); a lost task (its process ended, or the daemon
+     * restarted) is an error and follows the error setting.
+     */
+    private fun showBackgroundTaskFinished(thread: Thread, ended: BackgroundTaskEnded, prefs: AppSettings) {
+        val lost = ended.status == BackgroundTaskStatus.Lost
+        if (lost) {
+            if (!prefs.notifyErrors || visibility.isThreadVisible(thread.id)) return
+        } else {
+            when (prefs.turnNotifications) {
+                TurnNotificationMode.Never -> return
+                TurnNotificationMode.WhenNotViewing -> if (visibility.isThreadVisible(thread.id)) return
+                TurnNotificationMode.Always -> Unit
+            }
+        }
+        val text = res.getString(
+            when (ended.status) {
+                BackgroundTaskStatus.Completed -> R.string.notify_bg_completed
+                BackgroundTaskStatus.Failed -> R.string.notify_bg_failed
+                BackgroundTaskStatus.Stopped -> R.string.notify_bg_stopped
+                BackgroundTaskStatus.Lost -> R.string.notify_bg_lost
+                BackgroundTaskStatus.Running, BackgroundTaskStatus.Unknown -> R.string.notify_bg_ended
+            },
+            ended.title,
+        )
+        val channel = if (lost) NotificationChannels.ERRORS else NotificationChannels.TURNS
+        val builder = base(channel)
+            .setContentTitle(thread.title)
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setContentIntent(openThread(thread.id, null))
+            .setCategory(if (lost) NotificationCompat.CATEGORY_ERROR else NotificationCompat.CATEGORY_STATUS)
+            .setWhen(ended.endedAt)
+            .setShowWhen(true)
+        post(if (lost) errorTag(thread.id) else turnTag(thread.id), if (lost) ID_ERROR else ID_TURN, builder.build(), thread.id)
     }
 
     private fun showOperationFinished(operation: Operation, prefs: AppSettings) {

@@ -240,6 +240,7 @@ pub fn policy() -> AdapterPolicy {
         stop_grace: Duration::from_secs(2),
         max_line_bytes: 16 << 20,
         handshake_timeout: STEP_TIMEOUT,
+        ..AdapterPolicy::default()
     }
 }
 
@@ -294,6 +295,34 @@ pub async fn start_entries(
         link,
         events: Vec::new(),
     }
+}
+
+/// Replays `entries` against the native session listing (`list_native_sessions` over the
+/// scripted app-server); returns the listing and the runner's verdict.
+pub async fn list_entries(
+    entries: Vec<Value>,
+    limit: usize,
+) -> (
+    Result<Vec<aas_harness::NativeSessionSummary>, aas_harness::AdapterError>,
+    Result<(), String>,
+) {
+    let (adapter_writer, runner_reader) = tokio::io::duplex(1 << 20);
+    let (runner_writer, adapter_reader) = tokio::io::duplex(1 << 20);
+    let link = FakeLink::new();
+    let runner = tokio::spawn(run_script(entries, runner_reader, runner_writer, link));
+    let listed = aas_adapter_codex::testing::list_native_sessions(
+        adapter_reader,
+        adapter_writer,
+        &workspace(),
+        limit,
+        policy(),
+    )
+    .await;
+    let verdict = tokio::time::timeout(STEP_TIMEOUT, runner)
+        .await
+        .expect("runner did not finish")
+        .expect("runner panicked");
+    (listed, verdict)
 }
 
 impl Replay {

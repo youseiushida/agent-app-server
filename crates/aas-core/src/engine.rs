@@ -127,6 +127,7 @@ impl Engine {
         });
         let roots = canonical_roots(&config.project_roots);
         let (running_turns, _) = watch::channel(0usize);
+        let (running_background, _) = watch::channel(0usize);
         let (storage_failure, _) = watch::channel(None);
         let sh = Arc::new(Shared {
             db,
@@ -138,6 +139,7 @@ impl Engine {
             git,
             fs: FsApi::new(roots, config.policy.file_index_ttl),
             running_turns,
+            running_background,
             draining: AtomicBool::new(false),
             session_ending: AtomicBool::new(false),
             operations: OperationRegistry::default(),
@@ -258,6 +260,12 @@ impl Engine {
 
     pub fn running_processes(&self) -> usize {
         self.sh.capacity.in_use()
+    }
+
+    /// Background tasks that keep an agent busy (in their harness's live set and not ambient),
+    /// over all threads.
+    pub fn running_background_tasks(&self) -> usize {
+        *self.sh.running_background.borrow()
     }
 
     pub fn is_draining(&self) -> bool {
@@ -661,6 +669,7 @@ impl Engine {
                 running_turns: self.running_turns() as u32,
                 draining: self.is_draining(),
                 prevent_sleep_while_running: self.sh.config.policy.prevent_sleep_while_running,
+                running_background_tasks: self.running_background_tasks() as u32,
             })?,
             R::DeviceList(_) => to_value(DeviceListResult {
                 devices: self.list_devices(Some(&ctx.device_id)).await?,
@@ -864,6 +873,17 @@ impl Engine {
                 to_value(OperationListResult { operations })?
             }
             R::OperationCancel(p) => to_value(self.operation_cancel(p).await?)?,
+            R::BackgroundTaskStop(p) => {
+                let id = p.thread_id.clone();
+                to_value(
+                    self.ask(&id, |reply| Msg::StopBackground {
+                        task_id: p.task_id,
+                        idem,
+                        reply,
+                    })
+                    .await?,
+                )?
+            }
         })
     }
 
@@ -903,14 +923,15 @@ impl Engine {
         }
         let id = thread_id.clone();
         let preview_chars = self.sh.config.policy.queued_preview_chars;
-        let (row, queue_len, next_index) = self
+        let (row, queue_len, next_index, last_turn) = self
             .sh
             .db
             .read(move |tx| {
                 let row = store::get_thread(tx, &id)?.ok_or_else(|| not_found("thread", &id))?;
                 let queue = store::list_queued(tx, &id, preview_chars)?.len();
                 let next = store::next_turn_index(tx, &id)?;
-                Ok((row, queue, next))
+                let last = store::last_turn(tx, &id)?.map(|t| t.turn.id);
+                Ok((row, queue, next, last))
             })
             .await?;
         let mut actors = self.actors.lock();
@@ -927,7 +948,7 @@ impl Engine {
         let handle = match actors.get(thread_id).filter(|h| !h.is_closed()) {
             Some(h) => h.clone(),
             None => {
-                let h = actor::spawn(self.sh.clone(), row, true, queue_len, next_index);
+                let h = actor::spawn(self.sh.clone(), row, true, queue_len, next_index, last_turn);
                 actors.insert(thread_id.clone(), h.clone());
                 h
             }
@@ -1686,7 +1707,7 @@ impl Engine {
         };
         match input {
             Some(input) => {
-                let handle = actor::spawn(self.sh.clone(), row, false, 0, 0);
+                let handle = actor::spawn(self.sh.clone(), row, false, 0, 0, None);
                 self.actors.lock().insert(thread_id.clone(), handle.clone());
                 let (tx, rx) = oneshot::channel();
                 handle
@@ -1790,8 +1811,9 @@ impl Engine {
                     store::list_turns(tx, &p.thread_id, p.before_turn_index, limit)?;
                 let ids: Vec<TurnId> = turn_rows.iter().map(|t| t.turn.id.clone()).collect();
                 let items = store::items_of_turns(tx, &ids)?;
-                let interactions = store::interactions_of_turns(tx, &ids)?;
+                let interactions = store::interactions_for_read(tx, &p.thread_id, &ids)?;
                 let queued = store::list_queued(tx, &p.thread_id, preview_chars)?;
+                let background_tasks = store::background_tasks_for_read(tx, &p.thread_id, &ids)?;
                 let head = aas_eventlog::head(tx, &thread_stream(&p.thread_id))?;
                 Ok(ThreadReadResult {
                     thread,
@@ -1799,6 +1821,7 @@ impl Engine {
                     items,
                     interactions,
                     queued,
+                    background_tasks,
                     head,
                     has_more_before,
                 })
@@ -1911,6 +1934,8 @@ impl Engine {
                     item.id = ItemId::generate();
                     item.thread_id = row.id.clone();
                     item.turn_id = turn_map.get(&item.turn_id).cloned().unwrap_or(item.turn_id);
+                    // Background tasks are not copied: they belong to the parent's process.
+                    item.background_task_id = None;
                     store::insert_item(tx, &item)?;
                 }
                 let view = thread_changed(tx, em, &mut row)?;
@@ -2105,11 +2130,12 @@ impl Engine {
                 }),
             None => Vec::new(),
         };
-        commands.extend(
-            harness_commands
-                .into_iter()
-                .filter(|c| !commands_contains(&app_commands(&info, true), &c.name)),
-        );
+        let reserved = app_commands(&info, true);
+        let switching = adapter.session_switching_commands();
+        commands.extend(harness_commands.into_iter().filter(|c| {
+            !commands_contains(&reserved, &c.name)
+                && !is_session_switching_command(&c.name, switching)
+        }));
         Ok(CommandListResult { commands })
     }
 
@@ -2130,10 +2156,11 @@ impl Engine {
             )
             .with_cap("nativeSessions"));
         }
-        let sessions = adapter
+        let listed = adapter
             .list_native_sessions(Path::new(&project.path))
             .await
             .map_err(|e| rpc(ErrorKind::AdapterError, e.to_string()))?;
+        let sessions = unique_native_sessions(&p.harness_id, listed);
         let harness = p.harness_id.clone();
         let sessions = self
             .sh
@@ -2266,6 +2293,7 @@ impl Engine {
                         error: None,
                         usage: None,
                         diff: None,
+                        trigger: None,
                     };
                     store::insert_turn(
                         tx,
@@ -2283,6 +2311,7 @@ impl Engine {
                             status: hi.status,
                             started_at: started,
                             completed_at: Some(turn.completed_at.unwrap_or(started)),
+                            background_task_id: None,
                             body: hi.body,
                         };
                         store::insert_item(tx, &item)?;
@@ -2318,14 +2347,30 @@ impl Engine {
         self.sh.db.page_counts().await
     }
 
-    /// Stops accepting new turns and resolves once no turn runs any more. Cancel safe: the
-    /// caller may stop waiting (e.g. when a drain is escalated to an immediate stop).
+    /// Stops accepting new turns and resolves once no turn runs and no background work keeps
+    /// an agent busy any more, both at the same moment (a run the agent started by itself
+    /// counts as a running turn once its start is reported).
+    ///
+    /// A run the agent is about to start because its background work ended is not waited for:
+    /// Claude Code reports the end of the work before that run's start, and nothing explicit
+    /// in between says a run will follow (design.md §1 out of scope, §18.5). Such a run gets
+    /// the staged stop's grace after the drain (`policy.stop_grace`, stdin closed first).
+    ///
+    /// Cancel safe: the caller may stop waiting (e.g. when a drain is escalated to an immediate
+    /// stop).
     pub async fn wait_drained(&self) {
         self.sh.draining.store(true, Ordering::SeqCst);
-        let mut rx = self.sh.running_turns.subscribe();
-        while *rx.borrow_and_update() > 0 {
-            if rx.changed().await.is_err() {
-                break;
+        let mut turns = self.sh.running_turns.subscribe();
+        let mut background = self.sh.running_background.subscribe();
+        loop {
+            let busy_turns = *turns.borrow_and_update();
+            let busy_background = *background.borrow_and_update();
+            if busy_turns == 0 && busy_background == 0 {
+                return;
+            }
+            tokio::select! {
+                changed = turns.changed() => if changed.is_err() { return },
+                changed = background.changed() => if changed.is_err() { return },
             }
         }
     }
@@ -2514,6 +2559,42 @@ fn commands_contains(list: &[Command], name: &str) -> bool {
     list.iter().any(|c| c.name == name)
 }
 
+/// Harness command names that are never offered, whatever the harness.
+///
+/// `resume`: every CLI that has a command of that name uses it to open another of its sessions
+/// in the running process (Claude Code's and pi's session pickers, Codex's `/resume`). A thread
+/// is one native session (design.md §9.5), and the app offers its own `/resume` that opens the
+/// session import (`native/list`, `native/import`), which a harness command of the same name
+/// would hide (docs/ux/codex-desktop.md §8.5).
+const SESSION_SWITCHING_COMMAND_NAMES: &[&str] = &["resume"];
+
+/// Whether a harness command switches the native session inside the running process: one of
+/// [`SESSION_SWITCHING_COMMAND_NAMES`], or one the adapter names
+/// ([`aas_harness::HarnessAdapter::session_switching_commands`]).
+fn is_session_switching_command(name: &str, adapter_names: &[&str]) -> bool {
+    SESSION_SWITCHING_COMMAND_NAMES.contains(&name) || adapter_names.contains(&name)
+}
+
+/// `native/list` names each native session once (protocol.md, `NativeSession`): a thread
+/// imports one native session, and clients key their lists by `nativeSessionId`. Entries that
+/// repeat an id are merged, keeping the position of the first and the content of the latest
+/// (`updatedAt`). Adapters merge what their CLI repeats, so a repeat reaching the engine is an
+/// adapter defect and is logged.
+fn unique_native_sessions(
+    harness_id: &str,
+    listed: Vec<aas_harness::NativeSessionSummary>,
+) -> Vec<aas_harness::NativeSessionSummary> {
+    let set: aas_harness::NativeSessionSet = listed.into_iter().collect();
+    if set.repeated() > 0 {
+        tracing::warn!(
+            harness = harness_id,
+            dropped = set.repeated(),
+            "the adapter listed native sessions more than once; kept the latest entry of each"
+        );
+    }
+    set.into_sessions()
+}
+
 /// Commands the app implements itself (mapped to protocol methods or pickers).
 fn app_commands(info: &HarnessInfo, in_thread: bool) -> Vec<Command> {
     let cmd = |name: &str, description: &str, action: CommandAction| Command {
@@ -2673,6 +2754,21 @@ async fn recover(sh: &Arc<Shared>) -> CoreResult<()> {
                 status: InteractionStatus::Expired,
             });
             touched.insert(thread_id, ());
+        }
+        // Background work ended with the processes of the previous run (every process is gone).
+        let (task_status, task_reason) = if session_ended {
+            (BackgroundTaskStatus::Stopped, BackgroundEndReason::SystemShutdown)
+        } else {
+            (BackgroundTaskStatus::Lost, BackgroundEndReason::DaemonRestarted)
+        };
+        for mut task in store::running_background_tasks(tx)? {
+            task.status = task_status;
+            task.ended_at = Some(now);
+            task.end_reason = Some(task_reason);
+            task.stop_requested_at = None;
+            store::upsert_background_task(tx, &task)?;
+            touched.insert(task.thread_id.clone(), ());
+            em.thread(&task.thread_id.clone(), Event::BackgroundTaskUpdated { task });
         }
         let busy = [ThreadStatus::Queued, ThreadStatus::Starting, ThreadStatus::Ready, ThreadStatus::Running, ThreadStatus::Stopping];
         for row in store::threads_with_status(tx, &busy)? {

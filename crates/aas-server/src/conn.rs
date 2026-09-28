@@ -1,15 +1,17 @@
 //! One WebSocket connection.
 //!
 //! Tasks per connection:
-//! * reader — parses frames, dispatches requests (via [`Lanes`]), tracks inbound liveness;
+//! * reader — parses frames, dispatches requests (via [`Lanes`]), and closes the connection
+//!   `client_timeout` after its last inbound frame ([`InboundDeadline`]);
 //! * writer — owns the socket sink; drains the high-priority queue before stream batches;
-//! * heartbeat — sends `heartbeat` + Ping every interval, closes a silent connection;
+//! * heartbeat — sends `heartbeat` + Ping every interval;
 //! * one tailer per subscription — reads the log from its cursor and waits on the head.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use aas_core::{Batch, CoreResult, Engine, RequestCtx};
@@ -95,35 +97,47 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// When the connection last received a frame, on the monotonic clock
-/// (`tokio::time::Instant`). The wall clock can step (a time synchronization, the user
-/// changing the time, a correction after resuming from sleep): measured on it, one step
-/// forward would close every connection at once and one step back would keep a dead
-/// connection open until the clock catches up.
-struct InboundClock {
-    base: tokio::time::Instant,
-    /// Milliseconds after `base` of the last inbound frame.
-    last_ms: AtomicU64,
+/// The deadline of a connection's silence: `client_timeout` after its last inbound frame
+/// (a Pong counts), re-armed on every frame. The connection closes exactly when it passes, not
+/// at the next heartbeat tick after it (checking on the ticks made the effective limit anything
+/// up to `client_timeout + heartbeat_interval`).
+///
+/// Measured on the monotonic clock (`tokio::time::Instant`). The wall clock can step (a time
+/// synchronization, the user changing the time, a correction after resuming from sleep):
+/// measured on it, one step forward would close every connection at once and one step back
+/// would keep a dead connection open until the clock catches up.
+struct InboundDeadline {
+    timeout: Duration,
+    last_frame: tokio::time::Instant,
+    timer: Pin<Box<tokio::time::Sleep>>,
 }
 
-impl InboundClock {
-    fn new() -> Self {
+impl InboundDeadline {
+    /// Armed from now (the connection's opening counts as its first frame).
+    fn new(timeout: Duration) -> Self {
+        let now = tokio::time::Instant::now();
         Self {
-            base: tokio::time::Instant::now(),
-            last_ms: AtomicU64::new(0),
+            timeout,
+            last_frame: now,
+            timer: Box::pin(tokio::time::sleep_until(now + timeout)),
         }
     }
 
-    fn touch(&self) {
-        let now = self.base.elapsed().as_millis() as u64;
-        self.last_ms.store(now, Ordering::SeqCst);
+    /// A frame arrived: the deadline moves to `timeout` from now.
+    fn touch(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.last_frame = now;
+        self.timer.as_mut().reset(now + self.timeout);
     }
 
     /// How long no frame has arrived.
     fn silent_for(&self) -> Duration {
-        self.base
-            .elapsed()
-            .saturating_sub(Duration::from_millis(self.last_ms.load(Ordering::SeqCst)))
+        self.last_frame.elapsed()
+    }
+
+    /// Resolves once `timeout` has passed since the last frame.
+    async fn expired(&mut self) {
+        self.timer.as_mut().await;
     }
 }
 
@@ -188,7 +202,8 @@ async fn run(state: Arc<AppState>, device: aas_core::AuthenticatedDevice, socket
     let (done_tx, done_rx) = oneshot::channel();
     let lo_stream = futures::stream::poll_fn(move |cx| lo_rx.poll_recv(cx));
     let mut writer = tokio::spawn(write_loop(sink, hi_rx, lo_stream, done_rx));
-    let inbound = Arc::new(InboundClock::new());
+    let policy = state.engine.policy().clone();
+    let mut inbound = InboundDeadline::new(policy.client_timeout);
     let heads: Heads = Arc::default();
     let mut conn = Conn {
         state: state.clone(),
@@ -201,16 +216,11 @@ async fn run(state: Arc<AppState>, device: aas_core::AuthenticatedDevice, socket
         heads: heads.clone(),
     };
 
-    let policy = state.engine.policy().clone();
-    let (timeout_tx, mut timeout_rx) = oneshot::channel::<()>();
     let heartbeat = tokio::spawn(heartbeat_loop(
         state.engine.clone(),
         heads,
         hi_tx.clone(),
-        inbound.clone(),
         policy.heartbeat_interval,
-        policy.client_timeout,
-        timeout_tx,
     ));
     let mut shutdown_rx = state.shutdown_rx.clone();
     let mut replace_rx = replace_rx;
@@ -243,7 +253,14 @@ async fn run(state: Arc<AppState>, device: aas_core::AuthenticatedDevice, socket
                         CloseReason::Revoked => break Some((CLOSE_REVOKED, "device revoked")),
                     }
                 }
-                _ = &mut timeout_rx => break Some((CLOSE_TIMEOUT, "no frames within client_timeout")),
+                _ = inbound.expired() => {
+                    tracing::info!(
+                        device = %device.id,
+                        silent_ms = inbound.silent_for().as_millis() as u64,
+                        "client timed out"
+                    );
+                    break Some((CLOSE_TIMEOUT, "no frames within client_timeout"));
+                }
                 notice = async { shutdown_rx.wait_for(Option::is_some).await.ok().and_then(|n| *n) } => {
                     // The notice was decided once by whoever stopped the server; every
                     // connection reports the same reason. A server dropped without a notice
@@ -350,28 +367,19 @@ async fn write_loop<S, L>(
     let _ = sink.close().await;
 }
 
-/// Sends a heartbeat and a Ping every `interval`; fires `timeout_tx` once no frame has arrived
-/// for longer than `timeout` (measured on the monotonic clock, see [`InboundClock`]).
+/// Sends a heartbeat and a Ping every `interval`. (A silent client is closed by the reader's
+/// [`InboundDeadline`], independently of these ticks.)
 async fn heartbeat_loop<L: HeadSource>(
     engine: Arc<L>,
     heads: Heads,
     hi: mpsc::UnboundedSender<Out>,
-    inbound: Arc<InboundClock>,
     interval: Duration,
-    timeout: Duration,
-    timeout_tx: oneshot::Sender<()>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        let silent = inbound.silent_for();
-        if silent > timeout {
-            tracing::info!(silent_ms = silent.as_millis() as u64, "client timed out");
-            let _ = timeout_tx.send(());
-            return;
-        }
         // The heads come from the log itself, not from the tailers: a subscription whose
         // tailer stalled shows a head ahead of the client's cursor, and the client
         // resubscribes (design.md §7.3).
@@ -709,7 +717,6 @@ async fn tail<L: StreamLog>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Poll};
 
@@ -736,62 +743,79 @@ mod tests {
         }
     }
 
-    fn heartbeat(
-        inbound: Arc<InboundClock>,
-    ) -> (
-        JoinHandle<()>,
-        mpsc::UnboundedReceiver<Out>,
-        oneshot::Receiver<()>,
-    ) {
+    fn heartbeat() -> (JoinHandle<()>, mpsc::UnboundedReceiver<Out>) {
         let (hi_tx, hi_rx) = mpsc::unbounded_channel();
-        let (timeout_tx, timeout_rx) = oneshot::channel();
         let task = tokio::spawn(heartbeat_loop(
             Arc::new(FixedHeads),
             Arc::default(),
             hi_tx,
-            inbound,
             Duration::from_secs(15),
-            Duration::from_secs(45),
-            timeout_tx,
         ));
-        (task, hi_rx, timeout_rx)
+        (task, hi_rx)
+    }
+
+    /// Whether the deadline has passed by now (polled once, without waiting).
+    async fn has_expired(deadline: &mut InboundDeadline) -> bool {
+        tokio::time::timeout(Duration::ZERO, deadline.expired())
+            .await
+            .is_ok()
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_silent_connection_times_out_on_the_monotonic_clock() {
+    async fn a_silent_connection_expires_exactly_client_timeout_after_its_last_frame() {
         // Only the monotonic clock moves here (tokio's paused clock); the wall clock of the
         // machine does not take part in the decision at all.
-        let inbound = Arc::new(InboundClock::new());
-        let (task, mut out, mut timed_out) = heartbeat(inbound.clone());
-        tokio::time::sleep(Duration::from_secs(40)).await;
-        assert!(timed_out.try_recv().is_err(), "silent for 40 s of 45 s");
-        assert_eq!(inbound.silent_for(), Duration::from_secs(40));
-        // The check at 60 s (the first one after 45 s of silence) closes it.
-        tokio::time::sleep(Duration::from_secs(21)).await;
-        assert!(timed_out.try_recv().is_ok(), "silent for 60 s: timed out");
-        task.await.unwrap();
-        // Heartbeats and pings went out meanwhile.
+        let timeout = Duration::from_secs(45);
+        let mut deadline = InboundDeadline::new(timeout);
+        tokio::time::sleep(timeout - Duration::from_millis(1)).await;
+        assert!(
+            !has_expired(&mut deadline).await,
+            "1 ms before the deadline"
+        );
+        assert_eq!(deadline.silent_for(), Duration::from_millis(44_999));
+        let started = tokio::time::Instant::now();
+        deadline.expired().await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(1),
+            "closed at client_timeout itself, not at a later heartbeat tick"
+        );
+        assert_eq!(deadline.silent_for(), timeout);
+        assert!(has_expired(&mut deadline).await, "stays expired");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_inbound_frame_moves_the_deadline() {
+        let timeout = Duration::from_secs(45);
+        let mut deadline = InboundDeadline::new(timeout);
+        // Frames every 30 s keep it open far beyond one timeout.
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            assert!(!has_expired(&mut deadline).await);
+            deadline.touch();
+            assert_eq!(deadline.silent_for(), Duration::ZERO);
+        }
+        // Then silence: it expires 45 s after the last frame, to the millisecond.
+        let last_frame = tokio::time::Instant::now();
+        deadline.expired().await;
+        assert_eq!(last_frame.elapsed(), timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeats_and_pings_go_out_every_interval() {
+        let (task, mut out) = heartbeat();
+        tokio::time::sleep(Duration::from_secs(46)).await;
         let mut sent = Vec::new();
         while let Ok(o) = out.try_recv() {
             sent.push(o);
         }
-        assert!(
-            sent.iter()
-                .any(|o| matches!(o, Out::Text(t) if t.contains("heartbeat")))
-        );
-        assert!(sent.iter().any(|o| matches!(o, Out::Ping)));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn inbound_frames_keep_a_connection_alive() {
-        let inbound = Arc::new(InboundClock::new());
-        let (task, _out, mut timed_out) = heartbeat(inbound.clone());
-        for _ in 0..12 {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            inbound.touch();
-        }
-        assert!(timed_out.try_recv().is_err(), "alive after 120 s of frames");
-        assert_eq!(inbound.silent_for(), Duration::ZERO);
+        let beats = sent
+            .iter()
+            .filter(|o| matches!(o, Out::Text(t) if t.contains("heartbeat")))
+            .count();
+        let pings = sent.iter().filter(|o| matches!(o, Out::Ping)).count();
+        // Ticks at 15, 30 and 45 s.
+        assert_eq!((beats, pings), (3, 3), "{sent:?}");
         task.abort();
     }
 

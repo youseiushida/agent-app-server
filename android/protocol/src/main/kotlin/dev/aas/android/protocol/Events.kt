@@ -87,6 +87,10 @@ sealed interface Event {
     @Serializable
     data object CommandsChanged : Event
 
+    /** A background task started, progressed or ended (always the whole task; protocol.md §3.1). */
+    @Serializable
+    data class BackgroundTaskUpdated(val task: BackgroundTask) : Event
+
     @Serializable
     data class Native(val harnessId: String, val payload: JsonElement) : Event
 
@@ -118,6 +122,7 @@ sealed interface Event {
             is InteractionExpired -> "interaction/expired"
             is QueueUpdated -> "queue/updated"
             CommandsChanged -> "commands/changed"
+            is BackgroundTaskUpdated -> "backgroundTask/updated"
             is Native -> "native"
             is Unknown -> null
         }
@@ -128,7 +133,7 @@ sealed interface Event {
             "interaction/closed", "harness/updated", "operation/updated", "thread/updated", "turn/started",
             "turn/completed", "turn/diffUpdated", "turn/usageUpdated", "item/started", "item/delta", "item/updated",
             "item/completed", "interaction/requested", "interaction/resolved", "interaction/expired", "queue/updated",
-            "commands/changed", "native",
+            "commands/changed", "backgroundTask/updated", "native",
         )
 
         fun serializerFor(type: String): KSerializer<out Event>? = when (type) {
@@ -154,6 +159,7 @@ sealed interface Event {
             "interaction/expired" -> InteractionExpired.serializer()
             "queue/updated" -> QueueUpdated.serializer()
             "commands/changed" -> CommandsChanged.serializer()
+            "backgroundTask/updated" -> BackgroundTaskUpdated.serializer()
             "native" -> Native.serializer()
             else -> null
         }

@@ -5,16 +5,43 @@
 //!
 //! # Turn lifecycle (explicit signals only)
 //!
-//! * `send` writes `prompt` and marks a turn active.
-//! * The `prompt` response (`success`) or the first `agent_start` → `TurnStarted`.
-//!   A failed `prompt` response → `TurnCompleted { failed }` (pi rejected it before starting).
-//! * `agent_settled` (pi: "no retry, compaction retry or queued continuation remains") →
-//!   `TurnCompleted`. `agent_end` is not used: it may be followed by retries/compaction.
-//! * Prompts that pi handles without an agent run (extension commands, `input` handlers)
-//!   never produce `agent_settled`. After the `prompt` response the session therefore asks
-//!   `get_state`: pi sets `isStreaming` synchronously right after it answers a prompt that
-//!   starts a run, so `isStreaming == false` in that answer means "no run" → the turn
-//!   completes immediately. (Derived from `agent-session.js`/`rpc-mode.js` of pi 0.85.1.)
+//! pi (0.85.1, `agent-session.js` / `rpc-mode.js`) runs one agent run at a time. A run starts
+//! with `agent_start` and ends with `agent_settled` ("no retry, compaction retry or queued
+//! continuation remains"); within a run, every agent loop (the first one and each retry or
+//! continuation) goes from `agent_start` to `agent_end`. `agent_end` alone is not an end: a
+//! retry or compaction may follow.
+//!
+//! * **The user's turn.** `send` writes `prompt` and marks a turn active. The `prompt` response
+//!   (`success`) or the first `agent_start` → `TurnStarted`. A failed `prompt` response →
+//!   `TurnCompleted { failed }` (pi refused it before starting). `agent_settled` →
+//!   `TurnCompleted`.
+//! * **Prompts that start no run** (extension commands, `input` handlers) never produce
+//!   `agent_settled`. After the `prompt` response the session therefore asks `get_state`: pi
+//!   sets `isStreaming` synchronously right after it answers a prompt that starts a run, so
+//!   `isStreaming == false` in that answer means "no run" → the turn completes immediately.
+//! * **Runs pi starts by itself** (an extension's `sendMessage(…, { triggerTurn })` or
+//!   `sendUserMessage`, from a timer, a watcher or an event handler): an `agent_start` while
+//!   no turn is active → `TurnStarted` of a turn without input (design.md §5.5), mapped like
+//!   any turn until its `agent_settled` → `TurnCompleted`. `interrupt` sends `abort`. While
+//!   such a run goes on, `send` returns [`AdapterError::TurnInProgress`] without writing
+//!   anything (pi would refuse a prompt: it is busy).
+//! * **A run started from a run's end.** An extension can start a run from its handler of
+//!   `agent_settled`; pi then writes the new run's `agent_start` before the old run's
+//!   `agent_settled` (recorded). An `agent_settled` that arrives while an agent loop is
+//!   running (an `agent_start` after the last `agent_end`) therefore ends the turn at once and
+//!   opens a turn for the run that goes on; an `agent_start` after the turn's run has settled
+//!   (the turn only waits for its context) is a new run too.
+//! * **The race with a busy agent.** pi answers a plain prompt only after its preflight, and
+//!   refuses it (`success: false`) when a run of its own started first. `send` waits for pi's
+//!   answer to a plain prompt; an `agent_start` before that answer is a run pi started by
+//!   itself (for a plain prompt pi answers before its own run starts). The run gets its own
+//!   turn at once; the answer decides the rest, by event order only (pi's error text is never
+//!   read): refused → the run stays a turn of its own and `send` returns `TurnInProgress`
+//!   (the engine sends the input again after that turn); taken → the run is part of the
+//!   user's turn. `send` stops waiting at the first sign that pi is working on the prompt
+//!   and needs the user or time: a dialog, or a compaction before the prompt runs. Extension
+//!   commands (pi runs them even while busy, and answers when their handler returns) are not
+//!   waited for.
 //! * `/compact [instructions]` (see [`crate::commands`]) is sent as the RPC command `compact`
 //!   and runs as a turn of its own: `compaction_start` or the response starts it, the
 //!   `compact` response ends it.
@@ -24,13 +51,17 @@
 //! After every finished assistant message the session asks `get_session_stats` and relays
 //! its `contextUsage` (tokens and window, as pi computes them for its own footer and
 //! compaction) with the turn's usage. `agent_settled` completes the turn only once the
-//! answers to those requests are in, so the last one belongs to the turn.
+//! answers to those requests are in, so the last one belongs to the turn — unless a new run
+//! has already started (above), which ends the turn at once.
 //!
 //! # Dialogs
 //!
-//! Dialogs are withdrawn only on explicit signals: the gate's `dialogClosed` report (pi closed
-//! the gate's dialog because the turn was aborted), the end of the turn, or the end of the
-//! process. pi's RPC mode closes a dialog that carries a `timeout` by itself without telling
+//! Every dialog stays pending until it is answered ([`SessionControl::respond`], or
+//! [`SessionControl::expire_request`] when the engine no longer waits for it: pi then gets
+//! the dismissal, `cancelled: true`), until an explicit signal withdraws it (the gate's
+//! `dialogClosed` report: pi closed the gate's dialog because the turn was aborted), or until
+//! the process ends. The end of a turn does not close a dialog: pi would wait for its answer
+//! forever. pi's RPC mode closes a dialog that carries a `timeout` by itself without telling
 //! the client; the adapter does not time it (see `docs/adapters/pi.md` §6).
 //!
 //! Every event is emitted by the reader task, so `Exited` is always last.
@@ -98,19 +129,38 @@ enum Internal {
     StatsTimeout(String),
 }
 
-/// What the turn's command was.
+/// What began the turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnKind {
+    /// The user's `prompt`.
     Prompt,
     /// `/compact`, sent as the RPC command `compact`.
     Compact,
+    /// A run pi started by itself: an `agent_start` while no turn was active.
+    Agent,
 }
+
+/// Runs pi started by itself while a plain prompt waited for pi's answer (the race with a busy
+/// agent, see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Foreign {
+    #[default]
+    None,
+    /// Such a run goes on.
+    Running,
+    /// Such a run has settled (its `TurnCompleted` waits for pi's answer to the prompt).
+    Settled,
+}
+
+/// What `send` returns once pi has decided about a plain prompt.
+type Decision = oneshot::Sender<Result<(), AdapterError>>;
 
 #[derive(Debug)]
 struct ActiveTurn {
-    /// Id of the `prompt` (or `compact`) command that began the turn.
-    prompt_id: String,
     kind: TurnKind,
+    /// Id of the `prompt` (or `compact`) command that began the turn; `None` for a run pi
+    /// started by itself.
+    command_id: Option<String>,
     started: bool,
     accepted: bool,
     settled_early: bool,
@@ -125,13 +175,23 @@ struct ActiveTurn {
     stats_pending: HashSet<String>,
     /// `agent_settled` arrived while stats requests were pending.
     settle_waiting: bool,
+    /// `send` waits for pi's answer to this (plain) prompt.
+    decision: Option<Decision>,
+    /// Runs pi started by itself before it answered this prompt.
+    foreign: Foreign,
+    /// The user messages that open this turn's run are relayed as notices: the run's input
+    /// was not typed by the user (a run pi started by itself, or one an extension command
+    /// started), so the engine has no user message for it.
+    relay_input: bool,
+    /// Between the start of the turn's run and its first assistant message.
+    input_phase: bool,
 }
 
 impl ActiveTurn {
-    fn new(prompt_id: String, kind: TurnKind) -> Self {
+    fn new(kind: TurnKind, command_id: Option<String>) -> Self {
         Self {
-            prompt_id,
             kind,
+            command_id,
             started: false,
             accepted: false,
             settled_early: false,
@@ -141,7 +201,41 @@ impl ActiveTurn {
             abort_on_run_start: false,
             stats_pending: HashSet::new(),
             settle_waiting: false,
+            decision: None,
+            foreign: Foreign::None,
+            relay_input: false,
+            input_phase: false,
         }
+    }
+
+    /// The turn of a run pi started by itself, from its `agent_start` on.
+    fn agent() -> Self {
+        Self {
+            started: true,
+            accepted: true,
+            run_started: true,
+            relay_input: true,
+            input_phase: true,
+            ..Self::new(TurnKind::Agent, None)
+        }
+    }
+
+    /// Whether `send` still waits for pi's answer to this prompt (its caller may have given up).
+    fn waiting(&self) -> bool {
+        self.decision.as_ref().is_some_and(|tx| !tx.is_closed())
+    }
+
+    /// A plain prompt pi has not answered yet, with no run of pi's own seen before: pi is
+    /// working on it (its preflight).
+    fn in_preflight(&self) -> bool {
+        self.kind == TurnKind::Prompt && !self.accepted && self.foreign == Foreign::None
+    }
+}
+
+/// Hands pi's decision about a prompt to the waiting `send` (nothing when it gave up).
+fn decide(decision: Option<Decision>, outcome: Result<(), AdapterError>) {
+    if let Some(tx) = decision {
+        let _ = tx.send(outcome);
     }
 }
 
@@ -158,6 +252,26 @@ struct State {
     permission_mode: Option<String>,
     /// `/compact` is executed by the adapter (pi lists no command of that name).
     builtin_compact: bool,
+    /// Invocation names of pi's extension commands (from the last `get_commands`).
+    extension_commands: HashSet<String>,
+    /// An agent loop is running: an `agent_start` arrived after the last `agent_end`.
+    loop_running: bool,
+}
+
+impl State {
+    /// Whether a new turn may start: the session is open and no turn is active. A run pi
+    /// started by itself is going on → [`AdapterError::TurnInProgress`] (its `TurnStarted` has
+    /// been emitted).
+    fn idle(&self) -> Result<(), AdapterError> {
+        if self.closed {
+            return Err(AdapterError::Closed);
+        }
+        match &self.turn {
+            None => Ok(()),
+            Some(turn) if turn.kind == TurnKind::Agent => Err(AdapterError::TurnInProgress),
+            Some(_) => Err(AdapterError::Other("a turn is already running".into())),
+        }
+    }
 }
 
 pub(crate) struct Shared {
@@ -307,7 +421,11 @@ impl PiSession {
         let commands: Vec<PiCommand> =
             serde_json::from_value(data.get("commands").cloned().unwrap_or(Value::Null))
                 .map_err(|e| AdapterError::Protocol(format!("get_commands: {e}")))?;
-        self.shared.state.lock().builtin_compact = commands::builtin_compact(&commands);
+        {
+            let mut st = self.shared.state.lock();
+            st.builtin_compact = commands::builtin_compact(&commands);
+            st.extension_commands = commands::extension_command_names(&commands);
+        }
         Ok(commands)
     }
 
@@ -460,20 +578,24 @@ async fn prompt_payload(input: &TurnInput) -> Result<(String, Vec<Value>), Adapt
 
 #[async_trait]
 impl SessionControl for PiSession {
+    /// Starts a turn: `compact` for `/compact`, else `prompt`. Returns
+    /// [`AdapterError::TurnInProgress`] without writing anything while a run pi started by
+    /// itself goes on. For a plain prompt (not an extension command) it waits for pi's
+    /// decision (see the module docs, "The race with a busy agent"): taken → `Ok`, refused
+    /// because a run of pi's own started first → `TurnInProgress`, refused otherwise → `Ok`
+    /// with the turn's `TurnCompleted { failed }` emitted.
     async fn send(&self, input: TurnInput) -> Result<(), AdapterError> {
-        let compact = {
+        let (compact, extension_command) = {
             let st = self.shared.state.lock();
-            if st.closed {
-                return Err(AdapterError::Closed);
-            }
-            if st.turn.is_some() {
-                return Err(AdapterError::Other("a turn is already running".into()));
-            }
-            if st.builtin_compact {
+            st.idle()?;
+            let compact = if st.builtin_compact {
                 commands::parse_compact(&input)
             } else {
                 None
-            }
+            };
+            let command = compact.is_none()
+                && commands::is_extension_command(&input.to_plain_text(), &st.extension_commands);
+            (compact, command)
         };
         let id = self.next_id();
         let (cmd, kind) = match compact {
@@ -493,12 +615,37 @@ impl SessionControl for PiSession {
                 (cmd, TurnKind::Prompt)
             }
         };
-        self.shared.state.lock().turn = Some(ActiveTurn::new(id, kind));
+        let decision = (kind == TurnKind::Prompt && !extension_command).then(oneshot::channel);
+        let decision = {
+            let mut st = self.shared.state.lock();
+            // pi may have started a run of its own while the input was prepared.
+            st.idle()?;
+            let mut turn = ActiveTurn::new(kind, Some(id.clone()));
+            turn.relay_input = extension_command;
+            let rx = decision.map(|(tx, rx)| {
+                turn.decision = Some(tx);
+                rx
+            });
+            st.turn = Some(turn);
+            rx
+        };
         if let Err(e) = self.write(cmd).await {
-            self.shared.state.lock().turn = None;
+            // pi's input is closed: the process is ending (its `Exited` follows).
+            let mut st = self.shared.state.lock();
+            if st
+                .turn
+                .as_ref()
+                .is_some_and(|t| t.command_id.as_deref() == Some(id.as_str()) && !t.started)
+            {
+                st.turn = None;
+            }
             return Err(e);
         }
-        Ok(())
+        match decision {
+            None => Ok(()),
+            // The reader decides; it drops the decision only when pi's output ends.
+            Some(rx) => rx.await.unwrap_or(Err(AdapterError::Closed)),
+        }
     }
 
     async fn steer(&self, input: TurnInput) -> Result<(), AdapterError> {
@@ -513,10 +660,11 @@ impl SessionControl for PiSession {
         self.request_ok("steer", fields).await.map(|_| ())
     }
 
-    /// Sends `abort`. pi's abort stops what runs at that moment (the agent run, a retry, a
-    /// compaction); a `prompt` still in its preflight (auth check, auto-compaction, the
-    /// extensions' `before_agent_start`) goes on and starts its run afterwards. An abort sent
-    /// before the turn's `agent_start` is therefore sent again when that run starts.
+    /// Sends `abort`, for the user's turn and for a run pi started by itself alike. pi's abort
+    /// stops what runs at that moment (the agent run, a retry, a compaction); a `prompt` still
+    /// in its preflight (auth check, auto-compaction, the extensions' `before_agent_start`)
+    /// goes on and starts its run afterwards. An abort sent before the turn's `agent_start` is
+    /// therefore sent again when that run starts.
     async fn interrupt(&self) -> Result<(), AdapterError> {
         {
             let mut st = self.shared.state.lock();
@@ -560,7 +708,7 @@ impl SessionControl for PiSession {
         {
             let mut st = self.shared.state.lock();
             if st.dialogs.remove(request_id).is_none() {
-                // Withdrawn (closed by pi, turn ended) between the lookup and now.
+                // Answered or withdrawn (the gate reported its closure) meanwhile.
                 return Err(AdapterError::UnknownRequest(request_id.to_owned()));
             }
             if let PendingDialog::Gate { tool_call_id, .. } = &pending
@@ -652,11 +800,14 @@ impl ReaderTask {
                 Some(msg) = internal.recv() => self.handle_internal(msg).await,
             }
         }
-        {
+        let decision = {
             let mut st = self.shared.state.lock();
             st.closed = true;
             st.waiters.clear();
-        }
+            st.turn.as_mut().and_then(|t| t.decision.take())
+        };
+        // pi ended before it decided about the prompt.
+        decide(decision, Err(AdapterError::Closed));
         // Drain events queued by control methods before the process ended.
         while let Ok(msg) = internal.try_recv() {
             if let Internal::Emit(ev) = msg {
@@ -719,18 +870,74 @@ impl ReaderTask {
 
     /// The run is over (`agent_settled`, or pi said no run started): completes the turn, or,
     /// while `get_session_stats` answers of the turn are outstanding, lets the last of them
-    /// complete it.
+    /// complete it. When an agent loop is already running again (a run started from the old
+    /// run's end, see the module docs), the turn completes at once and the running run gets a
+    /// turn of its own.
     async fn settle(&mut self) {
-        let wait = match self.shared.state.lock().turn.as_mut() {
-            Some(turn) if !turn.stats_pending.is_empty() => {
-                turn.settle_waiting = true;
-                true
-            }
-            _ => false,
-        };
-        if !wait {
-            self.complete_turn(None).await;
+        enum Settle {
+            Now,
+            WaitForStats,
+            NowThenNewRun,
         }
+        let settle = {
+            let mut st = self.shared.state.lock();
+            let loop_running = st.loop_running;
+            match st.turn.as_mut() {
+                Some(_) if loop_running => Settle::NowThenNewRun,
+                Some(turn) if !turn.stats_pending.is_empty() => {
+                    turn.settle_waiting = true;
+                    Settle::WaitForStats
+                }
+                _ => Settle::Now,
+            }
+        };
+        match settle {
+            Settle::Now => self.complete_turn(None).await,
+            Settle::WaitForStats => {}
+            Settle::NowThenNewRun => {
+                self.complete_turn(None).await;
+                self.open_agent_turn();
+            }
+        }
+    }
+
+    /// Opens the turn of a run pi started by itself (its `agent_start` has arrived).
+    fn open_agent_turn(&mut self) {
+        self.shared.state.lock().turn = Some(ActiveTurn::agent());
+        self.mapper.begin_turn();
+        self.emit(AdapterEvent::TurnStarted);
+    }
+
+    /// pi works on the prompt that `send` waits for and needs the user or time first (a
+    /// dialog of an `input` or `before_agent_start` handler, a compaction before the prompt
+    /// runs): `send` returns so that the engine can relay the dialog, and the turn goes on. A
+    /// refusal that still follows is handled by `on_response` (`PromptNotTaken`).
+    fn stop_waiting_in_preflight(&mut self) {
+        let decision = self
+            .shared
+            .state
+            .lock()
+            .turn
+            .as_mut()
+            .filter(|t| t.in_preflight())
+            .and_then(|t| t.decision.take());
+        decide(decision, Ok(()));
+    }
+
+    /// The notice for a user message that opens a run the user did not type (see
+    /// [`ActiveTurn::relay_input`]); the run's first assistant message ends its input.
+    fn run_input(&mut self, kind: &str, value: &Value) -> Option<AdapterEvent> {
+        let mut st = self.shared.state.lock();
+        let turn = st.turn.as_mut()?;
+        if kind == "message_start"
+            && value.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
+        {
+            turn.input_phase = false;
+            return None;
+        }
+        (turn.relay_input && turn.input_phase)
+            .then(|| mapping::run_input_notice(value))
+            .flatten()
     }
 
     /// Starts a `/compact` turn at its first explicit sign of life.
@@ -761,42 +968,105 @@ impl ReaderTask {
             "response" => self.on_response(value).await,
             "extension_ui_request" => self.on_ui_request(value),
             "agent_start" => {
-                let (start_now, abort_again) = {
+                enum Start {
+                    /// No turn: a run pi started by itself.
+                    AgentRun,
+                    /// The turn's run has settled (the turn waits for its context only): this
+                    /// is a new run.
+                    AfterSettled,
+                    /// A run of pi's own before pi answered the waiting prompt.
+                    Foreign { first: bool },
+                    /// The turn's run (or a retry / continuation of it).
+                    TurnRun { start_now: bool, abort_again: bool },
+                }
+                let start = {
                     let mut st = self.shared.state.lock();
+                    st.loop_running = true;
                     match st.turn.as_mut() {
+                        None => Start::AgentRun,
+                        Some(turn) if turn.settle_waiting => Start::AfterSettled,
+                        // pi answers a plain prompt before its run starts: whatever starts
+                        // before the answer is not this prompt's run.
+                        Some(turn)
+                            if turn.kind == TurnKind::Prompt
+                                && !turn.accepted
+                                && turn.waiting() =>
+                        {
+                            let first = !turn.started;
+                            if turn.foreign != Foreign::Running {
+                                turn.input_phase = true;
+                            }
+                            turn.started = true;
+                            turn.foreign = Foreign::Running;
+                            turn.relay_input = true;
+                            Start::Foreign { first }
+                        }
                         Some(turn) => {
                             let start_now = !turn.started;
+                            if !turn.run_started {
+                                turn.input_phase = true;
+                            }
                             turn.started = true;
                             turn.run_started = true;
-                            (start_now, std::mem::take(&mut turn.abort_on_run_start))
-                        }
-                        None => {
-                            drop(st);
-                            // A run we did not start (e.g. triggered by an extension later).
-                            self.emit(AdapterEvent::Native { payload: value });
-                            return;
+                            Start::TurnRun {
+                                start_now,
+                                abort_again: std::mem::take(&mut turn.abort_on_run_start),
+                            }
                         }
                     }
                 };
-                if start_now {
-                    self.mapper.begin_turn();
-                    self.emit(AdapterEvent::TurnStarted);
-                }
-                if abort_again {
-                    // The abort arrived during the prompt's preflight and did not stop this run.
-                    let id = next_id(&self.shared);
-                    if write(&self.shared, wire::cmd(&id, "abort")).await.is_err() {
-                        // pi is gone; the end of its output settles the turn.
-                        tracing::debug!(session = %self.shared.cfg.label, "could not repeat the abort: pi's input is closed");
+                match start {
+                    Start::AgentRun => self.open_agent_turn(),
+                    Start::AfterSettled => {
+                        self.complete_turn(None).await;
+                        self.open_agent_turn();
+                    }
+                    Start::Foreign { first } => {
+                        if first {
+                            self.mapper.begin_turn();
+                            self.emit(AdapterEvent::TurnStarted);
+                        }
+                    }
+                    Start::TurnRun {
+                        start_now,
+                        abort_again,
+                    } => {
+                        if start_now {
+                            self.mapper.begin_turn();
+                            self.emit(AdapterEvent::TurnStarted);
+                        }
+                        if abort_again {
+                            // The abort arrived during the prompt's preflight and did not stop
+                            // this run.
+                            let id = next_id(&self.shared);
+                            if write(&self.shared, wire::cmd(&id, "abort")).await.is_err() {
+                                // pi is gone; the end of its output settles the turn.
+                                tracing::debug!(session = %self.shared.cfg.label, "could not repeat the abort: pi's input is closed");
+                            }
+                        }
                     }
                 }
+            }
+            "agent_end" => {
+                self.shared.state.lock().loop_running = false;
             }
             "agent_settled" => {
                 let action = {
                     let mut st = self.shared.state.lock();
+                    let loop_running = st.loop_running;
                     match st.turn.as_mut() {
                         // A compaction ends with the `compact` response, not with a run.
                         Some(turn) if turn.kind == TurnKind::Compact => SettleAction::None,
+                        // A run of pi's own settled before pi answered the prompt: its end
+                        // waits for the answer (see `on_response`).
+                        Some(turn) if !turn.accepted && turn.foreign != Foreign::None => {
+                            turn.foreign = if loop_running {
+                                Foreign::Running
+                            } else {
+                                Foreign::Settled
+                            };
+                            SettleAction::None
+                        }
                         Some(turn) if turn.accepted => SettleAction::Complete,
                         Some(turn) => {
                             turn.settled_early = true;
@@ -843,8 +1113,13 @@ impl ReaderTask {
                 }
                 if kind == "compaction_start" {
                     self.start_compact_turn();
+                    // A compaction before the waiting prompt runs (pi's preflight).
+                    self.stop_waiting_in_preflight();
                 }
                 if let Some(notice) = mapping::custom_message_notice(&value) {
+                    self.emit(notice);
+                }
+                if let Some(notice) = self.run_input(&kind, &value) {
                     self.emit(notice);
                 }
                 let shared = self.shared.clone();
@@ -873,10 +1148,24 @@ impl ReaderTask {
 
         enum Route {
             Waiter(oneshot::Sender<Response>),
-            PromptRejected,
+            PromptRejected {
+                decision: Option<Decision>,
+            },
             PromptAccepted {
                 start_now: bool,
                 settled_early: bool,
+                decision: Option<Decision>,
+            },
+            /// pi refused the waiting prompt because a run of its own had started: that run
+            /// is a turn of its own (`settled`: it has ended already).
+            RefusedForOwnRun {
+                settled: bool,
+                decision: Option<Decision>,
+            },
+            /// pi refused the prompt after a run had started that the turn shows already
+            /// (`send` no longer waited): the run stays the turn's, which ends with it.
+            PromptNotTaken {
+                settled: bool,
             },
             Probe,
             CompactDone {
@@ -888,6 +1177,9 @@ impl ReaderTask {
             },
             Other,
         }
+        let is_command = |t: &ActiveTurn, kind: TurnKind| {
+            t.kind == kind && id.is_some() && t.command_id.as_ref() == id.as_ref()
+        };
         let route = {
             let mut st = self.shared.state.lock();
             if let Some(tx) = id.as_ref().and_then(|id| st.waiters.remove(id)) {
@@ -895,7 +1187,7 @@ impl ReaderTask {
             } else if let Some(turn) = st
                 .turn
                 .as_mut()
-                .filter(|t| t.kind == TurnKind::Compact && id.as_ref() == Some(&t.prompt_id))
+                .filter(|t| is_command(t, TurnKind::Compact))
             {
                 let start_now = !turn.started;
                 turn.started = true;
@@ -914,22 +1206,44 @@ impl ReaderTask {
                 Route::Stats {
                     settle_now: turn.settle_waiting && turn.stats_pending.is_empty(),
                 }
-            } else if let Some(turn) = st
-                .turn
-                .as_mut()
-                .filter(|t| id.as_ref() == Some(&t.prompt_id))
+            } else if let Some(turn) = st.turn.as_mut().filter(|t| is_command(t, TurnKind::Prompt))
             {
                 if resp.success {
                     turn.accepted = true;
                     let start_now = !turn.started;
                     turn.started = true;
+                    if turn.foreign != Foreign::None {
+                        // pi took the prompt although a run of its own had started first: the
+                        // runs seen so far are part of this turn, and a run still going on is
+                        // the one the prompt joined.
+                        turn.run_started = turn.foreign == Foreign::Running;
+                        turn.foreign = Foreign::None;
+                        turn.relay_input = false;
+                    }
                     Route::PromptAccepted {
                         start_now,
                         settled_early: turn.settled_early,
+                        decision: turn.decision.take(),
                     }
+                } else if turn.foreign != Foreign::None && turn.waiting() {
+                    let settled = turn.foreign == Foreign::Settled;
+                    let decision = turn.decision.take();
+                    let mut own = ActiveTurn::agent();
+                    own.stats_pending = std::mem::take(&mut turn.stats_pending);
+                    own.input_phase = turn.input_phase;
+                    *turn = own;
+                    Route::RefusedForOwnRun { settled, decision }
+                } else if turn.started {
+                    let settled = turn.settled_early || turn.foreign == Foreign::Settled;
+                    turn.accepted = true;
+                    turn.foreign = Foreign::None;
+                    turn.relay_input = true;
+                    // The waiting `send` gave up (its caller's deadline): nothing to decide.
+                    turn.decision = None;
+                    Route::PromptNotTaken { settled }
                 } else {
-                    st.turn = None;
-                    Route::PromptRejected
+                    let decision = st.turn.take().and_then(|t| t.decision);
+                    Route::PromptRejected { decision }
                 }
             } else if let Some(turn) = st
                 .turn
@@ -947,18 +1261,43 @@ impl ReaderTask {
             Route::Waiter(tx) => {
                 let _ = tx.send(resp);
             }
-            Route::PromptRejected => self.emit(AdapterEvent::TurnCompleted {
-                status: TurnStatus::Failed,
-                usage: None,
-                error: Some(TurnError {
-                    message: resp.error_message(),
-                    kind: "harnessError".into(),
-                }),
-            }),
+            Route::PromptRejected { decision } => {
+                self.emit(AdapterEvent::TurnCompleted {
+                    trigger: None,
+                    status: TurnStatus::Failed,
+                    usage: None,
+                    error: Some(TurnError {
+                        message: resp.error_message(),
+                        kind: "harnessError".into(),
+                    }),
+                });
+                // The refusal is the turn's outcome, reported by the event above.
+                decide(decision, Ok(()));
+            }
+            Route::RefusedForOwnRun { settled, decision } => {
+                // Its `TurnStarted` went out at its `agent_start`.
+                tracing::info!(session = %self.shared.cfg.label, "pi refused the prompt: a run of its own had started; the input waits for that run");
+                if settled {
+                    self.settle().await;
+                }
+                decide(decision, Err(AdapterError::TurnInProgress));
+            }
+            Route::PromptNotTaken { settled } => {
+                self.emit(AdapterEvent::Notice {
+                    level: aas_harness::NoticeLevel::Warning,
+                    message: format!("pi did not take this message: {}", resp.error_message()),
+                    code: Some("promptNotTaken".into()),
+                });
+                if settled {
+                    self.settle().await;
+                }
+            }
             Route::PromptAccepted {
                 start_now,
                 settled_early,
+                decision,
             } => {
+                decide(decision, Ok(()));
                 if start_now {
                     self.mapper.begin_turn();
                     self.emit(AdapterEvent::TurnStarted);
@@ -971,7 +1310,10 @@ impl ReaderTask {
                 if let Some(turn) = self.shared.state.lock().turn.as_mut() {
                     turn.probe_id = Some(probe_id.clone());
                 }
-                let _ = write(&self.shared, wire::cmd(&probe_id, "get_state")).await;
+                if let Err(e) = write(&self.shared, wire::cmd(&probe_id, "get_state")).await {
+                    // pi's stdin is closed: the process is ending, and its exit ends the turn.
+                    tracing::warn!(session = %self.shared.cfg.label, error = %e, "could not ask pi whether the accepted prompt runs");
+                }
             }
             Route::Probe => {
                 // `isStreaming` missing means we cannot tell: keep waiting for agent_settled.
@@ -1064,12 +1406,19 @@ impl ReaderTask {
                 pending,
                 tool_call_id,
             } => {
+                // Pending until answered or expired (also across turns: it belongs to the
+                // running turn, or to the thread when none runs), withdrawn only by the
+                // gate's report or the end of the process.
                 self.shared.state.lock().dialogs.insert(id.clone(), pending);
                 self.emit(AdapterEvent::InteractionRequested {
+                    background_key: None,
                     request_id: id,
                     request,
                     item_key: tool_call_id.map(|t| mapping::tool_key(&t)),
                 });
+                // A dialog of the waiting prompt's preflight (an `input` or
+                // `before_agent_start` handler) needs the user: `send` returns.
+                self.stop_waiting_in_preflight();
             }
             Dialog::GateClosed {
                 tool_call_id,
@@ -1112,30 +1461,26 @@ impl ReaderTask {
         &mut self,
         outcome: Option<(TurnStatus, Option<aas_harness::Usage>, Option<TurnError>)>,
     ) {
+        // Open dialogs stay: pi still waits for their answers. The engine expires those that
+        // belonged to this turn and answers them through `expire_request` (a dismissal).
         let taken = {
             let mut st = self.shared.state.lock();
-            st.turn.take().map(|turn| {
-                let dialogs: Vec<String> = st.dialogs.drain().map(|(k, _)| k).collect();
-                (
-                    turn.abort_requested,
-                    dialogs,
-                    std::mem::take(&mut st.steering),
-                )
-            })
+            st.turn
+                .take()
+                .map(|turn| (turn.abort_requested, std::mem::take(&mut st.steering)))
         };
-        let Some((abort_requested, dialogs, steering)) = taken else {
+        let Some((abort_requested, steering)) = taken else {
             return;
         };
-        let mut dialogs = dialogs;
-        dialogs.sort();
-        for request_id in dialogs {
-            self.emit(AdapterEvent::InteractionWithdrawn { request_id });
-        }
         if !steering.is_empty() {
             // pi would deliver these with the next prompt; drop them so they do not leak into
             // an unrelated turn, and tell the user.
             let id = next_id(&self.shared);
-            let _ = write(&self.shared, wire::cmd(&id, "clear_queue")).await;
+            if let Err(e) = write(&self.shared, wire::cmd(&id, "clear_queue")).await {
+                // pi's stdin is closed: the process is ending, so nothing it queued can leak
+                // into a later turn.
+                tracing::warn!(session = %self.shared.cfg.label, error = %e, "could not clear pi's queue of undelivered messages");
+            }
             self.emit(AdapterEvent::Notice {
                 level: aas_harness::NoticeLevel::Warning,
                 message: format!(
@@ -1153,6 +1498,7 @@ impl ReaderTask {
             }
         };
         self.emit(AdapterEvent::TurnCompleted {
+            trigger: None,
             status,
             usage,
             error,

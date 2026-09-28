@@ -34,6 +34,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import dev.aas.android.AppContainer
+import dev.aas.android.AppVersion
 import dev.aas.android.R
 import dev.aas.android.diagnostics.LogEntry
 import dev.aas.android.domain.RequestLabels
@@ -100,7 +101,11 @@ class DiagnosticsViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    fun logText(): String = container.connectionLog.asText()
+    /** The installed app's version (from the git commit it was built from). */
+    val version: AppVersion = AppVersion.Current
+
+    /** The log as copied from the screen, headed by the app's version (a report names its build). */
+    fun logText(): String = "app $version\n" + container.connectionLog.asText()
 }
 
 /**
@@ -143,6 +148,9 @@ fun DiagnosticsScreen(vm: DiagnosticsViewModel, navigator: AppNavigator) {
     ) { padding ->
         LazyColumn(Modifier.fillMaxWidth(), contentPadding = padding) {
             item {
+                SectionHeader(stringResource(R.string.diagnostics_app))
+                Kv(stringResource(R.string.diagnostics_app_version), stringResource(R.string.diagnostics_app_version_value, vm.version.name, vm.version.code, vm.version.buildType))
+                HorizontalDivider()
                 SectionHeader(stringResource(R.string.diagnostics_connection)) {
                     TextButton(onClick = vm::reconnectNow) { Text(stringResource(R.string.action_reconnect)) }
                 }

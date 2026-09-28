@@ -1,5 +1,7 @@
 package dev.aas.android.sync
 
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskId
 import dev.aas.android.protocol.Harness
 import dev.aas.android.protocol.Interaction
 import dev.aas.android.protocol.InteractionId
@@ -56,6 +58,7 @@ internal class Views {
         val turns = HashMap<TurnId, Turn>()
         val items = HashMap<ItemId, StoredItem>()
         val interactions = HashMap<InteractionId, Interaction>()
+        val tasks = HashMap<BackgroundTaskId, BackgroundTask>()
         var queued: List<QueuedInput> = emptyList()
         var meta = ThreadMeta()
         var dirty = false
@@ -140,6 +143,8 @@ internal class Views {
         tx.itemsOf(id).forEach { view.items[it.item.id] = it }
         view.interactions.clear()
         tx.interactionsOf(id).forEach { view.interactions[it.id] = it }
+        view.tasks.clear()
+        tx.backgroundTasksOf(id).forEach { view.tasks[it.id] = it }
         view.queued = tx.queued(id)
         view.meta = tx.threadMeta(id)
     }
@@ -165,6 +170,7 @@ internal class Views {
                         view.turns.clear()
                         view.items.clear()
                         view.interactions.clear()
+                        view.tasks.clear()
                         view.queued = emptyList()
                         view.meta = ThreadMeta()
                         view.dirty = true
@@ -208,6 +214,7 @@ internal class Views {
                         view.turns.clear()
                         view.items.clear()
                         view.interactions.clear()
+                        view.tasks.clear()
                         view.queued = emptyList()
                         view.meta = ThreadMeta()
                         view.sync = ThreadSync.Removed
@@ -241,6 +248,10 @@ internal class Views {
                         it.dirty = true
                     }
                 }
+                is StoreChange.BackgroundTaskUpserted -> open[change.task.threadId]?.let {
+                    it.tasks[change.task.id] = change.task
+                    it.dirty = true
+                }
                 is StoreChange.QueueReplaced -> open[change.threadId]?.let {
                     it.queued = change.queued
                     it.dirty = true
@@ -248,6 +259,7 @@ internal class Views {
                 is StoreChange.ThreadContentCleared -> open[change.threadId]?.let {
                     it.turns.clear()
                     it.items.clear()
+                    it.tasks.clear()
                     it.queued = emptyList()
                     it.dirty = true
                 }
@@ -316,6 +328,7 @@ internal class Views {
             commandsVersion = view.meta.commandsVersion,
             pending = outboxEntries.filter { it.threadId == id },
             loadError = view.loadError,
+            backgroundTasks = view.tasks.values.sortedWith(compareBy({ it.startedAt }, { it.id })),
         )
     }
 }

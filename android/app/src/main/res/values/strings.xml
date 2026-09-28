@@ -297,7 +297,7 @@
     <string name="settings_server_status">サーバの状態</string>
     <string name="settings_uptime">稼働時間</string>
     <string name="settings_running">実行中</string>
-    <string name="settings_running_value">ターン %1$d · プロセス %2$d</string>
+    <string name="settings_running_value">ターン %1$d · バックグラウンドの作業 %2$d · プロセス %3$d</string>
     <string name="settings_prevent_sleep">実行中は PC をスリープさせない</string>
     <string name="settings_prevent_sleep_note">daemon の設定（policy.prevent_sleep_while_running）で変えます</string>
     <string name="settings_draining">停止準備中</string>
@@ -352,6 +352,9 @@
     <string name="devices_revoked">%1$s のアクセスを取り消しました</string>
 
     <!-- Diagnostics -->
+    <string name="diagnostics_app">アプリ</string>
+    <string name="diagnostics_app_version">バージョン</string>
+    <string name="diagnostics_app_version_value">%1$s（versionCode %2$d、%3$s ビルド）</string>
     <string name="diagnostics_connection">接続</string>
     <string name="diagnostics_state">状態</string>
     <string name="diagnostics_raw_state">内部状態</string>

@@ -16,17 +16,13 @@ use std::path::{Path, PathBuf};
 
 use aas_harness::protocol::{ItemBody, ItemStatus, NoticeLevel, UserMessageDelivery};
 use aas_harness::{
-    AdapterError, HistoryItem, HistoryTurn, Millis, NativeHistory, NativeSessionScan,
-    NativeSessionSummary, UnreadableNativeSession,
+    AdapterError, AdapterPolicy, HistoryItem, HistoryTurn, Millis, NativeHistory,
+    NativeSessionScan, NativeSessionSummary, UnreadableNativeSession,
 };
 use serde_json::Value;
 
 use crate::mapping::{self, TaskList, ToolClass, ToolResult};
 use crate::time::parse_rfc3339_millis;
-
-/// Most characters of a title made from a prompt (Claude Code's own rule for untitled
-/// sessions); a longer first line is cut and ends with `…`.
-const PROMPT_TITLE_MAX_CHARS: usize = 80;
 
 /// `CLAUDE_CONFIG_DIR`, or `~/.claude`.
 pub fn claude_config_dir() -> Option<PathBuf> {
@@ -174,23 +170,31 @@ fn is_prompt_entry(v: &Value) -> bool {
         && v.get("message").and_then(prompt_text).is_some()
 }
 
-/// First line of a prompt, at most 80 characters (the rule used for untitled sessions).
-pub fn title_from_prompt(prompt: &str) -> String {
-    let first = prompt
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    let mut out: String = first.chars().take(PROMPT_TITLE_MAX_CHARS).collect();
-    if first.chars().count() > PROMPT_TITLE_MAX_CHARS {
-        out.push('…');
-    }
-    out
+/// Title of a session: the one the user or Claude Code gave it (`custom-title`, then
+/// `ai-title`, then `summary`; cut to `policy.harness_title_chars`), else the first line of its
+/// first prompt (cut to `policy.first_message_title_chars`, the engine's rule for titles made
+/// from a first message).
+fn session_title(
+    custom_title: Option<String>,
+    ai_title: Option<String>,
+    summary: Option<String>,
+    first_prompt: Option<&str>,
+    policy: &AdapterPolicy,
+) -> Option<String> {
+    [custom_title, ai_title, summary]
+        .into_iter()
+        .flatten()
+        .find_map(|t| policy.harness_title(&t))
+        .or_else(|| first_prompt.and_then(|p| policy.prompt_title(p)))
 }
 
 /// Sessions whose transcript records `cwd`, newest first, and the transcripts (or folders)
 /// that could not be read.
-pub fn list_sessions(projects_dir: &Path, cwd: &Path) -> Result<NativeSessionScan, AdapterError> {
+pub fn list_sessions(
+    projects_dir: &Path,
+    cwd: &Path,
+    policy: &AdapterPolicy,
+) -> Result<NativeSessionScan, AdapterError> {
     let wanted = normalize_path(&cwd.to_string_lossy());
     let (files, mut skipped) = transcript_files(projects_dir)?;
     let mut out = Vec::new();
@@ -238,10 +242,13 @@ pub fn list_sessions(projects_dir: &Path, cwd: &Path) -> Result<NativeSessionSca
         let id = session_id
             .or_else(|| file.file_stem().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_default();
-        let title = custom_title
-            .or(ai_title)
-            .or(summary)
-            .or_else(|| first_prompt.as_deref().map(title_from_prompt));
+        let title = session_title(
+            custom_title,
+            ai_title,
+            summary,
+            first_prompt.as_deref(),
+            policy,
+        );
         out.push(NativeSessionSummary {
             native_session_id: id,
             title,
@@ -289,7 +296,7 @@ pub fn find_transcript(
 }
 
 /// Parses a transcript into turns and items.
-pub fn read_history(path: &Path) -> Result<NativeHistory, AdapterError> {
+pub fn read_history(path: &Path, policy: &AdapterPolicy) -> Result<NativeHistory, AdapterError> {
     let entries = lines(path)
         .map_err(|e| AdapterError::Other(format!("cannot read {}: {e}", path.display())))?;
     let mut history = NativeHistory::default();
@@ -501,10 +508,13 @@ pub fn read_history(path: &Path) -> Result<NativeHistory, AdapterError> {
     if !skipped.is_empty() {
         tracing::debug!(path = %path.display(), ?skipped, "skipped unknown transcript entry types");
     }
-    history.title = custom_title
-        .or(ai_title)
-        .or(summary)
-        .or_else(|| first_prompt.as_deref().map(title_from_prompt));
+    history.title = session_title(
+        custom_title,
+        ai_title,
+        summary,
+        first_prompt.as_deref(),
+        policy,
+    );
     Ok(history)
 }
 
@@ -568,7 +578,7 @@ mod tests {
         } else {
             "C:\\Work\\Proj"
         };
-        let scan = list_sessions(dir.path(), Path::new(cwd)).unwrap();
+        let scan = list_sessions(dir.path(), Path::new(cwd), &AdapterPolicy::default()).unwrap();
         assert!(scan.unreadable.is_empty(), "{:?}", scan.unreadable);
         let list = scan.sessions;
         assert_eq!(list.len(), 1);
@@ -593,7 +603,12 @@ mod tests {
     #[test]
     fn a_missing_projects_folder_holds_no_sessions() {
         let dir = tempfile::tempdir().unwrap();
-        let scan = list_sessions(&dir.path().join("never-created"), Path::new("C:\\p")).unwrap();
+        let scan = list_sessions(
+            &dir.path().join("never-created"),
+            Path::new("C:\\p"),
+            &AdapterPolicy::default(),
+        )
+        .unwrap();
         assert_eq!(scan, NativeSessionScan::default());
     }
 
@@ -603,7 +618,7 @@ mod tests {
         let file = dir.path().join("projects");
         std::fs::write(&file, b"not a folder").unwrap();
         assert!(matches!(
-            list_sessions(&file, Path::new("C:\\p")),
+            list_sessions(&file, Path::new("C:\\p"), &AdapterPolicy::default()),
             Err(AdapterError::Other(_))
         ));
     }
@@ -625,7 +640,12 @@ mod tests {
         // Not UTF-8: reading the file fails.
         let broken = dir.path().join("a").join("s3.jsonl");
         std::fs::write(&broken, [0xff, 0xfe, b'\n']).unwrap();
-        let scan = list_sessions(dir.path(), Path::new("C:\\Work\\Proj")).unwrap();
+        let scan = list_sessions(
+            dir.path(),
+            Path::new("C:\\Work\\Proj"),
+            &AdapterPolicy::default(),
+        )
+        .unwrap();
         let ids: Vec<&str> = scan
             .sessions
             .iter()
@@ -643,7 +663,7 @@ mod tests {
     fn reads_history_grouped_by_prompt_id() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_transcript(dir.path(), "a", "s1", &sample("C:\\Work\\Proj", "s1"));
-        let h = read_history(&path).unwrap();
+        let h = read_history(&path, &AdapterPolicy::default()).unwrap();
         assert_eq!(h.title.as_deref(), Some("Note creation"));
         assert_eq!(h.turns.len(), 2);
         let t0 = &h.turns[0];
@@ -672,12 +692,35 @@ mod tests {
     }
 
     #[test]
-    fn titles_from_prompts() {
-        assert_eq!(
-            title_from_prompt("\n  hello world  \nsecond"),
-            "hello world"
-        );
+    fn titles_prefer_the_given_title_then_the_first_prompt_with_the_policy_lengths() {
+        let policy = AdapterPolicy {
+            first_message_title_chars: 50,
+            harness_title_chars: 5,
+            ..AdapterPolicy::default()
+        };
         let long = "x".repeat(100);
-        assert_eq!(title_from_prompt(&long).chars().count(), 81);
+        assert_eq!(
+            session_title(None, None, None, Some("\n  hello world  \nsecond"), &policy).as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(
+            session_title(None, None, None, Some(&long), &policy)
+                .unwrap()
+                .chars()
+                .count(),
+            51
+        );
+        assert_eq!(
+            session_title(
+                Some("  ".into()),
+                Some("Generated title".into()),
+                Some("summary".into()),
+                Some("prompt"),
+                &policy
+            )
+            .as_deref(),
+            Some("Gener")
+        );
+        assert_eq!(session_title(None, None, None, Some(" \n "), &policy), None);
     }
 }

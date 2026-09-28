@@ -10,7 +10,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::error::{CoreError, CoreResult};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 
 /// SQLite's `auto_vacuum` value for incremental vacuuming (free pages are kept until
 /// `PRAGMA incremental_vacuum` returns them).
@@ -200,6 +200,47 @@ CREATE TABLE cleanup_jobs (
 
 CREATE INDEX items_thread ON items(thread_id);
 CREATE INDEX operations_finished ON operations(finished_at) WHERE finished_at IS NOT NULL;
+"#;
+
+/// v4: background tasks (design.md §5.6). A task is stored as its protocol form (`task`, JSON)
+/// with the columns queries select on. Items name the task they launched, interactions the
+/// task that asked; an interaction that belongs to no turn keeps the turn it was asked during
+/// (`anchor_turn_id`, internal: `thread/read` returns it with that turn). Turns keep what made
+/// the agent start them (`start_trigger`).
+const SCHEMA_V4: &str = r#"
+CREATE TABLE background_tasks (
+    id TEXT PRIMARY KEY NOT NULL,
+    thread_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    ambient INTEGER NOT NULL DEFAULT 0,
+    turn_id TEXT,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    task TEXT NOT NULL
+) STRICT;
+CREATE INDEX background_tasks_thread ON background_tasks(thread_id, started_at);
+CREATE INDEX background_tasks_turn ON background_tasks(turn_id) WHERE turn_id IS NOT NULL;
+CREATE INDEX background_tasks_running ON background_tasks(status) WHERE status = 'running';
+
+ALTER TABLE items ADD COLUMN background_task_id TEXT;
+ALTER TABLE interactions ADD COLUMN background_task_id TEXT;
+ALTER TABLE interactions ADD COLUMN anchor_turn_id TEXT;
+CREATE INDEX interactions_turn ON interactions(turn_id) WHERE turn_id IS NOT NULL;
+CREATE INDEX interactions_anchor ON interactions(anchor_turn_id) WHERE anchor_turn_id IS NOT NULL;
+ALTER TABLE turns ADD COLUMN start_trigger TEXT;
+"#;
+
+/// v5: the last end a thread's background work reached (`Thread.background.lastEnded`), one
+/// row per thread (`ended`: the protocol form, JSON), kept apart from the tasks because a task
+/// that starts a new run clears its own `ended_at` and the summary must not go back to an older
+/// end then (`store::note_background_end`). Filled from the tasks stored so far.
+const SCHEMA_V5: &str = r#"
+CREATE TABLE background_last_ended (
+    thread_id TEXT PRIMARY KEY NOT NULL,
+    ended_at INTEGER NOT NULL,
+    task_id TEXT NOT NULL,
+    ended TEXT NOT NULL
+) STRICT;
 "#;
 
 /// Connection settings (from [`crate::Policy`]).
@@ -554,6 +595,19 @@ fn migrate(conn: &mut Connection) -> CoreResult<()> {
         tx.pragma_update(None, "user_version", 3)?;
         tx.commit()?;
     }
+    if version < 4 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V4)?;
+        tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+    }
+    if version < 5 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V5)?;
+        crate::store::backfill_background_last_ended(&tx)?;
+        tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+    }
     // A file created before incremental vacuuming was enabled is rebuilt with it once.
     let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
     if auto_vacuum != AUTO_VACUUM_INCREMENTAL {
@@ -714,6 +768,227 @@ mod tests {
             orphaned(&orphan).is_some(),
             "a blob nothing refers to starts its grace period"
         );
+    }
+
+    /// A version 3 database gains the background tasks (v4); what it held reads as before, with
+    /// nothing linked to a background task and no turn trigger.
+    #[tokio::test]
+    async fn a_version_3_database_gains_background_tasks() {
+        use aas_protocol::{
+            BackgroundTaskStatus, InteractionId, ItemId, ThreadId, TurnId, examples,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        {
+            let mut conn = open_connection(&path, &opts()).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(SCHEMA_V1).unwrap();
+            aas_eventlog::migrate(&tx).unwrap();
+            tx.execute_batch(SCHEMA_V2).unwrap();
+            tx.execute_batch(SCHEMA_V3).unwrap();
+            tx.pragma_update(None, "user_version", 3).unwrap();
+            tx.execute(
+                "INSERT INTO turns (id, thread_id, idx, status, started_at) VALUES ('trn_1', 'thr_1', 0, 'completed', 1)",
+                [],
+            )
+            .unwrap();
+            let body =
+                serde_json::to_string(&aas_protocol::ItemBody::AgentMessage { text: "hi".into() })
+                    .unwrap();
+            tx.execute(
+                "INSERT INTO items (id, thread_id, turn_id, ord, status, started_at, body) VALUES ('itm_1', 'thr_1', 'trn_1', 1, 'completed', 1, ?1)",
+                [body],
+            )
+            .unwrap();
+            let request = serde_json::to_string(&examples::approval().request).unwrap();
+            tx.execute(
+                "INSERT INTO interactions (id, thread_id, turn_id, status, created_at, request, adapter_request_id)
+                 VALUES ('int_1', 'thr_1', 'trn_1', 'pending', 1, ?1, 'r1')",
+                [request],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path, opts()).unwrap();
+        db.write(|tx| {
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(version, SCHEMA_VERSION);
+            let turn = crate::store::get_turn(tx, &TurnId::from("trn_1"))?.unwrap();
+            assert_eq!(turn.turn.trigger, None);
+            let items = crate::store::items_of_turns(tx, &[TurnId::from("trn_1")])?;
+            assert_eq!(items[0].id, ItemId::from("itm_1"));
+            assert_eq!(items[0].background_task_id, None);
+            let interaction =
+                crate::store::get_interaction(tx, &InteractionId::from("int_1"))?.unwrap();
+            assert_eq!(interaction.interaction.background_task_id, None);
+            assert_eq!(interaction.anchor_turn_id, None);
+            // The new table takes tasks and answers the thread's summary.
+            let task = aas_protocol::BackgroundTask {
+                thread_id: ThreadId::from("thr_1"),
+                ..examples::background_task()
+            };
+            crate::store::upsert_background_task(tx, &task)?;
+            let ended = aas_protocol::BackgroundTask {
+                status: BackgroundTaskStatus::Completed,
+                ended_at: Some(5),
+                ..task.clone()
+            };
+            crate::store::upsert_background_task(tx, &ended)?;
+            assert_eq!(
+                crate::store::get_background_task(tx, &task.id)?,
+                Some(ended.clone())
+            );
+            let summary = crate::store::thread_background(tx, &ThreadId::from("thr_1"))?;
+            assert_eq!(summary.running, 0);
+            assert_eq!(summary.last_ended.unwrap().task_id, task.id);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A background task with the given id, `ended_at` (`None`: running) and `ambient` flag.
+    fn task_ended(n: u32, ended_at: Option<i64>, ambient: bool) -> aas_protocol::BackgroundTask {
+        use aas_protocol::{BackgroundTaskStatus, ThreadId, examples};
+        aas_protocol::BackgroundTask {
+            id: examples::background_task_id(n),
+            thread_id: ThreadId::from("thr_1"),
+            native_id: format!("native-{n}"),
+            title: format!("task {n}"),
+            status: match ended_at {
+                Some(_) => BackgroundTaskStatus::Completed,
+                None => BackgroundTaskStatus::Running,
+            },
+            ambient,
+            ended_at,
+            ..examples::background_task()
+        }
+    }
+
+    /// A version 4 database keeps the last end of each thread's background work apart from the
+    /// tasks (v5), filled from what it held: the latest end that is not ambient.
+    #[tokio::test]
+    async fn a_version_4_database_gains_the_last_end_of_background_work() {
+        use aas_protocol::ThreadId;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.db");
+        {
+            let mut conn = open_connection(&path, &opts()).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(SCHEMA_V1).unwrap();
+            aas_eventlog::migrate(&tx).unwrap();
+            tx.execute_batch(SCHEMA_V2).unwrap();
+            tx.execute_batch(SCHEMA_V3).unwrap();
+            tx.execute_batch(SCHEMA_V4).unwrap();
+            tx.pragma_update(None, "user_version", 4).unwrap();
+            for task in [
+                task_ended(1, Some(5), false),
+                task_ended(2, Some(7), false),
+                task_ended(3, Some(9), true),
+                task_ended(4, None, false),
+            ] {
+                tx.execute(
+                    "INSERT INTO background_tasks (id, thread_id, status, ambient, started_at, ended_at, task)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        task.id.as_str(),
+                        task.thread_id.as_str(),
+                        task.status.as_str(),
+                        task.ambient,
+                        task.started_at,
+                        task.ended_at,
+                        serde_json::to_string(&task).unwrap(),
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path, opts()).unwrap();
+        db.write(|tx| {
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(version, SCHEMA_VERSION);
+            let summary = crate::store::thread_background(tx, &ThreadId::from("thr_1"))?;
+            assert_eq!(summary.running, 1);
+            let last = summary.last_ended.unwrap();
+            assert_eq!(
+                (last.task_id, last.ended_at),
+                (task_ended(2, None, false).id, 7)
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `lastEnded` never goes back: a task that starts a new run under the same id keeps its
+    /// previous end as the thread's last one until a later end comes; an older end written
+    /// late does not replace a later one; the same end written again takes its new state.
+    #[tokio::test]
+    async fn the_last_end_of_background_work_only_moves_forward() {
+        use aas_protocol::{BackgroundTaskStatus, ThreadId};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("m.db"), opts()).unwrap();
+        db.write(|tx| {
+            let thread = ThreadId::from("thr_1");
+            let last = |tx: &Transaction<'_>| {
+                crate::store::thread_background(tx, &thread)
+                    .map(|s| s.last_ended.map(|e| (e.task_id, e.ended_at, e.status)))
+            };
+            let (b, a) = (
+                task_ended(1, Some(10), false),
+                task_ended(2, Some(20), false),
+            );
+            assert_eq!(last(tx)?, None);
+            crate::store::upsert_background_task(tx, &b)?;
+            crate::store::upsert_background_task(tx, &a)?;
+            let a_first = Some((a.id.clone(), 20, BackgroundTaskStatus::Completed));
+            assert_eq!(last(tx)?, a_first);
+            // A's second run: B (older) must not become the last end again.
+            let a_again = aas_protocol::BackgroundTask {
+                runs: 2,
+                ..task_ended(2, None, false)
+            };
+            crate::store::upsert_background_task(tx, &a_again)?;
+            assert_eq!(last(tx)?, a_first);
+            assert_eq!(
+                crate::store::thread_background(tx, &thread)?.running,
+                1,
+                "the running count follows the task"
+            );
+            // An end that is older than the last one, written late, changes nothing.
+            crate::store::upsert_background_task(tx, &task_ended(3, Some(15), false))?;
+            assert_eq!(last(tx)?, a_first);
+            // Ambient work never becomes the last end.
+            crate::store::upsert_background_task(tx, &task_ended(4, Some(40), true))?;
+            assert_eq!(last(tx)?, a_first);
+            // The second run's end is the new last end; the same end written again takes its
+            // new status.
+            let a_second = aas_protocol::BackgroundTask {
+                runs: 2,
+                ..task_ended(2, Some(30), false)
+            };
+            crate::store::upsert_background_task(tx, &a_second)?;
+            assert_eq!(
+                last(tx)?,
+                Some((a.id.clone(), 30, BackgroundTaskStatus::Completed))
+            );
+            let a_stopped = aas_protocol::BackgroundTask {
+                status: BackgroundTaskStatus::Stopped,
+                ..a_second
+            };
+            crate::store::upsert_background_task(tx, &a_stopped)?;
+            assert_eq!(
+                last(tx)?,
+                Some((a.id.clone(), 30, BackgroundTaskStatus::Stopped))
+            );
+            // Purging the thread removes it.
+            crate::store::purge_thread(tx, &thread, 100)?;
+            assert_eq!(last(tx)?, None);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

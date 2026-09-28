@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Background work: tasks the harness runs outside the turn lifecycle (docs/android.md 30) -->
+    <string name="activity_background">バックグラウンドで実行中</string>
+    <string name="activity_background_count">バックグラウンドで実行中 (%1$d)</string>
+
+    <!-- The バックグラウンド section of the thread -->
+    <string name="bg_section_title">バックグラウンド</string>
+    <string name="bg_section_running">実行中 %1$d</string>
+    <string name="bg_section_ambient">常駐 %1$d</string>
+    <string name="bg_section_ended">終了 %1$d</string>
+    <string name="bg_section_idle">実行中の作業はありません</string>
+    <string name="bg_ended_title">終了した作業 (%1$d)</string>
+
+    <string name="bg_kind_agent">エージェント</string>
+    <string name="bg_kind_shell">シェル</string>
+    <string name="bg_kind_workflow">ワークフロー</string>
+    <string name="bg_kind_monitor">監視</string>
+    <string name="bg_kind_remote">リモート</string>
+    <string name="bg_kind_scheduled">予約</string>
+    <string name="bg_kind_other">バックグラウンドの作業</string>
+
+    <string name="bg_status_running">実行中 · %1$s</string>
+    <string name="bg_status_completed">完了</string>
+    <string name="bg_status_failed">失敗</string>
+    <string name="bg_status_stopped">停止</string>
+    <string name="bg_status_lost">失われました</string>
+    <string name="bg_status_ended">終了</string>
+    <string name="bg_status_after">%1$s · %2$s</string>
+    <string name="bg_run_number">%1$d 回目</string>
+    <string name="bg_ambient">常駐</string>
+    <string name="bg_parent">「%1$s」から起動</string>
+    <string name="bg_next_run">次の実行: %1$s</string>
+
+    <string name="bg_end_thread_stopped">スレッドのプロセスを停止したため</string>
+    <string name="bg_end_idle_stop">アイドルのプロセスを止めたため</string>
+    <string name="bg_end_daemon_shutdown">サーバが停止したため</string>
+    <string name="bg_end_system_shutdown">Windows のサインアウト・シャットダウンのため</string>
+    <string name="bg_end_forced_stop">中断に応じないプロセスを強制終了したため</string>
+    <string name="bg_end_process_replaced">設定を反映するためにプロセスを入れ替えたため</string>
+    <string name="bg_end_process_exited">エージェントのプロセスが終了したため、結果は分かりません</string>
+    <string name="bg_end_daemon_restarted">サーバが再起動したため、結果は分かりません</string>
+    <string name="bg_end_unknown">終わった理由は分かりません</string>
+
+    <string name="bg_last_tool">最後のツール: %1$s</string>
+    <string name="bg_tool_uses">ツール %1$d 回</string>
+    <string name="bg_tokens">%1$s トークン</string>
+    <string name="bg_workflow_agent_start">開始</string>
+    <string name="bg_workflow_agent_progress">実行中</string>
+    <string name="bg_workflow_agent_done">完了</string>
+    <string name="bg_workflow_agent_error">エラー</string>
+    <string name="bg_workflow_agent_unknown">不明</string>
+    <string name="bg_exit_code">終了コード %1$d</string>
+    <string name="bg_show_output">出力の全文を表示</string>
+
+    <string name="bg_stop">停止</string>
+    <string name="bg_stop_description">「%1$s」を停止</string>
+    <string name="bg_stopping">停止中…</string>
+    <string name="bg_stop_pending">停止の送信待ち</string>
+    <string name="bg_stop_unconfirmed">エージェントが停止を確認していません。もう一度止めることができます</string>
+    <string name="bg_stop_title">バックグラウンドの作業を止めますか？</string>
+    <string name="bg_stop_body">「%1$s」を止めるようエージェントに求めます。止まるまでにしていた作業は失われることがあります。</string>
+    <string name="bg_stop_requested">停止を求めました: %1$s</string>
+    <string name="bg_stop_offline">接続したら停止を求めます: %1$s</string>
+
+    <!-- The chip of an item whose work goes on in the background -->
+    <string name="item_backgrounded">バックグラウンドで続行</string>
+    <string name="bg_chip_running">バックグラウンドで実行中 · %1$s</string>
+    <string name="bg_chip_ended">バックグラウンド: %1$s</string>
+    <string name="bg_chip_unknown">バックグラウンドで続行</string>
+    <string name="bg_chip_open">バックグラウンドの作業を表示</string>
+
+    <!-- Turns the agent started by itself (Turn.trigger) -->
+    <string name="turn_trigger_background">バックグラウンド作業の完了を受けて</string>
+    <string name="turn_trigger_scheduled">予約した時刻に再開</string>
+    <string name="turn_trigger_other">エージェントが自分で開始</string>
+
+    <!-- Composer, dialogs, interactions -->
+    <string name="composer_hint_interrupt_background">ターンを止めます（バックグラウンドの作業は続きます）</string>
+    <string name="stop_background_tasks">%1$d 件のバックグラウンド作業も止まります</string>
+    <string name="stop_background_more">ほか %1$d 件</string>
+    <string name="interaction_from_background">バックグラウンドの作業「%1$s」から</string>
+    <string name="interaction_from_background_unknown">バックグラウンドの作業から</string>
+    <string name="expire_task_ended">バックグラウンドの作業が終わった</string>
+    <string name="request_background_stop">バックグラウンド作業の停止</string>
+    <string name="status_background">バックグラウンド</string>
+    <string name="status_background_value">実行中 %1$d</string>
+    <string name="status_background_last">最後に終わった作業: %1$s（%2$s）</string>
+
+    <!-- Notifications -->
+    <string name="notify_bg_completed">バックグラウンドの作業が完了しました: %1$s</string>
+    <string name="notify_bg_failed">バックグラウンドの作業が失敗しました: %1$s</string>
+    <string name="notify_bg_stopped">バックグラウンドの作業が止まりました: %1$s</string>
+    <string name="notify_bg_lost">バックグラウンドの作業の結果が分からなくなりました（エージェントのプロセスが終了したか、サーバが再起動しました）: %1$s</string>
+    <string name="notify_bg_ended">バックグラウンドの作業が終わりました: %1$s</string>
+    <string name="notify_from_background">バックグラウンドの作業「%1$s」から</string>
+    <string name="notify_from_background_unknown">バックグラウンドの作業から</string>
+</resources>

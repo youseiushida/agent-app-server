@@ -98,6 +98,81 @@ class SyncEngineConnectionTest {
         assertTrue(f.engine.status.value.lastHeartbeatAtMs != null)
     }
 
+    /**
+     * A phone that slept past the client timeout: the watchdog's timer does not count deep sleep
+     * (it would still wait), so the app's return to the foreground measures the silence with
+     * the engine's clock, which does, and replaces the dead connection at once.
+     */
+    @Test
+    fun afterADeepSleepTheForegroundReplacesTheSilentConnectionAtOnce() {
+        val clock = SleepingClock()
+        withFixture(EngineFixture(clock = clock).also { it.server.snapshot = emptySnapshot }) { f ->
+            f.server.clientTimeoutMs = 60_000
+            f.connect()
+            f.awaitOnline()
+            clock.sleep(61_000)
+            delay(QUIET_MS)
+            assertEquals(1, f.server.connections.size, "the watchdog's timer did not notice the sleep")
+            assertTrue(f.engine.status.value.isOnline, "shown as connected until something checks")
+
+            f.engine.onAppForeground()
+            eventually(what = "a new connection") { f.server.connections.size.takeIf { it >= 2 } }
+            f.awaitOnline()
+            assertTrue(f.logs.any { "the app came to the foreground: no frame for" in it }, "${f.logs}")
+            assertEquals(1, f.server.requestsFor("workspace/snapshot").size, "the new connection resumes, it does not resync")
+        }
+    }
+
+    @Test
+    fun aNetworkThatBecomesAvailableAfterADeepSleepAlsoReplacesTheSilentConnection() {
+        val clock = SleepingClock()
+        withFixture(EngineFixture(clock = clock).also { it.server.snapshot = emptySnapshot }) { f ->
+            f.server.clientTimeoutMs = 60_000
+            f.connect()
+            f.awaitOnline()
+            clock.sleep(120_000)
+            f.engine.onNetworkAvailable()
+            eventually(what = "a new connection") { f.server.connections.size.takeIf { it >= 2 } }
+            f.awaitOnline()
+        }
+    }
+
+    @Test
+    fun aForegroundWithinTheClientTimeoutKeepsTheConnection() {
+        val clock = SleepingClock()
+        withFixture(EngineFixture(clock = clock).also { it.server.snapshot = emptySnapshot }) { f ->
+            f.server.clientTimeoutMs = 60_000
+            f.connect()
+            f.awaitOnline()
+            clock.sleep(30_000)
+            f.engine.onAppForeground()
+            f.engine.onNetworkAvailable()
+            delay(QUIET_MS)
+            assertEquals(1, f.server.connections.size, "a connection silent for less than the client timeout stays")
+            assertTrue(f.engine.status.value.isOnline)
+        }
+    }
+
+    /**
+     * After a sleep shorter than the client timeout, the watchdog is re-armed for the time
+     * actually left (measured with the engine's clock), not for what its stopped timer believed.
+     */
+    @Test
+    fun theForegroundReArmsTheWatchdogForTheTimeActuallyLeft() {
+        val clock = SleepingClock()
+        withFixture(EngineFixture(clock = clock).also { it.server.snapshot = emptySnapshot }) { f ->
+            f.server.clientTimeoutMs = 60_000
+            f.connect()
+            f.awaitOnline()
+            clock.sleep(59_000)
+            f.engine.onAppForeground()
+            assertEquals(1, f.server.connections.size, "not silent for the client timeout yet")
+            // Within seconds (the second left), not the minute the stopped timer still waits.
+            eventually(timeoutMs = REARMED_WAIT_MS, what = "the re-armed watchdog's reconnect") { f.server.connections.size.takeIf { it >= 2 } }
+            assertTrue(f.engine.status.value.connection !is ConnectionState.Suspended)
+        }
+    }
+
     @Test
     fun aStreamAheadOfItsCursorIsResubscribedAfterTheClientTimeoutNotBefore() = withFixture(fixture()) { f ->
         f.server.clientTimeoutMs = 1_500
@@ -453,5 +528,13 @@ class SyncEngineConnectionTest {
         f.engine.start()
         val suspended = eventually(what = "suspended") { f.engine.status.value.connection as? ConnectionState.Suspended }
         assertIs<SuspendReason.InvalidServerUrl>(suspended.reason)
+    }
+
+    private companion object {
+        /** Long enough for a reconnect to show if one were (wrongly) made. */
+        const val QUIET_MS = 500L
+
+        /** The re-armed watchdog fires after the second left; the stopped timer would wait a minute. */
+        const val REARMED_WAIT_MS = 10_000L
     }
 }

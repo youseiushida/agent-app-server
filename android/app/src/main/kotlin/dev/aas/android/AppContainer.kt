@@ -17,6 +17,7 @@ import dev.aas.android.data.InteractionRepository
 import dev.aas.android.data.ProjectRepository
 import dev.aas.android.data.Reads
 import dev.aas.android.data.SentDrafts
+import dev.aas.android.data.ServerLists
 import dev.aas.android.data.ServerRepository
 import dev.aas.android.data.ThreadRepository
 import dev.aas.android.data.WorkspaceRepository
@@ -77,7 +78,8 @@ class AppContainer(
     /** The token key's source: the Android Keystore; tests substitute a software key. */
     keyProviderFactory: () -> SecretKeyProvider = { AndroidKeystoreKeyProvider() },
 ) {
-    val clock: Clock = Clock.System
+    /** elapsedRealtime for durations: it counts deep sleep, which the engine's watchdog must see (AndroidClock). */
+    val clock: Clock = AndroidClock
 
     val connectionLog = ConnectionLog(policy.connectionLogCapacity, clock)
 
@@ -160,13 +162,16 @@ class AppContainer(
     /** Read-only calls of the repositories, sent again after a reconnect (data/Reads.kt). */
     val reads: Reads by lazy { Reads(engine, policy.readReconnectWaitMs) }
 
-    val threadRepository: ThreadRepository by lazy { ThreadRepository(engine, reads) }
+    /** Server lists made unique by the ids the screens key them by (data/ServerLists.kt). */
+    val serverLists: ServerLists by lazy { ServerLists(connectionLog.logger(ConnectionLog.SOURCE_DATA)) }
+
+    val threadRepository: ThreadRepository by lazy { ThreadRepository(engine, reads, serverLists) }
 
     val interactionRepository: InteractionRepository by lazy { InteractionRepository(engine) }
 
-    val serverRepository: ServerRepository by lazy { ServerRepository(engine, reads) }
+    val serverRepository: ServerRepository by lazy { ServerRepository(engine, reads, serverLists) }
 
-    val projectRepository: ProjectRepository by lazy { ProjectRepository(engine, reads) }
+    val projectRepository: ProjectRepository by lazy { ProjectRepository(engine, reads, serverLists) }
 
     val harnessRepository: HarnessRepository by lazy { HarnessRepository(engine) }
 

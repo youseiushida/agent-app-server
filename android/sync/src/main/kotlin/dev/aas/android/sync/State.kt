@@ -1,5 +1,7 @@
 package dev.aas.android.sync
 
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskEnded
 import dev.aas.android.protocol.ClientPolicy
 import dev.aas.android.protocol.Harness
 import dev.aas.android.protocol.Interaction
@@ -220,6 +222,12 @@ data class ThreadState(
     val pending: List<OutboxEntry>,
     /** Why the last load failed while [sync] is [ThreadSync.Failed]. */
     val loadError: SyncError? = null,
+    /**
+     * The thread's background tasks (protocol.md §3.1): those first reported during the loaded
+     * turns and every running one, ascending by `startedAt`, then id. Each is the whole task of
+     * its latest `backgroundTask/updated`.
+     */
+    val backgroundTasks: List<BackgroundTask> = emptyList(),
 ) {
     companion object {
         fun empty(threadId: ThreadId) =
@@ -232,8 +240,12 @@ data class ThreadState(
  * store; replays of already applied events never emit again.
  */
 sealed interface SyncSignal {
-    /** An interaction (approval or question) became pending. [thread] is its summary, if known. */
-    data class InteractionPending(val interaction: Interaction, val thread: Thread?) : SyncSignal
+    /**
+     * An interaction (approval or question) became pending. [thread] is its summary, if known.
+     * [backgroundTask] is the task that asked (`Interaction.backgroundTaskId`) when it is stored
+     * on this device (its thread was opened here); `null` otherwise.
+     */
+    data class InteractionPending(val interaction: Interaction, val thread: Thread?, val backgroundTask: BackgroundTask? = null) : SyncSignal
 
     /** A pending interaction was resolved or expired (dismiss its notification). */
     data class InteractionClosed(val interactionId: InteractionId, val threadId: ThreadId, val status: InteractionStatus) :
@@ -244,6 +256,27 @@ sealed interface SyncSignal {
      * summary: its `lastTurn` went from running (or another turn) to a terminal status.
      */
     data class TurnFinished(val thread: Thread, val turn: TurnSummary) : SyncSignal
+
+    /**
+     * The background task that asked a pending interaction became known after the interaction was
+     * reported without it ([InteractionPending.backgroundTask] was `null`): the workspace stream
+     * delivered the request before the thread stream delivered its task. Emitted when the task is
+     * first stored, for each pending interaction of it; the app names the task where it shows the
+     * request (the notification is updated without alerting again).
+     */
+    data class InteractionTaskKnown(val interaction: Interaction, val task: BackgroundTask) : SyncSignal
+
+    /**
+     * A background task of [thread] ended ([ended], the summary's `background.lastEnded`). Derived
+     * from the thread summary like [TurnFinished]: its `lastEnded` moved to a later end than the
+     * stored one, in the server's order (`endedAt`, then task id) — another task's end, or the
+     * next end of the same task. The same end again (its status or title corrected) and an
+     * earlier end (an older daemon falls back to one when the task that ended last runs again)
+     * are not reported. A thread seen for the first time does not report it (imports, forks,
+     * other devices' threads). Ambient work never ends up here: the server leaves it out of
+     * `lastEnded` (protocol.md §3.1).
+     */
+    data class BackgroundTaskFinished(val thread: Thread, val ended: BackgroundTaskEnded) : SyncSignal
 
     /** An operation (git clone) ended. */
     data class OperationFinished(val operation: Operation) : SyncSignal

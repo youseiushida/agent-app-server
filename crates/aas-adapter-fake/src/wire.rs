@@ -3,9 +3,10 @@
 //! It mirrors [`aas_harness::AdapterEvent`] closely so the adapter is a thin translation and
 //! tests exercise the engine rather than this protocol.
 
+use aas_harness::BackgroundTaskInfo;
 use aas_protocol::types::{
     Command, DeltaField, InteractionRequest, InteractionResolution, ItemBody, ItemStatus,
-    NoticeLevel, TurnError, TurnStatus, Usage,
+    NoticeLevel, TurnError, TurnStatus, TurnTrigger, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +44,10 @@ pub enum Op {
     SetModel {
         model: Option<String>,
     },
+    /// Asks the agent to stop background task `key` (answered only by the task's end).
+    StopBackground {
+        key: String,
+    },
 }
 
 /// Agent → adapter.
@@ -62,6 +67,14 @@ pub enum Ev {
     },
     Commands {
         commands: Vec<Command>,
+    },
+    /// Answers every `prompt`: taken (a turn follows), or refused because a turn runs;
+    /// `own_run` says that the running turn is one the agent started by itself (whose
+    /// `turnStarted` came before this answer).
+    PromptAck {
+        accepted: bool,
+        #[serde(default)]
+        own_run: bool,
     },
     TurnStarted,
     ItemStarted {
@@ -86,6 +99,9 @@ pub enum Ev {
         request_id: String,
         request: InteractionRequest,
         item_key: Option<String>,
+        /// The background task that asks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_key: Option<String>,
     },
     Withdraw {
         request_id: String,
@@ -97,6 +113,13 @@ pub enum Ev {
         status: TurnStatus,
         usage: Option<Usage>,
         error: Option<TurnError>,
+        /// Why the agent started this turn by itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<TurnTrigger>,
+    },
+    /// The whole state of one background task.
+    Background {
+        task: BackgroundTaskInfo,
     },
     Notice {
         level: NoticeLevel,

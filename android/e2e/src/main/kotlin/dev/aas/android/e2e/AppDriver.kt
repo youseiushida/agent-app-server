@@ -348,10 +348,13 @@ class AppDriver(val instrumentation: Instrumentation = InstrumentationRegistry.g
 
     /**
      * Taps the element [target] of the group (card, row, dialog) that holds [anchor]: the
-     * nearest ancestor of the anchor that contains a [target].
+     * nearest ancestor of the anchor that contains a [target], once it is enabled. A tap on a
+     * disabled element is lost (an approval card's buttons arm only after
+     * `AppPolicy.interactionArmDelayMs`; tapped as soon as the card showed, the inbox test's
+     * answer was lost and the card stayed).
      */
     fun tapNear(anchor: BySelector, target: BySelector, what: String) {
-        waitUntil("tapping $what", Waits.SCREEN_MS) {
+        waitUntil("tapping $what (enabled)", Waits.SCREEN_MS) {
             try {
                 var node: UiObject2? = find(anchor)
                 var hit: UiObject2? = null
@@ -359,7 +362,7 @@ class AppDriver(val instrumentation: Instrumentation = InstrumentationRegistry.g
                     hit = node.findObject(target)
                     node = node.parent
                 }
-                hit?.click() != null
+                hit?.takeIf { it.isEnabled }?.click() != null
             } catch (e: StaleObjectException) {
                 false
             }

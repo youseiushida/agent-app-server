@@ -17,6 +17,9 @@ typealias OperationId = String
 typealias DeviceId = String
 typealias BlobId = String
 
+/** A background task (`bgt_…`): work the harness runs outside the turn lifecycle. */
+typealias BackgroundTaskId = String
+
 /** Unix epoch milliseconds. */
 typealias Millis = Long
 
@@ -50,6 +53,10 @@ data class HarnessCapabilities(
     val images: Boolean = false,
     val modelSwitchLive: Boolean = false,
     val nativeSessions: Boolean = false,
+    /** The harness reports work that runs outside the turn lifecycle as background tasks. */
+    val backgroundTasks: Boolean = false,
+    /** A single background task can be stopped (`backgroundTask/stop`). */
+    val backgroundStop: Boolean = false,
 )
 
 @Serializable
@@ -232,6 +239,34 @@ data class Thread(
      * thread the one with the larger head is the newer one (protocol.md §3.1).
      */
     val head: Long = 0,
+    /** The thread's background work: how many tasks run, and the one that ended last (protocol.md §3.1). */
+    val background: ThreadBackground = ThreadBackground(),
+)
+
+/**
+ * Summary of a thread's background tasks. It changes when a task starts, ends or changes its
+ * `ambient` flag; progress alone does not change it.
+ */
+@Serializable
+data class ThreadBackground(
+    /** Tasks with status `running` that are not `ambient` (they keep the agent's process alive). */
+    val running: Int = 0,
+    /**
+     * The last end of a task that is not `ambient` (by `endedAt`, then task id). It only moves
+     * on to later ends: when that task starts a new run, it stays the previous run's end until
+     * the new run ends. Notifications follow it moving on to a later end.
+     */
+    val lastEnded: BackgroundTaskEnded? = null,
+)
+
+/** The task a thread's background work ended with last (`ThreadBackground.lastEnded`). */
+@Serializable
+data class BackgroundTaskEnded(
+    val taskId: BackgroundTaskId,
+    val title: String,
+    val kind: BackgroundTaskKind,
+    val status: BackgroundTaskStatus,
+    val endedAt: Millis,
 )
 
 @Serializable
@@ -276,6 +311,11 @@ data class Turn(
     val error: TurnError? = null,
     val usage: Usage? = null,
     val diff: DiffSummary? = null,
+    /**
+     * Why the harness started this run by itself, when it said so explicitly (only on turns the
+     * agent started, reported with `turn/completed`).
+     */
+    val trigger: TurnTrigger? = null,
 )
 
 @Serializable
@@ -283,6 +323,97 @@ data class TurnError(val message: String, val kind: String)
 
 @Serializable
 data class DiffSummary(val files: Int, val insertions: Long, val deletions: Long)
+
+// ----- background tasks ------------------------------------------------------------------------
+
+/**
+ * Work the harness runs outside the turn lifecycle: a background agent, a shell left running, a
+ * workflow, a scheduled wakeup… Reported only from explicit signals of the harness; it can
+ * outlive turns and start again under the same [nativeId] ([runs]). Every
+ * `backgroundTask/updated` carries the whole object (protocol.md §3.1).
+ */
+@Serializable
+data class BackgroundTask(
+    val id: BackgroundTaskId,
+    val threadId: ThreadId,
+    /** The harness's own id of the task (Claude's `task_id`, a Codex process id). */
+    val nativeId: String,
+    val kind: BackgroundTaskKind,
+    /** The harness's description, verbatim. */
+    val title: String,
+    val status: BackgroundTaskStatus,
+    /** The harness says it is not activity: shown, but neither counted as running nor keeping the process. */
+    val ambient: Boolean = false,
+    /** How many times it started under the same [nativeId] (1 for the first run). */
+    val runs: Int = 1,
+    /** The turn that ran when it was first reported (or the thread's last turn). */
+    val turnId: TurnId? = null,
+    /** The item that launched it (its status is `backgrounded`). */
+    val originItemId: ItemId? = null,
+    /** The background task that launched this one. */
+    val parentTaskId: BackgroundTaskId? = null,
+    /** When the current run started. */
+    val startedAt: Millis,
+    val endedAt: Millis? = null,
+    /** Present once it ended. */
+    val endReason: BackgroundEndReason? = null,
+    val progress: BackgroundProgress? = null,
+    /** What it produced, only from explicit fields of the harness. */
+    val result: BackgroundResult? = null,
+    val usage: BackgroundUsage? = null,
+    /** `backgroundTask/stop` can stop it on its own. */
+    val stoppable: Boolean = false,
+    /** Set while a `backgroundTask/stop` waits for the harness to report the end. */
+    val stopRequestedAt: Millis? = null,
+    /** The harness did not report the end within the daemon's confirmation time after the last stop request. */
+    val stopUnconfirmedAt: Millis? = null,
+    /** When the harness says it runs next (scheduled wakeups). */
+    val nextRunAt: Millis? = null,
+)
+
+/** Progress a harness reports for a running task; every value is the harness's own. */
+@Serializable
+data class BackgroundProgress(
+    val lastToolName: String? = null,
+    val toolUses: Long? = null,
+    val tokens: Long? = null,
+    val durationMs: Long? = null,
+    /** What the task is doing, as the harness summarizes it (display only). */
+    val summary: String? = null,
+    /** The agents of a workflow in the harness's order (absent when there are none). */
+    val workflow: List<WorkflowAgent>? = null,
+)
+
+/** One agent of a workflow ([BackgroundProgress.workflow]). */
+@Serializable
+data class WorkflowAgent(
+    val label: String,
+    val phase: String? = null,
+    val state: WorkflowAgentState,
+    val agentType: String? = null,
+    val model: String? = null,
+    val tokens: Long? = null,
+)
+
+/** What a finished task produced (never parsed out of text written for people). */
+@Serializable
+data class BackgroundResult(
+    val summary: String? = null,
+    val exitCode: Int? = null,
+    /** The output up to the daemon's inline limit; the whole output is in [outputBlobId] when longer. */
+    val output: String? = null,
+    val outputTruncated: Boolean = false,
+    val outputBlobId: BlobId? = null,
+)
+
+/** What a task used, as the harness reports it. */
+@Serializable
+data class BackgroundUsage(
+    val totalTokens: Long? = null,
+    val toolUses: Long? = null,
+    val durationMs: Long? = null,
+    val costUsd: Double? = null,
+)
 
 // ----- small value types -----------------------------------------------------------------------
 

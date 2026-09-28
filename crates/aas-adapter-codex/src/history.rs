@@ -3,37 +3,27 @@
 use std::path::Path;
 
 use aas_harness::protocol::{ItemBody, ItemStatus, Mention, UserMessageDelivery};
-use aas_harness::{HistoryItem, HistoryTurn, NativeHistory, NativeSessionSummary};
+use aas_harness::{AdapterPolicy, HistoryItem, HistoryTurn, NativeHistory, NativeSessionSummary};
 use serde_json::Value;
 
 use crate::mapping::{MappedItem, map_item};
 use crate::wire::{WireItem, WireThread};
 
-/// Most characters of a title made from a thread's preview; a longer first line is cut and ends
-/// with `…`. A display rule: long enough to tell threads apart in a phone's list.
-const PREVIEW_TITLE_MAX_CHARS: usize = 120;
-
-/// Title of a Codex thread: its name, else the first line of its preview (the first user
-/// message), truncated to [`PREVIEW_TITLE_MAX_CHARS`] characters.
-pub fn thread_title(thread: &WireThread) -> Option<String> {
-    if let Some(name) = thread.name.as_ref().filter(|n| !n.trim().is_empty()) {
-        return Some(name.trim().to_owned());
-    }
-    let first = thread.preview.lines().next().unwrap_or("").trim();
-    if first.is_empty() {
-        return None;
-    }
-    let mut title: String = first.chars().take(PREVIEW_TITLE_MAX_CHARS).collect();
-    if first.chars().count() > PREVIEW_TITLE_MAX_CHARS {
-        title.push('…');
-    }
-    Some(title)
+/// Title of a Codex thread: its name (cut to `policy.harness_title_chars`), else the first line
+/// of its preview (the first user message), cut to `policy.first_message_title_chars` like the
+/// engine's titles from a first message.
+pub fn thread_title(thread: &WireThread, policy: &AdapterPolicy) -> Option<String> {
+    thread
+        .name
+        .as_deref()
+        .and_then(|name| policy.harness_title(name))
+        .or_else(|| policy.prompt_title(&thread.preview))
 }
 
-pub fn summary(thread: &WireThread) -> NativeSessionSummary {
+pub fn summary(thread: &WireThread, policy: &AdapterPolicy) -> NativeSessionSummary {
     NativeSessionSummary {
         native_session_id: thread.id.clone(),
-        title: thread_title(thread),
+        title: thread_title(thread, policy),
         updated_at: thread.updated_at.or(thread.created_at).map(|s| s * 1000),
         cwd: thread.cwd.clone(),
     }
@@ -68,7 +58,7 @@ pub fn user_message_body(content: &[Value]) -> ItemBody {
     }
 }
 
-pub fn history(thread: &WireThread, cwd: &Path) -> NativeHistory {
+pub fn history(thread: &WireThread, cwd: &Path, policy: &AdapterPolicy) -> NativeHistory {
     let turns = thread
         .turns
         .iter()
@@ -101,7 +91,7 @@ pub fn history(thread: &WireThread, cwd: &Path) -> NativeHistory {
         })
         .collect();
     NativeHistory {
-        title: thread_title(thread),
+        title: thread_title(thread, policy),
         turns,
     }
 }
@@ -117,12 +107,32 @@ mod tests {
             json!({"id":"a","preview":"Reply with exactly: OK\nmore","name":null}),
         )
         .unwrap();
-        assert_eq!(thread_title(&t).as_deref(), Some("Reply with exactly: OK"));
-        t.name = Some("Named".into());
-        assert_eq!(thread_title(&t).as_deref(), Some("Named"));
+        let policy = AdapterPolicy::default();
+        assert_eq!(
+            thread_title(&t, &policy).as_deref(),
+            Some("Reply with exactly: OK")
+        );
+        t.name = Some("  Named  ".into());
+        assert_eq!(thread_title(&t, &policy).as_deref(), Some("Named"));
+        // A blank name falls back to the preview.
+        t.name = Some("   ".into());
+        assert_eq!(
+            thread_title(&t, &policy).as_deref(),
+            Some("Reply with exactly: OK")
+        );
+        // The lengths are the engine's policy values.
         let long: WireThread =
-            serde_json::from_value(json!({"id":"b","preview":"x".repeat(130)})).unwrap();
-        assert_eq!(thread_title(&long).unwrap().chars().count(), 121);
+            serde_json::from_value(json!({"id":"b","preview":"x".repeat(130),"name":null}))
+                .unwrap();
+        let short = AdapterPolicy {
+            first_message_title_chars: 100,
+            harness_title_chars: 10,
+            ..AdapterPolicy::default()
+        };
+        assert_eq!(thread_title(&long, &short).unwrap().chars().count(), 101);
+        let named: WireThread =
+            serde_json::from_value(json!({"id":"c","preview":"p","name":"n".repeat(30)})).unwrap();
+        assert_eq!(thread_title(&named, &short).unwrap(), "n".repeat(10));
     }
 
     #[test]
@@ -137,7 +147,7 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let h = history(&thread, Path::new("/p"));
+        let h = history(&thread, Path::new("/p"), &AdapterPolicy::default());
         assert_eq!(h.title.as_deref(), Some("hi"));
         assert_eq!(h.turns.len(), 1);
         let turn = &h.turns[0];
@@ -146,6 +156,9 @@ mod tests {
         assert!(matches!(&turn.items[0].body, ItemBody::UserMessage { text, .. } if text == "hi"));
         assert!(matches!(&turn.items[1].body, ItemBody::Reasoning { text } if text == "thinking"));
         assert!(matches!(&turn.items[2].body, ItemBody::AgentMessage { text } if text == "hello"));
-        assert_eq!(summary(&thread).updated_at, Some(10_000));
+        assert_eq!(
+            summary(&thread, &AdapterPolicy::default()).updated_at,
+            Some(10_000)
+        );
     }
 }

@@ -1,5 +1,7 @@
 package dev.aas.android.sync
 
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskId
 import dev.aas.android.protocol.Harness
 import dev.aas.android.protocol.Interaction
 import dev.aas.android.protocol.InteractionId
@@ -39,6 +41,7 @@ class InMemorySyncStore : SyncStore {
         val turns: Map<TurnId, Turn> = emptyMap(),
         val items: Map<ItemId, StoredItem> = emptyMap(),
         val interactions: Map<InteractionId, Interaction> = emptyMap(),
+        val backgroundTasks: Map<BackgroundTaskId, BackgroundTask> = emptyMap(),
         val queued: Map<ThreadId, List<QueuedInput>> = emptyMap(),
         val meta: Map<ThreadId, ThreadMeta> = emptyMap(),
         val viewStates: Map<ThreadId, ThreadViewState> = emptyMap(),
@@ -129,6 +132,7 @@ class InMemorySyncStore : SyncStore {
                 turns = st.turns.filterValues { it.threadId != id },
                 items = st.items.filterValues { it.item.threadId != id },
                 interactions = st.interactions.filterValues { it.threadId != id },
+                backgroundTasks = st.backgroundTasks.filterValues { it.threadId != id },
                 queued = st.queued - id,
                 meta = st.meta - id,
                 viewStates = st.viewStates - id,
@@ -174,6 +178,15 @@ class InMemorySyncStore : SyncStore {
             s.interactions.values.filter { it.threadId == threadId }.sortedWith(compareBy({ it.createdAt }, { it.id }))
         }
 
+        override suspend fun backgroundTask(id: BackgroundTaskId) = read { s.backgroundTasks[id] }
+
+        override suspend fun upsertBackgroundTask(task: BackgroundTask) =
+            write { it.copy(backgroundTasks = it.backgroundTasks + (task.id to task)) }
+
+        override suspend fun backgroundTasksOf(threadId: ThreadId) = read {
+            s.backgroundTasks.values.filter { it.threadId == threadId }.sortedWith(compareBy({ it.startedAt }, { it.id }))
+        }
+
         override suspend fun queued(threadId: ThreadId) = read { s.queued[threadId].orEmpty() }
 
         override suspend fun replaceQueued(threadId: ThreadId, queued: List<QueuedInput>) =
@@ -183,6 +196,7 @@ class InMemorySyncStore : SyncStore {
             st.copy(
                 turns = st.turns.filterValues { it.threadId != threadId },
                 items = st.items.filterValues { it.item.threadId != threadId },
+                backgroundTasks = st.backgroundTasks.filterValues { it.threadId != threadId },
                 queued = st.queued - threadId,
             )
         }

@@ -28,6 +28,11 @@ struct TestServerProcess {
 
 impl TestServerProcess {
     fn spawn(state: &Path) -> Self {
+        Self::spawn_with(state, &[])
+    }
+
+    /// Spawns with `extra` arguments after the usual ones.
+    fn spawn_with(state: &Path, extra: &[&str]) -> Self {
         let mut child = tokio::process::Command::new(proc::bin_path("aas-test-server"))
             .args([
                 "--state-dir",
@@ -37,6 +42,7 @@ impl TestServerProcess {
                 "--client-timeout-ms",
                 "1500",
             ])
+            .args(extra)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -285,6 +291,102 @@ async fn the_test_server_serves_restarts_resets_and_quits_cleanly() {
         survivors.is_empty(),
         "agent processes outlived the test server: {survivors:?}"
     );
+}
+
+/// Background work through the test server (real agent processes): a task that runs until it is
+/// stopped keeps the agent's process however long the thread is idle, is stopped through
+/// `backgroundTask/stop`, and the idle stop follows; nothing outlives the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_work_keeps_the_agent_until_it_is_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let agent_pids: PathBuf = state.join("agent-pids");
+    let mut cleanup = Cleanup::new();
+    cleanup.dir(&agent_pids);
+    let mut server = TestServerProcess::spawn_with(
+        &state,
+        &[
+            "--idle-process-ttl-ms",
+            "400",
+            "--background-stop-confirm-ms",
+            "5000",
+        ],
+    );
+    let ready = server.next_event().await;
+    let root = PathBuf::from(ready["root"].as_str().unwrap());
+    let c = client(&ready);
+    wait_connects(&c, 1).await;
+    std::fs::create_dir_all(root.join("bg")).unwrap();
+    let project = mutate(
+        &c,
+        "project/open",
+        json!({"path": root.join("bg").display().to_string()}),
+        STEP,
+    )
+    .await;
+    let thread = mutate(
+        &c,
+        "thread/create",
+        json!({"projectId": project["project"]["id"], "harnessId": "fake",
+            "input": [{"type": "text", "text": "@bg dev kind=shell ms=0 npm run dev\n@text the server runs"}]}),
+        STEP,
+    )
+    .await;
+    let thread_id = thread["thread"]["id"].as_str().unwrap().to_owned();
+    let stream = format!("thread:{thread_id}");
+    c.subscribe(&stream);
+    c.wait_until(STEP, |s| {
+        client_events(s, &stream)
+            .iter()
+            .any(|e| matches!(e.event, Event::TurnCompleted { .. }))
+    })
+    .await;
+    // Far longer than the idle time: the agent keeps running.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let read = mutate(&c, "thread/read", json!({"threadId": thread_id}), STEP).await;
+    assert_eq!(read["thread"]["status"], "ready", "{read}");
+    assert_eq!(read["thread"]["background"]["running"], 1, "{read}");
+    let task = &read["backgroundTasks"][0];
+    assert_eq!(task["status"], "running");
+    assert_eq!(task["kind"], "shell");
+    let agents: Vec<Proc> = proc::recorded(&agent_pids);
+    assert_eq!(agents.len(), 1, "{agents:?}");
+
+    let stop = mutate(
+        &c,
+        "backgroundTask/stop",
+        json!({"threadId": thread_id, "taskId": task["id"]}),
+        STEP,
+    )
+    .await;
+    assert!(stop["task"]["stopRequestedAt"].is_number(), "{stop}");
+    c.wait_until(STEP, |s| {
+        client_events(s, &stream).iter().any(|e| {
+            matches!(&e.event, Event::BackgroundTaskUpdated { task }
+                if task.status == aas_protocol::BackgroundTaskStatus::Stopped)
+        })
+    })
+    .await;
+    // Nothing keeps it busy any more: the idle stop follows.
+    c.wait_until(STEP, |s| {
+        client_events(s, &stream).iter().any(|e| {
+            matches!(&e.event, Event::ThreadUpdated { thread }
+                if thread.status == aas_protocol::ThreadStatus::Idle)
+        })
+    })
+    .await;
+    drop(c);
+    server.ok("quit").await;
+    let status = tokio::time::timeout(STEP, server.child.wait())
+        .await
+        .expect("exits after quit")
+        .expect("exit status");
+    assert_eq!(status.code(), Some(0));
+    let survivors =
+        tokio::task::spawn_blocking(move || proc::wait_all_dead(&agents, Duration::from_secs(10)))
+            .await
+            .unwrap();
+    assert!(survivors.is_empty(), "{survivors:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

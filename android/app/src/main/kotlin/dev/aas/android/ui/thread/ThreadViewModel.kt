@@ -13,11 +13,13 @@ import dev.aas.android.data.SentDrafts
 import dev.aas.android.data.ThreadRepository
 import dev.aas.android.domain.HarnessWait
 import dev.aas.android.domain.InboxModel
+import dev.aas.android.domain.NativeSessionHarnesses
 import dev.aas.android.domain.ResultMessages
 import dev.aas.android.domain.ThreadActivity
 import dev.aas.android.domain.composer.ComposerText
 import dev.aas.android.domain.composer.FollowUpDelivery
 import dev.aas.android.domain.composer.LocalCommand
+import dev.aas.android.domain.composer.Palette
 import dev.aas.android.domain.composer.PaletteContext
 import dev.aas.android.domain.composer.PaletteEntry
 import dev.aas.android.domain.composer.SendAction
@@ -27,6 +29,9 @@ import dev.aas.android.domain.timeline.PendingInput
 import dev.aas.android.domain.timeline.Timeline
 import dev.aas.android.domain.timeline.TimelineRow
 import dev.aas.android.notify.AppVisibility
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskId
+import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.CommandAction
 import dev.aas.android.protocol.ContextUsage
 import dev.aas.android.protocol.Harness
@@ -35,6 +40,7 @@ import dev.aas.android.protocol.Interaction
 import dev.aas.android.protocol.InteractionResolution
 import dev.aas.android.protocol.InteractionStatus
 import dev.aas.android.protocol.Item
+import dev.aas.android.protocol.JsonKeys
 import dev.aas.android.protocol.Methods
 import dev.aas.android.protocol.PickerKind
 import dev.aas.android.protocol.Project
@@ -70,11 +76,15 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 
 /** Everything the thread screen shows. */
 data class ThreadUiState(
@@ -104,8 +114,25 @@ data class ThreadUiState(
      * message sent now…); messages show it in their own pending row.
      */
     val harnessWaits: List<HarnessWait> = emptyList(),
+    /** Background tasks with a `backgroundTask/stop` still in the outbox. */
+    val stopQueued: Set<BackgroundTaskId> = emptySet(),
 ) {
     val pendingInteractions: List<Interaction> get() = thread.interactions.filter { it.status == InteractionStatus.Pending }
+
+    /** The thread's background tasks by id (a backgrounded item's chip, a background approval's title). */
+    val backgroundTasks: Map<BackgroundTaskId, BackgroundTask> get() = thread.backgroundTasks.associateBy { it.id }
+
+    /** Background tasks that run now (they stop with the agent's process: the stop and archive dialogs name them). */
+    val runningTasks: List<BackgroundTask> get() = thread.backgroundTasks.filter { it.status == BackgroundTaskStatus.Running }
+
+    /** The harness can stop single background tasks (`capabilities.backgroundStop`). */
+    val canStopBackground: Boolean get() = harness?.capabilities?.backgroundStop == true
+
+    /** The harness reports background work, so interrupting a turn leaves it running (the stop button's hint). */
+    val keepsBackgroundOnInterrupt: Boolean get() = harness?.capabilities?.backgroundTasks == true
+
+    /** How 停止 of [task] behaves now. */
+    fun stopOf(task: BackgroundTask): BackgroundStop = BackgroundStop.of(task, canStopBackground, task.id in stopQueued)
     val queued: List<QueuedInput> get() = thread.queued
     val settings: ThreadSettings get() = thread.thread?.settings ?: ThreadSettings()
 
@@ -121,6 +148,9 @@ sealed interface ThreadEvent {
 
     data class OpenNewThread(val projectId: String, val harnessId: String) : ThreadEvent
 
+    /** `/resume`: 「PC のセッションを取り込む」 of [projectId] with [harnessId] preselected. */
+    data class OpenImport(val projectId: String, val harnessId: String) : ThreadEvent
+
     data class OpenPicker(val kind: PickerKind) : ThreadEvent
 
     data object ShowStatus : ThreadEvent
@@ -134,6 +164,9 @@ sealed interface ThreadEvent {
 
     /** A message was sent: show the bottom of the conversation. */
     data object ScrollToBottom : ThreadEvent
+
+    /** Show the row with [key] (a background task's card, once its section is open). */
+    data class ScrollToRow(val key: String) : ThreadEvent
 }
 
 /**
@@ -147,7 +180,7 @@ class ThreadViewModel(
     val route: ThreadRoute,
     private val threads: ThreadRepository,
     private val interactions: InteractionRepository,
-    workspace: StateFlow<WorkspaceState>,
+    private val workspace: StateFlow<WorkspaceState>,
     outbox: StateFlow<List<OutboxEntry>>,
     private val status: StateFlow<SyncStatus>,
     settings: Flow<AppSettings>,
@@ -180,7 +213,7 @@ class ThreadViewModel(
         drafts = drafts.also { restoreSavedDraft(it) },
         draftKey = ComposerDrafts.threadKey(threadId),
         templates = templates,
-        paletteContext = PaletteContext(inThread = true),
+        paletteContext = paletteContext(workspace.value),
     )
 
     private val local = combine(expanded, loadingOlder, olderError, harnesses.refreshing) { e, l, o, p -> LocalState(e, l, o, p) }
@@ -205,7 +238,21 @@ class ThreadViewModel(
     init {
         // The draft text also lives in the saved state (it survives the process being killed).
         viewModelScope.launch { composer.state.collect { saved[SAVED_DRAFT] = it.value.text } }
+        // What the palette offers follows the workspace: `/pin` or unpin, and `/resume` while
+        // some harness can list its sessions.
+        viewModelScope.launch {
+            workspace
+                .map { ws -> paletteContext(ws) }
+                .distinctUntilChanged()
+                .collect { composer.setPaletteContext(it) }
+        }
     }
+
+    private fun paletteContext(ws: WorkspaceState) = PaletteContext(
+        inThread = true,
+        pinned = ws.threads.firstOrNull { it.thread.id == threadId }?.thread?.pinned == true,
+        canImport = NativeSessionHarnesses.canImport(ws.harnesses),
+    )
 
     private fun restoreSavedDraft(drafts: ComposerDrafts) {
         val key = ComposerDrafts.threadKey(route.threadId)
@@ -240,7 +287,8 @@ class ThreadViewModel(
         val context = runningTurn?.let { lt -> state.turns.firstOrNull { it.id == lt.id }?.usage?.context } ?: thread?.usage?.context
         val lastTurn = state.turns.lastOrNull()
         val plan = lastTurn?.takeIf { it.status == TurnStatus.Running }?.let { t -> state.items.lastOrNull { it.turnId == t.id && it is Item.Plan } as? Item.Plan }
-        val quiet = setOf(Methods.TurnStart.name, Methods.TurnInterrupt.name, Methods.InteractionRespond.name)
+        // Shown where they apply: messages in the conversation, stops on their task's card, answers on their card.
+        val quiet = setOf(Methods.TurnStart.name, Methods.TurnInterrupt.name, Methods.InteractionRespond.name, Methods.BackgroundTaskStop.name)
         return ThreadUiState(
             thread = state,
             harness = harness,
@@ -257,6 +305,10 @@ class ThreadViewModel(
             otherPending = state.pending.count { it.method !in quiet },
             followUp = appSettings.followUp,
             harnessWaits = HarnessWait.all(state.pending.filter { it.method != Methods.TurnStart.name }, ws.harnesses),
+            stopQueued = state.pending
+                .filter { it.method == Methods.BackgroundTaskStop.name }
+                .mapNotNull { (it.params[JsonKeys.TASK_ID] as? JsonPrimitive)?.contentOrNull }
+                .toSet(),
         )
     }
 
@@ -313,6 +365,12 @@ class ThreadViewModel(
             viewModelScope.launch { runLocal { threads.interrupt(threadId) } }
             return
         }
+        if (Palette.isResume(composer.textValue.text)) {
+            // Typed out instead of chosen: the app's `/resume`, never sent to the harness.
+            composer.setText("")
+            resume()
+            return
+        }
         val input = composer.input()
         if (input.isEmpty()) return
         val draft = composer.sentDraft()
@@ -344,6 +402,34 @@ class ThreadViewModel(
      */
     fun discardPending(clientRequestId: String) {
         viewModelScope.launch { runLocal { messages.show(ResultMessages.discarded(threads.discardPending(clientRequestId))) } }
+    }
+
+    // ----- background tasks ----------------------------------------------------------------------
+
+    /**
+     * `backgroundTask/stop` (after the screen's confirmation): asks the harness to stop [task].
+     * It shows 停止中… until the harness reports the end; offline the request waits in the outbox.
+     */
+    fun stopBackgroundTask(task: BackgroundTask) {
+        viewModelScope.launch {
+            runLocal {
+                threads.stopBackgroundTask(threadId, task.id)
+                messages.show(UiText.of(if (status.value.isOnline) R.string.bg_stop_requested else R.string.bg_stop_offline, task.title))
+            }
+        }
+    }
+
+    /**
+     * Shows a background task in the バックグラウンド section (from a backgrounded item's chip):
+     * opens the section (and the ended tasks when it ended) and scrolls to its card.
+     */
+    fun openBackgroundTask(taskId: BackgroundTaskId) {
+        val task = state.value.thread.backgroundTasks.firstOrNull { it.id == taskId } ?: return
+        expanded.update { current ->
+            current + (Timeline.BACKGROUND_SECTION to true) +
+                if (task.status != BackgroundTaskStatus.Running) mapOf(Timeline.BACKGROUND_ENDED to true) else emptyMap()
+        }
+        emit(ThreadEvent.ScrollToRow(TimelineRow.backgroundTaskKey(taskId)))
     }
 
     /** Loads the thread again after it failed to load. */
@@ -429,11 +515,26 @@ class ThreadViewModel(
                 LocalCommand.Status -> emit(ThreadEvent.ShowStatus)
                 LocalCommand.Rename -> emit(ThreadEvent.ShowRename)
                 LocalCommand.Pin -> togglePin()
+                LocalCommand.Resume -> resume()
                 // Inserted by the composer.
                 LocalCommand.Review, LocalCommand.Init -> Unit
             }
             is PaletteChoice.Unsupported -> messages.show(UiText.of(R.string.palette_unsupported_type, choice.type))
         }
+    }
+
+    /**
+     * `/resume`: 「PC のセッションを取り込む」 for this thread's project with its harness
+     * preselected; choosing a session there imports it and opens its thread.
+     */
+    fun resume() {
+        val ws = workspace.value
+        val thread = ws.threads.firstOrNull { it.thread.id == threadId }?.thread ?: state.value.thread.thread ?: return
+        if (!NativeSessionHarnesses.canImport(ws.harnesses)) {
+            messages.show(UiText.of(R.string.import_no_harness))
+            return
+        }
+        emit(ThreadEvent.OpenImport(thread.projectId, thread.harnessId))
     }
 
     /** A command's `method` action: the ones the app knows get their own screen or confirmation. */

@@ -5,7 +5,10 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.aas.android.data.db.AasDatabase
 import dev.aas.android.data.db.RoomSyncStore
+import dev.aas.android.protocol.AasJson
+import dev.aas.android.protocol.Thread
 import dev.aas.android.protocol.WORKSPACE_STREAM
+import dev.aas.android.sync.Samples
 import dev.aas.android.sync.OutboxEntry
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -98,6 +101,34 @@ class RoomMigrationTest {
                 assertEquals(listOf("codex", null, "claude"), tx.outbox().map { it.waitingForHarness })
                 assertEquals("not logged in", tx.outbox()[0].lastError)
             }
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun version2UpgradesWithAnEmptyTableOfBackgroundTasks() = runBlocking<Unit> {
+        createExported(2) { db ->
+            db.execSQL("INSERT INTO meta (`key`, value) VALUES ('epoch', 'e2')")
+            db.execSQL("INSERT INTO threads (id, json) VALUES (?, ?)", arrayOf<Any?>("thr_1", AasJson.encodeToString(Thread.serializer(), Samples.thread("thr_1", head = 4))))
+            db.execSQL(
+                "INSERT INTO outbox (client_request_id, method, params, created_at, failures, last_error, next_attempt_at, waiting_for_harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                arrayOf<Any?>("c1", "turn/start", """{"clientRequestId":"c1","threadId":"thr_1"}""", 5L, 0, null, 0L, "codex"),
+            )
+        }
+        val db = AasDatabase.open(context)
+        try {
+            val store = RoomSyncStore(db)
+            store.transaction { tx ->
+                assertEquals("e2", tx.epoch())
+                assertEquals(4L, tx.thread("thr_1")?.head)
+                assertEquals(listOf("codex"), tx.outbox().map { it.waitingForHarness })
+                assertEquals(emptyList(), tx.backgroundTasksOf("thr_1"))
+            }
+            // The new table works like the others.
+            val task = Samples.backgroundTask("bgt_1", threadId = "thr_1", title = "npm run dev")
+            store.transaction { tx -> tx.upsertBackgroundTask(task) }
+            store.transaction { tx -> assertEquals(listOf(task), tx.backgroundTasksOf("thr_1")) }
         } finally {
             db.close()
         }

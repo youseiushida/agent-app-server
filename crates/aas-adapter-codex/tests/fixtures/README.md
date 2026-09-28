@@ -1,6 +1,6 @@
 # Codex replay scripts
 
-`codex app-server`（codex-cli 0.148.0、Windows 11）との実際のやりとりを記録し、再生用のスクリプトに変換したもの。`tests/replay.rs` が `tests/support/mod.rs` のランナーで再生する。
+`codex app-server`（codex-cli 0.148.0、Windows 11）との実際のやりとりを記録し、再生用のスクリプトに変換したもの。`tests/replay.rs` と `tests/background.rs` が `tests/support/mod.rs` のランナーで再生する。
 
 ## 記録したシナリオ
 承認ポリシー `untrusted`、sandbox は read-only で、使い捨ての作業フォルダを使った。
@@ -16,6 +16,20 @@
 - `fork_compact.jsonl`: 同じプロセスで `thread/fork` し、`thread/compact/start` を実行した。記録はコンパクションの途中で終わっている。
 - `file_change.jsonl`: 新規スレッドでファイルを作成した（fileChange の承認）。
 
+- `native_list_*.jsonl`: `thread/list` の一覧（`list_native_sessions`）。実際の daemon で観察した形から手で作った（id、タイトル、パスは架空のもの。スレッドのオブジェクトの形は `resume_turn.jsonl` の記録と同じ）。
+  - 観察したこと（codex-cli 0.148.0、2026-09）: Codex desktop などで resume したスレッドは、rollout ファイルごとに1件ずつ、同じ id・同じタイトルで `updatedAt` だけが違う項目として、同じページに 2〜3 件並ぶ（4 つのプロジェクトのうち 3 つで起きた）。
+  - `native_list_paged.jsonl`: 上限 3 件。1ページ目に同じスレッドが2件あるので、アダプタは異なるスレッドが 3 件になるまで次のページを読む（ページの境目で同じスレッドの古い rollout が次のページに来る場合も含む）。
+  - `native_list_one_page.jsonl`: 1ページで終わる一覧。同じスレッドの rollout が3件あり、別のスレッドの新しい rollout が古いものより後ろに来る（並び順に頼らず、`updatedAt` の最大を明示的に取ることを確かめるための、意図した変形）。
+
+### バックグラウンドの作業（`bg_*.jsonl`、2026-09-28）
+ターンを越えて動くコマンドとサブエージェントの記録。設定済みのモデル（DeepSeek）が `402 Insufficient Balance` を返したため、モデルは `127.0.0.1` の台本の Responses API にした（Codex 自身の結合テストと同じ手法。`-c model_providers.…` で指定）。app-server、ツール、unified exec、サブエージェント、承認、中断は本物の codex-cli 0.148.0 で、台本なのはモデルの出力（どのツールをどの引数で呼ぶか）だけ。使用量の値（1応答 1010 トークン）も台本の値。
+
+- `bg_terminals.jsonl`（`experimentalApi: true`、承認ポリシー never）: 1ターン目に `exec_command` を2回（A: 5秒ごとに9行、B: 5秒ごとに120行）呼んでから返答する。ターンの終わりに A と B は動いている。2ターン目を途中で中断する。B を `thread/backgroundTerminals/terminate` で止め（`failed` / -1）、A は自分で終わる（`completed` / 0）。ターンのあとも元のターン id の `item/commandExecution/outputDelta` が届く。
+- `bg_terminals_unlisted.jsonl`（`experimentalApi: false` で記録）: 同じ流れ。`thread/backgroundTerminals/list` は `-32600 "…requires experimentalApi capability"` になる（experimental API を持たない Codex の代わり）。A の遅れた `item/completed` は届く。
+- `bg_subagents_v2.jsonl`（`features.multi_agent_v2`、承認ポリシー untrusted）: 親のターンが v2 のサブエージェントを3つ（approver、sleeper、pending）起動して終わる。3つの承認要求は親のターンのあとに届く。sleeper を `turn/interrupt` で止め（そのコマンドは子のバックグラウンドのターミナルとして残る）、そのターミナルを terminate する。pending は承認を保留したまま止める（`serverRequest/resolved` が来る）。approver は親のターンの 24 秒後にもう一度承認を求め、`APPROVER_DONE` で終わる。最後に親の追跡のターン。
+- `bg_subagent_v1_interrupt.jsonl`（`features.multi_agent`、v1）: 親が `spawnAgent` で子を起動して `wait` で待つ。親のターンを中断しても子は動き続け、子の `turn/interrupt` で止まる。子のコマンドはターミナルとして残り、terminate で止まる。
+- `bg_subagent_unannounced.jsonl`: `bg_subagents_v2.jsonl` の記録から作った変形。子を起動する `subAgentActivity` の Item を取り除き（子のスレッドの通知が先に届いた場合の代わり）、アダプタが子の最初の `active` のあとに送る `thread/read` の往復を足した（応答は同じ記録の `thread/read` の応答）。3つ目の子は `parentThreadId` を null にしてこのセッションの外のスレッドにし、その承認要求にアダプタがエラーで答えることを期待する行を足した。
+
 ## 加工したところ
 - パスとアカウントに関わる値を置き換えた。
   - 作業フォルダ → `C:\WORKSPACE`
@@ -24,6 +38,14 @@
 - 記録ドライバはアダプタとは別の順番で要求を送っていたので、次のように並べ替えた。
   - `model/list`、`thread/read`、`thread/list` は取り除いた。
   - `skills/list` の往復（応答の内容は記録どおり）は、アダプタが送るタイミングであるスレッド開始の応答の直後に移した。
+- `main_*` などは `experimentalApi: false` で記録した。アダプタは `true` を送るので、`initialize` の行でその値を照合する（両方の値で記録を比べ、メッセージの形は同じだった。`true` では `thread/settings/updated` が増えるだけで、これは無視する）。
+- `bg_*.jsonl` は次のように作った。
+  - 記録ドライバだけが送った要求（`thread/loaded/list`、確認用の `thread/read` と `thread/backgroundTerminals/list`、終わったターンへの `turn/interrupt`、2回目の terminate、`…/clean`、Codex が片付けたあとにドライバが答えた承認）と、その応答を取り除いた。`thread/delete` から後（ドライバの後片付け）は含めない。
+  - アダプタがドライバと違う時点で送る要求を足し、応答を記録の値から作った。
+    - `bg_terminals`: B の終了のあとの一覧（記録の A の項目だけ）
+    - `bg_subagents_v2`: sleeper のターミナルの終了のあとの一覧と、pending のターンの終わりの一覧（どちらも `[]`。記録では同じ時点のあとの一覧が `[]` だった）
+    - `bg_subagent_v1_interrupt`: 子のターミナルの終了のあとの一覧（`[]`）
+  - `skills/list` の応答は空にした（スキルは `main_*` で扱っている）。
 
 ## スクリプトの形式（1行1エントリ）
 - `{"s": msg, "respondsTo": recId?}`: サーバからクライアントへ送るメッセージ。`respondsTo` があるときは、記録上の要求 id を、アダプタが実際に使った id に置き換えてから送る。

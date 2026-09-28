@@ -1,6 +1,8 @@
 package dev.aas.android.sync
 
 import dev.aas.android.protocol.AasJson
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskId
 import dev.aas.android.protocol.ClientInfo
 import dev.aas.android.protocol.CommandAction
 import dev.aas.android.protocol.Empty
@@ -90,8 +92,11 @@ import kotlin.random.Random
  *    `turn/interrupt` and `thread/stop` do not wait behind an entry of their thread that only
  *    waits for its retry.
  * 4. **Liveness.** A watchdog closes the socket when no frame arrived within the server's
- *    `clientTimeoutMs`. A stream whose heartbeat head stays ahead of its cursor for
- *    `clientTimeoutMs` without progress is resubscribed from the cursor.
+ *    `clientTimeoutMs`, measured with [Clock.monotonicMs] (which counts deep sleep). Its timer
+ *    does not count deep sleep, so [onAppForeground] and [onNetworkAvailable] measure again at
+ *    once and replace a connection that went silent while the phone slept. A stream whose
+ *    heartbeat head stays ahead of its cursor for `clientTimeoutMs` without progress is
+ *    resubscribed from the cursor.
  * 5. **Reconnection.** Full-jitter backoff capped at [SyncConfig.backoffCapMs]; the attempt
  *    counter resets only once `initialize` and the resubscription completed. [reconnectNow],
  *    [onAppForeground] and [onNetworkAvailable]/[onNetworkChanged] skip the wait. Close codes
@@ -264,15 +269,23 @@ class SyncEngine(
         trigger(TriggerKind.UserAction)
     }
 
-    /** The app came to the foreground: skips the backoff wait and resumes after "connected elsewhere". */
+    /**
+     * The app came to the foreground: checks the connection's liveness now ([checkLiveness]: the
+     * phone may have slept), skips the backoff wait and resumes after "connected elsewhere".
+     */
     fun onAppForeground() {
         if (suspendReason is SuspendReason.Replaced) suspendReason = null
+        checkLiveness("the app came to the foreground")
         trigger(TriggerKind.AppForeground)
     }
 
-    /** A network is available (again): leaves [ConnectionState.Offline] and skips the backoff wait. */
+    /**
+     * A network is available (again): checks the liveness of a connection that is still open
+     * ([checkLiveness]), leaves [ConnectionState.Offline] and skips the backoff wait.
+     */
     fun onNetworkAvailable() {
         networkAvailable = true
+        checkLiveness("a network became available")
         trigger(TriggerKind.NetworkAvailable)
     }
 
@@ -498,6 +511,16 @@ class SyncEngine(
         val read = query(Methods.ThreadRead, ThreadReadParams(threadId, beforeTurnIndex = oldest, limitTurns = config.threadPageTurns))
         write { tx, signals -> EventApplier.applyOlderPage(tx, read, signals) }
         return read.hasMoreBefore
+    }
+
+    /**
+     * The stored background tasks among [ids] (tasks of threads followed on this device; a task of
+     * a thread never opened here is not stored). For showing which task asked an approval outside
+     * its thread's screen.
+     */
+    suspend fun storedBackgroundTasks(ids: Collection<BackgroundTaskId>): Map<BackgroundTaskId, BackgroundTask> {
+        if (ids.isEmpty()) return emptyMap()
+        return store.transaction { tx -> ids.toSet().mapNotNull { id -> tx.backgroundTask(id)?.let { id to it } }.toMap() }
     }
 
     /** Marks a thread as read up to its current summary. */
@@ -777,10 +800,21 @@ class SyncEngine(
 
         private var watchdogJob: Job? = null
 
-        /** (Re)starts the watchdog, e.g. when `initialize` replaced the timeout it sleeps on. */
+        /** The watchdog runs (the socket opened); before that the connect timeout bounds the session. */
+        @Volatile
+        var watching = false
+            private set
+
+        /**
+         * (Re)starts the watchdog, e.g. when `initialize` replaced the timeout it sleeps on, or
+         * when the time left must be measured again ([checkLiveness]). Called from the session's
+         * coroutines and from the app's callbacks, hence synchronized.
+         */
+        @Synchronized
         fun startWatchdog() {
             watchdogJob?.cancel()
             watchdogJob = scope.launch { watchdog(this@Session) }
+            watching = true
         }
 
         fun drop(end: SessionEnd) {
@@ -904,6 +938,30 @@ class SyncEngine(
             SessionEnd.Suspend(SuspendReason.Replaced)
         } else {
             SessionEnd.Retry(DisconnectCause.Closed(code, reason), RetryDelay.Backoff)
+        }
+    }
+
+    /**
+     * Measures the current connection's silence against the client timeout now (protocol.md
+     * §2.2), at moments after which the phone may have slept (the app returning to the
+     * foreground, a network becoming available). The watchdog's timer runs on the coroutine
+     * clock, which stops in deep sleep: after waking it would still wait for the rest of its delay
+     * while the socket died long ago, and the app would show the dead connection as live.
+     * [Clock.monotonicMs] counts the sleep, so a connection that has been silent for the client
+     * timeout is closed and replaced at once (without the backoff wait: nothing failed to
+     * connect, and the user is looking at the app); otherwise the watchdog is re-armed for the
+     * time actually left.
+     */
+    private fun checkLiveness(reason: String) {
+        val s = session ?: return
+        if (!s.watching) return
+        val timeout = s.clientTimeoutMs
+        val idle = clock.monotonicMs() - s.lastFrameAtMs
+        if (idle >= timeout) {
+            log(SyncLogger.Level.Info, "$reason: no frame for $idle ms (client timeout $timeout ms): closing the connection")
+            s.drop(SessionEnd.Retry(DisconnectCause.Watchdog(timeout), RetryDelay.Immediate))
+        } else {
+            s.startWatchdog()
         }
     }
 
@@ -1052,7 +1110,7 @@ class SyncEngine(
                 return
             }
             if (!openCounts.containsKey(threadId)) return
-            write { tx, signals -> EventApplier.applyThreadRead(tx, read, signals) }
+            write { tx, signals -> EventApplier.applyThreadRead(tx, read, signals, ::warnData) }
             s.suspendedStreams -= stream
             val result = subscribe(s, listOf(Subscription(stream, read.head)))
             if (result.subscriptions.any { it.stream == stream && it.status == SubscriptionState.NotFound }) {
@@ -1164,7 +1222,7 @@ class SyncEngine(
         val now = clock.nowMs()
         val outcome = write { tx, signals ->
             // An empty batch moves the cursor to the head (protocol.md §2.1): see EventApplier.
-            val o = EventApplier.applyBatch(tx, batch, signals)
+            val o = EventApplier.applyBatch(tx, batch, signals, ::warnData)
             if (o.cursorMoved) tx.setLastSyncAtMs(now)
             o
         }
@@ -1240,8 +1298,9 @@ class SyncEngine(
      * * One entry at a time per lane ([laneOf]): the next entry of a thread waits until the
      *   previous one was answered, so a retried request never lands after a later one.
      * * Except for the stop controls ([bypassesRetryWait]): while the lane's first entry only
-     *   waits for its retry (it is not on the wire), `turn/interrupt` and `thread/stop` of that
-     *   thread go ahead of it, one at a time in their own order. Stopping the agent must not
+     *   waits for its retry (it is not on the wire), `turn/interrupt`, `thread/stop` and
+     *   `backgroundTask/stop` of that thread go ahead of it, one at a time in their own order.
+     *   Stopping the agent (or its background work) must not
      *   depend on an input the server refuses for now (a steer that keeps failing, a harness
      *   that is gone). An entry on the wire is still waited for: the server handles the
      *   requests of one thread one at a time in arrival order anyway (protocol.md §1).
@@ -1322,9 +1381,12 @@ class SyncEngine(
         RetryWaiting,
     }
 
-    /** `turn/interrupt` and `thread/stop` pass an entry of their thread that waits for its retry. */
-    private fun bypassesRetryWait(entry: OutboxEntry): Boolean =
-        entry.method == Methods.TurnInterrupt.name || entry.method == Methods.ThreadStop.name
+    /**
+     * The requests that stop work — `turn/interrupt`, `thread/stop` and `backgroundTask/stop` —
+     * pass an entry of their thread that waits for its retry: input the server does not accept
+     * now must not keep the user from stopping a runaway agent or its background work.
+     */
+    private fun bypassesRetryWait(entry: OutboxEntry): Boolean = entry.method in STOP_METHODS
 
     /** Requests that must keep their order share a lane: same thread, same project, same interaction. */
     private fun laneOf(entry: OutboxEntry): String {
@@ -1530,6 +1592,9 @@ class SyncEngine(
 
     private fun log(level: SyncLogger.Level, message: String) = logger.log(level, message, null)
 
+    /** Something in the server's data had to be corrected to be stored (see [EventApplier]). */
+    private fun warnData(message: String) = log(SyncLogger.Level.Warn, message)
+
     companion object {
         /** Close codes of the server (protocol.md §2.3). */
         const val CLOSE_GOING_AWAY = 1001
@@ -1551,5 +1616,8 @@ class SyncEngine(
          * a replay). A capacity, not a timing policy: it bounds memory, never delays anything.
          */
         const val EVENT_BUFFER = 1024
+
+        /** The requests that stop work: they pass a retry-waiting entry of their lane ([bypassesRetryWait]). */
+        private val STOP_METHODS = setOf(Methods.TurnInterrupt.name, Methods.ThreadStop.name, Methods.BackgroundTaskStop.name)
     }
 }

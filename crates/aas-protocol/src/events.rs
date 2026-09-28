@@ -83,6 +83,9 @@ pub enum Event {
     QueueUpdated { queued: Vec<QueuedInput> },
     #[serde(rename = "commands/changed")]
     CommandsChanged {},
+    /// A background task started, progressed or ended (always the whole task).
+    #[serde(rename = "backgroundTask/updated")]
+    BackgroundTaskUpdated { task: BackgroundTask },
     #[serde(rename = "native")]
     Native { harness_id: String, payload: Value },
 }
@@ -113,6 +116,7 @@ impl Event {
             Event::InteractionExpired { .. } => "interaction/expired",
             Event::QueueUpdated { .. } => "queue/updated",
             Event::CommandsChanged {} => "commands/changed",
+            Event::BackgroundTaskUpdated { .. } => "backgroundTask/updated",
             Event::Native { .. } => "native",
         }
     }

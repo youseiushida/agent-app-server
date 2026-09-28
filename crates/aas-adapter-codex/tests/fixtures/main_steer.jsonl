@@ -1,4 +1,4 @@
-{"c":{"method":"initialize","recId":"1"}}
+{"c":{"method":"initialize","recId":"1","params":{"capabilities":{"experimentalApi":true,"requestAttestation":false}}}}
 {"s":{"id":1,"result":{"userAgent":"aas-probe/0.148.0 (Windows 10.0.26200; x86_64) WindowsTerminal (aas-probe; 0.0.1)","codexHome":"C:\\Users\\USER\\.codex","platformFamily":"windows","platformOs":"windows"}},"respondsTo":"1"}
 {"c":{"method":"initialized"}}
 {"s":{"method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"HOST","installationId":"00000000-0000-0000-0000-000000000000","environmentId":null},"emittedAtMs":1790480957951}}

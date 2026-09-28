@@ -1,0 +1,28 @@
+# Line endings: the repository stores text with LF, and the working tree uses LF too, whatever
+# core.autocrlf says (Git for Windows and the windows-latest runners default it to true). The
+# JSON Lines fixtures and the protocol's golden fixtures are compared byte for byte, the
+# daemon talks to its CLIs in LF-separated JSON Lines, and android/gradlew is a shell script.
+* text=auto eol=lf
+
+# Windows scripts keep CRLF in the working tree (cmd.exe misreads labels and line
+# continuations in LF batch files); the repository still stores LF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files: never converted, never diffed as text.
+*.jar binary
+*.apk binary
+*.aab binary
+*.keystore binary
+*.jks binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
+*.tzst binary
+*.sqlite binary
+*.db binary

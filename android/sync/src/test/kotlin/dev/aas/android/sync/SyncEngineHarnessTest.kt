@@ -225,7 +225,9 @@ class SyncEngineHarnessTest {
             assertEquals("codex", f.engine.outbox.value.single().waitingForHarness)
             f.harnessBack()
             eventually(what = "sent") { f.engine.outbox.value.takeIf { it.isEmpty() } }
-            assertIs<OutboxResult.Succeeded>(f.results.single())
+            // The fixture collects `results` on its own coroutine: the result may land just after
+            // the outbox emptied.
+            assertIs<OutboxResult.Succeeded>(eventually(what = "the result") { f.results.singleOrNull() })
         }
     }
 }

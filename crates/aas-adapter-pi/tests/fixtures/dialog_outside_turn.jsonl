@@ -1,0 +1,3 @@
+{"type":"extension_ui_request","id":"4fb6e6cc-187a-4918-9e27-1bf526c3d9ff","method":"confirm","title":"aas-live","message":"A dialog outside a turn"}
+{"$await": "extension_ui_response"}
+{"type":"extension_ui_request","id":"08962e9c-99c2-4c03-9560-d7e2c4f9aa77","method":"notify","message":"aas-live answered: false","notifyType":"info"}

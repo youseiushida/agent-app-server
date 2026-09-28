@@ -4,6 +4,7 @@
 //! independent of process spawning so that recorded transcripts can be replayed over in-memory
 //! pipes (see `tests/replay.rs`).
 
+mod background;
 mod commands;
 mod history;
 mod link;
@@ -19,7 +20,8 @@ use std::sync::{Arc, Weak};
 use aas_harness::protocol::{Command, HarnessCapabilities, HarnessKind};
 use aas_harness::{
     AdapterContext, AdapterError, AdapterPolicy, CommandContext, HarnessAdapter, HarnessConfig,
-    HarnessInfo, NativeHistory, NativeSessionSummary, SessionHandle, StartRequest,
+    HarnessInfo, NativeHistory, NativeSessionSet, NativeSessionSummary, SessionHandle,
+    StartRequest,
 };
 use aas_stdio::{RpcCallError, RpcPeer};
 use aas_supervisor::{StopReason, ToolSpec, resolve_program};
@@ -71,6 +73,9 @@ impl CodexOptions {
 const THREAD_LIST_PAGE_SIZE: usize = 100;
 
 const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
+    // Background terminals and sub-agent threads (docs/adapters/codex.md §13).
+    background_tasks: true,
+    background_stop: true,
     interrupt: true,
     steer: true,
     approvals: true,
@@ -184,6 +189,63 @@ async fn list_models(
         }
     }
     Ok(models)
+}
+
+/// The native sessions of `cwd`: `thread/list` (newest first), each thread once.
+///
+/// Codex lists a thread once per rollout file: a thread resumed in another client (Codex
+/// desktop) gets a new rollout with the same thread id, and `thread/list` returns an entry for
+/// each, with the same id and name and their own `updatedAt`, within one page. They are one
+/// session: [`NativeSessionSet`] keeps the position of the first entry and the content of the
+/// entry with the latest `updatedAt` (taken explicitly, not from the order of the list).
+/// `limit` counts distinct threads; pages are read until `limit` threads are collected or the
+/// list ends.
+async fn list_threads(
+    peer: &RpcPeer,
+    harness: &str,
+    cwd: &str,
+    limit: usize,
+    policy: &AdapterPolicy,
+) -> Result<Vec<NativeSessionSummary>, AdapterError> {
+    let mut threads = NativeSessionSet::new();
+    let mut cursor: Option<String> = None;
+    while threads.len() < limit {
+        let mut params = json!({
+            "cwd": cwd,
+            "limit": (limit - threads.len()).min(THREAD_LIST_PAGE_SIZE),
+            "sortKey": "updated_at",
+            "sortDirection": "desc",
+            "archived": false,
+        });
+        if let Some(c) = &cursor {
+            params["cursor"] = json!(c);
+        }
+        let page: wire::ThreadListResponse = peer
+            .request_timeout("thread/list", params, policy.handshake_timeout)
+            .await
+            .map_err(|e| rpc_err("thread/list", e))?;
+        for thread in &page.data {
+            threads.insert(history::summary(thread, policy));
+        }
+        match page.next_cursor {
+            Some(next) if Some(&next) != cursor.as_ref() && !page.data.is_empty() => {
+                cursor = Some(next)
+            }
+            _ => break,
+        }
+    }
+    if threads.repeated() > 0 {
+        tracing::debug!(
+            harness,
+            merged = threads.repeated(),
+            "thread/list listed threads once per rollout; merged them"
+        );
+    }
+    let mut sessions = threads.into_sessions();
+    // A page never holds more entries than asked for, so this only guards against a server
+    // that ignores `limit`.
+    sessions.truncate(limit);
+    Ok(sessions)
 }
 
 #[async_trait]
@@ -320,6 +382,14 @@ impl HarnessAdapter for CodexAdapter {
         Ok(commands::commands(&skills))
     }
 
+    /// None. The adapter offers `/compact` and `/review` (both act on the thread's own Codex
+    /// thread) and the skills (`$name`, run in the same thread); Codex's session commands
+    /// (`/new`, `/resume`, `/fork`) are features of its clients that app-server does not
+    /// expose as commands.
+    fn session_switching_commands(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     async fn list_native_sessions(
         &self,
         cwd: &Path,
@@ -327,35 +397,10 @@ impl HarnessAdapter for CodexAdapter {
         let limit = self.options()?.native_session_list_limit;
         let policy = self.policy().clone();
         let cwd = cwd.to_string_lossy().into_owned();
-        self.with_peer(|peer| async move {
-            let mut out = Vec::new();
-            let mut cursor: Option<String> = None;
-            while out.len() < limit {
-                let mut params = json!({
-                    "cwd": cwd,
-                    "limit": (limit - out.len()).min(THREAD_LIST_PAGE_SIZE),
-                    "sortKey": "updated_at",
-                    "sortDirection": "desc",
-                    "archived": false,
-                });
-                if let Some(c) = &cursor {
-                    params["cursor"] = json!(c);
-                }
-                let page: wire::ThreadListResponse = peer
-                    .request_timeout("thread/list", params, policy.handshake_timeout)
-                    .await
-                    .map_err(|e| rpc_err("thread/list", e))?;
-                out.extend(page.data.iter().map(history::summary));
-                match page.next_cursor {
-                    Some(next) if Some(&next) != cursor.as_ref() && !page.data.is_empty() => {
-                        cursor = Some(next)
-                    }
-                    _ => break,
-                }
-            }
-            out.truncate(limit);
-            Ok(out)
-        })
+        let harness = self.config.id.clone();
+        self.with_peer(
+            |peer| async move { list_threads(&peer, &harness, &cwd, limit, &policy).await },
+        )
         .await
     }
 
@@ -379,7 +424,7 @@ impl HarnessAdapter for CodexAdapter {
                 Ok(resp.thread)
             })
             .await?;
-        Ok(history::history(&thread, cwd))
+        Ok(history::history(&thread, cwd, self.policy()))
     }
 }
 
@@ -455,17 +500,42 @@ pub mod testing {
     }
 
     /// Maps a raw `thread/read` result to history (for tests of native import).
-    pub fn history_from_thread_read(result: Value, cwd: &Path) -> Result<NativeHistory, String> {
+    pub fn history_from_thread_read(
+        result: Value,
+        cwd: &Path,
+        policy: &AdapterPolicy,
+    ) -> Result<NativeHistory, String> {
         let resp: wire::ThreadReadResponse =
             serde_json::from_value(result).map_err(|e| e.to_string())?;
-        Ok(history::history(&resp.thread, cwd))
+        Ok(history::history(&resp.thread, cwd, policy))
     }
 
-    /// Maps a raw `thread/list` result to summaries.
-    pub fn summaries_from_thread_list(result: Value) -> Result<Vec<NativeSessionSummary>, String> {
-        let resp: wire::ThreadListResponse =
-            serde_json::from_value(result).map_err(|e| e.to_string())?;
-        Ok(resp.data.iter().map(history::summary).collect())
+    /// Runs the `initialize` handshake over arbitrary streams, then lists the native sessions
+    /// of `cwd` the way `list_native_sessions` does (the process stays with the caller).
+    pub async fn list_native_sessions<R, W>(
+        reader: R,
+        writer: W,
+        cwd: &Path,
+        limit: usize,
+        policy: AdapterPolicy,
+    ) -> Result<Vec<NativeSessionSummary>, AdapterError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let (peer, _incoming) = RpcPeer::start(
+            reader,
+            writer,
+            RpcPeerConfig {
+                emit_jsonrpc_field: false,
+                max_line_bytes: policy.max_line_bytes,
+                label: "codex[test]".into(),
+            },
+        );
+        server::initialize(&peer, policy.handshake_timeout).await?;
+        let listed = list_threads(&peer, "codex", &cwd.to_string_lossy(), limit, &policy).await;
+        peer.close_writer().await;
+        listed
     }
 }
 

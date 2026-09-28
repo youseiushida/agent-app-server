@@ -4,6 +4,7 @@ import dev.aas.android.AppPolicy
 import dev.aas.android.data.ImageUploadException
 import dev.aas.android.data.ImageUploader
 import dev.aas.android.data.Reads
+import dev.aas.android.data.ServerLists
 import dev.aas.android.data.UploadedImage
 import dev.aas.android.protocol.AasJson
 import dev.aas.android.protocol.ClientInfo
@@ -31,6 +32,9 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.job
+import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -56,7 +60,11 @@ object Fixtures {
     fun <T> result(name: String, serializer: KSerializer<T>): T =
         AasJson.decodeFromJsonElement(serializer, json("responses", name).jsonObject["result"]!!)
 
-    /** `thread/read`: one turn with every item kind and two interactions. */
+    /**
+     * `thread/read`: a turn with every item kind (one launched a background agent), a turn the
+     * agent started after background work finished, three interactions (one of a background
+     * task) and three background tasks (running, completed, stopped).
+     */
     val threadRead: ThreadReadResult by lazy { result("thread_read", ThreadReadResult.serializer()) }
 }
 
@@ -91,6 +99,12 @@ class TestEngine : AutoCloseable {
     /** The repositories' reads, as the app wires them (AppContainer.reads). */
     val reads = Reads(engine, AppPolicy().readReconnectWaitMs)
 
+    /** Warnings about the server's lists (duplicates removed), as ServerLists logs them. */
+    val dataWarnings = java.util.concurrent.CopyOnWriteArrayList<String>()
+
+    /** The repositories' list checks (AppContainer.serverLists), logging into [dataWarnings]. */
+    val lists = ServerLists { _, message, _ -> dataWarnings += message }
+
     /** Results by method name; a method without one answers `{}`. */
     val answers = ConcurrentHashMap<String, (RpcMessage) -> Any?>()
 
@@ -109,6 +123,7 @@ class TestEngine : AutoCloseable {
             read.turns.forEach { tx.upsertTurn(it) }
             read.items.forEachIndexed { i, item -> tx.upsertItem(StoredItem(item, ItemPosition(read.turns.firstOrNull { it.id == item.turnId }?.index ?: ItemPosition.UNKNOWN_TURN, i.toLong()))) }
             read.interactions.forEach { tx.upsertInteraction(it) }
+            read.backgroundTasks.forEach { tx.upsertBackgroundTask(it) }
             tx.replaceQueued(read.thread.id, read.queued)
         }
     }
@@ -148,9 +163,13 @@ class TestEngine : AutoCloseable {
     }
 
     companion object {
-        fun fakeHarness(steer: Boolean = true, images: Boolean = true) = Harness(
+        /** The fake harness; [background]: it reports background tasks and can stop them. */
+        fun fakeHarness(steer: Boolean = true, images: Boolean = true, background: Boolean = false) = Harness(
             id = "fake", kind = HarnessKind.Fake, displayName = "Fake", available = true,
-            capabilities = HarnessCapabilities(interrupt = true, steer = steer, approvals = true, questions = true, resume = true, fork = true, images = images),
+            capabilities = HarnessCapabilities(
+                interrupt = true, steer = steer, approvals = true, questions = true, resume = true, fork = true, images = images,
+                backgroundTasks = background, backgroundStop = background,
+            ),
             models = listOf(Model("small", "Small", isDefault = true, effortLevels = listOf("low")), Model("large", "Large")),
             defaultModel = "small",
             effortLevels = listOf(EffortLevel("low", "Low"), EffortLevel("high", "High")),
@@ -177,6 +196,16 @@ class MainDispatcherRule : TestWatcher() {
         Dispatchers.resetMain()
         executor.shutdownNow()
     }
+}
+
+/**
+ * Clears view models the way Android does when their screen goes: their scope is cancelled and
+ * its coroutines finish. Call it in `@After` (before [MainDispatcherRule] resets Main): a view
+ * model's collectors of the engine's flows keep running otherwise, and may touch Dispatchers.Main
+ * while the rule resets it.
+ */
+fun clearViewModels(viewModels: Iterable<androidx.lifecycle.ViewModel>) = runBlocking {
+    viewModels.forEach { vm -> vm.viewModelScope.coroutineContext.job.cancelAndJoin() }
 }
 
 /** An image uploader that answers from a table (URI → blob) or fails. */

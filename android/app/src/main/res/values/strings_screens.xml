@@ -221,6 +221,7 @@
     <string name="command_unpin">スレッドのピン留めを外す</string>
     <string name="command_review">コードレビューを依頼する文を入れる</string>
     <string name="command_init">AGENTS.md の作成を依頼する文を入れる</string>
+    <string name="command_resume">PC のセッションを取り込んで続ける</string>
     <string name="command_done">%1$s を実行しました</string>
     <string name="mention_prompt">入力してファイルを検索</string>
     <string name="mention_loading">ファイルを検索中…</string>
@@ -465,4 +466,6 @@
     <string name="settings_harnesses_note">使えないハーネスは、PC で CLI をインストールしたりログインしたりしたあとに「再確認」してください。サーバも一定の間隔で確認し直しています。</string>
     <string name="newthread_harness_refresh_note">使えないハーネスは、PC で CLI にログインしたあとに再確認できます。</string>
     <string name="import_harness_unavailable">「%1$s」を使えません: %2$s</string>
+    <string name="import_harness_unsupported">「%1$s」は PC のセッションの一覧に対応していません</string>
+    <string name="import_harness_unsupported_switched">「%1$s」は PC のセッションの一覧に対応していないため、「%2$s」のセッションを表示しています</string>
 </resources>

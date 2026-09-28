@@ -51,11 +51,13 @@ dependencies = [
 name = "aas-adapter-codex"
 version = "0.1.0"
 dependencies = [
+ "aas-core",
  "aas-harness",
  "aas-protocol",
  "aas-stdio",
  "aas-supervisor",
  "async-trait",
+ "dunce",
  "parking_lot",
  "pretty_assertions",
  "serde",

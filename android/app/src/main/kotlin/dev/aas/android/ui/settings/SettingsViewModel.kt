@@ -3,7 +3,7 @@ package dev.aas.android.ui.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.aas.android.AppContainer
-import dev.aas.android.BuildConfig
+import dev.aas.android.AppVersion
 import dev.aas.android.R
 import dev.aas.android.domain.composer.FollowUpDelivery
 import dev.aas.android.protocol.Device
@@ -61,7 +61,7 @@ data class SettingsUiState(
     val harnesses: List<Harness> = emptyList(),
     val probing: Set<String> = emptySet(),
 ) {
-    val appVersion: String get() = BuildConfig.VERSION_NAME
+    val appVersion: String get() = AppVersion.Current.name
 }
 
 class SettingsViewModel(private val container: AppContainer) : ViewModel() {

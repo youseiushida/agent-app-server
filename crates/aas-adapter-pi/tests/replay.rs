@@ -9,6 +9,11 @@
 //! * `{"$await": "<command>", "respond"?: true}` — wait for the adapter to send `<command>`
 //!   (and answer it with success when `respond` is set);
 //! * `"id": "$prompt"` / `"id": "$abort"` — replaced by the id of that command.
+//!
+//! `agent_*.jsonl` and `dialog_outside_turn.jsonl` were recorded from pi 0.85.1 with the live
+//! test's extension (`tests/extension/aas-live.ts`): runs pi starts by itself, the race of a
+//! prompt with such a run, a run started from a run's end, an abort, the approval gate inside
+//! such a run, and a dialog outside any turn. Response ids are replaced by `resp-<n>`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,14 +22,15 @@ use std::time::Duration;
 
 use aas_adapter_pi::{PiSession, ProcessLink, SessionConfig, handshake};
 use aas_harness::{
-    AdapterError, AdapterEvent, ContextUsage, DeltaField, ExitInfo, InteractionRequest,
-    InteractionResolution, ItemBody, ItemStatus, NoticeLevel, SessionControl, StopReason,
-    ThreadSettings, TurnInput, TurnStatus,
+    AdapterError, AdapterEvent, ContextUsage, DeltaField, ExitInfo, ExpireReason,
+    InteractionRequest, InteractionResolution, ItemBody, ItemStatus, NoticeLevel, SessionControl,
+    StopReason, ThreadSettings, TurnInput, TurnStatus,
 };
 use aas_protocol::Subject;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinHandle;
 
 const WAIT: Duration = Duration::from_secs(10);
 /// Context window of the recorded model (`contextWindow` in `handshake.json`).
@@ -124,13 +130,18 @@ impl Fake {
     /// Plays a fixture. `prompt_id` replaces `$prompt`; returns the answers the adapter
     /// sent to `$await` points (in order).
     async fn play(&mut self, name: &str, prompt_id: &str) -> Vec<Value> {
+        self.play_from(name, prompt_id, 0).await
+    }
+
+    /// Plays a fixture from its line `skip` on (the lines before were written by the test).
+    async fn play_from(&mut self, name: &str, prompt_id: &str, skip: usize) -> Vec<Value> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(name);
         let text = std::fs::read_to_string(path).unwrap();
         let mut awaited = Vec::new();
         let mut abort_id = String::new();
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        for line in text.lines().filter(|l| !l.trim().is_empty()).skip(skip) {
             let mut value: Value = serde_json::from_str(line).unwrap();
             if let Some(kind) = value.get("$await").and_then(Value::as_str) {
                 let kind = kind.to_owned();
@@ -173,6 +184,9 @@ struct Harness {
     session: PiSession,
     events: mpsc::UnboundedReceiver<AdapterEvent>,
     fake: Fake,
+    /// The `send` of the last turn started with [`Harness::start_turn`]: it waits for pi's
+    /// answer to a plain prompt.
+    sending: Option<JoinHandle<Result<(), AdapterError>>>,
 }
 
 impl Harness {
@@ -246,6 +260,7 @@ impl Harness {
                 link,
                 stats,
             },
+            sending: None,
         }
     }
 
@@ -269,11 +284,35 @@ impl Harness {
         }
     }
 
+    /// Sends `text` and returns the id of the `prompt` pi got. The `send` goes on in the
+    /// background ([`Harness::sent`]): for a plain prompt it returns once pi answered it.
     async fn start_turn(&mut self, text: &str) -> String {
-        self.session.send(TurnInput::text(text)).await.unwrap();
+        let session = self.session.clone();
+        let input = TurnInput::text(text);
+        self.sending = Some(tokio::spawn(async move { session.send(input).await }));
         let cmd = self.fake.expect("prompt").await;
         assert_eq!(cmd["message"], text);
         cmd["id"].as_str().unwrap().to_owned()
+    }
+
+    /// What the `send` of the last [`Harness::start_turn`] returned.
+    async fn sent(&mut self) -> Result<(), AdapterError> {
+        let sending = self.sending.take().expect("a turn was started");
+        tokio::time::timeout(WAIT, sending)
+            .await
+            .expect("send returned in time")
+            .unwrap()
+    }
+
+    /// Lets the session learn pi's commands (`get_commands`), as the handshake does.
+    async fn load_commands(&mut self, commands: Value) {
+        let session = self.session.clone();
+        let listing = tokio::spawn(async move { session.get_commands().await });
+        let cmd = self.fake.expect("get_commands").await;
+        self.fake
+            .respond(&cmd, Some(json!({ "commands": commands })))
+            .await;
+        listing.await.unwrap().unwrap();
     }
 }
 
@@ -326,6 +365,7 @@ async fn normal_turn_streams_items_and_completes() {
             status,
             usage,
             error,
+            ..
         } => {
             assert_eq!(*status, TurnStatus::Completed);
             assert!(usage.is_some_and(|u| u.output_tokens > 0));
@@ -370,6 +410,7 @@ async fn gate_approval_allows_the_command() {
                 request_id,
                 request,
                 item_key,
+                ..
             } = &ev
             {
                 match request {
@@ -692,8 +733,9 @@ async fn prompt_handled_without_a_run_completes_through_the_state_probe() {
             ..
         }
     ));
+    assert_eq!(h.sent().await, Ok(()));
     // The session is idle again.
-    h.session.send(TurnInput::text("next")).await.unwrap();
+    h.start_turn("next").await;
 }
 
 #[tokio::test]
@@ -714,6 +756,10 @@ async fn rejected_prompt_fails_the_turn() {
         }
         other => panic!("{other:?}"),
     }
+    // The refusal is reported by the turn's `TurnCompleted`; `send` itself succeeded.
+    assert_eq!(h.sent().await, Ok(()));
+    // The session is idle again.
+    h.start_turn("again").await;
 }
 
 #[tokio::test]
@@ -782,8 +828,9 @@ async fn running_turn(h: &mut Harness, text: &str) {
 #[tokio::test]
 async fn timed_dialogs_are_not_timed_by_the_adapter() {
     // pi closes a dialog with a `timeout` by itself and does not tell the client. The adapter
-    // does not guess when that happened: the interaction stays open until an explicit signal
-    // (here the end of the turn), and the prompt says that pi may answer by itself.
+    // does not guess when that happened: the interaction stays open until it is answered (here
+    // by the engine's expiry at the end of the turn), and the prompt says that pi may answer by
+    // itself.
     let mut h = Harness::new();
     running_turn(&mut h, "hello").await;
     h.fake
@@ -809,17 +856,31 @@ async fn timed_dialogs_are_not_timed_by_the_adapter() {
         h.events.try_recv().is_err(),
         "nothing happens when the dialog's time is up"
     );
+    // pi ends the run's agent loop, then settles it.
+    h.fake
+        .write(&json!({"type":"agent_end","messages":[]}))
+        .await;
     h.fake.write(&json!({"type":"agent_settled"})).await;
     let events = h.until(completed).await;
     assert_eq!(
-        events[0],
-        AdapterEvent::InteractionWithdrawn {
-            request_id: "u9".into()
-        }
+        events.len(),
+        1,
+        "the end of the turn withdraws nothing: {events:?}"
+    );
+    // The engine expired the turn's request and answers pi: the dismissal (pi ignores an
+    // answer for a dialog it closed itself).
+    h.session
+        .expire_request("u9", ExpireReason::TurnEnded)
+        .await
+        .unwrap();
+    let answer = h.fake.expect("extension_ui_response").await;
+    assert_eq!(
+        answer,
+        json!({"type":"extension_ui_response","id":"u9","cancelled":true})
     );
     let err = h
         .session
-        .respond("u9", &InteractionResolution::Dismissed)
+        .expire_request("u9", ExpireReason::TurnEnded)
         .await
         .unwrap_err();
     assert!(matches!(err, AdapterError::UnknownRequest(_)));
@@ -868,6 +929,10 @@ async fn the_gate_reports_a_dialog_closed_by_the_abort() {
         .write(&json!({"type":"tool_execution_end","toolCallId":"call_1","toolName":"bash",
             "result":{"content":[{"type":"text","text":"The approval request was cancelled."}]},"isError":true}))
         .await;
+    // pi ends the run's agent loop, then settles it.
+    h.fake
+        .write(&json!({"type":"agent_end","messages":[]}))
+        .await;
     h.fake.write(&json!({"type":"agent_settled"})).await;
     let events = h.until(completed).await;
     assert!(
@@ -906,6 +971,10 @@ async fn settling_waits_for_the_context_of_the_last_message() {
         .await;
     let stats = h.fake.expect("get_session_stats").await;
     // pi settles before it answers the stats request: the turn waits for the answer.
+    // pi ends the run's agent loop, then settles it.
+    h.fake
+        .write(&json!({"type":"agent_end","messages":[]}))
+        .await;
     h.fake.write(&json!({"type":"agent_settled"})).await;
     let early = h
         .until(|e| matches!(e, AdapterEvent::TurnUsage { .. }))
@@ -949,6 +1018,10 @@ async fn settling_waits_for_the_context_of_the_last_message() {
     let mut unknown = session_stats(0);
     unknown["contextUsage"] = json!({"tokens": null, "contextWindow": WINDOW, "percent": null});
     h.fake.respond(&stats, Some(unknown)).await;
+    // pi ends the run's agent loop, then settles it.
+    h.fake
+        .write(&json!({"type":"agent_end","messages":[]}))
+        .await;
     h.fake.write(&json!({"type":"agent_settled"})).await;
     let events = h.until(completed).await;
     assert!(
@@ -987,6 +1060,7 @@ async fn compact_runs_the_rpc_compaction_as_a_turn() {
             status: TurnStatus::Completed,
             usage: Some(usage),
             error: None,
+            ..
         } => {
             assert_eq!(
                 (usage.input_tokens, usage.output_tokens, usage.cost_usd),
@@ -996,8 +1070,7 @@ async fn compact_runs_the_rpc_compaction_as_a_turn() {
         other => panic!("{other:?}"),
     }
     // The session is idle again.
-    h.session.send(TurnInput::text("next")).await.unwrap();
-    h.fake.expect("prompt").await;
+    h.start_turn("next").await;
 }
 
 #[tokio::test]
@@ -1189,4 +1262,602 @@ async fn shutdown_is_not_blocked_by_a_write_pi_never_reads() {
         .expect("the stuck write was abandoned")
         .unwrap();
     assert!(sent.is_err());
+}
+
+// ----- runs pi starts by itself, the race with a busy agent, dialogs outside a turn -----------
+
+/// The messages of the notices with `code`, in order.
+fn notices(events: &[AdapterEvent], code: &str) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::Notice {
+                message,
+                code: Some(c),
+                ..
+            } if c == code => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn count(events: &[AdapterEvent], pred: impl Fn(&AdapterEvent) -> bool) -> usize {
+    events.iter().filter(|e| pred(e)).count()
+}
+
+/// Commands of the live test's extension, as `get_commands` lists them.
+fn live_commands() -> Value {
+    json!([
+        {"name": "aas-later", "description": "aas live test: start a run by itself later (custom message)", "source": "extension"},
+        {"name": "skill:review", "description": "A skill", "source": "skill"}
+    ])
+}
+
+/// Nothing more reaches pi (the fake answers `get_state` and `get_session_stats` itself).
+async fn nothing_written(h: &mut Harness) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), h.fake.commands.recv())
+            .await
+            .is_err(),
+        "nothing more was written to pi"
+    );
+}
+
+/// The assistant message `text` of a run, reported whole (as pi does for a provider that
+/// does not stream).
+async fn assistant(h: &mut Harness, text: &str) {
+    h.fake
+        .write(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}))
+        .await;
+    h.fake
+        .write(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":text}],
+            "stopReason":"stop","usage":{"input":10,"output":1,"cacheRead":0,"cacheWrite":0}}}))
+        .await;
+}
+
+/// The end of a run: its (last) agent loop ends, then the run settles.
+async fn run_ends(h: &mut Harness) {
+    h.fake
+        .write(&json!({"type":"agent_end","messages":[]}))
+        .await;
+    h.fake.write(&json!({"type":"agent_settled"})).await;
+}
+
+const BUSY: &str = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+
+#[tokio::test]
+async fn a_run_pi_starts_by_itself_is_a_turn_without_input() {
+    let mut h = Harness::new();
+    h.load_commands(live_commands()).await;
+    // The extension command's own turn: pi runs the command, answers, and starts no run then.
+    // `send` does not wait for pi's answer to an extension command.
+    let prompt = h.start_turn("/aas-later 1500").await;
+    assert_eq!(h.sent().await, Ok(()));
+    h.fake
+        .write(&json!({"type":"response","command":"prompt","success":true,"id":prompt}))
+        .await;
+    let events = h.until(completed).await;
+    assert_eq!(events[0], AdapterEvent::TurnStarted);
+    assert!(matches!(
+        events.last().unwrap(),
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            usage: None,
+            ..
+        }
+    ));
+
+    // 1.5 s later the extension starts a run by itself (recorded).
+    h.fake.write(&json!({"type":"agent_start"})).await;
+    assert_eq!(h.next().await, AdapterEvent::TurnStarted);
+    // While that run goes on, the user's input is not written to pi (pi would refuse it): the
+    // engine sends it again once the run's turn has completed.
+    assert_eq!(
+        h.session.send(TurnInput::text("hello")).await,
+        Err(AdapterError::TurnInProgress)
+    );
+    h.fake.play_from("agent_custom.jsonl", "", 1).await;
+    let events = h.until(completed).await;
+    assert_eq!(
+        notices(&events, "extensionMessage"),
+        ["Reply with exactly: WOKE"],
+        "the extension's message opens the turn, once"
+    );
+    assert!(final_text(&events, "WOKE"), "{events:?}");
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AdapterEvent::ItemStarted {
+            body: ItemBody::UserMessage { .. },
+            ..
+        }
+    )));
+    match events.last().unwrap() {
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            usage: Some(usage),
+            error: None,
+            trigger: None,
+        } => {
+            assert_eq!((usage.input_tokens, usage.output_tokens), (1613, 4));
+            assert!(usage.context.is_some(), "get_session_stats was asked");
+        }
+        other => panic!("{other:?}"),
+    }
+    nothing_written(&mut h).await;
+
+    // Idle again: the input goes to pi.
+    let prompt = h.start_turn("hello").await;
+    h.fake
+        .write(&json!({"type":"response","command":"prompt","success":true,"id":prompt}))
+        .await;
+    assert_eq!(h.sent().await, Ok(()));
+    assert_eq!(h.next().await, AdapterEvent::TurnStarted);
+}
+
+#[tokio::test]
+async fn a_user_message_an_extension_sends_opens_its_run_as_a_notice() {
+    let mut h = Harness::new();
+    h.fake.play("agent_user.jsonl", "").await;
+    let events = h.until(completed).await;
+    assert_eq!(events[0], AdapterEvent::TurnStarted);
+    assert_eq!(
+        notices(&events, "extensionPrompt"),
+        ["Reply with exactly: WOKE-USER"]
+    );
+    assert!(final_text(&events, "WOKE-USER"));
+    assert!(matches!(
+        events.last().unwrap(),
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_prompt_refused_because_of_a_run_of_pi_own_waits_for_that_run() {
+    // Recorded: the extension started a run while pi checked the prompt; pi wrote that run's
+    // `agent_start`, then refused the prompt (`success: false`).
+    let mut h = Harness::new();
+    let prompt = h.start_turn("aas-race Reply with exactly: MINE").await;
+    h.fake.play("agent_race.jsonl", &prompt).await;
+    assert_eq!(h.sent().await, Err(AdapterError::TurnInProgress));
+    let events = h.until(completed).await;
+    // The run is a turn of its own; the refusal fails nothing.
+    assert_eq!(events[0], AdapterEvent::TurnStarted);
+    assert_eq!(count(&events, completed), 1);
+    assert_eq!(
+        notices(&events, "extensionMessage"),
+        ["Reply with exactly: RACED"]
+    );
+    assert!(final_text(&events, "RACED"));
+    assert!(matches!(
+        events.last().unwrap(),
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            error: None,
+            ..
+        }
+    ));
+    // The engine sends the input again after that turn: pi takes it now.
+    let prompt = h.start_turn("aas-race Reply with exactly: MINE").await;
+    h.fake
+        .write(&json!({"type":"response","command":"prompt","success":true,"id":prompt}))
+        .await;
+    assert_eq!(h.sent().await, Ok(()));
+    assert_eq!(h.next().await, AdapterEvent::TurnStarted);
+}
+
+#[tokio::test]
+async fn a_run_of_pi_own_that_ended_before_the_refusal_is_a_turn_of_its_own() {
+    let mut h = Harness::new();
+    let prompt = h.start_turn("hello").await;
+    h.fake.write(&json!({"type":"agent_start"})).await;
+    assistant(&mut h, "OWN").await;
+    run_ends(&mut h).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !h.sending.as_ref().unwrap().is_finished(),
+        "send waits for pi's answer"
+    );
+    h.fake
+        .write(
+            &json!({"type":"response","command":"prompt","success":false,"id":prompt,"error":BUSY}),
+        )
+        .await;
+    assert_eq!(h.sent().await, Err(AdapterError::TurnInProgress));
+    let events = h.until(completed).await;
+    assert_eq!(events[0], AdapterEvent::TurnStarted);
+    assert!(final_text(&events, "OWN"));
+    assert!(matches!(
+        events.last().unwrap(),
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            ..
+        }
+    ));
+    h.start_turn("hello").await;
+}
+
+#[tokio::test]
+async fn a_prompt_pi_takes_after_a_run_of_its_own_joins_that_run_in_one_turn() {
+    // pi took the prompt: what ran before its answer was part of what pi did then.
+    let mut h = Harness::new();
+    let prompt = h.start_turn("hello").await;
+    h.fake.write(&json!({"type":"agent_start"})).await;
+    assistant(&mut h, "OWN").await;
+    run_ends(&mut h).await;
+    // pi streams from its answer on (the adapter's run probe sees it).
+    h.fake.streaming.store(true, Ordering::SeqCst);
+    h.fake
+        .write(&json!({"type":"response","command":"prompt","success":true,"id":prompt}))
+        .await;
+    assert_eq!(h.sent().await, Ok(()));
+    h.fake.write(&json!({"type":"agent_start"})).await;
+    assistant(&mut h, "MINE").await;
+    run_ends(&mut h).await;
+    let events = h.until(completed).await;
+    assert_eq!(count(&events, |e| *e == AdapterEvent::TurnStarted), 1);
+    assert!(final_text(&events, "OWN") && final_text(&events, "MINE"));
+    match events.last().unwrap() {
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            usage: Some(usage),
+            ..
+        } => assert_eq!(usage.output_tokens, 2, "both runs count"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_run_started_at_the_end_of_a_run_gets_a_turn_of_its_own() {
+    // Recorded: an extension starts a run from its `agent_settled` handler; pi writes the new
+    // run's `agent_start` before the old run's `agent_settled`.
+    let mut h = Harness::new();
+    let prompt = h.start_turn("Reply with exactly: FIRST").await;
+    h.fake.play("agent_chain.jsonl", &prompt).await;
+    assert_eq!(h.sent().await, Ok(()));
+    let first = h.until(completed).await;
+    assert_eq!(first[0], AdapterEvent::TurnStarted);
+    assert!(final_text(&first, "FIRST"));
+    assert!(notices(&first, "extensionMessage").is_empty());
+    let second = h.until(completed).await;
+    assert_eq!(second[0], AdapterEvent::TurnStarted);
+    assert_eq!(
+        notices(&second, "extensionMessage"),
+        ["Reply with exactly: CHAINED"]
+    );
+    assert!(final_text(&second, "CHAINED"));
+    assert!(matches!(
+        second.last().unwrap(),
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            ..
+        }
+    ));
+    h.start_turn("next").await;
+}
+
+#[tokio::test]
+async fn a_run_that_starts_while_the_turn_waits_for_its_context_is_a_new_turn() {
+    let mut h = Harness::build(true, false);
+    running_turn(&mut h, "hello").await;
+    assistant(&mut h, "Hi").await;
+    let stats = h.fake.expect("get_session_stats").await;
+    run_ends(&mut h).await;
+    // The turn waits for its context; a new run starts meanwhile.
+    h.fake.write(&json!({"type":"agent_start"})).await;
+    let events = h.until(|e| matches!(e, AdapterEvent::TurnStarted)).await;
+    assert!(completed(&events[events.len() - 2]), "{events:?}");
+    // The late answer belongs to the old turn: it is not reported for the new one.
+    h.fake.respond(&stats, Some(session_stats(4200))).await;
+    assistant(&mut h, "AGAIN").await;
+    let stats = h.fake.expect("get_session_stats").await;
+    h.fake.respond(&stats, Some(session_stats(5000))).await;
+    run_ends(&mut h).await;
+    let events = h.until(completed).await;
+    assert!(final_text(&events, "AGAIN"));
+    let contexts: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::TurnUsage { usage } => usage.context.map(|c| c.used_tokens),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(contexts, [5000]);
+}
+
+#[tokio::test]
+async fn interrupting_a_run_of_pi_own_aborts_it() {
+    // Recorded: an extension-started run, aborted while the model wrote.
+    let mut h = Harness::new();
+    let fixture = h.fake.play("agent_abort.jsonl", "");
+    let session = h.session.clone();
+    let mut events = h.events;
+    let driver = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        let mut interrupted = false;
+        loop {
+            let ev = tokio::time::timeout(WAIT, events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if !interrupted
+                && matches!(
+                    &ev,
+                    AdapterEvent::ItemStarted {
+                        body: ItemBody::AgentMessage { .. },
+                        ..
+                    }
+                )
+            {
+                interrupted = true;
+                session.interrupt().await.unwrap();
+            }
+            let done = completed(&ev);
+            seen.push(ev);
+            if done {
+                return seen;
+            }
+        }
+    });
+    let awaited = fixture.await;
+    assert_eq!(awaited[0]["type"], "abort");
+    let events = driver.await.unwrap();
+    assert_eq!(events[0], AdapterEvent::TurnStarted);
+    assert!(matches!(
+        events.last().unwrap(),
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Interrupted,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn the_gate_asks_inside_a_run_of_pi_own() {
+    // Recorded with the gate in `ask` mode.
+    let mut h = Harness::new();
+    let fixture = h.fake.play("agent_gate.jsonl", "");
+    let session = h.session.clone();
+    let mut events = h.events;
+    let driver = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(WAIT, events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let AdapterEvent::InteractionRequested {
+                request_id,
+                request,
+                background_key,
+                ..
+            } = &ev
+            {
+                assert!(matches!(
+                    request,
+                    InteractionRequest::Approval { subject: Subject::Command { command, .. }, .. }
+                        if command == "echo agent-aas"
+                ));
+                assert_eq!(*background_key, None);
+                session
+                    .respond(
+                        request_id,
+                        &InteractionResolution::Approval {
+                            option_id: "allow".into(),
+                            feedback: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let done = completed(&ev);
+            seen.push(ev);
+            if done {
+                return seen;
+            }
+        }
+    });
+    let awaited = fixture.await;
+    assert_eq!(awaited[0]["value"], "{\"choice\":\"allow\"}");
+    let events = driver.await.unwrap();
+    assert_eq!(events[0], AdapterEvent::TurnStarted);
+    // The approval came inside the turn, before its end.
+    let asked = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::InteractionRequested { .. }))
+        .unwrap();
+    assert!(asked < events.len() - 1);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AdapterEvent::ItemCompleted {
+            body: Some(ItemBody::CommandExecution { output, .. }),
+            status: ItemStatus::Completed,
+            ..
+        } if output == "agent-aas\n"
+    )));
+    assert!(final_text(&events, "DONE"));
+    assert!(matches!(
+        events.last().unwrap(),
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_dialog_outside_a_turn_is_relayed_and_answered() {
+    // Recorded: an extension asks from a timer while no run goes on; the answer reaches pi.
+    let mut h = Harness::new();
+    let fixture = h.fake.play("dialog_outside_turn.jsonl", "");
+    let session = h.session.clone();
+    let mut events = h.events;
+    let driver = tokio::spawn(async move {
+        let first = tokio::time::timeout(WAIT, events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let AdapterEvent::InteractionRequested {
+            request_id,
+            request,
+            item_key,
+            background_key,
+        } = &first
+        else {
+            panic!("{first:?}")
+        };
+        assert!(
+            matches!(request, InteractionRequest::Approval { title, .. } if title == "aas-live")
+        );
+        assert_eq!((item_key, background_key), (&None, &None));
+        session
+            .respond(request_id, &InteractionResolution::Dismissed)
+            .await
+            .unwrap();
+        tokio::time::timeout(WAIT, events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    let awaited = fixture.await;
+    assert_eq!(
+        awaited[0],
+        json!({"type":"extension_ui_response","id":"4fb6e6cc-187a-4918-9e27-1bf526c3d9ff","cancelled":true})
+    );
+    // The extension got pi's answer (`confirm` resolves to false when dismissed).
+    assert_eq!(
+        driver.await.unwrap(),
+        AdapterEvent::Notice {
+            level: NoticeLevel::Info,
+            message: "aas-live answered: false".into(),
+            code: Some("extensionNotify".into()),
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_dialog_asked_outside_a_turn_outlives_the_next_turn() {
+    let mut h = Harness::new();
+    h.fake
+        .write(&json!({"type":"extension_ui_request","id":"d1","method":"confirm","title":"aas-live","message":"A dialog outside a turn"}))
+        .await;
+    assert!(matches!(
+        h.next().await,
+        AdapterEvent::InteractionRequested { request_id, .. } if request_id == "d1"
+    ));
+    running_turn(&mut h, "hello").await;
+    run_ends(&mut h).await;
+    let events = h.until(completed).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::InteractionWithdrawn { .. })),
+        "{events:?}"
+    );
+    // pi still waits for the answer.
+    h.session
+        .respond(
+            "d1",
+            &InteractionResolution::Approval {
+                option_id: "yes".into(),
+                feedback: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.fake.expect("extension_ui_response").await,
+        json!({"type":"extension_ui_response","id":"d1","confirmed":true})
+    );
+}
+
+#[tokio::test]
+async fn send_waits_for_pi_answer_to_a_plain_prompt_until_pi_needs_the_user() {
+    let mut h = Harness::new();
+    h.start_turn("hello").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!h.sending.as_ref().unwrap().is_finished());
+
+    // A dialog of pi's preflight (an `input` handler asks): the engine must relay it, so
+    // `send` returns.
+    h.fake
+        .write(&json!({"type":"extension_ui_request","id":"q1","method":"input","title":"Why?"}))
+        .await;
+    assert!(matches!(
+        h.next().await,
+        AdapterEvent::InteractionRequested { .. }
+    ));
+    assert_eq!(h.sent().await, Ok(()));
+}
+
+#[tokio::test]
+async fn a_compaction_before_the_prompt_runs_ends_the_wait() {
+    let mut h = Harness::new();
+    let prompt = h.start_turn("hello").await;
+    h.fake
+        .write(&json!({"type":"compaction_start","reason":"threshold"}))
+        .await;
+    assert_eq!(h.sent().await, Ok(()));
+    h.fake
+        .write(&json!({"type":"compaction_end","reason":"threshold","result":{"tokensBefore":900000},"aborted":false,"willRetry":false}))
+        .await;
+    h.fake
+        .write(&json!({"type":"response","command":"prompt","success":true,"id":prompt}))
+        .await;
+    let events = h.until(|e| matches!(e, AdapterEvent::TurnStarted)).await;
+    assert_eq!(
+        notices(&events, "compaction"),
+        [
+            "Compacting the conversation (threshold)",
+            "Conversation compacted (900000 tokens before)"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pi_ending_before_it_answers_the_prompt_closes_the_send() {
+    let mut h = Harness::new();
+    h.start_turn("hello").await;
+    h.fake.exit(1).await;
+    assert_eq!(h.sent().await, Err(AdapterError::Closed));
+}
+
+#[tokio::test]
+async fn a_refusal_after_the_wait_ended_keeps_the_run_in_the_turn() {
+    // `send` stopped waiting (a dialog of the preflight); a run of pi's own started, and pi
+    // refused the prompt: the run is shown in the user's turn already and stays there.
+    let mut h = Harness::new();
+    let prompt = h.start_turn("hello").await;
+    h.fake
+        .write(&json!({"type":"extension_ui_request","id":"q1","method":"confirm","title":"Go on?","message":""}))
+        .await;
+    assert!(matches!(
+        h.next().await,
+        AdapterEvent::InteractionRequested { .. }
+    ));
+    assert_eq!(h.sent().await, Ok(()));
+    h.fake.write(&json!({"type":"agent_start"})).await;
+    assert_eq!(h.next().await, AdapterEvent::TurnStarted);
+    h.fake
+        .write(
+            &json!({"type":"response","command":"prompt","success":false,"id":prompt,"error":BUSY}),
+        )
+        .await;
+    assistant(&mut h, "OWN").await;
+    run_ends(&mut h).await;
+    let events = h.until(completed).await;
+    assert_eq!(
+        notices(&events, "promptNotTaken"),
+        [format!("pi did not take this message: {BUSY}")]
+    );
+    assert!(final_text(&events, "OWN"));
+    assert!(matches!(
+        events.last().unwrap(),
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            ..
+        }
+    ));
 }

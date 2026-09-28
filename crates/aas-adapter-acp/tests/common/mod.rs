@@ -12,7 +12,7 @@ use aas_adapter_acp::testing::FakeLink;
 use aas_harness::protocol::{
     InteractionRequest, ItemBody, ItemStatus, NoticeLevel, TurnError, TurnStatus, Usage,
 };
-use aas_harness::{AdapterEvent, ExitInfo};
+use aas_harness::{AdapterEvent, BackgroundTaskInfo, ExitInfo};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::mpsc;
@@ -28,6 +28,10 @@ pub enum Step {
     Send(Value),
     /// The agent waits for the next client message and checks its shape.
     Expect(Expect),
+    /// The agent waits until the test calls [`Agent::release`]. A replayed recording sends
+    /// everything at once; a gate keeps what the agent sent after a point (e.g. after a
+    /// turn's end) from arriving before the test has seen that point.
+    Gate,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,9 +101,15 @@ pub fn load_fixture(name: &str) -> Vec<Step> {
 /// Handle of a running scripted agent.
 pub struct Agent {
     pub task: JoinHandle<Result<Vec<Value>, String>>,
+    gates: mpsc::UnboundedSender<()>,
 }
 
 impl Agent {
+    /// Lets the script go past its next [`Step::Gate`].
+    pub fn release(&self) {
+        self.gates.send(()).expect("the scripted agent is running");
+    }
+
     /// Waits for the script to finish; returns every message the client sent.
     pub async fn finish(self) -> Vec<Value> {
         match tokio::time::timeout(STEP_TIMEOUT * 3, self.task).await {
@@ -130,6 +140,7 @@ pub fn spawn_agent(
 ) -> (DuplexStream, DuplexStream, Agent) {
     let (client_writer, agent_reader) = tokio::io::duplex(1 << 20);
     let (agent_writer, client_reader) = tokio::io::duplex(1 << 20);
+    let (gates, mut gate_rx) = mpsc::unbounded_channel::<()>();
     let task = tokio::spawn(async move {
         let mut lines = BufReader::new(agent_reader).lines();
         let mut out = agent_writer;
@@ -185,6 +196,12 @@ pub fn spawn_agent(
                     }
                     received.push(got);
                 }
+                Step::Gate => {
+                    tokio::time::timeout(STEP_TIMEOUT * 3, gate_rx.recv())
+                        .await
+                        .map_err(|_| format!("step {i}: the gate was never released"))?
+                        .ok_or_else(|| format!("step {i}: the test ended before the gate"))?;
+                }
             }
         }
         match end {
@@ -212,7 +229,22 @@ pub fn spawn_agent(
         }
         Ok(received)
     });
-    (client_reader, client_writer, Agent { task })
+    (client_reader, client_writer, Agent { task, gates })
+}
+
+/// Inserts a [`Step::Gate`] right after the agent's response to the client request recorded
+/// with id `recorded_id` (e.g. the `session/prompt` that ends a turn).
+pub fn gate_after_response(mut steps: Vec<Step>, recorded_id: i64) -> Vec<Step> {
+    let at = steps
+        .iter()
+        .position(|s| {
+            matches!(s, Step::Send(m) if m.get("method").is_none()
+                && m["id"] == recorded_id
+                && (m.get("result").is_some() || m.get("error").is_some()))
+        })
+        .unwrap_or_else(|| panic!("no response to request {recorded_id}"));
+    steps.insert(at + 1, Step::Gate);
+    steps
 }
 
 /// Everything a session emitted, folded like the engine would.
@@ -223,7 +255,13 @@ pub struct Folded {
     pub index: HashMap<String, usize>,
     pub turns: Vec<(TurnStatus, Option<Usage>, Option<TurnError>)>,
     pub interactions: Vec<(String, InteractionRequest, Option<String>)>,
+    /// `background_key` of each interaction, by request id.
+    pub interaction_tasks: HashMap<String, Option<String>>,
     pub withdrawn: Vec<String>,
+    /// Every background task report, in order.
+    pub task_events: Vec<BackgroundTaskInfo>,
+    /// The latest report of each background task, by key.
+    pub tasks: HashMap<String, BackgroundTaskInfo>,
     pub notices: Vec<(NoticeLevel, String, Option<String>)>,
     pub natives: Vec<Value>,
     pub infos: Vec<(Option<String>, Option<String>, Option<String>)>,
@@ -258,6 +296,14 @@ impl Folded {
                 self.items[i].1 = body.clone();
             }
             AdapterEvent::ItemCompleted { key, body, status } => {
+                if *status == ItemStatus::Backgrounded {
+                    assert!(
+                        self.tasks
+                            .values()
+                            .any(|t| t.origin_item_key.as_deref() == Some(key.as_str())),
+                        "item {key} backgrounded before a task named it as its origin"
+                    );
+                }
                 let i = self.index[key];
                 assert_eq!(
                     self.items[i].2,
@@ -273,6 +319,7 @@ impl Folded {
                 status,
                 usage,
                 error,
+                ..
             } => {
                 let open: Vec<_> = self
                     .items
@@ -287,9 +334,32 @@ impl Folded {
                 request_id,
                 request,
                 item_key,
+                background_key,
             } => {
                 self.interactions
                     .push((request_id.clone(), request.clone(), item_key.clone()));
+                self.interaction_tasks
+                    .insert(request_id.clone(), background_key.clone());
+            }
+            AdapterEvent::BackgroundTask { task } => {
+                // The port's contract: an ended task is not live, and only a new run (one
+                // more `runs`) makes an ended task run again.
+                assert!(
+                    !(task.state.is_ended() && task.live),
+                    "ended task reported live: {task:?}"
+                );
+                if let Some(before) = self.tasks.get(&task.key)
+                    && before.state.is_ended()
+                    && !task.state.is_ended()
+                {
+                    assert_eq!(
+                        task.runs,
+                        before.runs + 1,
+                        "restart without a new run: {task:?}"
+                    );
+                }
+                self.task_events.push((**task).clone());
+                self.tasks.insert(task.key.clone(), (**task).clone());
             }
             AdapterEvent::InteractionWithdrawn { request_id } => {
                 self.withdrawn.push(request_id.clone())
@@ -319,6 +389,18 @@ impl Folded {
     pub fn item(&self, key: &str) -> &(String, ItemBody, ItemStatus) {
         &self.items[self.index[key]]
     }
+
+    /// The latest report of background task `key`.
+    pub fn task(&self, key: &str) -> &BackgroundTaskInfo {
+        self.tasks
+            .get(key)
+            .unwrap_or_else(|| panic!("no background task {key}: {:?}", self.tasks.keys()))
+    }
+
+    /// Position of the first event matching `pred`.
+    pub fn position(&self, pred: impl Fn(&AdapterEvent) -> bool) -> usize {
+        self.events.iter().position(pred).expect("no event matches")
+    }
 }
 
 /// Pumps events until `stop` returns true for one of them (inclusive).
@@ -345,6 +427,11 @@ pub fn is_turn_completed(ev: &AdapterEvent) -> bool {
 
 pub fn is_exited(ev: &AdapterEvent) -> bool {
     matches!(ev, AdapterEvent::Exited { .. })
+}
+
+/// A report of background task `key` in which it has ended.
+pub fn task_ended(key: &'static str) -> impl FnMut(&AdapterEvent) -> bool {
+    move |ev| matches!(ev, AdapterEvent::BackgroundTask { task } if task.key == key && task.state.is_ended())
 }
 
 /// Drains remaining events until `Exited` and asserts the channel then closes.

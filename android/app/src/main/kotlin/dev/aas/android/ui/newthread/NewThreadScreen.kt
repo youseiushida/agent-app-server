@@ -106,6 +106,7 @@ fun NewThreadScreen(vm: NewThreadViewModel, navigator: AppNavigator) {
             when (event) {
                 is NewThreadEvent.Created -> navigator.threadCreated(event.threadId)
                 is NewThreadEvent.OpenPicker -> picker = event.kind
+                is NewThreadEvent.OpenImport -> navigator.importSession(event.projectId, event.harnessId)
             }
         }
     }

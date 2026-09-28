@@ -89,6 +89,10 @@ pub struct Shared {
     pub git: Option<Git>,
     pub fs: FsApi,
     pub running_turns: watch::Sender<usize>,
+    /// Background tasks that keep an agent busy (in their harness's live set and not ambient),
+    /// over all threads: each thread actor adds what its process holds. A drain waits for
+    /// them as for running turns.
+    pub running_background: watch::Sender<usize>,
     pub draining: AtomicBool,
     /// Set when Windows ends the session (sign-out, shutdown, reboot) before the engine
     /// shuts down: the turns the shutdown ends are recorded as `systemShutdown` instead of
@@ -231,6 +235,15 @@ impl Shared {
 
     pub fn turn_finished(&self) {
         self.running_turns.send_modify(|n| *n = n.saturating_sub(1));
+    }
+
+    /// A thread's count of background tasks that keep its agent busy went from `before` to
+    /// `after`.
+    pub fn background_busy_changed(&self, before: usize, after: usize) {
+        if before != after {
+            self.running_background
+                .send_modify(|n| *n = (*n + after).saturating_sub(before));
+        }
     }
 
     pub fn is_draining(&self) -> bool {

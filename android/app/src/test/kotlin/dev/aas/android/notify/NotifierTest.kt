@@ -7,6 +7,8 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import android.os.Looper
 import dev.aas.android.appContainer
+import dev.aas.android.protocol.BackgroundTaskKind
+import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.ErrorKind
 import dev.aas.android.protocol.InteractionStatus
 import dev.aas.android.protocol.Methods
@@ -144,6 +146,94 @@ class NotifierTest {
         // A failed turn is an error, reported whatever the turn setting says.
         container.notifier.onSignal(SyncSignal.TurnFinished(thread, Samples.turnSummary("trn_2", 1, TurnStatus.Failed)))
         assertEquals(NotificationChannels.ERRORS, assertNotNull(active(Notifier.errorTag("thr_2"))).notification.channelId)
+    }
+
+    /**
+     * A finished background task shares the thread's turn notification: the turn the agent then
+     * starts about it replaces it (one notification, not two). It follows the turn setting and
+     * the screen; a lost task is an error.
+     */
+    @Test
+    fun aFinishedBackgroundTaskIsTheThreadsTurnNotificationAndALostOneAnError() = runBlocking<Unit> {
+        container.settings.setTurnNotifications(TurnNotificationMode.WhenNotViewing)
+        val thread = Samples.thread("thr_bg", title = "Dev server")
+        val build = Samples.backgroundTask("bgt_1", threadId = "thr_bg", status = BackgroundTaskStatus.Completed, kind = BackgroundTaskKind.Shell, title = "npm run build")
+        container.notifier.onSignal(SyncSignal.BackgroundTaskFinished(thread, Samples.ended(build)))
+        val posted = assertNotNull(active(Notifier.turnTag("thr_bg")))
+        assertEquals(NotificationChannels.TURNS, posted.notification.channelId)
+        assertEquals("Dev server", posted.notification.extras.getString("android.title"))
+        assertEquals("バックグラウンドの作業が完了しました: npm run build", posted.notification.extras.getCharSequence("android.text").toString())
+
+        // The agent's own turn about it follows: the same notification is replaced.
+        container.notifier.onSignal(SyncSignal.TurnFinished(thread, Samples.turnSummary("trn_2", 1, TurnStatus.Completed)))
+        val turns = manager.activeNotifications.filter { it.id == Notifier.ID_TURN }
+        assertEquals(listOf(Notifier.turnTag("thr_bg")), turns.map { it.tag }, "one notification for the thread")
+        assertTrue(turns.single().notification.extras.getCharSequence("android.text").toString().startsWith("完了しました"))
+
+        // On screen: nothing; never: nothing.
+        manager.cancelAll()
+        container.visibility.setAppInForeground(true)
+        container.visibility.threadShown("thr_bg")
+        container.notifier.onSignal(SyncSignal.BackgroundTaskFinished(thread, Samples.ended(build)))
+        assertNull(active(Notifier.turnTag("thr_bg")))
+        container.visibility.threadHidden("thr_bg")
+        container.settings.setTurnNotifications(TurnNotificationMode.Never)
+        container.notifier.onSignal(SyncSignal.BackgroundTaskFinished(thread, Samples.ended(build)))
+        assertNull(active(Notifier.turnTag("thr_bg")))
+
+        // A lost task (its process ended) is an error, whatever the turn setting says.
+        val lost = Samples.backgroundTask("bgt_2", threadId = "thr_bg", status = BackgroundTaskStatus.Lost, title = "Review the reconnect logic")
+        container.notifier.onSignal(SyncSignal.BackgroundTaskFinished(thread, Samples.ended(lost)))
+        val error = assertNotNull(active(Notifier.errorTag("thr_bg")))
+        assertEquals(NotificationChannels.ERRORS, error.notification.channelId)
+        assertTrue(error.notification.extras.getCharSequence("android.text").toString().contains("Review the reconnect logic"))
+        assertNull(active(Notifier.turnTag("thr_bg")))
+        // Opening the thread clears it like the thread's other outcome notifications.
+        container.visibility.threadShown("thr_bg")
+        assertNull(active(Notifier.errorTag("thr_bg")))
+    }
+
+    @Test
+    fun finishedBackgroundTasksStayWithinTheBudget() = runBlocking<Unit> {
+        container.settings.setTurnNotifications(TurnNotificationMode.Always)
+        container.notifier.onSignal(SyncSignal.InteractionPending(Samples.approval("int_keep", threadId = "thr_0"), null))
+        val budget = container.policy.notificationBudget
+        repeat(budget + 5) { i ->
+            val task = Samples.backgroundTask("bgt_$i", threadId = "thr_$i", status = BackgroundTaskStatus.Completed)
+            container.notifier.onSignal(SyncSignal.BackgroundTaskFinished(Samples.thread("thr_$i", title = "T$i"), Samples.ended(task)))
+        }
+        assertTrue(manager.activeNotifications.size <= budget, "${manager.activeNotifications.size} posted, budget $budget")
+        assertNotNull(active(Notifier.interactionTag("int_keep")), "approvals are never trimmed")
+    }
+
+    @Test
+    fun anApprovalOfABackgroundTaskNamesTheTask() = runBlocking<Unit> {
+        val task = Samples.backgroundTask("bgt_1", threadId = "thr_1", title = "Review the reconnect logic")
+        val asked = Samples.approval("int_bg", threadId = "thr_1").copy(turnId = null, backgroundTaskId = "bgt_1")
+        container.notifier.onSignal(SyncSignal.InteractionPending(asked, Samples.thread("thr_1", title = "Fix the build"), task))
+        val posted = assertNotNull(active(Notifier.interactionTag("int_bg")))
+        val body = posted.notification.extras.getCharSequence("android.bigText").toString()
+        assertTrue(body.startsWith("バックグラウンドの作業「Review the reconnect logic」から"), body)
+        // Not stored on this device: it still says it came from background work.
+        container.notifier.onSignal(SyncSignal.InteractionPending(asked.copy(id = "int_bg2"), null, null))
+        val unknown = assertNotNull(active(Notifier.interactionTag("int_bg2"))).notification.extras.getCharSequence("android.bigText").toString()
+        assertTrue(unknown.startsWith("バックグラウンドの作業から"), unknown)
+
+        // The task became known afterwards: the notification names it (without alerting again).
+        container.notifier.onSignal(SyncSignal.InteractionTaskKnown(asked.copy(id = "int_bg2"), task))
+        val named = assertNotNull(active(Notifier.interactionTag("int_bg2"))).notification
+        assertTrue(named.extras.getCharSequence("android.bigText").toString().startsWith("バックグラウンドの作業「Review the reconnect logic」から"))
+        assertTrue(named.flags and android.app.Notification.FLAG_ONLY_ALERT_ONCE != 0, "no second alert")
+        // One the user dismissed stays dismissed.
+        container.notifier.onSignal(SyncSignal.InteractionPending(asked.copy(id = "int_bg3"), null, null))
+        manager.cancel(Notifier.interactionTag("int_bg3"), Notifier.ID_INTERACTION)
+        container.notifier.onSignal(SyncSignal.InteractionTaskKnown(asked.copy(id = "int_bg3"), task))
+        assertNull(active(Notifier.interactionTag("int_bg3")))
+        // One whose answer is on its way keeps saying so.
+        container.notifier.onSignal(SyncSignal.InteractionPending(asked.copy(id = "int_bg4"), null, null))
+        container.notifier.markSending("int_bg4")
+        container.notifier.onSignal(SyncSignal.InteractionTaskKnown(asked.copy(id = "int_bg4"), task))
+        assertEquals("回答を送信しています…", active(Notifier.interactionTag("int_bg4"))?.notification?.extras?.getCharSequence("android.text")?.toString())
     }
 
     @Test

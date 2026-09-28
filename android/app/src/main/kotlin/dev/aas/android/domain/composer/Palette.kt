@@ -29,6 +29,14 @@ enum class LocalCommand(val commandName: String) {
 
     /** Inserts the AGENTS.md prompt (for harnesses without an `init` command). */
     Init("init"),
+
+    /**
+     * 「PC のセッションを取り込む」 for this project, with this harness preselected (only when some
+     * harness can list its sessions, [PaletteContext.canImport]). It replaces the harnesses' own
+     * `/resume`, which picks a session in the CLI's terminal UI that a daemon session cannot show:
+     * that one is never offered or sent ([Palette.entries], [Palette.isResume]).
+     */
+    Resume("resume"),
 }
 
 /** What choosing a palette entry does. */
@@ -66,6 +74,8 @@ data class PaletteContext(
     val inThread: Boolean,
     /** The thread is pinned (the `/pin` entry says whether it pins or unpins). */
     val pinned: Boolean = false,
+    /** Some harness can list its own sessions (`/resume` applies, see NativeSessionHarnesses.canImport). */
+    val canImport: Boolean = false,
 )
 
 object Palette {
@@ -77,16 +87,35 @@ object Palette {
      * Each (source, name) appears once, the first listed: a harness may list two commands of one
      * name (Codex adds `compact` and `review` and then one command per skill under the skill's
      * own name, and the daemon passes harness lists through), and a name identifies the entry.
+     *
+     * A harness command named `resume` is never offered: the app's own `/resume` replaces it
+     * ([LocalCommand.Resume]). The daemon stops listing it; one that still does is ignored here.
      */
     fun entries(commands: List<Command>, context: PaletteContext): List<PaletteEntry> {
-        val names = commands.map { it.name }.toSet()
-        val app = commands.filter { it.source != CommandSource.Harness }.map(::fromServer)
-        val harness = commands.filter { it.source == CommandSource.Harness }.map(::fromServer)
+        val offered = commands.filterNot { it.source == CommandSource.Harness && it.name == LocalCommand.Resume.commandName }
+        val names = offered.map { it.name }.toSet()
+        val app = offered.filter { it.source != CommandSource.Harness }.map(::fromServer)
+        val harness = offered.filter { it.source == CommandSource.Harness }.map(::fromServer)
         val local = LocalCommand.entries
             .filter { it.commandName !in names }
-            .filter { context.inThread || (it == LocalCommand.Review || it == LocalCommand.Init) }
+            .filter { applies(it, context) }
             .map { command -> PaletteEntry(command.commandName, PaletteSource.Local, localDescription(command, context), null, PaletteAction.Local(command)) }
         return (app + local + harness).distinctBy { it.source to it.name }
+    }
+
+    /**
+     * Whether a draft about to be sent is `/resume` typed out instead of chosen from the palette
+     * (its first word; anything after it is not sent either). It runs the app's `/resume` and is
+     * never sent: a harness's `/resume` must not reach the harness ([LocalCommand.Resume]).
+     */
+    fun isResume(text: String): Boolean =
+        text.trimStart().takeWhile { !it.isWhitespace() } == COMMAND_PREFIX + LocalCommand.Resume.commandName
+
+    /** Where each of the app's commands is offered. */
+    private fun applies(command: LocalCommand, context: PaletteContext): Boolean = when (command) {
+        LocalCommand.Review, LocalCommand.Init -> true
+        LocalCommand.Resume -> context.canImport
+        LocalCommand.New, LocalCommand.Status, LocalCommand.Rename, LocalCommand.Pin -> context.inThread
     }
 
     /** Entries whose name starts with [query] first, then those containing it (case-insensitive). */
@@ -130,5 +159,9 @@ object Palette {
         LocalCommand.Pin -> UiText.of(if (context.pinned) R.string.command_unpin else R.string.command_pin)
         LocalCommand.Review -> UiText.of(R.string.command_review)
         LocalCommand.Init -> UiText.of(R.string.command_init)
+        LocalCommand.Resume -> UiText.of(R.string.command_resume)
     }
+
+    /** The character that starts a command in the composer. */
+    private const val COMMAND_PREFIX = "/"
 }

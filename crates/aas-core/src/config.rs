@@ -35,8 +35,11 @@ pub struct Policy {
     /// connections and exiting; `stop_grace` (5 s) does not fit into the time Windows gives.
     #[serde(with = "humantime_serde")]
     pub end_session_stop_grace: Duration,
-    /// Processes idle (no turn, no pending interaction, empty queue) this long are stopped;
-    /// the next input resumes the native session.
+    /// Processes idle this long are stopped; the next input resumes the native session. Idle:
+    /// no turn runs, no queued input would start one, and no background task keeps the agent
+    /// busy (the harness's live set holds nothing but ambient work). The wait starts when the
+    /// process becomes idle; background work the harness reports as running is never stopped
+    /// because of time (design.md §4.7, §5.6).
     #[serde(with = "humantime_serde")]
     pub idle_process_ttl: Duration,
     /// Upper bound of concurrently alive agent processes; further starts wait (FIFO).
@@ -93,6 +96,21 @@ pub struct Policy {
     /// Upper bound of one relayed progress line. Progress lines are about 100 bytes; a longer
     /// line (a remote can print anything) is cut so that one update stays a small event.
     pub max_progress_line_bytes: usize,
+    /// Minimum time between two stored updates of a running background task that change only
+    /// its progress or usage. A workflow reports the whole list of its agents with every step,
+    /// and every update is a `backgroundTask/updated` in the thread's log; the phone needs
+    /// about one refresh per second. The latest state is kept and written when the interval
+    /// has passed, and any other change (an end, a new run, a stop request) is written at
+    /// once with it, so nothing but intermediate progress is left out.
+    #[serde(with = "humantime_serde")]
+    pub background_progress_interval: Duration,
+    /// How long after a `backgroundTask/stop` the task shows as stopping while the harness has
+    /// not reported its end. The harness answers a stop within milliseconds when it honours it
+    /// (Claude's `stop_task`, measured at about 50 ms); 30 s leaves room for slow tool
+    /// teardown. Past it the task is marked `stopUnconfirmedAt` so the phone offers the stop
+    /// again; nothing is escalated (`thread/stop` stops everything).
+    #[serde(with = "humantime_serde")]
+    pub background_stop_confirm_timeout: Duration,
     pub stderr_tail_bytes: usize,
     /// Lines of the end of an agent's stderr quoted in the error of a turn whose agent exited
     /// unexpectedly: enough for the usual last words (an exception and its cause) while the
@@ -106,7 +124,7 @@ pub struct Policy {
     pub harness_title_chars: usize,
     /// Characters of the preview of a queued message (its first line), shown in the queue.
     pub queued_preview_chars: usize,
-    /// Keep the PC awake while at least one turn runs.
+    /// Keep the PC awake while at least one turn runs or background work keeps an agent busy.
     pub prevent_sleep_while_running: bool,
     /// Period of compaction and garbage collection.
     #[serde(with = "humantime_serde")]
@@ -238,6 +256,8 @@ impl Default for Policy {
             clone_timeout: Duration::from_secs(30 * 60),
             operation_progress_interval: Duration::from_secs(1),
             max_progress_line_bytes: 1024,
+            background_progress_interval: Duration::from_secs(1),
+            background_stop_confirm_timeout: Duration::from_secs(30),
             stderr_tail_bytes: 16 * 1024,
             exit_message_stderr_lines: 5,
             first_message_title_chars: 80,
@@ -496,6 +516,14 @@ impl Policy {
                 "max_progress_line_bytes",
                 F::count(self.max_progress_line_bytes, 1),
             ),
+            (
+                "background_progress_interval",
+                d(self.background_progress_interval, zero),
+            ),
+            (
+                "background_stop_confirm_timeout",
+                d(self.background_stop_confirm_timeout, MIN_TIMER),
+            ),
             ("stderr_tail_bytes", F::count(self.stderr_tail_bytes, 0)),
             (
                 "exit_message_stderr_lines",
@@ -692,6 +720,8 @@ impl Policy {
             stop_grace: self.stop_grace,
             max_line_bytes: self.max_line_bytes,
             handshake_timeout: self.handshake_timeout,
+            first_message_title_chars: self.first_message_title_chars,
+            harness_title_chars: self.harness_title_chars,
         }
     }
 
@@ -837,6 +867,15 @@ mod tests {
         assert_eq!(json["heartbeat_interval"], "15s");
         let back: Policy = serde_json::from_value(json).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn the_adapter_policy_of_the_defaults_is_the_adapters_default() {
+        // design.md §13: `AdapterPolicy::default()` holds the same values as the table.
+        assert_eq!(
+            format!("{:?}", Policy::default().adapter_policy()),
+            format!("{:?}", AdapterPolicy::default())
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 mod actor;
 pub mod auth;
+mod background;
 mod blobs;
 mod capacity;
 pub mod config;

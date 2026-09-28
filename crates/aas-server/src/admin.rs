@@ -135,6 +135,7 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>, headers: HeaderMa
         public_url: state.options.public_url.clone(),
         running_processes: e.running_processes() as u32,
         running_turns: e.running_turns() as u32,
+        running_background_tasks: e.running_background_tasks() as u32,
         connected_devices: state.connections.lock().len() as u32,
         draining: e.is_draining(),
     })

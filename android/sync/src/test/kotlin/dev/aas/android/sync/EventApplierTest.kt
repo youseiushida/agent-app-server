@@ -1,5 +1,9 @@
 package dev.aas.android.sync
 
+import dev.aas.android.protocol.BackgroundProgress
+import dev.aas.android.protocol.BackgroundTaskEnded
+import dev.aas.android.protocol.BackgroundTaskKind
+import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.ContextUsage
 import dev.aas.android.protocol.DeltaField
 import dev.aas.android.protocol.DiffSummary
@@ -10,6 +14,7 @@ import dev.aas.android.protocol.Item
 import dev.aas.android.protocol.ItemStatus
 import dev.aas.android.protocol.OperationStatus
 import dev.aas.android.protocol.StreamBatch
+import dev.aas.android.protocol.ThreadBackground
 import dev.aas.android.protocol.ThreadReadResult
 import dev.aas.android.protocol.TurnStatus
 import dev.aas.android.protocol.Usage
@@ -29,6 +34,7 @@ class EventApplierTest {
     private val stream = threadStream("thr_1")
     private val store = InMemorySyncStore()
     private val signals = mutableListOf<SyncSignal>()
+    private val warnings = mutableListOf<String>()
 
     private fun env(seq: Long, event: Event, seqFrom: Long? = null) = EventEnvelope(seq, seqFrom, 1_000 + seq, event)
 
@@ -37,7 +43,7 @@ class EventApplierTest {
     }
 
     private suspend fun batch(stream: String, vararg events: EventEnvelope): EventApplier.BatchOutcome =
-        store.transaction { EventApplier.applyBatch(it, StreamBatch(stream, events.maxOf { e -> e.seq }, events.toList()), signals) }
+        store.transaction { EventApplier.applyBatch(it, StreamBatch(stream, events.maxOf { e -> e.seq }, events.toList()), signals, warnings::add) }
 
     private fun text(id: String) = (store.state.value.items[id]!!.item as Item.AgentMessage).text
 
@@ -119,7 +125,7 @@ class EventApplierTest {
     fun threadReadDoesNotRollBackANewerSummary() = test {
         store.transaction { it.upsertThread(Samples.thread("thr_1", head = 40, title = "from workspace")) }
         val read = ThreadReadResult(Samples.thread("thr_1", head = 30, title = "stale"), emptyList(), emptyList(), emptyList(), emptyList(), 35, false)
-        store.transaction { EventApplier.applyThreadRead(it, read, signals) }
+        store.transaction { EventApplier.applyThreadRead(it, read, signals, warnings::add) }
         assertEquals("from workspace", store.state.value.threads["thr_1"]!!.title)
         assertEquals(35L, store.state.value.cursors[stream])
     }
@@ -173,6 +179,168 @@ class EventApplierTest {
     }
 
     @Test
+    fun backgroundTaskFinishedFollowsTheSummarysLastEnded() = test {
+        store.transaction { it.setCursor(WORKSPACE_STREAM, 0) }
+        val build = Samples.backgroundTask("bgt_1", status = BackgroundTaskStatus.Completed, kind = BackgroundTaskKind.Shell, title = "npm run build")
+        // A thread first seen with an ended task (import, another device) reports nothing.
+        batch(WORKSPACE_STREAM, env(1, Event.ThreadUpserted(Samples.thread("thr_0", head = 1, background = ThreadBackground(0, Samples.ended(build))))))
+        batch(WORKSPACE_STREAM, env(2, Event.ThreadUpserted(Samples.thread("thr_1", head = 1, background = ThreadBackground(running = 1)))))
+        assertTrue(signals.isEmpty(), "$signals")
+        batch(WORKSPACE_STREAM, env(3, Event.ThreadUpserted(Samples.thread("thr_1", head = 4, background = ThreadBackground(0, Samples.ended(build))))))
+        // The same summary from the thread stream, and a later summary with the same last task: no second report.
+        store.transaction { it.setCursor(stream, 0) }
+        batch(stream, env(6, Event.ThreadUpdated(Samples.thread("thr_1", head = 4, background = ThreadBackground(0, Samples.ended(build))))))
+        batch(WORKSPACE_STREAM, env(4, Event.ThreadUpserted(Samples.thread("thr_1", head = 6, title = "renamed", background = ThreadBackground(0, Samples.ended(build))))))
+        val finished = signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>()
+        assertEquals(1, finished.size, "$signals")
+        assertEquals(Samples.ended(build), finished.single().ended)
+        assertEquals("thr_1", finished.single().thread.id)
+        // The same task ends again after a new run (another endedAt): reported again; a lost one too.
+        val again = Samples.ended(build).copy(endedAt = 50)
+        batch(WORKSPACE_STREAM, env(5, Event.ThreadUpserted(Samples.thread("thr_1", head = 8, background = ThreadBackground(0, again)))))
+        val lost = Samples.ended(Samples.backgroundTask("bgt_2", status = BackgroundTaskStatus.Lost, startedAt = 60))
+        batch(WORKSPACE_STREAM, env(7, Event.ThreadUpserted(Samples.thread("thr_1", head = 9, background = ThreadBackground(0, lost)))))
+        assertEquals(listOf(Samples.ended(build), again, lost), signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>().map { it.ended })
+        // An older summary (smaller head) is ignored and reports nothing.
+        batch(WORKSPACE_STREAM, env(8, Event.ThreadUpserted(Samples.thread("thr_1", head = 2, background = ThreadBackground(1, null)))))
+        assertEquals(3, signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>().size)
+        assertEquals(lost, store.state.value.threads["thr_1"]!!.background.lastEnded)
+    }
+
+    /**
+     * Only a `lastEnded` later in the server's order (`endedAt`, then task id) is a new end: the
+     * same end again (a new run of its task started, its status was corrected) is not, and
+     * neither is an earlier end, which a daemon from before `lastEnded` only moved forward falls
+     * back to when the task that ended last runs again (it was reported when it happened).
+     */
+    @Test
+    fun onlyALaterEndIsReportedNotTheSameOneAgainOrAnEarlierOne() = test {
+        store.transaction { it.setCursor(WORKSPACE_STREAM, 0) }
+        fun summary(head: Long, running: Int, last: BackgroundTaskEnded?) =
+            Event.ThreadUpserted(Samples.thread("thr_1", head = head, background = ThreadBackground(running, last)))
+        fun reported() = signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>().map { it.ended }
+        val a = Samples.ended(Samples.backgroundTask("bgt_a", status = BackgroundTaskStatus.Completed, startedAt = 10))
+        val b = Samples.ended(Samples.backgroundTask("bgt_b", status = BackgroundTaskStatus.Completed, startedAt = 20))
+        batch(WORKSPACE_STREAM, env(1, summary(1, running = 2, last = null)))
+        batch(WORKSPACE_STREAM, env(2, summary(3, running = 1, last = a)), env(3, summary(5, running = 0, last = b)))
+        assertEquals(listOf(a, b), reported())
+        // B runs again (Codex input to a finished sub-agent, a restarted Claude agent): the
+        // summary keeps B's previous end; then that end's status is corrected (endedAt kept).
+        batch(WORKSPACE_STREAM, env(4, summary(7, running = 1, last = b)))
+        batch(WORKSPACE_STREAM, env(5, summary(9, running = 1, last = b.copy(status = BackgroundTaskStatus.Failed))))
+        assertEquals(listOf(a, b), reported())
+        // An older daemon falls back to A's end instead: reported at the time, not again.
+        batch(WORKSPACE_STREAM, env(6, summary(11, running = 1, last = a)))
+        assertEquals(listOf(a, b), reported())
+        assertEquals(a, store.state.value.threads["thr_1"]!!.background.lastEnded, "the summary is stored as the server sent it")
+        // ...and to none when A runs again too.
+        batch(WORKSPACE_STREAM, env(7, summary(13, running = 2, last = null)))
+        // B's second run ends: a later end, reported.
+        val bAgain = b.copy(endedAt = 41)
+        batch(WORKSPACE_STREAM, env(8, summary(15, running = 1, last = bAgain)))
+        // Another task ending in the same millisecond comes later by its id (the server's order)...
+        val c = Samples.ended(Samples.backgroundTask("bgt_c", status = BackgroundTaskStatus.Failed, startedAt = 40))
+        assertEquals(bAgain.endedAt, c.endedAt)
+        batch(WORKSPACE_STREAM, env(9, summary(17, running = 1, last = c)))
+        // ...and B's end at the same millisecond is earlier: not reported again.
+        batch(WORKSPACE_STREAM, env(10, summary(19, running = 2, last = bAgain)))
+        assertEquals(listOf(a, b, bAgain, c), reported())
+    }
+
+    @Test
+    fun backgroundTaskUpdatesReplaceTheWholeTask() = test {
+        seedThread(0)
+        val started = Samples.backgroundTask("bgt_1", originItemId = "itm_1")
+        val progressed = started.copy(progress = BackgroundProgress(lastToolName = "Read", toolUses = 3, tokens = 900))
+        val ended = progressed.copy(status = BackgroundTaskStatus.Completed, endedAt = 9, stoppable = false)
+        batch(stream, env(1, Event.BackgroundTaskUpdated(started)), env(2, Event.BackgroundTaskUpdated(progressed)))
+        assertEquals(progressed, store.state.value.backgroundTasks["bgt_1"])
+        batch(stream, env(3, Event.BackgroundTaskUpdated(ended)))
+        assertEquals(ended, store.state.value.backgroundTasks["bgt_1"])
+        // A new run of the same task is running again.
+        val rerun = ended.copy(status = BackgroundTaskStatus.Running, runs = 2, startedAt = 12, endedAt = null, endReason = null)
+        batch(stream, env(4, Event.BackgroundTaskUpdated(rerun)))
+        assertEquals(rerun, store.state.value.backgroundTasks["bgt_1"])
+        assertTrue(signals.isEmpty(), "task updates are not notifications (the summary's lastEnded is): $signals")
+    }
+
+    @Test
+    fun threadReadBringsTheTasksAndAnOlderPageNeverRollsOneBack() = test {
+        seedThread(3)
+        store.transaction { it.upsertBackgroundTask(Samples.backgroundTask("bgt_stale")) }
+        val running = Samples.backgroundTask("bgt_run", turnId = "trn_2", startedAt = 5)
+        val read = ThreadReadResult(
+            Samples.thread("thr_1", head = 8), listOf(Samples.turn("trn_2", index = 1)), emptyList(), emptyList(), emptyList(), 8, true,
+            backgroundTasks = listOf(running),
+        )
+        store.transaction { EventApplier.applyThreadRead(it, read, signals, warnings::add) }
+        assertEquals(setOf("bgt_run"), store.state.value.backgroundTasks.keys, "the read replaces the thread's tasks")
+        // The task ends (live) before an older page arrives that still lists it as running.
+        val ended = running.copy(status = BackgroundTaskStatus.Stopped, endedAt = 20)
+        batch(stream, env(9, Event.BackgroundTaskUpdated(ended)))
+        val older = ThreadReadResult(
+            Samples.thread("thr_1", head = 8), listOf(Samples.turn("trn_1", index = 0, status = TurnStatus.Completed)), emptyList(), emptyList(), emptyList(), 8, false,
+            backgroundTasks = listOf(Samples.backgroundTask("bgt_old", status = BackgroundTaskStatus.Completed, startedAt = 1), running),
+        )
+        store.transaction { EventApplier.applyOlderPage(it, older, signals) }
+        assertEquals(ended, store.state.value.backgroundTasks["bgt_run"])
+        assertEquals(BackgroundTaskStatus.Completed, store.state.value.backgroundTasks["bgt_old"]?.status)
+    }
+
+    @Test
+    fun aPendingInteractionOfABackgroundTaskCarriesTheStoredTask() = test {
+        seedThread(0)
+        val task = Samples.backgroundTask("bgt_1", title = "Review the reconnect logic")
+        val asked = Samples.approval("int_1").copy(turnId = null, backgroundTaskId = "bgt_1")
+        batch(stream, env(1, Event.BackgroundTaskUpdated(task)), env(2, Event.InteractionRequested(asked)))
+        val pending = signals.filterIsInstance<SyncSignal.InteractionPending>().single()
+        assertEquals(task, pending.backgroundTask)
+        // A task not stored on this device (its thread never opened here): no task, still the approval.
+        store.transaction { it.setCursor(WORKSPACE_STREAM, 0) }
+        batch(WORKSPACE_STREAM, env(1, Event.InteractionPending(Samples.approval("int_2", threadId = "thr_9").copy(backgroundTaskId = "bgt_9"))))
+        val other = signals.filterIsInstance<SyncSignal.InteractionPending>().last()
+        assertEquals("int_2", other.interaction.id)
+        assertNull(other.backgroundTask)
+        assertTrue(signals.none { it is SyncSignal.InteractionTaskKnown }, "the first task was stored before its request")
+    }
+
+    /**
+     * The workspace stream may deliver a background task's request before the thread stream
+     * delivers the task: the request is reported without it, and once the task is first stored
+     * the request is reported again with it — once, not for later updates or re-reads.
+     */
+    @Test
+    fun aRequestReportedBeforeItsTaskIsReportedAgainWhenTheTaskIsStored() = test {
+        seedThread(0)
+        store.transaction { it.setCursor(WORKSPACE_STREAM, 0) }
+        val task = Samples.backgroundTask("bgt_1", title = "Review the reconnect logic")
+        val asked = Samples.approval("int_1").copy(turnId = null, backgroundTaskId = "bgt_1")
+        batch(WORKSPACE_STREAM, env(1, Event.InteractionPending(asked)))
+        assertNull(signals.filterIsInstance<SyncSignal.InteractionPending>().single().backgroundTask)
+        batch(stream, env(1, Event.BackgroundTaskUpdated(task)), env(2, Event.InteractionRequested(asked)))
+        val known = signals.filterIsInstance<SyncSignal.InteractionTaskKnown>().single()
+        assertEquals("int_1", known.interaction.id)
+        assertEquals(task, known.task)
+        assertEquals(1, signals.count { it is SyncSignal.InteractionPending }, "still pending once")
+        // Later updates and a re-read of the thread (the task is stored already) report nothing more.
+        batch(stream, env(3, Event.BackgroundTaskUpdated(task.copy(progress = BackgroundProgress(toolUses = 2)))))
+        val read = ThreadReadResult(
+            Samples.thread("thr_1", head = 9), listOf(Samples.turn("trn_1")), emptyList(), listOf(asked), emptyList(), 9, false,
+            backgroundTasks = listOf(task),
+        )
+        store.transaction { EventApplier.applyThreadRead(it, read, signals, warnings::add) }
+        assertEquals(1, signals.count { it is SyncSignal.InteractionTaskKnown })
+        // A thread read for the first time on this device names the tasks of its pending requests.
+        store.transaction { it.upsertInteraction(Samples.approval("int_2", threadId = "thr_2").copy(turnId = null, backgroundTaskId = "bgt_2")) }
+        val other = Samples.backgroundTask("bgt_2", threadId = "thr_2")
+        val first = ThreadReadResult(
+            Samples.thread("thr_2", head = 3), emptyList(), emptyList(), emptyList(), emptyList(), 3, false, backgroundTasks = listOf(other),
+        )
+        store.transaction { EventApplier.applyThreadRead(it, first, signals, warnings::add) }
+        assertEquals(listOf("int_1", "int_2"), signals.filterIsInstance<SyncSignal.InteractionTaskKnown>().map { it.interaction.id })
+    }
+
+    @Test
     fun operationFinishedIsSignalledOnItsTransition() = test {
         store.transaction { it.setCursor(WORKSPACE_STREAM, 0) }
         batch(
@@ -212,7 +380,7 @@ class EventApplierTest {
             ),
             emptyList(), emptyList(), 5, true,
         )
-        store.transaction { EventApplier.applyThreadRead(it, read, signals) }
+        store.transaction { EventApplier.applyThreadRead(it, read, signals, warnings::add) }
         batch(stream, env(6, Event.ItemStarted(Samples.agentMessage("itm_c", "c", turnId = "trn_1"))))
         // An older page arrives later and sorts before everything.
         val older = ThreadReadResult(
@@ -239,7 +407,7 @@ class EventApplierTest {
             listOf(Samples.queued("que_1")),
             8, false,
         )
-        store.transaction { EventApplier.applyThreadRead(it, read, signals) }
+        store.transaction { EventApplier.applyThreadRead(it, read, signals, warnings::add) }
         val s = store.state.value
         assertEquals(setOf("itm_new"), s.items.keys)
         assertEquals(setOf("trn_2"), s.turns.keys)
@@ -275,6 +443,24 @@ class EventApplierTest {
         batch(stream, env(1, Event.QueueUpdated(listOf(Samples.queued("que_1")))), env(2, Event.CommandsChanged), env(3, Event.CommandsChanged))
         assertEquals(listOf("que_1"), store.state.value.queued["thr_1"]!!.map { it.id })
         assertEquals(2, store.state.value.meta["thr_1"]!!.commandsVersion)
+        assertTrue(warnings.isEmpty(), "$warnings")
+    }
+
+    @Test
+    fun aQueuedInputListedTwiceIsStoredOnceAtItsFirstPositionWithAWarning() = test {
+        // The screens key the queue's rows by id: a duplicate would crash the lazy list.
+        seedThread(0)
+        val twice = listOf(Samples.queued("que_1"), Samples.queued("que_2"), Samples.queued("que_1").copy(preview = "later copy"))
+        batch(stream, env(1, Event.QueueUpdated(twice)))
+        assertEquals(listOf("que_1", "que_2"), store.state.value.queued["thr_1"]!!.map { it.id })
+        assertEquals("preview", store.state.value.queued["thr_1"]!!.first().preview)
+        assertTrue(warnings.single().contains("que_1"), "$warnings")
+
+        warnings.clear()
+        val read = ThreadReadResult(Samples.thread("thr_1", head = 5), emptyList(), emptyList(), emptyList(), twice, 5, false)
+        store.transaction { EventApplier.applyThreadRead(it, read, signals, warnings::add) }
+        assertEquals(listOf("que_1", "que_2"), store.state.value.queued["thr_1"]!!.map { it.id })
+        assertEquals(1, warnings.size, "$warnings")
     }
 
     @Test

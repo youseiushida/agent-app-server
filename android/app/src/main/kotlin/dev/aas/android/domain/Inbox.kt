@@ -17,6 +17,8 @@ data class InboxInteraction(
     val project: Project?,
     /** An `interaction/respond` for it is still in the outbox (answered offline, not yet sent). */
     val responsePending: Boolean,
+    /** The title of the background task that asked (`backgroundTaskId`), when stored on this device. */
+    val backgroundTaskTitle: String? = null,
 )
 
 /** A thread listed in the inbox with its status. */
@@ -66,7 +68,7 @@ data class InboxModel(
                     // Threads waiting for an answer are already listed through their interaction.
                     activity == ThreadActivity.NeedsApproval || activity == ThreadActivity.NeedsInput -> Unit
                     activity == ThreadActivity.Error && entry.unread -> errors += row
-                    activity == ThreadActivity.Running -> running += row
+                    activity.working -> running += row
                     entry.unread -> unread += row
                 }
             }

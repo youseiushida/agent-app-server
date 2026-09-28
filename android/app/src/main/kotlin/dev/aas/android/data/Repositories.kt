@@ -1,6 +1,9 @@
 package dev.aas.android.data
 
 import dev.aas.android.domain.InboxModel
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskId
+import dev.aas.android.protocol.BackgroundTaskStopParams
 import dev.aas.android.protocol.Command
 import dev.aas.android.protocol.CommandAction
 import dev.aas.android.protocol.CommandListParams
@@ -10,6 +13,7 @@ import dev.aas.android.protocol.DeviceId
 import dev.aas.android.protocol.DeviceRevokeParams
 import dev.aas.android.protocol.DiffScope
 import dev.aas.android.protocol.Empty
+import dev.aas.android.protocol.FsEntry
 import dev.aas.android.protocol.FsListParams
 import dev.aas.android.protocol.FsListResult
 import dev.aas.android.protocol.FsMkdirParams
@@ -67,6 +71,7 @@ import dev.aas.android.protocol.WorkspaceSpec
 import dev.aas.android.sync.OutboxDiscard
 import dev.aas.android.sync.PendingMutation
 import dev.aas.android.sync.SyncEngine
+import dev.aas.android.sync.SyncSignal
 import dev.aas.android.sync.ThreadState
 import dev.aas.android.sync.WorkspaceState
 import kotlinx.coroutines.NonCancellable
@@ -75,6 +80,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
@@ -120,17 +126,32 @@ class WorkspaceRepository(private val engine: SyncEngine) {
 
     suspend fun markUnread(threadId: ThreadId) = engine.markUnread(threadId)
 
+    /**
+     * Ticks when the background task of a pending interaction became known after the interaction
+     * (`SyncSignal.InteractionTaskKnown`): lists that name the task look it up again.
+     */
+    val interactionTasksKnown: Flow<Unit> = engine.signals.filterIsInstance<SyncSignal.InteractionTaskKnown>().map { }
+
+    /** The background tasks stored on this device among [ids] (see `SyncEngine.storedBackgroundTasks`). */
+    suspend fun backgroundTasks(ids: Collection<BackgroundTaskId>): Map<BackgroundTaskId, BackgroundTask> = engine.storedBackgroundTasks(ids)
+
     /** Drops a request from the outbox without an answer (a request on the wire stays). */
     suspend fun discard(clientRequestId: String): OutboxDiscard = engine.discardOutbox(clientRequestId)
 }
 
-/** Projects, folders on the PC and operations (clone). Reads go through [reads] (sent again after a reconnect). */
-class ProjectRepository(private val engine: SyncEngine, private val reads: Reads) {
-    /** `fs/roots`: the folders projects may live in. */
-    suspend fun roots(): List<FsRoot> = reads.query(Methods.FsRoots, Empty).roots
+/**
+ * Projects, folders on the PC and operations (clone). Reads go through [reads] (sent again after
+ * a reconnect); lists the screens key by id pass [lists] (each id once).
+ */
+class ProjectRepository(private val engine: SyncEngine, private val reads: Reads, private val lists: ServerLists) {
+    /** `fs/roots`: the folders projects may live in (each path once). */
+    suspend fun roots(): List<FsRoot> = lists.unique(reads.query(Methods.FsRoots, Empty).roots, "fs/roots", FsRoot::path)
 
-    /** `fs/list`: the sub-folders of [path] (directories only). */
-    suspend fun list(path: String): FsListResult = reads.query(Methods.FsList, FsListParams(path))
+    /** `fs/list`: the sub-folders of [path] (directories only, each path once). */
+    suspend fun list(path: String): FsListResult {
+        val result = reads.query(Methods.FsList, FsListParams(path))
+        return result.copy(entries = lists.unique(result.entries, "fs/list", FsEntry::path))
+    }
 
     /*
      * The new-project flow's changes are committed to the outbox and their answer is awaited on
@@ -178,13 +199,33 @@ class ProjectRepository(private val engine: SyncEngine, private val reads: Reads
         engine.enqueue(Methods.OperationCancel) { crid -> OperationCancelParams(crid, operationId) }
     }
 
-    /** `thread/list` of one project (the archived ones are only here, not in the workspace). */
+    /**
+     * `thread/list` of one project (the archived ones are only here, not in the workspace): one
+     * page as the server sent it (its last thread is the cursor of the next page). Pages are
+     * joined with [joinThreadPages].
+     */
     suspend fun threads(projectId: ProjectId, includeArchived: Boolean, before: ThreadCursor? = null): ThreadListResult =
         reads.query(Methods.ThreadList, ThreadListParams(projectId = projectId, includeArchived = includeArchived, before = before))
 
-    /** `native/list`: the harness's own sessions in the project's folder. */
-    suspend fun nativeSessions(projectId: ProjectId, harnessId: String): List<NativeSession> =
-        reads.query(Methods.NativeList, NativeListParams(projectId, harnessId)).sessions
+    /**
+     * [shown] followed by the threads of the next [page], each thread once: a thread whose
+     * activity moved it between pages while they were read comes in both. The newer summary
+     * (the larger `head`, protocol.md §3.1) is kept, at the thread's first position.
+     */
+    fun joinThreadPages(shown: List<Thread>, page: List<Thread>): List<Thread> =
+        lists.unique(shown + page, "thread/list", Thread::id, compareBy(Thread::head))
+
+    /**
+     * `native/list`: the harness's own sessions in the project's folder, each session once. A
+     * harness may list a session several times (Codex: once per rollout of a thread resumed
+     * elsewhere, same id, different `updatedAt`); the latest is kept.
+     */
+    suspend fun nativeSessions(projectId: ProjectId, harnessId: String): List<NativeSession> = lists.unique(
+        reads.query(Methods.NativeList, NativeListParams(projectId, harnessId)).sessions,
+        "native/list of $harnessId",
+        NativeSession::nativeSessionId,
+        compareBy(nullsFirst()) { it.updatedAt },
+    )
 
     /**
      * `native/import`: the thread continuing a native session. Committed to the outbox; the
@@ -197,13 +238,16 @@ class ProjectRepository(private val engine: SyncEngine, private val reads: Reads
     suspend fun commands(projectId: ProjectId, harnessId: String): List<Command> =
         reads.query(Methods.CommandList, CommandListParams(projectId = projectId, harnessId = harnessId)).commands
 
-    /** `fs/search` in the project's folder (mentions in the new-thread composer). */
+    /** `fs/search` in the project's folder (mentions in the new-thread composer; each path once). */
     suspend fun search(projectId: ProjectId, query: String): List<SearchResult> =
-        reads.query(Methods.FsSearch, FsSearchParams(projectId = projectId, query = query)).results
+        lists.unique(reads.query(Methods.FsSearch, FsSearchParams(projectId = projectId, query = query)).results, "fs/search", SearchResult::path)
 }
 
-/** An open thread and everything done to it. Reads go through [reads] (sent again after a reconnect). */
-class ThreadRepository(private val engine: SyncEngine, private val reads: Reads) {
+/**
+ * An open thread and everything done to it. Reads go through [reads] (sent again after a
+ * reconnect); lists the screens key by id pass [lists] (each id once).
+ */
+class ThreadRepository(private val engine: SyncEngine, private val reads: Reads, private val lists: ServerLists) {
     /**
      * The thread's state while collected: opens it (stored content at once, then `thread/read`
      * and a live subscription when online) and closes it when the collection ends. Use it with
@@ -262,6 +306,14 @@ class ThreadRepository(private val engine: SyncEngine, private val reads: Reads)
         engine.enqueue(Methods.ThreadStop) { crid -> ThreadStopParams(crid, threadId) }
     }
 
+    /**
+     * `backgroundTask/stop`: asks the harness to stop one background task. The answer only says
+     * the request was taken (`stopRequestedAt`); the end arrives with `backgroundTask/updated`.
+     */
+    suspend fun stopBackgroundTask(threadId: ThreadId, taskId: BackgroundTaskId) {
+        engine.enqueue(Methods.BackgroundTaskStop) { crid -> BackgroundTaskStopParams(crid, threadId, taskId) }
+    }
+
     suspend fun rename(threadId: ThreadId, title: String) {
         engine.enqueue(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, title = title) }
     }
@@ -304,9 +356,9 @@ class ThreadRepository(private val engine: SyncEngine, private val reads: Reads)
     /** `command/list` of the thread (app commands, then the harness's). */
     suspend fun commands(threadId: ThreadId): List<Command> = reads.query(Methods.CommandList, CommandListParams(threadId = threadId)).commands
 
-    /** `fs/search` in the thread's working folder (its worktree, if any). */
+    /** `fs/search` in the thread's working folder (its worktree, if any; each path once). */
     suspend fun search(threadId: ThreadId, query: String): List<SearchResult> =
-        reads.query(Methods.FsSearch, FsSearchParams(threadId = threadId, query = query)).results
+        lists.unique(reads.query(Methods.FsSearch, FsSearchParams(threadId = threadId, query = query)).results, "fs/search", SearchResult::path)
 
     /** A command's `method` action for a method this app has no dedicated call for. */
     suspend fun runCommand(action: CommandAction.Method, threadId: ThreadId): JsonElement = engine.runCommand(action, threadId)
@@ -319,11 +371,14 @@ class InteractionRepository(private val engine: SyncEngine) {
         engine.enqueue(Methods.InteractionRespond) { crid -> InteractionRespondParams(crid, interaction.id, resolution) }
 }
 
-/** Server information and devices (設定). Read-only calls need a connection; they go through [reads]. */
-class ServerRepository(private val engine: SyncEngine, private val reads: Reads) {
+/**
+ * Server information and devices (設定). Read-only calls need a connection; they go through
+ * [reads], and the device list passes [lists] (each id once).
+ */
+class ServerRepository(private val engine: SyncEngine, private val reads: Reads, private val lists: ServerLists) {
     suspend fun status(): ServerStatusResult = reads.query(Methods.ServerStatus, Empty)
 
-    suspend fun devices(): List<Device> = reads.query(Methods.DeviceList, Empty).devices
+    suspend fun devices(): List<Device> = lists.unique(reads.query(Methods.DeviceList, Empty).devices, "device/list", Device::id)
 
     /** Revokes another device; waits for the server's answer. */
     suspend fun revoke(deviceId: DeviceId) {

@@ -21,8 +21,37 @@
 //! | `@bigoutput <bytes>` | command execution streaming `bytes` of output in 1 KiB deltas |
 //! | `@context <used> <window>` | reports the turn's usage so far with a context-window occupancy of `used` of `window` tokens (also carried by the final usage) |
 //! | `@hang [ms]` | keeps the turn running for `ms` (default 60 s) without reacting to interrupts or to its input ending: only terminating the process ends it early |
+//! | `@bg <key> [options…] [title…]` | starts a background task that goes on after the turn (see below) |
 //!
 //! Attached images are acknowledged with an extra message `received <n> image(s) (<bytes> bytes)`.
+//!
+//! # Background tasks (`@bg`)
+//!
+//! `@bg <key> [options…] [title…]` starts background task `key` (see [`crate::background`]).
+//! The turn reports a launching item (a command for `kind=shell`, a tool call otherwise), the
+//! task (running, in the live set), and closes the item as `backgrounded`; the task then runs
+//! on its own, across turns, until it ends by itself or is stopped. Options (before the title;
+//! the first other word starts the title, default `<kind> <key>`):
+//!
+//! | option | effect |
+//! |---|---|
+//! | `kind=<k>` | `agent` (default), `shell`, `workflow`, `monitor`, `remote`, `scheduled`, `other` |
+//! | `ms=<n>` | each run lasts `n` ms (default 1000); `0`: until it is stopped |
+//! | `end=completed\|failed` | how a run ends by itself (default `completed`) |
+//! | `exit=<code>` | exit code of the result (shell tasks report 0, or 1 when failed, without it) |
+//! | `progress=<n>` | progress reports per run (a workflow reports its agents) |
+//! | `parent=<key>` | launched by that background task |
+//! | `restart=<n>` | starts again under the same key `n` times after a run ended (`runs`) |
+//! | `ambient` | the harness marks it as not being activity |
+//! | `wake` | when it ends, the agent starts a turn by itself about it (trigger `backgroundTask`; `scheduled` for `kind=scheduled`) |
+//! | `approve` | asks for approval (belonging to the task) during its first run; a denial fails it |
+//! | `unstoppable` | cannot be stopped on its own |
+//! | `stubborn` | ignores stop requests (it still dies with the agent) |
+//! | `detached` | no launching item |
+//!
+//! A turn the agent starts by itself runs after the current turn; a prompt that arrives while
+//! it runs is refused with `promptAck { accepted: false, ownRun: true }` (the adapter then
+//! reports [`aas_harness::AdapterError::TurnInProgress`]).
 //!
 //! # Sessions
 //!
@@ -44,6 +73,7 @@ use aas_stdio::{JsonLinesReader, JsonLinesWriter, ReadLine};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, watch};
 
+use crate::background::{BackgroundGuard, BackgroundRuntime, BackgroundSpec, Wake};
 use crate::store::{RecordedItem, RecordedTurn, SessionStore};
 use crate::wire::{Ev, Op};
 
@@ -67,6 +97,9 @@ const BIG_OUTPUT_LINE_BYTES: usize = 14;
 const ITEM_KEYS_PER_TURN: u64 = 1000;
 /// Exit code of an agent whose `hello` was rejected (its session could not be opened).
 pub const REJECTED_EXIT_CODE: i32 = 1;
+/// How long a turn the agent starts by itself runs after its message, like a short model
+/// answer: a prompt sent right after that turn started finds it running (and is refused).
+const OWN_RUN_MS: u64 = 200;
 
 /// Options of the fake agent.
 #[derive(Debug, Clone)]
@@ -90,20 +123,32 @@ impl Default for AgentOptions {
 pub enum Step {
     Text(String),
     Reason(String),
-    Stream { count: u32, interval_ms: u64 },
+    Stream {
+        count: u32,
+        interval_ms: u64,
+    },
     Exec(String),
     Approve(String),
     Question,
     Plan,
-    Write { path: String, content: String },
+    Write {
+        path: String,
+        content: String,
+    },
     Sleep(u64),
     Fail(String),
     Crash(i32),
     Withdraw,
     BigOutput(usize),
-    Context { used: u64, window: u64 },
+    Context {
+        used: u64,
+        window: u64,
+    },
     Hang(u64),
+    Background(BackgroundSpec),
     Unknown(String),
+    /// A directive whose arguments are wrong (reported as a warning notice).
+    Invalid(String),
 }
 
 /// Parses a prompt into scenario steps.
@@ -149,6 +194,7 @@ pub fn parse_script(prompt: &str) -> Vec<Step> {
                 | "bigoutput"
                 | "context"
                 | "hang"
+                | "bg"
         );
         if !known {
             if !text.is_empty() {
@@ -215,6 +261,10 @@ pub fn parse_script(prompt: &str) -> Vec<Step> {
                 used: nums.next().and_then(|n| n.parse().ok()).unwrap_or(0),
                 window: nums.next().and_then(|n| n.parse().ok()).unwrap_or(0),
             },
+            "bg" => match BackgroundSpec::parse(args) {
+                Ok(spec) => Step::Background(spec),
+                Err(message) => Step::Invalid(message),
+            },
             other => Step::Unknown(other.to_owned()),
         });
     }
@@ -228,9 +278,19 @@ pub fn parse_script(prompt: &str) -> Vec<Step> {
 
 /// Where the agent's events go: to the adapter and, during a turn of a stored session, into
 /// the turn's record as well.
-struct Emitter<W> {
+pub(crate) struct Emitter<W> {
     writer: Arc<Mutex<JsonLinesWriter<W>>>,
     record: Option<Arc<parking_lot::Mutex<TurnRecord>>>,
+}
+
+impl<W> Emitter<W> {
+    /// The same output without a turn's record (background work is not part of a turn).
+    pub(crate) fn detached(&self) -> Self {
+        Self {
+            writer: self.writer.clone(),
+            record: None,
+        }
+    }
 }
 
 impl<W> Clone for Emitter<W> {
@@ -242,7 +302,7 @@ impl<W> Clone for Emitter<W> {
     }
 }
 
-async fn emit<W: AsyncWrite + Unpin>(w: &Emitter<W>, ev: Ev) -> bool {
+pub(crate) async fn emit<W: AsyncWrite + Unpin>(w: &Emitter<W>, ev: Ev) -> bool {
     if let Some(record) = &w.record {
         record.lock().observe(&ev);
     }
@@ -251,19 +311,24 @@ async fn emit<W: AsyncWrite + Unpin>(w: &Emitter<W>, ev: Ev) -> bool {
 
 /// What a turn produced, kept for the session transcript: the items as the adapter sees them
 /// (started, streamed, updated, completed), in order.
-struct TurnRecord {
+pub(crate) struct TurnRecord {
     started_at: Millis,
     items: Vec<(Option<String>, RecordedItem)>,
 }
 
 impl TurnRecord {
     fn new(prompt: &str) -> Self {
-        let mut record = Self {
-            started_at: now_ms(),
-            items: Vec::new(),
-        };
+        let mut record = Self::own();
         record.user_message(prompt, UserMessageDelivery::Normal);
         record
+    }
+
+    /// A turn the agent started by itself (no user message).
+    fn own() -> Self {
+        Self {
+            started_at: now_ms(),
+            items: Vec::new(),
+        }
     }
 
     fn user_message(&mut self, text: &str, delivery: UserMessageDelivery) {
@@ -335,11 +400,13 @@ impl TurnRecord {
             | Ev::Rejected { .. }
             | Ev::SessionInfo { .. }
             | Ev::Commands { .. }
+            | Ev::PromptAck { .. }
             | Ev::TurnStarted
             | Ev::Request { .. }
             | Ev::Withdraw { .. }
             | Ev::Usage { .. }
-            | Ev::TurnCompleted { .. } => {}
+            | Ev::TurnCompleted { .. }
+            | Ev::Background { .. } => {}
         }
     }
 
@@ -442,19 +509,62 @@ where
     let (end_tx, mut end_rx) = mpsc::unbounded_channel::<TurnEnd>();
     let mut turn: Option<TurnChannels> = None;
     let mut turn_task = TurnTask(None);
+    // Background work (`@bg`), and the turns it makes the agent start by itself: they run
+    // after the current turn, in order. Dropped with the agent, which ends its tasks.
+    let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Wake>();
+    let background = BackgroundRuntime::new(wake_tx);
+    let _background_guard = BackgroundGuard(background.clone());
+    let mut wakes: std::collections::VecDeque<Wake> = std::collections::VecDeque::new();
+    // Whether the running turn is one the agent started by itself.
+    let mut own_run = false;
     // Set while a `@hang` step runs: the agent then outlives the end of its input.
     let hanging = Arc::new(AtomicBool::new(false));
     let mut model: Option<String> = Some("fake-fast".into());
     let mut item_counter = 0u64;
+
+    // Starts the next turn of the agent's own when none runs.
+    macro_rules! start_own_run {
+        () => {
+            if turn.is_none()
+                && let Some(wake) = wakes.pop_front()
+            {
+                let (channels, ctx) = turn_ctx(
+                    &writer,
+                    &session,
+                    None,
+                    &options,
+                    &mut item_counter,
+                    &hanging,
+                    &end_tx,
+                    &background,
+                    Some(wake.trigger),
+                );
+                turn = Some(channels);
+                own_run = true;
+                let end_tx = end_tx.clone();
+                let task = tokio::spawn(async move {
+                    let steps = vec![Step::Text(wake.text), Step::Sleep(OWN_RUN_MS)];
+                    if let TurnEnd::Crash(code) = run_turn(ctx, steps).await {
+                        let _ = end_tx.send(TurnEnd::Crash(code));
+                    }
+                });
+                turn_task.track(task.abort_handle());
+            }
+        };
+    }
 
     loop {
         tokio::select! {
             end = end_rx.recv() => {
                 match end {
                     Some(TurnEnd::Crash(code)) => return code,
-                    Some(TurnEnd::Done) => { turn = None; }
+                    Some(TurnEnd::Done) => { turn = None; own_run = false; start_own_run!(); }
                     None => {}
                 }
+            }
+            Some(wake) = wake_rx.recv() => {
+                wakes.push_back(wake);
+                start_own_run!();
             }
             line = reader.next() => {
                 let op = match line {
@@ -483,13 +593,22 @@ where
                     }
                 };
                 // A turn that has reported its completion has sent `Done` before: whatever the
-                // adapter sends in response to the completion finds the turn over.
+                // adapter sends in response to the completion finds the turn over. A turn of the
+                // agent's own that is due starts first (like a CLI that takes up a notification
+                // before the next input).
                 while let Ok(end) = end_rx.try_recv() {
                     match end {
                         TurnEnd::Crash(code) => return code,
-                        TurnEnd::Done => turn = None,
+                        TurnEnd::Done => {
+                            turn = None;
+                            own_run = false;
+                        }
                     }
                 }
+                while let Ok(wake) = wake_rx.try_recv() {
+                    wakes.push_back(wake);
+                }
+                start_own_run!();
                 match op {
                     Op::Hello { session_id, resume, fork_from, sessions_dir } => {
                         match open_session(&options.cwd, &session_id, resume, fork_from.as_deref(), sessions_dir.as_deref()) {
@@ -509,30 +628,22 @@ where
                     }
                     Op::Prompt { text, images } => {
                         if turn.is_some() {
-                            emit(&writer, Ev::Notice { level: NoticeLevel::Error, message: "a turn is already running".into() }).await;
+                            emit(&writer, Ev::PromptAck { accepted: false, own_run }).await;
                             continue;
                         }
-                        let (interrupt_tx, interrupt_rx) = watch::channel(false);
-                        let (respond_tx, respond_rx) = mpsc::unbounded_channel();
-                        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
-                        turn = Some(TurnChannels { interrupt_tx, respond_tx, steer_tx });
-                        let ctx = TurnCtx {
-                            writer: Emitter {
-                                writer: writer.writer.clone(),
-                                record: session
-                                    .as_ref()
-                                    .map(|_| Arc::new(parking_lot::Mutex::new(TurnRecord::new(&text)))),
-                            },
-                            session: session.clone(),
-                            interrupt: interrupt_rx,
-                            responses: respond_rx,
-                            steers: steer_rx,
-                            options: options.clone(),
-                            first_item: item_counter,
-                            hanging: hanging.clone(),
-                            end: end_tx.clone(),
-                        };
-                        item_counter += ITEM_KEYS_PER_TURN;
+                        emit(&writer, Ev::PromptAck { accepted: true, own_run: false }).await;
+                        let (channels, ctx) = turn_ctx(
+                            &writer,
+                            &session,
+                            Some(&text),
+                            &options,
+                            &mut item_counter,
+                            &hanging,
+                            &end_tx,
+                            &background,
+                            None,
+                        );
+                        turn = Some(channels);
                         let end_tx = end_tx.clone();
                         let mut steps = parse_script(&text);
                         if !images.is_empty() {
@@ -559,8 +670,18 @@ where
                         }
                     }
                     Op::Respond { request_id, resolution } => {
+                        // A background task's request, else the turn's.
+                        let resolution = match background.answer(&request_id, resolution.clone()) {
+                            true => continue,
+                            false => resolution,
+                        };
                         if let Some(t) = &turn {
                             let _ = t.respond_tx.send((request_id, resolution));
+                        }
+                    }
+                    Op::StopBackground { key } => {
+                        if !background.stop(&key) {
+                            emit(&writer, Ev::Notice { level: NoticeLevel::Warning, message: format!("no running background task {key}") }).await;
                         }
                     }
                 }
@@ -615,6 +736,61 @@ struct TurnCtx<W> {
     hanging: Arc<AtomicBool>,
     /// Tells the main loop that the turn is over.
     end: mpsc::UnboundedSender<TurnEnd>,
+    /// The agent's background work (`@bg` starts tasks there).
+    background: Arc<BackgroundRuntime>,
+    /// Why the agent started this turn by itself (`None` for a prompt).
+    trigger: Option<TurnTrigger>,
+}
+
+/// The channels and context of a new turn: for `prompt`, or one the agent starts by itself
+/// (`prompt` is `None`, `trigger` says why).
+// One call site per kind of turn, each passing the main loop's state as it is.
+#[allow(clippy::too_many_arguments)]
+fn turn_ctx<W>(
+    writer: &Emitter<W>,
+    session: &Option<Session>,
+    prompt: Option<&str>,
+    options: &AgentOptions,
+    item_counter: &mut u64,
+    hanging: &Arc<AtomicBool>,
+    end: &mpsc::UnboundedSender<TurnEnd>,
+    background: &Arc<BackgroundRuntime>,
+    trigger: Option<TurnTrigger>,
+) -> (TurnChannels, TurnCtx<W>) {
+    let (interrupt_tx, interrupt_rx) = watch::channel(false);
+    let (respond_tx, respond_rx) = mpsc::unbounded_channel();
+    let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+    let record = session.as_ref().map(|_| {
+        Arc::new(parking_lot::Mutex::new(match prompt {
+            Some(text) => TurnRecord::new(text),
+            None => TurnRecord::own(),
+        }))
+    });
+    let ctx = TurnCtx {
+        writer: Emitter {
+            writer: writer.writer.clone(),
+            record,
+        },
+        session: session.clone(),
+        interrupt: interrupt_rx,
+        responses: respond_rx,
+        steers: steer_rx,
+        options: options.clone(),
+        first_item: *item_counter,
+        hanging: hanging.clone(),
+        end: end.clone(),
+        background: background.clone(),
+        trigger,
+    };
+    *item_counter += ITEM_KEYS_PER_TURN;
+    (
+        TurnChannels {
+            interrupt_tx,
+            respond_tx,
+            steer_tx,
+        },
+        ctx,
+    )
 }
 
 impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
@@ -675,6 +851,7 @@ impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
                 status,
                 usage,
                 error,
+                trigger: self.trigger,
             },
         )
         .await;
@@ -717,7 +894,10 @@ impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
     }
 }
 
-async fn run_turn<W: AsyncWrite + Unpin + Send>(mut ctx: TurnCtx<W>, steps: Vec<Step>) -> TurnEnd {
+async fn run_turn<W: AsyncWrite + Unpin + Send + 'static>(
+    mut ctx: TurnCtx<W>,
+    steps: Vec<Step>,
+) -> TurnEnd {
     let w = ctx.writer.clone();
     emit(&w, Ev::TurnStarted).await;
     let mut next_key = ctx.first_item;
@@ -931,6 +1111,7 @@ async fn run_turn<W: AsyncWrite + Unpin + Send>(mut ctx: TurnCtx<W>, steps: Vec<
                                 ],
                             },
                             item_key: Some(k.clone()),
+                            background_key: None,
                         },
                     )
                     .await;
@@ -1032,6 +1213,7 @@ async fn run_turn<W: AsyncWrite + Unpin + Send>(mut ctx: TurnCtx<W>, steps: Vec<
                                 }],
                             },
                             item_key: None,
+                            background_key: None,
                         },
                     )
                     .await;
@@ -1067,6 +1249,7 @@ async fn run_turn<W: AsyncWrite + Unpin + Send>(mut ctx: TurnCtx<W>, steps: Vec<
                                 }],
                             },
                             item_key: None,
+                            background_key: None,
                         },
                     )
                     .await;
@@ -1251,12 +1434,49 @@ async fn run_turn<W: AsyncWrite + Unpin + Send>(mut ctx: TurnCtx<W>, steps: Vec<
                     )
                     .await;
                 }
+                Step::Background(spec) => {
+                    let item = spec.launch_item.then(&mut key);
+                    if let Some(k) = &item {
+                        let cwd = ctx.options.cwd.display().to_string();
+                        emit(
+                            &w,
+                            Ev::ItemStarted {
+                                key: k.clone(),
+                                body: spec.launch_body(&cwd),
+                            },
+                        )
+                        .await;
+                    }
+                    // The task is reported before its launching item is closed.
+                    ctx.background.start(&w, spec, item.clone()).await;
+                    if let Some(k) = item {
+                        emit(
+                            &w,
+                            Ev::ItemCompleted {
+                                key: k,
+                                status: ItemStatus::Backgrounded,
+                                body: None,
+                            },
+                        )
+                        .await;
+                    }
+                }
                 Step::Unknown(name) => {
                     emit(
                         &w,
                         Ev::Notice {
                             level: NoticeLevel::Warning,
                             message: format!("unknown directive @{name}"),
+                        },
+                    )
+                    .await;
+                }
+                Step::Invalid(message) => {
+                    emit(
+                        &w,
+                        Ev::Notice {
+                            level: NoticeLevel::Warning,
+                            message,
                         },
                     )
                     .await;
@@ -1511,6 +1731,13 @@ mod tests {
             },
         )
         .await;
+        assert_eq!(
+            next_ev(&mut events).await,
+            Ev::PromptAck {
+                accepted: true,
+                own_run: false
+            }
+        );
         assert_eq!(next_ev(&mut events).await, Ev::TurnStarted);
         send(&mut ops, &Op::Interrupt).await;
         drop(ops);
@@ -1533,6 +1760,13 @@ mod tests {
             },
         )
         .await;
+        assert_eq!(
+            next_ev(&mut events).await,
+            Ev::PromptAck {
+                accepted: true,
+                own_run: false
+            }
+        );
         assert_eq!(next_ev(&mut events).await, Ev::TurnStarted);
         send(&mut ops, &Op::Interrupt).await;
         let status = loop {
@@ -1575,6 +1809,9 @@ mod tests {
                         assert_eq!(status, TurnStatus::Completed);
                         break;
                     }
+                    Ev::PromptAck {
+                        accepted: false, ..
+                    } => panic!("round {round}: the prompt was refused"),
                     Ev::Notice { message, .. } => panic!("round {round}: {message}"),
                     _ => {}
                 }

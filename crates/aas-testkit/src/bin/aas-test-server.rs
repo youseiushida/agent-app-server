@@ -5,7 +5,15 @@
 //!
 //! ```text
 //! aas-test-server --state-dir <dir> [--heartbeat-ms 300] [--client-timeout-ms 1500]
+//!                 [--idle-process-ttl-ms <ms>] [--background-progress-ms <ms>]
+//!                 [--background-stop-confirm-ms <ms>]
 //! ```
+//!
+//! The last three set the daemon's `policy.idle_process_ttl`, `background_progress_interval` and
+//! `background_stop_confirm_timeout` (defaults: the daemon's), so that a client test can see an
+//! idle agent stopped, coalesced progress, and an unconfirmed stop within its patience. The
+//! fake agent's background work (`@bg`, see `aas_adapter_fake::agent`) runs in the prompts
+//! like every other scenario.
 //!
 //! Output (stdout, one JSON object per line, flushed):
 //! * `{"event":"ready","wsUrl":…,"httpUrl":…,"token":…,"deviceId":…,"pairingCode":…,"root":…,"epoch":…,
@@ -94,16 +102,35 @@ struct Args {
     state_dir: PathBuf,
     heartbeat: Duration,
     client_timeout: Duration,
+    idle_process_ttl: Option<Duration>,
+    background_progress_interval: Option<Duration>,
+    background_stop_confirm_timeout: Option<Duration>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut state_dir = None;
     let mut heartbeat_ms = DEFAULT_HEARTBEAT_MS;
     let mut client_timeout_ms = DEFAULT_CLIENT_TIMEOUT_MS;
+    let mut idle_process_ttl = None;
+    let mut background_progress_interval = None;
+    let mut background_stop_confirm_timeout = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().with_context(|| format!("{name} needs a value"));
+        let mut millis = |name: &str| -> anyhow::Result<Option<Duration>> {
+            let v: u64 = value(name)?
+                .parse()
+                .with_context(|| format!("{name} must be a number"))?;
+            Ok(Some(Duration::from_millis(v)))
+        };
         match arg.as_str() {
+            "--idle-process-ttl-ms" => idle_process_ttl = millis("--idle-process-ttl-ms")?,
+            "--background-progress-ms" => {
+                background_progress_interval = millis("--background-progress-ms")?
+            }
+            "--background-stop-confirm-ms" => {
+                background_stop_confirm_timeout = millis("--background-stop-confirm-ms")?
+            }
             "--state-dir" => state_dir = Some(PathBuf::from(value("--state-dir")?)),
             "--heartbeat-ms" => {
                 heartbeat_ms = value("--heartbeat-ms")?
@@ -127,6 +154,9 @@ fn parse_args() -> anyhow::Result<Args> {
         state_dir,
         heartbeat: Duration::from_millis(heartbeat_ms),
         client_timeout: Duration::from_millis(client_timeout_ms),
+        idle_process_ttl,
+        background_progress_interval,
+        background_stop_confirm_timeout,
     })
 }
 
@@ -209,13 +239,21 @@ impl TestServer {
         std::fs::create_dir_all(paths.projects())?;
         let root = dunce::canonicalize(paths.projects())?;
         seed_native_sessions(&paths.native_sessions(), &root.join(NATIVE_PROJECT)).await?;
+        let defaults = Policy::default();
         let policy = Policy {
             heartbeat_interval: args.heartbeat,
             client_timeout: args.client_timeout,
             stop_grace: STOP_GRACE,
             interrupt_grace: INTERRUPT_GRACE,
             prevent_sleep_while_running: false,
-            ..Policy::default()
+            idle_process_ttl: args.idle_process_ttl.unwrap_or(defaults.idle_process_ttl),
+            background_progress_interval: args
+                .background_progress_interval
+                .unwrap_or(defaults.background_progress_interval),
+            background_stop_confirm_timeout: args
+                .background_stop_confirm_timeout
+                .unwrap_or(defaults.background_stop_confirm_timeout),
+            ..defaults.clone()
         };
         policy.validate().map_err(anyhow::Error::msg)?;
         Ok(Self {
@@ -411,9 +449,10 @@ impl TestServer {
         let (code, _) = engine.create_pairing_code().await?;
         let project = self.root.join(NATIVE_PROJECT);
         let store = SessionStore::new(self.paths.native_sessions());
+        let policy = self.policy.adapter_policy();
         let scan = {
             let project = project.clone();
-            tokio::task::spawn_blocking(move || store.scan(&project))
+            tokio::task::spawn_blocking(move || store.scan(&project, &policy))
                 .await
                 .context("listing the native sessions")?
                 .context("listing the native sessions")?
@@ -474,7 +513,7 @@ impl TestServer {
             "event": "nativeSession",
             "nativeSessionId": transcript.id,
             "cwd": cwd.display().to_string(),
-            "title": transcript.title(),
+            "title": transcript.title(&self.policy.adapter_policy()),
         }))
     }
 

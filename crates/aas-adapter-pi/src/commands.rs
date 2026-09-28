@@ -9,6 +9,12 @@
 //!
 //! A command of the same name listed by `get_commands` (an extension's own `/compact`) takes
 //! precedence: the adapter then neither adds nor intercepts it.
+//!
+//! Extension commands (`source: "extension"`) are also told apart from other prompts: pi runs
+//! them as soon as the prompt arrives, even while a run goes on, and answers the prompt only
+//! once the command's handler has returned (see [`is_extension_command`]).
+
+use std::collections::HashSet;
 
 use aas_harness::{Command, TurnInput, TurnInputPart};
 use aas_protocol::{CommandAction, CommandSource};
@@ -55,6 +61,27 @@ pub fn commands(pi_commands: Vec<PiCommand>) -> Vec<Command> {
         out.push(compact_command());
     }
     out
+}
+
+/// Invocation names of the extension commands in a `get_commands` listing (the names pi
+/// matches a prompt against).
+pub fn extension_command_names(pi_commands: &[PiCommand]) -> HashSet<String> {
+    pi_commands
+        .iter()
+        .filter(|c| c.source.as_deref() == Some("extension"))
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// Whether pi runs `message` (the prompt text as sent) as one of these extension commands. The
+/// same test as pi 0.85.1's `_tryExecuteExtensionCommand`: the text starts with `/` and the
+/// name, up to the first space, is a registered command's invocation name.
+pub fn is_extension_command(message: &str, extension_commands: &HashSet<String>) -> bool {
+    let Some(rest) = message.strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split_once(' ').map_or(rest, |(name, _)| name);
+    extension_commands.contains(name)
 }
 
 /// Recognises `/compact [instructions]` as the whole turn (a single text part). Returns the
@@ -125,5 +152,31 @@ mod tests {
             ],
         };
         assert_eq!(parse_compact(&with_image), None);
+    }
+
+    #[test]
+    fn extension_commands_are_matched_like_pi_does() {
+        let mut listed = vec![pi("aas-later"), pi("review:2")];
+        listed.push(PiCommand {
+            name: "skill:x".into(),
+            description: None,
+            source: Some("skill".into()),
+        });
+        let names = extension_command_names(&listed);
+        assert_eq!(names.len(), 2, "skills and templates are expanded, not run");
+        assert!(is_extension_command("/aas-later", &names));
+        assert!(is_extension_command("/aas-later 1500 some text", &names));
+        assert!(is_extension_command("/review:2 x", &names));
+        assert!(!is_extension_command("/skill:x", &names));
+        assert!(
+            !is_extension_command(" /aas-later", &names),
+            "pi needs the leading slash"
+        );
+        assert!(
+            !is_extension_command("/aas-later\tx", &names),
+            "pi splits at a space only"
+        );
+        assert!(!is_extension_command("aas-later", &names));
+        assert!(!is_extension_command("/", &names));
     }
 }

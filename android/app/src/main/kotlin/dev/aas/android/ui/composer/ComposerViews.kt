@@ -89,7 +89,8 @@ object ComposerTags {
  * The composer (docs/ux/codex-desktop.md §2, §8.2): the `/` palette or the `@` results right
  * above the input (so they stay above the keyboard), attached images, the multi-line input, then
  * a row of chips ([chips]: model, permission, context) with the image button and the send
- * button. The send button's long press runs [SendState.alternate].
+ * button. The send button's long press runs [SendState.alternate]. [interruptHint] is said under
+ * the composer while the button stops the turn (e.g. that background work goes on).
  */
 @Composable
 fun ComposerBar(
@@ -108,6 +109,7 @@ fun ComposerBar(
     onSend: (SendAction) -> Unit,
     modifier: Modifier = Modifier,
     inputEnabled: Boolean = true,
+    interruptHint: String? = null,
     chips: @Composable RowScope.() -> Unit = {},
 ) {
     Column(modifier.fillMaxWidth()) {
@@ -145,7 +147,7 @@ fun ComposerBar(
             if (imagesAllowed) AttachButton(inputEnabled, onPickImages, onTakePhoto)
             SendButton(send, onSend)
         }
-        sendHint(send)?.let {
+        (sendHint(send) ?: interruptHint?.takeIf { send.primary == SendAction.Interrupt && send.enabled })?.let {
             Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 4.dp))
         }
     }

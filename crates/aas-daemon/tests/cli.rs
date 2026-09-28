@@ -163,7 +163,7 @@ async fn stop_drain_waits_for_running_turns_and_a_later_stop_ends_it() {
 
     let (code, out, err) = dirs.cli(&["stop", "--drain"]);
     assert_eq!(code, 0, "{err}");
-    assert!(out.contains("after running turns finish"));
+    assert!(out.contains("after running turns and background work finish"));
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         daemon.child.try_wait().unwrap().is_none(),
@@ -172,7 +172,9 @@ async fn stop_drain_waits_for_running_turns_and_a_later_stop_ends_it() {
     let (code, out, _) = dirs.cli(&["status"]);
     assert_eq!(code, 0);
     assert!(
-        out.contains("draining:          true") && out.contains("running turns:     1"),
+        out.contains("draining:          true")
+            && out.contains("running turns:     1")
+            && out.contains("background work:   0"),
         "{out}"
     );
 

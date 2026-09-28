@@ -5,6 +5,9 @@
     "disposition": "started",
     "thread": {
       "archived": false,
+      "background": {
+        "running": 0
+      },
       "createdAt": 1790000000000,
       "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
       "diffAvailable": true,

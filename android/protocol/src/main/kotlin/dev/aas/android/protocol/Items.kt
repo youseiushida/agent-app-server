@@ -19,6 +19,12 @@ sealed interface Item {
     val startedAt: Millis
     val completedAt: Millis?
 
+    /**
+     * The background task this item launched (its status is then `backgrounded`; the task names
+     * the item as its origin).
+     */
+    val backgroundTaskId: BackgroundTaskId?
+
     @Serializable
     data class UserMessage(
         override val id: ItemId,
@@ -31,6 +37,7 @@ sealed interface Item {
         val attachments: List<Attachment> = emptyList(),
         val mentions: List<Mention> = emptyList(),
         val delivery: UserMessageDelivery = UserMessageDelivery.Normal,
+        override val backgroundTaskId: BackgroundTaskId? = null,
     ) : Item
 
     /** Markdown text. */
@@ -43,6 +50,7 @@ sealed interface Item {
         override val startedAt: Millis,
         override val completedAt: Millis? = null,
         val text: String,
+        override val backgroundTaskId: BackgroundTaskId? = null,
     ) : Item
 
     @Serializable
@@ -54,6 +62,7 @@ sealed interface Item {
         override val startedAt: Millis,
         override val completedAt: Millis? = null,
         val text: String,
+        override val backgroundTaskId: BackgroundTaskId? = null,
     ) : Item
 
     @Serializable
@@ -71,6 +80,7 @@ sealed interface Item {
         val outputBlobId: BlobId? = null,
         val exitCode: Int? = null,
         val durationMs: Long? = null,
+        override val backgroundTaskId: BackgroundTaskId? = null,
     ) : Item
 
     @Serializable
@@ -82,6 +92,7 @@ sealed interface Item {
         override val startedAt: Millis,
         override val completedAt: Millis? = null,
         val changes: List<FileChange>,
+        override val backgroundTaskId: BackgroundTaskId? = null,
     ) : Item
 
     @Serializable
@@ -100,6 +111,7 @@ sealed interface Item {
         val output: String? = null,
         val outputTruncated: Boolean = false,
         val outputBlobId: BlobId? = null,
+        override val backgroundTaskId: BackgroundTaskId? = null,
     ) : Item
 
     @Serializable
@@ -111,6 +123,7 @@ sealed interface Item {
         override val startedAt: Millis,
         override val completedAt: Millis? = null,
         val entries: List<PlanEntry>,
+        override val backgroundTaskId: BackgroundTaskId? = null,
     ) : Item
 
     @Serializable
@@ -124,6 +137,7 @@ sealed interface Item {
         val level: NoticeLevel,
         val message: String,
         val code: String? = null,
+        override val backgroundTaskId: BackgroundTaskId? = null,
     ) : Item
 
     /** An item kind this client does not know; the raw object is kept verbatim. */
@@ -135,6 +149,7 @@ sealed interface Item {
             get() = ItemStatus.entries.firstOrNull { it.wire == raw.strOrNull("status") } ?: ItemStatus.Unknown
         override val startedAt: Millis get() = raw.long("startedAt")
         override val completedAt: Millis? get() = raw.longOrNull("completedAt")
+        override val backgroundTaskId: BackgroundTaskId? get() = raw.strOrNull("backgroundTaskId")
     }
 
     object Serializer : TaggedUnionSerializer<Item>("Item", "kind") {
@@ -192,6 +207,11 @@ data class Interaction(
     val threadId: ThreadId,
     val turnId: TurnId? = null,
     val itemId: ItemId? = null,
+    /**
+     * The background task that asked (protocol.md §3.1 "Interaction の所属"): it outlives the turn
+     * and expires `taskEnded` when the task ends. Neither this nor [turnId]: it belongs to the thread.
+     */
+    val backgroundTaskId: BackgroundTaskId? = null,
     val status: InteractionStatus,
     val createdAt: Millis,
     val resolvedAt: Millis? = null,

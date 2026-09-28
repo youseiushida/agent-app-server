@@ -104,6 +104,26 @@ class SyncEngineSyncTest {
     }
 
     @Test
+    fun anOpenThreadShowsItsBackgroundTasksAndTheirUpdates() = withFixture { f ->
+        f.server.snapshot = snapshot(0)
+        val agent = Samples.backgroundTask("bgt_2", startedAt = 7, title = "Review the reconnect logic")
+        val shell = Samples.backgroundTask("bgt_1", startedAt = 3, kind = dev.aas.android.protocol.BackgroundTaskKind.Shell, title = "npm run dev")
+        f.server.threadReads["thr_1"] = threadRead(10).copy(backgroundTasks = listOf(shell, agent))
+        f.connect()
+        f.awaitOnline()
+        val state = f.engine.openThread("thr_1")
+        eventually(what = "live thread") { state.value.takeIf { it.sync == ThreadSync.Live } }
+        assertEquals(listOf("bgt_1", "bgt_2"), state.value.backgroundTasks.map { it.id }, "by start")
+        val stopping = shell.copy(stopRequestedAt = 20)
+        f.server.append(threadStream("thr_1"), Event.BackgroundTaskUpdated(stopping), seq = 11)
+        f.server.lastConnection.pushNew(threadStream("thr_1"))
+        eventually(what = "stop requested") { state.value.backgroundTasks.firstOrNull { it.id == "bgt_1" }?.takeIf { it.stopRequestedAt == 20L } }
+        // Stored for other screens (the inbox's approvals of a background task).
+        assertEquals(mapOf("bgt_2" to agent), f.engine.storedBackgroundTasks(listOf("bgt_2", "bgt_missing")))
+        assertEquals(emptyMap(), f.engine.storedBackgroundTasks(emptyList()))
+    }
+
+    @Test
     fun openingAThreadReadsItThenSubscribesAfterItsHead() = withFixture { f ->
         f.server.snapshot = snapshot(0)
         f.server.threadReads["thr_1"] = threadRead(10, Samples.agentMessage("itm_1", "Hi"))

@@ -21,11 +21,14 @@ enum class ProjectSort {
 data class ProjectRow(
     val project: Project,
     val threads: Int,
-    /** The most urgent status among its threads (承認が必要 > 入力が必要 > エラー > 実行中 > 待機中). */
+    /** The most urgent status among its threads (承認が必要 > 入力が必要 > エラー > 実行中 > バックグラウンド > 待機中). */
     val activity: ThreadActivity,
     val approvals: Int,
     val questions: Int,
+    /** Threads whose agent works (a turn or background work). */
     val running: Int,
+    /** Background tasks running in threads whose status is バックグラウンドで実行中 (the chip's count). */
+    val backgroundRunning: Int,
     val errors: Int,
     val unread: Int,
     /** Messages waiting in the daemon's queues of its threads (`Thread.queuedInputs`). */
@@ -82,7 +85,9 @@ object ProjectLists {
             activity = activities.minByOrNull { it.ordinal } ?: ThreadActivity.Idle,
             approvals = pending.count { it.request !is InteractionRequest.Question },
             questions = pending.count { it.request is InteractionRequest.Question },
-            running = activities.count { it == ThreadActivity.Running },
+            running = activities.count { it.working },
+            backgroundRunning = threads.filter { ThreadActivity.of(it.thread, workspace.pendingInteractions) == ThreadActivity.Background }
+                .sumOf { it.thread.background.running },
             errors = activities.count { it == ThreadActivity.Error },
             unread = threads.count { it.unread },
             queued = threads.sumOf { it.thread.queuedInputs },

@@ -53,10 +53,36 @@ android/
 |---|---|
 | `harnessUnavailable` が `data.harnessId` と `data.reason` を持つ（確定でない。サーバは使えないハーネスを予定に従って、また断る前に probe し直す） | `RpcError.harnessId` / `reason`（:protocol）。outbox の要求はハーネスを待つ（6.3）。黙って再送し続けず、理由を画面に出し、`harness/updated` で使えるようになったら待たずに送る。画面は 24.2 / 24.4 / 24.5、設定は 14章 |
 | `harness/refresh` の結果が変われば `harness/updated`。背景の probe、断る前の probe、ハーネスを使えないとして失敗した起動でも出る | 変更なし（workspace ストリームで適用）。使えるようになったハーネスを待っている要求を送り出す（6.3） |
-| `thread/fork`・`native/list`・`native/import` が使えないハーネスで `harnessUnavailable`（以前は `capabilityUnsupported`） | 分岐と取り込みも待つ（6.3）。`native/list` は取り込み画面が理由と「再確認」を出す（24.2） |
+| `thread/fork`・`native/list`・`native/import` が使えないハーネスで `harnessUnavailable`（以前は `capabilityUnsupported`） | 分岐と取り込みも待つ（6.3）。`native/list` は取り込み画面が理由と「再確認」を出す（24.2）。断る前の probe で使えるようになり、能力がないと分かったハーネスは `capabilityUnsupported`（確定）になる。取り込み画面はそのハーネスを選択肢から外し、次に一覧するハーネスへ移って理由をスナックバーで伝える（24.2） |
 | `server/shuttingDown.restartExpected` は、watchdog の下の daemon が失敗で止まるとき（今は `storageFailure`）だけ `true` | `SyncStatus.serverRestartExpected`。`false` なら接続バーと常駐通知は「サーバが停止しています · PC でサーバが起動されたら再接続します」（「再起動しています」と言わない）。再接続はいつもどおりバックオフで続ける |
 | worktree の不正な `baseRef` / `branch` は `invalidParams`（確定。以前は git の `invalidState`） | 変更なし（確定エラーとして下書きを戻し、シェルがサーバの理由を出す。24.4） |
 | 管理 API の `POST /v1/admin/harnesses/refresh` | 対象外（PC の中だけの API） |
+
+### 2.3 サーバとハーネスのデータへの備え（2026-09、取り込み画面のクラッシュ）
+
+実機で「PC のセッションを取り込む」を Codex で開くとアプリが落ちた。Codex app-server の `thread/list` は、別の場所（Codex desktop など）で resume したスレッドを rollout ごとに1件ずつ返し（同じ id、`updatedAt` だけ違う、同じ題名）、daemon はそれを `native/list` にそのまま渡していた（4 つのプロジェクトのうち 3 つで、1 ページの中に 2〜3 件）。取り込み画面は `LazyColumn` の行を `nativeSessionId` で key にしていて、Compose は同じ key が2回あると例外を投げる。
+
+| 変更 | アプリ |
+|---|---|
+| サーバのデータで落ちない | 画面が id を key にする一覧は、アプリに入るところ（repository、`data/ServerLists.kt`）で id ごとに1件にする。同じ id が複数あれば警告を診断のログ（`[data]`）に残す。`native/list` は `updatedAt` の最も新しいものを残す（10.4）。daemon も Codex の重複を除くようになるが、アプリはそれに頼らない |
+| daemon がハーネスの `resume` コマンドを出さなくなる（`command/list`） | アプリ側の `/resume`（25章）。古い daemon が出しても、ハーネスの `resume` はパレットに出さず、打った `/resume` も送らない |
+
+### 2.4 サーバ側の変更への追従（2026-09、バックグラウンドの作業）
+
+ハーネスがターンの外で動かす作業（バックグラウンドのエージェント・シェル・ワークフローなど）がプロトコルに入った（protocol.md 3.1「バックグラウンドタスク」、design.md 5.6）。アプリ側の全体は 30章。
+
+| サーバの変更 | アプリ |
+|---|---|
+| `BackgroundTask` と thread ストリームの `backgroundTask/updated`（常にタスク全体） | :protocol の型。`EventApplier` がタスクを丸ごと置き換えて保存し（15.1 の `background_tasks`）、`ThreadState.backgroundTasks` に出す（3〜5章） |
+| `Thread.background`（`running` と `lastEnded`） | スレッドの状態の語彙に「バックグラウンドで実行中 (N)」（10.4）。`lastEnded` が後の終わりに進んだことから `SyncSignal.BackgroundTaskFinished`（4.4）と通知（12章） |
+| `thread/read` の `backgroundTasks` | 読み直しでスレッドのタスクを置き換える。古いページはまだないタスクだけ足す（ストリームが先に進めたものを戻さない） |
+| `backgrounded` の Item と `Item.backgroundTaskId` | 起動した Item にタスクの状態のチップ（26章） |
+| `Interaction.backgroundTaskId`、`expireReason` の `taskEnded`、ターンに属さない Interaction | 承認・質問のカードと通知がどのタスクからかを言う。ターンのない Interaction は、求められた時刻のターンの後に並べる（26章） |
+| `Turn.trigger`（`backgroundTask` / `scheduled`） | ターンの区切りに「バックグラウンド作業の完了を受けて」「予約した時刻に再開」（26章） |
+| `backgroundTask/stop` ★ | 1つのタスクの「停止」（確認あり）。outbox 経由で、`turn/interrupt` と `thread/stop` と同じく再送待ちの要求を追い越す（6.3） |
+| 能力 `backgroundTasks` / `backgroundStop` | 「停止」はハーネスが `backgroundStop` を持つときだけ。`backgroundTasks` を持つハーネスでは、ターンの停止ボタンに「ターンを止めます（バックグラウンドの作業は続きます）」（25章） |
+| `server/status` の `runningBackgroundTasks` | 設定のサーバの「実行中」に「バックグラウンドの作業 n」（14章） |
+| 新しい enum 値（`ItemStatus.backgrounded`、`ExpireReason.taskEnded`、`BackgroundTaskKind` など） | 知らない値は各 enum の `Unknown`（`BackgroundTaskStatus.isTerminal` は知らない値を「終わった」とみなす） |
 
 ## 3. :sync の構成
 
@@ -94,8 +120,8 @@ engine.start()                                      // stop() は Job を返す
 | `status: StateFlow<SyncStatus>` | 接続状態 `connection`、`lastSyncAtMs`（最後に同期が取れていた時刻。永続化される）、`pendingOutbox`、`server`、`deviceId`、`policy`、`serverShuttingDown` と `serverShutdownReason`、`lastError`、診断値（`reconnects`、`stallResubscribes`、`cursors`、`serverHeads` など） |
 | `workspace: StateFlow<WorkspaceState>` | `harnesses`、`projects`（名前順）、`threads`（`ThreadEntry(thread, unread)`。`lastActivityAt` の降順で `thread/list` と同じ）、`pendingInteractions`、`operations`（新しい順）、`synced` |
 | `outbox: StateFlow<List<OutboxEntry>>` | まだ確定した応答のない要求（作った順） |
-| `openThread(id): StateFlow<ThreadState>` | 開いたスレッドの `thread`、`turns`、`items`、`interactions`、`queued`、`hasMoreBefore`、`commandsVersion`、このスレッド宛ての outbox の要求 `pending`、同期の状態 `sync`（`Cached` / `Loading` / `Live` / `Failed` / `Removed`）と、`Failed` の理由 `loadError` |
-| `signals: SharedFlow<SyncSignal>` | 通知のきっかけ: `InteractionPending`、`InteractionClosed`、`TurnFinished`、`OperationFinished`、`ThreadRemoved` |
+| `openThread(id): StateFlow<ThreadState>` | 開いたスレッドの `thread`、`turns`、`items`、`interactions`、`backgroundTasks`（読み込んだターンのタスクと動いているすべてのタスク。開始の古い順）、`queued`、`hasMoreBefore`、`commandsVersion`、このスレッド宛ての outbox の要求 `pending`、同期の状態 `sync`（`Cached` / `Loading` / `Live` / `Failed` / `Removed`）と、`Failed` の理由 `loadError` |
+| `signals: SharedFlow<SyncSignal>` | 通知のきっかけ: `InteractionPending`、`InteractionTaskKnown`、`InteractionClosed`、`TurnFinished`、`BackgroundTaskFinished`、`OperationFinished`、`ThreadRemoved` |
 | `refreshingHarnesses: StateFlow<Set<String>>` | この端末の `harness/refresh` が応答を待っているハーネス（画面の「確認しています…」）。プロトコルには probe 中という状態がないので、この端末の要求だけを表す |
 | `results: SharedFlow<OutboxResult>` | outbox の要求の最終結果: `Succeeded` / `Failed`（確定エラー）/ `Discarded`（`resetLocalData`、`discardOutbox`） |
 
@@ -149,14 +175,19 @@ engine.start()                                      // stop() は Job を返す
   - `retryThread(id)`: 読み込みに失敗したスレッド（`ThreadSync.Failed`）を読み直す。オフラインなら何もしない（次の接続で開いているスレッドはすべて読み込まれる）。
   - `loadOlder(id)`: 読み込み済みの最古のターンより前のページ。まだ前があれば `true`。
   - `markViewed(id)` / `markUnread(id)`: 端末ごとの未読（design.md 15章）。スレッドの要約の `head` が見た位置より先なら未読。
+- `storedBackgroundTasks(ids)`: 端末に保存されたバックグラウンドタスクのうち [ids] のもの（そのスレッドをこの端末で開いたことがあるもの）。要対応のタブが、承認を求めたタスクの題名を出すのに使う（13章）。
 - `resetLocalData()`: ペアリング解除。同期データ、読み取り位置、epoch、outbox をすべて消す。
 
 ### 4.4 通知に使う SyncSignal
 
 - 変更がストアにコミットされた後に1回だけ出る。再送されたイベント（`seq <= 読み取り位置`）は適用しないので、同じ通知が二重に出ることはない。
-- `InteractionPending`: 承認・質問が保留になった（workspace と thread のどちらのストリームで先に届いても1回）。スナップショットで受け取った保留中のものも出る（注意が必要な状態のため）。
+- `InteractionPending`: 承認・質問が保留になった（workspace と thread のどちらのストリームで先に届いても1回）。スナップショットで受け取った保留中のものも出る（注意が必要な状態のため）。バックグラウンドタスクが求めたもの（`backgroundTaskId`）は、そのタスクが端末に保存されていれば `backgroundTask` に入る（同じトランザクションで読む）。
+- `InteractionTaskKnown(interaction, task)`: 保留中の Interaction を求めたタスクが、その Interaction より後に初めて保存された。workspace ストリーム（`interaction/pending`）が thread ストリームのタスク（`backgroundTask/updated`）より先に届くと、`InteractionPending` はタスクなしで出るので、タスクを初めて保存したとき（イベント、スレッドを初めて読んだとき）にその保留中の Interaction ごとに1回出す。既に保存していたタスクの更新や読み直しでは出ない。
 - `InteractionClosed`: 保留が解決・失効した（通知を消す）。
 - `TurnFinished(thread, turn)`: スレッドの要約の `lastTurn` が、実行中（または別のターン）から終了状態になった。サーバの明示的な状態の遷移で判定する。初めて見たスレッドが既に終わったターンを持っていても出さない（取り込みや fork）。
+- `BackgroundTaskFinished(thread, ended)`: スレッドの要約の `background.lastEnded` が、保存している要約のものより後の終わりに進んだ（サーバの順: `endedAt`、同じなら `taskId`。別のタスクの終わりと、同じタスクの次の run の終わり）。`TurnFinished` と同じく要約の明示的な変化で判定し、初めて見たスレッドでは出さない。同じ要約を両方のストリームで受け取っても1回。
+  - サーバの `lastEnded` は後の終わりにだけ進む（protocol.md 3.1。最後に終わったタスクが新しい run を始めても、前の run の終わりのまま）。同じ終わりがもう一度届いたとき（`endedAt` はそのままで `status` や `title` が直された、スレッドの題名が変わった、など）は出さない。前の終わり（またはなし）に戻る古い daemon を相手にしても、戻った先の終わりは終わったときにもう知らせているので出さない（要約はサーバのとおりに保存する）。
+  - `ambient` のタスク（ハーネスが「活動ではない」としたもの）の終わりは、サーバが `lastEnded` に入れないので出ない。アイドル回収やプロセスの終了でそれが止まっても、「止まりました」や「失われました」の通知にならない。
 - `OperationFinished`: clone などが `running` から終わった。
 - `ThreadRemoved`: サーバでスレッドが消えた。
 - `signals` はホットなフローなので、通知を出す間（foreground service の間）ずっと collect する。遅い collector のために 1024 件まで溜め、それを超えたら `status.droppedSignals` に数える。
@@ -168,10 +199,10 @@ engine.start()                                      // stop() は Job を返す
 1. **原子性**: 1つのブロックの書き込みは、すべてコミットされるか、何も残らない（`CancellationException` を含む例外で終わった場合）。エンジンは `stream/batch` の適用と読み取り位置の更新を1つのブロックで行う（protocol.md 2.1、7.1）。
 2. **直列化**: ブロックは重ならない。Room では `withTransaction` を使う。エンジンはトランザクションを入れ子にしない。
 3. **永続性**: `transaction` が返った時点で、書き込みはプロセスが死んでも残る。outbox の要求はフレームを送る前にコミットする（protocol.md 1.2、7.4）ので、サーバが実行したかもしれない要求を忘れない。
-4. **epoch の wipe でも outbox は残す**: `wipeSyncedData()` は同期データ（epoch、読み取り位置、最終同期時刻、ハーネス、プロジェクト、スレッド、ターン、Item、Interaction、キュー、Operation、スレッドのメタデータ、未読の状態）を消し、outbox だけを残す。
-5. `removeThread(id)` はそのスレッドのすべて（ターン、Item、Interaction、キュー、メタデータ、未読の状態、ストリームの読み取り位置）を消す。
-6. `clearThreadContent(id)` はターン、Item、キューだけを消す（Interaction、要約、メタデータ、読み取り位置は残す）。
-7. 並び順: `turnsOf` は index の昇順、`itemsOf` は `ItemPosition`（ターンの index、次に `seq`）の昇順、`interactionsOf` は `createdAt`、次に id の昇順、`outbox()` は追加した順。`updateOutbox` は位置を変えず、存在しなければ何もしない。`removeOutbox` は存在したかを返す。
+4. **epoch の wipe でも outbox は残す**: `wipeSyncedData()` は同期データ（epoch、読み取り位置、最終同期時刻、ハーネス、プロジェクト、スレッド、ターン、Item、Interaction、バックグラウンドタスク、キュー、Operation、スレッドのメタデータ、未読の状態）を消し、outbox だけを残す。
+5. `removeThread(id)` はそのスレッドのすべて（ターン、Item、Interaction、バックグラウンドタスク、キュー、メタデータ、未読の状態、ストリームの読み取り位置）を消す。
+6. `clearThreadContent(id)` はターン、Item、バックグラウンドタスク、キューだけを消す（Interaction、要約、メタデータ、読み取り位置は残す）。新しい `thread/read` が、返したターンのタスクと動いているすべてのタスクを入れ直す。
+7. 並び順: `turnsOf` は index の昇順、`itemsOf` は `ItemPosition`（ターンの index、次に `seq`）の昇順、`interactionsOf` は `createdAt`、次に id の昇順、`backgroundTasksOf` は `startedAt`（今の run の開始）、次に id の昇順、`outbox()` は追加した順。`updateOutbox` は位置を変えず、存在しなければ何もしない。`removeOutbox` は存在したかを返す。`upsertBackgroundTask` はタスク全体を置き換える。
 
 アプリの実装は `RoomSyncStore`（`dev.aas.android.data.db`）。テーブルとスキーマの移行の方針は 15.1、15.2。`SyncStoreContract` を継承した `RoomSyncStoreTest` がこの契約を検査する。UI は Room を直接読まず、エンジンの StateFlow を使う（エンジンがコミット後の書き込みを写し取るので、Room の Flow と二重に購読しなくてよい。design.md 15章の「UI は Room を Flow で読む」はこの形で実現している）。
 
@@ -197,13 +228,14 @@ engine.start()                                      // stop() は Job を返す
 - 同じエンティティについて workspace と thread のストリームが順不同で届く点は、明示的な状態で順序を決める。
   - スレッドの要約は `Thread.head` で比べる（大きい方が新しい。時計の `updatedAt` は使わない）。`thread/read` の要約も同じ規則。
   - Interaction は解決・失効したら `pending` に戻さない。`interaction/closed` は状態だけを変え、時刻などは作らない。
+  - バックグラウンドタスクは `backgroundTask/updated` で丸ごと置き換える（同じストリームの中では順に届く。終わったタスクが同じ id の次の run で `running` に戻ることがあるので、状態の単調性は仮定しない）。古いページの `thread/read` は、まだ保存していないタスクだけを足す（その読み取りより後のイベントで既に進んだタスクを、ページの古い写しで戻さない）。
 - 購読していないストリーム（閉じたスレッド）のバッチは無視する。
 - `events` が空のバッチ（protocol.md 2.1）は、読み取り位置を `head` に進める（読み取り位置より前なら何もしない。読み取り位置のないストリームも何もしない）。サーバは、読み取り位置より後のイベントが保持期間で消え、head だけが先にあるときに1回だけ送る。以前はこれを捨てていたため、たとえばスレッドの最後の `native` イベントが消えた後に再接続すると、heartbeat の head が読み取り位置より先に見え続け、`clientTimeoutMs` ごとに再購読を繰り返し、同期が取れていないと表示し続けた。
 
 ### 6.3 outbox
 - 要求はコミットしてから送り、再送はいつも同じ `clientRequestId`。成功か確定エラー（protocol.md 1.3）で消え、それ以外（`draining`、`harnessUnavailable`、応答なしなど）は `failures` と `nextAttemptAtMs` を記録して、`outboxRetryDelayMs` の後に再送する。
 - 順序: 同じスレッド・同じプロジェクト・同じ Interaction の要求は1つずつ（前の要求の最終結果を待ってから次を送る）。再送が後の要求を追い越さない。レーンが違う要求は並行に送る。どれにも当たらない要求（`project/open`、`fs/mkdir` など）は1つの共通のレーンで順に送る（フォルダを作ってから開く、の順序を守るため）。
-- 止める操作だけは待たない: レーンの先頭の要求が再送待ち（送信中ではない）なら、その後ろの `turn/interrupt` と `thread/stop` は先に送る（その2つの間の順序は守る）。steer が失敗し続ける、ハーネスが消えたなど、サーバが今は受け付けない入力のせいで、暴走したエージェントを止められなくならないため。送信中の要求は待つ（サーバは同じスレッドの要求を到着順に1つずつ処理するので、先に送っても先には処理されない）。
+- 止める操作だけは待たない: レーンの先頭の要求が再送待ち（送信中ではない）なら、その後ろの `turn/interrupt`、`thread/stop`、`backgroundTask/stop` は先に送る（それらの間の順序は守る）。steer が失敗し続ける、ハーネスが消えたなど、サーバが今は受け付けない入力のせいで、暴走したエージェントやそのバックグラウンドの作業を止められなくならないため。送信中の要求は待つ（サーバは同じスレッドの要求を到着順に1つずつ処理するので、先に送っても先には処理されない）。
 - 利用者が外せる: `discardOutbox`。スレッド画面の送信待ちのメッセージの「送信を取り消す」と、診断画面の outbox の「破棄」から。確定でない失敗（`adapterError`、`harnessUnavailable` など）が続いて止まったレーンから抜ける手段で、以前は `resetLocalData`（ペアリングの解除）しかなかった。
 - **ハーネスを待つ要求**（`harnessUnavailable`、protocol.md 1.3）: サーバは断る前にハーネスを probe し直しているので、同じ要求をタイマーで送り直しても答えは変わらない。そのため:
   - 要求は outbox に残し（確定ではない）、`OutboxEntry.waitingForHarness` にハーネス（`data.harnessId`、なければ要求の `harnessId`、なければスレッドのハーネス）、`lastError` にサーバの理由（`data.reason`、なければ `message`）を記録する。どちらも分からない要求は、ほかの確定でない失敗と同じくタイマーで再送する。
@@ -221,6 +253,8 @@ engine.start()                                      // stop() は Job を返す
   - そのため、この端末が自分で接続し直したとき（ネットワークの切り替え、watchdog）に、サーバがまだ古い接続を覚えていて古いソケットへ `connection/replaced` と 4000 を送っても、「別の場所で接続中」にはならない。
   - 今のソケットへの 4000 は、同じトークンを持つ別の接続（別のインストール、復元した端末など）が本当にある。自動では取り返さない（2つが交互に取り返し続ける）。前面では注意のバナー、背面では通知（11.5）で利用者に知らせ、利用者の「再接続」か前面復帰で取り返す。
 - watchdog: どのフレームも `clientTimeoutMs`（`initialize` の値。それまでは `initialClientTimeoutMs`）の間届かなければソケットを捨てて再接続する。クライアントからの Ping は送らない（サーバの Ping への Pong は OkHttp が返す）。
+  - 無通信の時間は `Clock.monotonicMs()` で測る。これは端末のスリープ中も進む時計でなければならない。アプリは `SystemClock.elapsedRealtime()`（`AndroidClock`）を渡す。以前は `System.nanoTime()`（JVM の既定。Android ではディープスリープ中に止まる）だったので、スリープの間に死んだソケットに起きた後も気づかず、「接続済み」と出し続けていた。`:sync` のテストは注入した時計（`Clock.System` か、スリープを模す時計）を使う。
+  - watchdog のタイマー（コルーチンの `delay`）もディープスリープ中は止まる。そのため `onAppForeground()`（アプリの前面復帰）と `onNetworkAvailable()`（ネットワークが使えるようになった）で、その場で無通信の時間を測り直す（`checkLiveness`）。`clientTimeoutMs` を超えていればソケットを捨て、バックオフを待たずにつなぎ直す（接続に失敗したわけではなく、利用者が画面を見ている）。超えていなければ、残りの時間で watchdog を掛け直す。既定のネットワークが替わったとき（`onNetworkChanged()`）は、測らずにソケットを捨てる（以前から）。
 - 止まったストリーム: heartbeat の `heads` がストリームの読み取り位置より先なのに、`clientTimeoutMs` の間その読み取り位置が進まなければ、同じ接続でそこから再購読する。以前の「heartbeat 2回」という閾値は根拠のない推定だったので、protocol.md 2.2 のタイムアウトに置き換えた。
 - バックオフ: full jitter（`uniform(0, min(上限, 基準 × 2^試行回数))`、上限 30 秒）。
 - close code（protocol.md 2.3）:
@@ -246,6 +280,7 @@ engine.start()                                      // stop() は Job を返す
 
 - `SyncEngine` はプロセスに1つ（`AppContainer.engine`）。動かす期間（`start()` 〜 `stop()`）は foreground service の `ConnectionService` が持つ。
 - `registerDefaultNetworkCallback` → `onNetworkAvailable()` / `onNetworkChanged()` / `onNetworkLost()`、`ProcessLifecycleOwner` の ON_START → `onAppForeground()`、利用者の「再接続」→ `reconnectNow()`。
+- 時計はスリープ中も進むもの（`clock = AndroidClock`、`SystemClock.elapsedRealtime()`）を渡す（6.4）。
 - 通知は service が `signals` と `results` を collect して出す。承認の通知のボタンは `enqueue(Methods.InteractionRespond)`（outbox 経由なので、オフラインでも送信待ちとして残る）。
 - 送信待ちの表示: `ThreadState.pending`（このスレッド宛てで outbox にある要求）と `SyncStatus.pendingOutbox`。応答が来て outbox から消えるのと、その入力の `item/started` が届くのは別々に起きる。
 
@@ -299,20 +334,26 @@ AAS_TEST_SERVER="$(cygpath -w ../target/aas-test-bin/aas-test-server.exe)" ./gra
 | `replacedAndRevokedConnectionsFollowTheCloseCodes` | 同じデバイスの2つ目の接続で 4000（自動では取り返さない、前面復帰で取り返す）。別のデバイスからの `device/revoke` で 4001 |
 | `nativeSessionsAreListedImportedAndResumed` | fake ハーネスのネイティブセッション（テストサーバが `nativeProject` に2つ記録済み）: `harness/refresh`、`native/list`（ready 行の `nativeSessions` と一致、`importedThreadId` なし）、`native/import`（完了済みの2ターン、各種の Item、ローカル = `thread/read`）、取り込み済みの表示と2回目の取り込みが同じスレッド、次のターンが同じセッションの続き（セッションのファイルが 3 ターンに）、後から記録したセッション（`native-session` コマンド）が別のフォルダのプロジェクトに出る |
 | `aForkBranchesTheThreadAndItsNativeSession` | `thread/fork`: `forkedFrom`（元のスレッドと最後のターン）、履歴が新しい ID で複製、最初のターンで自分のネイティブセッションができる（`native/list` の `importedThreadId`）、元のスレッドは変わらない、ローカル = サーバ |
+| `aBackgroundShellKeepsItsAgentUntilItIsStoppedFromThePhone` | `idle_process_ttl` 1.5 秒のサーバで `@bg dev kind=shell ms=0`: ターンは終わり、起動したコマンドは `backgrounded` でタスクを指し（タスクの `originItemId` はその Item）、要約は `running: 1`。アイドルの時間の3倍待ってもプロセスは止まらない（`ready` のまま、タスクは `running`）。`backgroundTask/stop` の応答は `stopRequestedAt` だけで、その後ハーネスが `stopped`（`endReason: harness`）を報告し、`BackgroundTaskFinished` が1回、要約は `running: 0` と `lastEnded`、そしてアイドルで止まる（`idle`）。ローカル = `thread/read` と `thread/list` |
+| `ambientWorkEndsWithTheIdleAgentWithoutTellingThePhone` | `idle_process_ttl` 1.5 秒のサーバで `@bg mon kind=monitor ms=0 ambient`: `ambient` のタスクが動いていてもアイドルで止まり、タスクは `stopped`（`endReason: idleStop`）。要約は `running: 0` で `lastEnded` はなく、`BackgroundTaskFinished` は出ない（`ambient` でない次のタスク `@bg build kind=shell ms=200` の終わりは1回出る） |
+| `aBackgroundAgentAsksWhileNoTurnRunsAndItsEndWakesTheAgent` | `@bg rev ms=300 wake approve`: ターンが終わった後の承認はタスクに属し（`turnId` なし、`backgroundTaskId`）、シグナルか直後の `InteractionTaskKnown` がタスクの題名を持つ。許可するとタスクが完了し、エージェントが自分でターンを始める（`trigger: backgroundTask`、userMessage なし）。`BackgroundTaskFinished` と `TurnFinished`。ワークフロー（`kind=workflow progress=3`）はエージェントの一覧を報告しながら完了する |
+| `anUnconfirmedStopAThreadStopAndACrashEndTasksWithTheirReasons` | `background_stop_confirm_timeout` 0.8 秒のサーバで、停止を無視するタスク（`stubborn`）: 停止の後 `stopUnconfirmedAt` が付き `stopRequestedAt` が外れ、タスクは動いたまま（何もエスカレートしない）。`thread/stop` で `stopped` / `threadStopped`。次のタスクはエージェントの `@crash` で `lost` / `processExited`、`BackgroundTaskFinished` も `lost` |
 
 - `AasTestServer.Ready` は `nativeSessionsDir`、`nativeProject`、`nativeSessions` も読む。`nativeSession(folder, prompt)` がテストサーバの `native-session` コマンド（PC で CLI を使った記録を足す）。
+- `AasTestServer.start(..., policy = Policy(idleProcessTtlMs, backgroundProgressMs, backgroundStopConfirmMs))` がテストサーバのポリシーのフラグ（`--idle-process-ttl-ms` など）を渡す。バックグラウンドのテストは、既定のサーバを止めて（そのエージェントのプロセスが残っていないことも確かめて）このサーバに替える。
+- ローカル = サーバの比較（`assertThreadMatchesServer`）はバックグラウンドタスク（`thread/read` の `backgroundTasks`）も比べる。
 | `chaosSeed1〜3` | シード付きの乱数で drop / delay / blackhole を起こしながら、`@stream`、`@approve`、`@bigoutput` のターンを 10 回。ターン数、入力の重複・欠落、承認が1回ずつ解決、ローカルの状態 = サーバ。失敗したらシードを出力する |
 
 ### 9.3 単体テスト
 - `FixturesTest` / `TolerantDecodingTest`（:protocol）
-- `EventApplierTest`: 冪等な適用、結合 delta、重なる delta、`head` による順序、Interaction の単調性、signals、スナップショット、`thread/read`、古いページの並び順
+- `EventApplierTest`: 冪等な適用、結合 delta、重なる delta、`head` による順序、Interaction の単調性、signals、スナップショット、`thread/read`、古いページの並び順、キューに同じ id が2回あっても1件（最初の位置）にして警告すること。バックグラウンドタスク: `backgroundTask/updated` がタスク全体を置き換えること（次の run も）、`BackgroundTaskFinished` が `lastEnded` の変化で1回（初めて見たスレッド・同じ要約・古い要約では出ない、同じタスクの次の終わりと `lost` では出る）、最後に終わったタスクがもう一度動いても、同じ終わりの `status` が直されても、古い daemon のように `lastEnded` が前の終わりやなしに戻っても出ないこと（その後の次の終わりは出る。同じミリ秒の終わりは `taskId` の順）、`thread/read` がタスクを置き換え、古いページが先に進んだタスクを戻さないこと、タスクの承認の `InteractionPending` が保存済みのタスクを持つこと、タスクより先に届いた承認がタスクの保存で `InteractionTaskKnown` として1回だけ出直すこと（後の更新と読み直しでは出ない、初めて読んだスレッドでは出る）
 - `InMemorySyncStoreTest`（`SyncStoreContract`）
-- `SyncEngineSyncTest`: 初回同期、再購読、head の巻き戻りでの取り直し、スレッドを開く手順、重複と結合 delta、epoch の変更、削除されたスレッド、signals、未読、オフライン表示、古いページ
+- `SyncEngineSyncTest`: 初回同期、再購読、head の巻き戻りでの取り直し、スレッドを開く手順、重複と結合 delta、epoch の変更、削除されたスレッド、signals、未読、オフライン表示、古いページ、開いたスレッドのバックグラウンドタスク（`thread/read` と `backgroundTask/updated`）と `storedBackgroundTasks`
 - `SyncEngineOutboxTest`: コミットしてから送信、同じ id での再送と順序、確定・非確定のエラー、レーン、オフラインでの変更、リセット、1009、読み取り専用の上限、コマンドのアクション
-- `SyncEngineConnectionTest`: watchdog、heartbeat、止まったストリーム（`clientTimeoutMs` より前には再購読しない）、バックオフが初期同期の成功でだけ戻ること、再接続のきっかけ、close code 4000 / 4001 / 4003 / 1001（`storageFailure` の理由と `restartExpected`、再起動しない停止でも再接続を続けること）、401、非互換、ネットワーク、stop / start、ストアの失敗。ソケットが同時に2つにならないこと（数える `SocketFactory` で、ネットワークの切り替え（1回ずつと連続）、サーバの切断、資格情報の変更を通して最大 1）、捨てたソケットへの 4000（実サーバと同じく新しい接続が古い接続を置き換える `FakeServer.replaceOlderConnections`）で止まらないこと、同じトークンの2つのエンジンが取り合わないこと
+- `SyncEngineConnectionTest`: watchdog、heartbeat、止まったストリーム（`clientTimeoutMs` より前には再購読しない）、バックオフが初期同期の成功でだけ戻ること、再接続のきっかけ、close code 4000 / 4001 / 4003 / 1001（`storageFailure` の理由と `restartExpected`、再起動しない停止でも再接続を続けること）、401、非互換、ネットワーク、stop / start、ストアの失敗。ソケットが同時に2つにならないこと（数える `SocketFactory` で、ネットワークの切り替え（1回ずつと連続）、サーバの切断、資格情報の変更を通して最大 1）、捨てたソケットへの 4000（実サーバと同じく新しい接続が古い接続を置き換える `FakeServer.replaceOlderConnections`）で止まらないこと、同じトークンの2つのエンジンが取り合わないこと。ディープスリープ（`SleepingClock`: 時計だけが進み、コルーチンのタイマーは気づかない）の後、前面復帰と `onNetworkAvailable` が無通信の接続をすぐ捨ててつなぎ直すこと、`clientTimeoutMs` 未満なら接続を残し、残りの時間で watchdog を掛け直すこと
 - `SyncEngineHarnessTest`: `harnessUnavailable` の要求がハーネスを待ち（理由と回数を記録、再送の待ちを何回過ぎても送らない、呼び出し側は待ち続ける）、`harness/updated` で同じ `clientRequestId` のまま送られること。待っている要求がレーンを止め、`turn/interrupt` は追い越すこと。`refreshHarnesses` の間の `refreshingHarnesses` と、使えるという応答で送られること。workspace が「使える」と示している間は再送の待ちを守ること（ループしない）。ハーネスの分からない要求は通常の再送、エラーにハーネスがなければ要求のスレッドのハーネスを使うこと。待ちが再起動（同じストア）を越えて残ること
 - `SyncEngineThreadsTest`: 空のバッチの fixture（`notifications/stream_batch_empty.json`）で読み取り位置が head へ、保持期間でイベントが消えたストリームの再開で再購読を繰り返さないこと、読めないスレッド（`internal`）がそのスレッドだけ `Failed` になり、セッション・outbox・workspace は続き、`retryThread` で戻ること、初期同期が止まっている間も `openThread` / `closeThread` がすぐ返ること、閉じて開き直したスレッドを読み直すこと
-- `SyncEngineOutboxControlTest`: 再送待ちの入力を `turn/interrupt` と `thread/stop` が追い越し、ほかの要求は追い越さないこと、送信中の要求は待つこと、`discardOutbox`（再送待ち・オフライン・送信中・既になし）、知らないエラー種別が確定になること
+- `SyncEngineOutboxControlTest`: 再送待ちの入力を `turn/interrupt`、`backgroundTask/stop`、`thread/stop` が追い越し、ほかの要求は追い越さないこと、送信中の要求は待つこと、`discardOutbox`（再送待ち・オフライン・送信中・既になし）、知らないエラー種別が確定になること
 
 ## 10. :app の構成
 
@@ -372,7 +413,7 @@ Navigation Compose の型付きルート（`ui/navigation/Routes.kt`、`@Seriali
 | `ProjectsRoute` | プロジェクト一覧（タブ「プロジェクト」。ペアリング済みのときの開始画面）。検索、並べ替え、clone の進捗 | 完成 |
 | `ProjectThreadsRoute(projectId)` | プロジェクトのスレッド一覧（ピン留めが先、最終活動の新しい順）。スワイプと長押し | 完成 |
 | `ArchivedThreadsRoute(projectId)` | アーカイブ済みのスレッド（`thread/list` の `includeArchived`）と解除 | 完成 |
-| `ImportSessionRoute(projectId)` | PC のセッションの取り込み（`native/list` / `native/import`） | 完成 |
+| `ImportSessionRoute(projectId, harnessId?)` | PC のセッションの取り込み（`native/list` / `native/import`）。`harnessId` は最初に一覧するハーネス（`/resume` はそのスレッドのハーネスを渡す。24.2） | 完成 |
 | `NewProjectRoute` | 新規プロジェクト（既存のフォルダー / 最初から始める / clone） | 完成 |
 | `NewThreadRoute(projectId, harnessId?)` | 新しいスレッドのシートと最初のメッセージ（`/new` は `harnessId` 付き） | 完成 |
 | `ThreadRoute(threadId, interactionId?)` | スレッド。`interactionId` があれば、その承認カードまでスクロールし、質問なら回答シートを開く | 完成 |
@@ -385,7 +426,7 @@ Navigation Compose の型付きルート（`ui/navigation/Routes.kt`、`@Seriali
 | `SetupRoute` | 初回ペアリングの後の準備（通知の許可、電池の最適化） | 完成 |
 
 - 下部ナビ（`TopLevelTab`）: プロジェクト / 要対応（バッジ = 保留中の承認・質問 + 未読のエラー）/ 設定。各タブは自分のバックスタックを持つ（`popUpTo<ProjectsRoute> { saveState = true }` と `restoreState`）。タブに属するルートの画面でだけ下部ナビを出す（スレッド、新規作成、差分、出力、画像、ペアリングでは出さない）。
-- 作成の流れの移動: 新規プロジェクトの完了は `projectCreated`（スレッド一覧で置き換え、新しいフォルダなら新しいスレッドのシートを重ねる）、新しいスレッドの完了は `threadCreated`、取り込みの完了は `sessionImported`（どれも作成画面をバックスタックから外す）。
+- 作成の流れの移動: 新規プロジェクトの完了は `projectCreated`（スレッド一覧で置き換え、新しいフォルダなら新しいスレッドのシートを重ねる）、新しいスレッドの完了は `threadCreated`、取り込みの完了は `sessionImported`（どれも作成画面をバックスタックから外す）。取り込んだ（取り込み済みの）スレッドが `/resume` を実行したスレッドそのものなら、`sessionImported` は取り込み画面を閉じるだけにする（同じスレッドを2回積まない）。
 - 画面は `NavController` を直接触らず、`AppNavigator`（`openThread`、`openProject`、`openTab`、`startPairing`、`pairingCompleted`、`unpaired` など）を受け取る。バックスタックの規則はここに集める。
 - 開始画面は保存されたペアリングで決まる: 未ペアリングなら `PairingRoute`、ペアリング済み（トークンを復号できない場合も含む）なら `ProjectsRoute`。ペアリングが消えたら（設定での解除など）、シェルがペアリング画面だけにする。
 - **ディープリンク**: `aas://thread/<threadId>[?interactionId=<id>]`（`DeepLinks.thread()`）。通知は MainActivity への明示的な Intent にこの URI を入れる。`IntentTarget.of(intent)` が読み、`AppNavigator.handle()` が `ThreadRoute` へ移動する。
@@ -401,10 +442,15 @@ Navigation Compose の型付きルート（`ui/navigation/Routes.kt`、`@Seriali
   - 例: `InteractionRepository.respond(interaction, resolution)`、`ServerRepository.revoke(deviceId)`。`ThreadRepository.send`（`turn/start`）と `ProjectRepository.mkdir` / `open` / `create` は `PendingMutation` を返す（24.3、25章）。
   - ViewModel は `CancellationException` を再送出し、それ以外（端末内の DB の失敗など）は `UserMessages` に出す（握りつぶさない）。
 - **読み取り専用の呼び出し**: `engine.query(Methods.X, params)`。オフラインなら `NotConnectedException`。設定画面の `fetch { … }`（`Remote<T>`: Idle / Loading / Loaded / Failed）が結果と日本語の説明にする。
+- **サーバの一覧は id ごとに1件**: Compose の `LazyColumn` は同じ key が2回あると例外を投げ、アプリが落ちる（2.3）。画面が行をサーバの id で key にする一覧は、repository がアプリに入るところで `ServerLists.unique` を通す。同じ id が複数あれば1件だけ残し、`[data]` の警告を診断のログに残す。行の key は本当の id のままにする（位置を key にすると、取り込み中の表示や開いた行の状態が別の行に移る）。
+  - `native/list`: `updatedAt` の最も新しいもの（同じならサーバの順で先のもの）。Codex は別の場所で resume したスレッドを rollout ごとに返す。
+  - `thread/list` のページ（アーカイブ済みのスレッド）: ページをつなぐとき（`ProjectRepository.joinThreadPages`）に、`head` の大きい要約（protocol.md 3.1。新しい方）を最初の位置に残す。次のページのカーソルはサーバが返したページのままの最後のスレッドから作る。
+  - `fs/roots`・`fs/list`（パス）、`fs/search`（パス。メンションの候補）、`device/list`（id）: 最初のもの。
+  - エンジンが保存する一覧（プロジェクト、スレッド、Interaction、Operation、ターン、Item）はストアが id で持つので重ならない。スレッドのキュー（`queue/updated`、`thread/read` の `queued`）は位置で保存するので、エンジン（`EventApplier`）が id ごとに最初の1件にし、警告をログに残す。パレットは (source, name) ごとに1件（25章）。
 - **1回きりのメッセージ**: `container.userMessages.show(UiText.of(R.string.x, args))`。シェルの `SnackbarHost` が順に出す。ViewModel は Context を持たず、文字列は `UiText` で渡す。
   - 操作付きのメッセージ（`UserMessage(text, action) { … }`、たとえばアーカイブの「元に戻す」）の操作は `suspend` の関数で、シェルがアプリのスコープ（`applicationScope`。`ShellViewModel.runAction`）で実行する。スナックバーは出した画面より長く残る（順番待ちがあり、操作付きは長く出し、背面の間は待つ）ので、押されたときには出した画面の ViewModel が消えていることがある。そのスコープで `launch` すると何も起きない（以前の「元に戻す」がそうだった）。操作は ViewModel のスコープを使わず、失敗は自分で `UserMessages` に出す。
 - **送信待ちの表示**: `InboxModel.respondingInteractionIds(outbox)`（回答が outbox にある Interaction）、`ThreadState.pending`、`SyncStatus.pendingOutbox`。
-- **状態の語彙**: `ThreadActivity.of(thread, pendingInteractions)`（承認が必要 > 入力が必要 > 実行中 > エラー > 待機中）。一覧、チップ、要対応で同じものを使う。
+- **状態の語彙**: `ThreadActivity.of(thread, pendingInteractions)`（承認が必要 > 入力が必要 > 実行中 > エラー > バックグラウンドで実行中 > 待機中）。一覧、チップ、要対応で同じものを使う。「バックグラウンドで実行中」はターンが動いておらず、`Thread.background.running > 0`（ハーネスがバックグラウンドの作業を報告している。`ambient` のタスクは数えない）のときで、チップは「バックグラウンドで実行中 (N)」（N はその数。プロジェクトの行はそのスレッドの和）。プロジェクトの「実行中 n」と要対応の「実行中」には、ターンの動いているスレッドと一緒に入る（`ThreadActivity.working`）。
 
 ### 10.5 テーマ、共通コンポーネント、文字列
 
@@ -473,8 +519,8 @@ Navigation Compose の型付きルート（`ui/navigation/Routes.kt`、`@Seriali
 |---|---|---|---|
 | `approvals` | HIGH | 承認の要求（approval の `InteractionPending`）。本文に要求の題名、詳細、対象（コマンド1行、ファイル数と名前、ツール名など） | 拒否 / 許可（一度だけ）/ タップでスレッドの承認カード |
 | `questions` | HIGH | 質問 | タップで回答シートを直接開く |
-| `turns` | DEFAULT | ターンの完了（作業時間付き）・中断、clone の完了（アプリが背面のとき） | タップでスレッド |
-| `errors` | DEFAULT | ターンの失敗（`lastError`）、clone の失敗、アプリが背面のときにサーバが確定エラーで断った要求（スレッドごとに1つ、最新の失敗。スレッドのない要求は1つにまとめる）、通知のボタンの回答を送信待ちにできなかった場合・ペアリングがないため送らなかった場合 | タップでスレッド |
+| `turns` | DEFAULT | ターンの完了（作業時間付き）・中断、バックグラウンドの作業の完了・失敗・停止、clone の完了（アプリが背面のとき） | タップでスレッド |
+| `errors` | DEFAULT | ターンの失敗（`lastError`）、結果が分からなくなったバックグラウンドの作業（`lost`）、clone の失敗、アプリが背面のときにサーバが確定エラーで断った要求（スレッドごとに1つ、最新の失敗。スレッドのない要求は1つにまとめる）、通知のボタンの回答を送信待ちにできなかった場合・ペアリングがないため送らなかった場合 | タップでスレッド |
 | `connection` | LOW | 常駐通知（11.4） | 今すぐ再接続 |
 | `connectionAlerts` | DEFAULT | 別の場所で接続中（4000）でアプリが背面にある（11.5）。タグ `connection:elsewhere` の1件 | 再接続 / タップでアプリ |
 
@@ -485,6 +531,8 @@ Navigation Compose の型付きルート（`ui/navigation/Routes.kt`、`@Seriali
 - 表示中のスレッドの承認・質問は、音と heads-up なしで出す（画面のカードで見える）。
 - ターンの完了の通知（設定 → 通知）: 常に / 見ていないときだけ（既定。そのスレッドを前面で表示していなければ）/ 通知しない。失敗はエラーの設定に従う。
 - 種類ごとのオン・オフ（承認、質問、エラー）はアプリの設定で、音や表示の細かい設定はシステムのチャネルの設定で変える。
+- バックグラウンドの作業が終わった（`BackgroundTaskFinished`）: 「バックグラウンドの作業が完了しました: 題名」（失敗・停止も同じ形）。ターンの完了と同じ設定（常に / 見ていないときだけ / 通知しない）に従い、同じタグ `turn:<threadId>` に出す。エージェントがその作業について自分で始めたターンが終わると、その通知が置き換える（2つにならない）。`lost`（エージェントのプロセスが終わったか、サーバが再起動した）はエラーで、エラーの設定に従い `error:<threadId>` に出す。どちらも通知の数の上限（下）に入る。
+- バックグラウンドタスクが求めた承認・質問の通知は、本文の先頭に「バックグラウンドの作業「題名」から」（タスクがこの端末に保存されていなければ「バックグラウンドの作業から」）。後からタスクが分かったら（`InteractionTaskKnown`）、出ている通知を題名付きに出し直す（`setOnlyAlertOnce` なので音やポップアップはもう出ない。利用者が消した通知と「回答を送信しています…」の通知はそのまま）。
 - 同じスレッドのターンの通知は1つ（タグ `turn:<threadId>`）で、次のターンで置き換わる。承認は Interaction ごと（タグ `interaction:<id>`）。断られた要求はスレッドごと（`request:<threadId>`、スレッドのないものは `request:app`）。
 - スレッドの画面を開いたら（`AppVisibility.threadShown` から同じ呼び出しの中で）、そのスレッドのターン・エラー・断られた要求の通知を消す。アプリの中で既読になったスレッド（一覧のスワイプなど。未読から既読に変わったもの）も同じ。ただし画面に出ているスレッドは「常に」の設定で出した通知を消さない。プロセスの開始時は、既読のスレッドのターンとエラーの通知を消す（前のプロセスが残したもの）。
 - 通知の数の上限: Android はパッケージごとに 50 件を超える通知を黙って捨てる（NotificationManagerService の `MAX_PACKAGE_NOTIFICATIONS`。常駐通知とシステムが足すグループの要約も数える）。承認の通知が黙って出なくなるのを防ぐため、出す前に `AppPolicy.notificationBudget`（40 件）を超えるなら、古い順にターン・エラー・clone・断られた要求の通知を消し、ログに残す。承認・質問と常駐通知は消さない。
@@ -498,18 +546,19 @@ Navigation Compose の型付きルート（`ui/navigation/Routes.kt`、`@Seriali
   - ボタンはカードが出てから `AppPolicy.interactionArmDelayMs`（0.5 秒）押せない（レイアウトが動いた直後の誤タップ対策。UX 8.2）。
   - 回答が outbox にある間は「回答は送信待ちです」と出し、ボタンを無効にする。
   - 質問: 1問目と「回答する」（`QuestionSheet`: 1問ずつ、単一・複数選択、自由記述、スキップ = `dismissed`）。ほかの端末で答えられたり、ハーネスが取り下げたりしたら、シートは自動で閉じる。カウントダウンはない（design.md の範囲外）。
+- バックグラウンドタスクが求めた承認・質問（`backgroundTaskId`）のカードは「バックグラウンドの作業「題名」から」と出す。題名は、スレッドの画面ではそのスレッドのタスク、要対応のタブでは端末に保存されたタスク（`SyncEngine.storedBackgroundTasks`。ワークスペースの変化と `InteractionTaskKnown` で引き直す。そのスレッドを開いたことがなければ「バックグラウンドの作業から」）。
 - `ResultMessages`: 回答がほかの端末で既に確定していた（`alreadyResolved` で、確定させたのがこの端末でない）ときは、スナックバーで伝える。
 
 ## 14. 設定画面
 
-- サーバ: 名前、URL、接続の状態、バージョン、ホスト名、稼働時間、実行中のターンとプロセス、「実行中は PC をスリープさせない」（`server/status` の `preventSleepWhileRunning`）、停止準備中。更新、再接続。
+- サーバ: 名前、URL、接続の状態、バージョン、ホスト名、稼働時間、実行中のターン・バックグラウンドの作業（`runningBackgroundTasks`）・プロセス、「実行中は PC をスリープさせない」（`server/status` の `preventSleepWhileRunning`）、停止準備中。更新、再接続。
 - デバイス: `device/list`（この端末に印）、ほかのデバイスの取り消し（`device/revoke`。確認ダイアログあり。接続中だけ）。
 - ハーネス: 同期したハーネスの一覧（名前、バージョン、「使えます」/「使えません: 理由」/「確認しています…」）。各行とセクションの「すべて再確認」が `harness/refresh`（1つを確認したときは結果をスナックバーでも伝える。オフラインなら確認できないと伝える）。使えないハーネスがあれば、PC で CLI をインストール・ログインしたあとに再確認するよう案内する（サーバも一定の間隔で確認し直している）。
 - この端末: デバイス名、デバイス ID、ペアリングした日時、ペアリングし直す、ペアリングを解除（16.4）。
 - 通知: 承認・質問・エラーのオン・オフ、ターンの完了（常に / 見ていないときだけ / 通知しない）、通知が許可されていなければその案内、システムの通知設定。
 - 送信: 実行中に送信したとき「キューに追加」（既定）か「今すぐ反映」か（UX 2.5 のフォローアップの動作）。送信ボタンの長押しがもう一方になる。
 - 電池: 最適化の対象かどうかと、説明の画面（20章）。
-- 診断: 接続の状態（文言と内部状態）、接続サービスが動いているか、起動が拒否されたとき、最終同期、最後の heartbeat、再接続・再購読・取りこぼした通知の回数、最後のエラー、サーバのポリシー、epoch、デバイス ID、ストリームごとの読み取り位置とサーバの head、outbox の中身（メソッド、clientRequestId、作成時刻、スレッド、失敗の回数、最後のエラー、次の送信）、接続ログ（コピーできる）。
+- 診断: アプリのバージョン（`versionName`、`versionCode`、ビルドの種類。19.3。コピーするログの先頭にも入る）、接続の状態（文言と内部状態）、接続サービスが動いているか、起動が拒否されたとき、最終同期、最後の heartbeat、再接続・再購読・取りこぼした通知の回数、最後のエラー、サーバのポリシー、epoch、デバイス ID、ストリームごとの読み取り位置とサーバの head、outbox の中身（メソッド、clientRequestId、作成時刻、スレッド、失敗の回数、最後のエラー、次の送信）、接続ログ（コピーできる）。
 - アプリのバージョン。
 
 ## 15. 端末内のデータ
@@ -527,6 +576,7 @@ Navigation Compose の型付きルート（`ui/navigation/Routes.kt`、`@Seriali
 | `turns` | id | thread_id、turn_index（thread_id + turn_index） |
 | `items` | id | thread_id、turn_index、sort_seq（3つの組）。同じ位置は id で並べる |
 | `interactions` | id | thread_id、pending、created_at（thread_id + created_at、pending + created_at） |
+| `background_tasks` | id | thread_id、started_at（thread_id + started_at）。バージョン 3 から |
 | `queued` | thread_id + position | id |
 | `thread_meta` | thread_id | has_more_before、commands_version |
 | `view_states` | thread_id | last_viewed_head、marked_unread |
@@ -537,9 +587,10 @@ Navigation Compose の型付きルート（`ui/navigation/Routes.kt`、`@Seriali
 
 ### 15.2 スキーマのバージョンと移行の方針
 
-- `AasDatabase.VERSION`（現在 2）。スキーマを変えるたびに上げ、すべてのバージョンのスキーマを `android/app/schemas/`（Room の Gradle プラグインが出力する。リポジトリに入れる）に残す。
+- `AasDatabase.VERSION`（現在 3）。スキーマを変えるたびに上げ、すべてのバージョンのスキーマを `android/app/schemas/`（Room の Gradle プラグインが出力する。リポジトリに入れる）に残す。
 - 上げるたびに `Migrations.ALL` に明示的な `Migration(n-1, n)` を足し、エクスポートしたスキーマに対する移行のテストを書く（`RoomMigrationTest`: 古いバージョンのデータベースをエクスポートした `createSql` から作り、そのバージョンの形でデータを入れ、今のアプリで開く。Room は移行の結果が今のスキーマと違えば開かないので、通れば移行が完全でデータが残ったことになる）。
 - 1 → 2: `outbox.waiting_for_harness`（TEXT、NULL 可）を追加（`ALTER TABLE ... ADD COLUMN`）。既存の要求は何も待たない。
+- 2 → 3: `background_tasks`（id、thread_id、started_at、json）とその索引を作る（SQL はエクスポートしたスキーマ 3 の `createSql` と同じ）。空で始まり、開いたスレッドの次の `thread/read` がタスクを入れる。
 - アップグレードで **テーブルを捨てる fallback は使わない**。outbox にはサーバに届いていないかもしれない利用者の要求があり、未読の状態はこの端末にしかないため（同期データだけならサーバから取り直せる）。移行が欠けていれば Room は起動時に失敗する（黙ってデータを消さない）。
 - ダウングレード（古いデバッグビルドを `adb install -r -d` で入れた場合だけ起きる）はテーブルを作り直す（`fallbackToDestructiveMigrationOnDowngrade`）。古いビルドは新しいスキーマを読めず、同期データは次の接続で取り直せる。この場合 outbox は失われる。リリースビルドではダウングレードは起きない。
 
@@ -620,7 +671,7 @@ image.attachment   // 表示用の Attachment.Image
 
 ```
 cd android
-timeout 3000 ./gradlew --max-workers=6 :app:assembleRelease :app:testDebugUnitTest :app:lintDebug :protocol:test :sync:test
+timeout 3000 ./gradlew --max-workers=6 :app:assembleDebug :app:assembleRelease :app:assembleStaging :app:testDebugUnitTest :app:lintDebug :protocol:test :sync:test :e2e:assembleDebug
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
@@ -655,6 +706,17 @@ adb install -r app/build/outputs/apk/release/app-release.apk
 - デバッグビルドは `10.0.2.2`（エミュレータから見た PC）、`127.0.0.1`、`localhost` にだけ平文（`ws://`、`http://`）で接続できる（`src/debug/res/xml/network_security_config.xml`）。実機から PC の daemon に平文でつなぐには `adb reverse tcp:7878 tcp:7878` として `ws://127.0.0.1:7878/v1/ws` を使う。それ以外のホストとリリースビルドは TLS だけ（`tailscale serve --https=443` の `wss://<PC>.<tailnet>.ts.net/v1/ws`）。
 - デバッグビルドの applicationId もリリースと同じ `dev.aas.android`（`aas://` のリンクを受けるアプリを1つにするため）。署名が違うので、リリースを入れた端末にデバッグを上書きするときはアンインストールが要る。
 - R8 のルール（`proguard-rules.pro`）: ライブラリは自分のルールを持っている（kotlinx.serialization、coroutines、Room、DataStore の protobuf-lite、CameraX、lifecycle / startup、OkHttp）。アプリのファイルには、アプリ自身が頼るものを明示する: 型付きルートとプロトコルの型の `Companion` / `INSTANCE` / `serializer()`（Navigation の `navigate(route)` と保存状態の復元が `route::class.serializer()` で反射的に引く）と注釈、Room が名前で作る `AasDatabase_Impl`、名前で DataStore に保存する設定の enum、OkHttp が名前で探す任意の TLS プロバイダの `-dontwarn`。ZXing core は反射を使わない。R8 の出力（`app/build/outputs/mapping/release/seeds.txt`）でこれらが残ることを確かめた。
+
+### 19.3 バージョン
+
+- `versionCode` と `versionName` はビルドのときに git から作る（`app/build.gradle.kts` の `appVersion`）。以前は 1 / 0.1.0 のままで、端末に入っているのがどのコミットか分からなかった。
+  - `versionCode`: HEAD までのコミットの数（`git rev-list --count HEAD`）。main にコミットするたびに増えるので、新しいビルドは古いビルドの更新として入る。
+  - `versionName`: `0.1.0+<HEAD の短いハッシュ>`（`git rev-parse --short=7 HEAD`）。`android/` の下にコミットと違うファイル（変更、未追跡のファイル）があれば `.dirty` を付ける（コミットしていない作業のビルドを、そのコミットのビルドに見せない）。staging は後ろに `-staging` が付く。
+  - 同じコミット（と同じ作業ツリー）からは同じ値になる。時刻やマシンには依存しない。
+  - git はすべて `git --no-optional-locks` で呼ぶ（読み取りだけ）。この計算は `:app` を設定するたび（毎回のビルド、Android Studio の同期、並行して動くビルド）に走る。ふつうの `git status` は index を更新して `.git/index.lock` を取って書き戻すため、同時に実行した `git add` / `git commit` が `Unable to create '.git/index.lock': File exists` で失敗することがあった。このオプションでは index を書き戻さない（出力は同じ）。`AppVersionAndClockTest` の git の呼び出しも同じ。
+  - git がない・リポジトリでない: `versionCode` 1、`versionName` `0.1.0+nogit`。shallow clone（CI の checkout。コミットの数が履歴の数にならない）: `versionCode` 1、`versionName` はハッシュ付き。どちらもビルドの警告に出る（推測の値にしない）。
+  - `0.1.0` の部分（`APP_VERSION`）は機能の区切りで手で上げる。
+- アプリは 設定 → アプリのバージョン（`versionName`）と、設定 → 診断（`versionName`、`versionCode`、ビルドの種類）に出す。診断のログをコピーすると先頭の行が `app <versionName> (<versionCode>, <ビルドの種類>)` になる。`initialize` の `client.version` も `versionName`。
 
 ## 20. 電池の設定（利用者への案内）
 
@@ -702,13 +764,15 @@ adb install -r app/build/outputs/apk/release/app-release.apk
 | `display.approvalFiles` | 8 件 | 承認のカードに並べるファイル数（それ以上は件数と差分へ） |
 | `display.approvalInputLines` | 12 行 | 承認のカードに出すツールの入力の行数 |
 | `display.previewFiles` | 3 件 | 承認の1行の要約（通知の本文）に出すファイル名の数。それ以上は「ほか n 件」。通知の1行に短いパスが3つほど入る |
+| `display.dialogTaskTitles` | 5 件 | プロセスの停止・アーカイブの確認に名前を並べる動いているバックグラウンドタスクの数。それ以上は「ほか n 件」。スマホの画面でダイアログがスクロールせずに読める |
+| `display.taskOutputLines` | 6 行 | 終わったバックグラウンドタスクのカードに出す出力の末尾の行数。全文は出力の画面。ライブのログではなく結果の要約なので数行で足りる |
 | `keystoreRetryInitialMs` | 1s | キーストアが暗号を実行できなかった後、トークンを復号し直すまでの最初の待ち。失敗ごとに倍。再起動中のキーストアのサービスが戻るくらいの長さ |
 | `keystoreRetryMaxMs` | 60s | その待ちの上限。後から戻ったキーストアにも1分以内に気づく |
 | `notificationBudget` | 40 件 | 出したままにする通知の数。これを超えると古いターン・エラー・clone・断られた要求の通知から消す。Android の上限（パッケージごとに 50。常駐通知とグループの要約を含む）を超えると承認が黙って捨てられるので、承認・質問が続けて来ても入る余裕を残す |
 
 - 時刻に依存する更新と、長い内容をどこまで出すか（`display.*`）は `DisplayPolicy`（`AppPolicy.display`）にまとめ、composable は `LocalAppPolicy`（ルートで `container.policy` を提供）で読む。以前は各ファイルの定数だった。
 - レイアウトの寸法（表の列の最大幅、サムネイルの dp とデコードする画素数、入力欄の最大行数）、色の透明度、実装のバッファ（コピーのバッファ、スナックバーの待ち行列）は、それぞれのファイルに名前付きの定数と理由がある（振る舞いの上限ではない）。
-- `:app` にヒューリスティックはない。接続、通知、要対応の判定はすべてプロトコルの明示的な状態（`Thread.status`、`lastTurn.status`、`lastError`、Interaction の `status` と `request.kind`、close code、outbox の中身）とポリシー値で行う。
+- `:app` にヒューリスティックはない。接続、通知、要対応の判定はすべてプロトコルの明示的な状態（`Thread.status`、`lastTurn.status`、`lastError`、`Thread.background`、`BackgroundTask` の `status` / `stoppable` / `stopRequestedAt` / `stopUnconfirmedAt`、Interaction の `status` と `request.kind`、close code、outbox の中身）とポリシー値で行う。バックグラウンドタスクの経過時間は `startedAt` からの表示だけで、止まった・終わったの判断には使わない。
 
 ## 22. ライブラリのバージョン
 
@@ -751,28 +815,35 @@ timeout 3000 ./gradlew --max-workers=6 :app:testDebugUnitTest
 |---|---|
 | `RoomSyncStoreTest` | `SyncStoreContract` のすべて（原子性とキャンセル、wipe で outbox が残る、スレッドの削除、並び順、outbox の `waitingForHarness` の往復など）に加えて、読み書きのトランザクションが直列化されること、ファイルを開き直してもコミット済みのものは残り失敗したブロックは残らないこと、wipe の後も outbox の順序が保たれること、outbox の params が正確に往復すること |
 | `SchemaPolicyTest` | 15.2 の方針: すべてのバージョンのスキーマがエクスポートされてリポジトリにあり、すべての上げる段階に `Migration` があること |
-| `RoomMigrationTest` | エクスポートしたスキーマ 1 のデータベース（epoch、読み取り位置、outbox 2件）を今のアプリで開くと、移行 1 → 2 が走り、データと outbox の順序が残り、新しい列が使えること |
+| `RoomMigrationTest` | エクスポートしたスキーマ 1 のデータベース（epoch、読み取り位置、outbox 2件）を今のアプリで開くと、移行 1 → 2 → 3 が走り、データと outbox の順序が残り、新しい列が使えること。スキーマ 2 のデータベース（epoch、スレッド、ハーネスを待つ outbox）からは、データが残り、空の `background_tasks` が使えること |
 | `ReadsTest` | 読み取りの途中で接続が切れると、エンジンの次のセッションで1回だけ送り直す（別の接続で2回目が届く）。呼び出し側のスレッドが忙しく、切断に気づいたときにはエンジンがもう再接続していても、そのセッションで送り直す（オフラインと言わない）。戻らなければ `readReconnectWaitMs` の後にオフライン、2回目も切れたらその失敗。エンジンの例外（切断、時間切れ）が日本語の文言になること |
 | `TokenCipherTest` / `CredentialStoreTest` | 暗号化の往復と毎回違う IV、改ざん・別の鍵・壊れた形式の検出、ファイルにトークンの平文がないこと、鍵を失うと `Unreadable` になること（ソフトウェアの鍵で）。キーストアの失敗は `KeystoreUnavailable` で、倍にしていく待ちで自動に、`retryNow` ですぐに復号し直して `Paired` に戻ること。読めないファイルでは待たせずに `CredentialsUnreadableException` |
 | `PairingParserTest` | daemon の QR の文字列（Rust のテストと同じもの）、順序・大文字小文字・空白、ほかの QR、壊れたエンコード、URL とコードの欠落、平文の規則（リリース / デバッグ）、手入力 |
 | `PairingRepositoryTest` | MockWebServer で: 成功と保存と起動、`invalidCode` / `rateLimited` / その他 / プロキシのページ / 読めない応答、接続できない場合、outbox の判断（同じ / 別の epoch）と破棄、オフラインでの解除（通知も消す） |
 | `InteractionResponderTest` / `InteractionActionReceiverTest` | 通知のボタン → outbox の `interaction/respond`（エンジンが止まっていても。Room に永続化される）と接続サービスの起動。ペアリングがなければ何も入れないこと。必要な値のない Intent は無視 |
-| `NotifierTest` | 承認の通知のボタン（拒否 / 許可（一度だけ））とチャネル、解決で消えること、保留中でないものの整理、ターンの完了の設定と表示中のスレッド、失敗はエラーのチャネル、削除されたスレッドの通知。スレッドを開く・既読にするとターン・エラー・断られた要求の通知が消えること、断られた要求がスレッドごとに1つになること、上限（`notificationBudget`）を超えないことと承認が残ること、解除で消えて古いボタンが何も送らないこと。「別の場所で接続中」の通知（`connectionAlerts`、「再接続」が `ConnectionService` の `ACTION_RECONNECT` の foreground service の起動、タップでアプリ、消えること）と、常駐通知の「今すぐ再接続」も foreground service の起動であること |
+| `NotifierTest` | バックグラウンドの作業の終わりがスレッドのターンの通知（`turn:<id>`、turns チャネル）になり、続くエージェントのターンが置き換えること（1つのまま）、設定（見ていないときだけ・通知しない）と表示中のスレッド、`lost` がエラー（errors チャネル、エラーの設定）、上限（`notificationBudget`）、タスクの承認の本文がタスクの題名（保存されていなければ「バックグラウンドの作業から」）で始まり、後からタスクが分かると鳴らさずに題名付きになること（消された通知と送信中の通知は変えない）。承認の通知のボタン（拒否 / 許可（一度だけ））とチャネル、解決で消えること、保留中でないものの整理、ターンの完了の設定と表示中のスレッド、失敗はエラーのチャネル、削除されたスレッドの通知。スレッドを開く・既読にするとターン・エラー・断られた要求の通知が消えること、断られた要求がスレッドごとに1つになること、上限（`notificationBudget`）を超えないことと承認が残ること、解除で消えて古いボタンが何も送らないこと。「別の場所で接続中」の通知（`connectionAlerts`、「再接続」が `ConnectionService` の `ACTION_RECONNECT` の foreground service の起動、タップでアプリ、消えること）と、常駐通知の「今すぐ再接続」も foreground service の起動であること |
 | `ConnectionPresentationTest` / `ConnectionTextsTest` | エンジンのすべての接続状態と切断の原因の対応、注意が必要な状態、キーストアの再試行待ちが「未ペアリング」にならないこと、接続中は同期時刻が進んでも表示が変わらないこと、日本語の文言と詳細の行（`storageFailure` の停止、`restartExpected: false` の「サーバが停止しています」）、画面の時計より後の時刻を「0 分後」ではなく今として言うこと |
 | `DefaultNetworkTrackerTest` | 最初のネットワーク、切り替え、遅れて届く古いネットワークの喪失、起動時にネットワークがない場合、ブロック |
-| `HarnessesTest` | ハーネスの状態の語彙（使えます / 使えません: 理由 / 確認中は自分の再確認の間だけ）、ハーネスを待つ要求の表示（ワークスペースの新しい理由、なければ断られたときの理由、知らないハーネスは id）、`DisplayPolicy` の検査 |
-| `ThreadActivityTest` / `InboxModelTest` / `ProjectListsTest` | 状態の語彙の優先順位とエラーの判定、要対応の区分とバッジ、送信待ちの回答、ピン留めの並び |
+| `HarnessesTest` / `NativeSessionHarnessesTest` | ハーネスの状態の語彙（使えます / 使えません: 理由 / 確認中は自分の再確認の間だけ）、ハーネスを待つ要求の表示（ワークスペースの新しい理由、なければ断られたときの理由、知らないハーネスは id）、`DisplayPolicy` の検査。取り込みのハーネス: 取り込めるもの（使えて能力 `nativeSessions` がある）、選択肢に残す使えないハーネス、選んだハーネスは状態によらず選択肢に残ること（使えるのに能力がないと分かっても。直す前は落ちることを確かめた）、最初に一覧するハーネス（スレッドのハーネス → プロジェクトの既定 → 最初の取り込めるもの）、サーバが `capabilityUnsupported` と答えたハーネスはワークスペースがまだ使えないと示していても（取り込めると示していても）自分から選び直さず、取り込めると示す間は選択肢に残ること |
+| `ServerListsTest` | サーバの一覧を id ごとに1件にする: 重なりのない一覧はそのまま（ログなし）、`native/list` は `updatedAt` の最も新しいものを最初の位置に（`updatedAt` のないものより新しいものを）、優先のない一覧は最初のもの、警告に id（多ければ省略） |
+| `ThreadActivityTest` / `InboxModelTest` / `ProjectListsTest` | 状態の語彙の優先順位とエラーの判定（バックグラウンドで実行中はターン・エラー・承認より下、`running: 0` は待機中）、要対応の区分とバッジ（バックグラウンドの作業は実行中の区分）、送信待ちの回答、ピン留めの並び、プロジェクトの実行中の数とチップの (N) |
 | `ResultMessagesTest` / `QuestionAnswersTest` / `ApprovalChoicesTest` / `UploadPlanTest` / `IntentTargetTest` | 結果のメッセージ（ほかの端末で確定した回答）、すべての変更メソッドに説明があること、質問の検査と回答の組み立て、主ボタンと通知のボタンの選び方、画像の送り方、ディープリンクの往復 |
 | `AppUiTest`（Robolectric + Compose） | 実際の Activity とナビゲーション: 未ペアリングならペアリング画面と手入力の検査。ペアリング済み（到達できないサーバ）なら保存済みのデータでプロジェクト、要対応の承認カード、「許可」で outbox に `interaction/respond`、送信待ちの表示、設定のサーバ名 |
 | `MarkdownTest` | 見出し（ATX / setext）、段落と改行、強調・太字・取り消し線の入れ子と閉じていない記号、コード（span / fence / インデント / 閉じていない fence）、入れ子のリスト・タスク・loose、引用と遅延行、表（揃え、`\|`、短い行）、リンク・autolink・URL・エスケープ、HTML は文字のまま |
 | `UnifiedDiffTest` | git のパッチを複数ファイルに（更新・追加・削除・名前の変更・バイナリ・quote された UTF-8 のパス）、行番号、ヘッダに見える削除行、`\ No newline`、hunk だけの差分（fixture の `FileChange.diff`）、git ヘッダのない差分、CRLF |
-| `ComposerTextTest` / `PaletteTest` / `SendLogicTest` / `HarnessSettingsTest` | `/` と `@` の判定と挿入、入力の組み立て（メンションのトークンがその位置の `mention` になり、本文に二重に残らないこと、残っているメンションだけ、最長一致、画像、空白）と、入力から本文への戻し（daemon と同じ書き方）。パレットの並び（app → アプリ側 → ハーネス）と、同名のハーネスのコマンドがあるときの省略、同じ名前のハーネスのコマンドが1つになること、絞り込み。送信ボタンの状態（送信 / 停止 / キュー / 今すぐ反映 / 停止中 / アップロード中 / 画像を受け付けないハーネス / アーカイブ）と一時停止のキューの確認。モデル・推論・権限の既定と、プロジェクトの前回値 |
-| `TimelineTest` / `ProjectListSortingTest` / `NewProjectLogicTest` | fixture の `thread/read` から行: アクティビティのまとまりと開閉の既定、実行中の「作業中」、時刻で差し込む Interaction、古いページ、ターン不明の Item、outbox の送信待ち。プロジェクトの並び（最近 / 名前）・検索・集計、スレッドの未読と件数。フォルダ名の規則、clone の URL からの名前、root の中だけを上下するパス |
-| `ThreadViewModelTest` | 実際の `SyncEngine` で: キュー / 今すぐ反映 / 停止の outbox の中身、停止中の表示、一時停止のキューを消してから送る順序、キューの編集・今すぐ反映・削除・再開、設定とピン留め、パレットのコマンド（差分・アーカイブ・ピッカー・状態・新規・挿入・テンプレート）、まとまりの開閉、送信待ちのメッセージの取り消し、画像を受け付けないハーネスの下書き。台本のサーバで `command/list`、`fs/search`、メンションと画像を含む `turn/start`。daemon が `turn/start` を確定エラー（`invalidState`）で断ると、本文・メンション・画像が composer に戻り、その間に打った本文はその後の段落に残ること。断られたのが画面を離れた後でも、スレッドを開き直すと戻っていること（1回だけ） |
-| `NewProjectViewModelTest` / `NewThreadViewModelTest` / `DiffViewModelTest` | フォルダの閲覧と `project/open`、clone の進捗（`operation/updated`）・取り消し（`operation/cancel`）・やり直し・完了、エラーとオフライン。送れずに待っている `project/open` の間も戻るで画面を閉じられ（要求は残り、接続したら送られる）、「送信を取り消す」で outbox から外れてフォルダーに戻る（二度と送らない）。新しいスレッドの既定値、`thread/create`（設定・worktree・入力）と `project/update` の前回値、オフラインでの送信待ち、送信直後に画面を離れても `project/update` が `thread/create` の後に入ること、断られた作成で本文・メンション・画像が戻ること、画像を受け付けないハーネスに切り替えたら送れないこと、`harnessUnavailable` の作成がハーネスと理由を出して待ち（再送しない）、再確認が `harness/refresh` を送って結果を伝え、取り消すと本文が戻ること。差分のファイルとパッチの対応、blob のパッチ、1件ずつの表示、大きすぎるファイル、行のコメントが入力欄へ |
+| `ComposerTextTest` / `PaletteTest` / `SendLogicTest` / `HarnessSettingsTest`（`ultracode` はハーネスが挙げたモデルでだけ、ほかの推論レベルと同じに選べる） | `/` と `@` の判定と挿入、入力の組み立て（メンションのトークンがその位置の `mention` になり、本文に二重に残らないこと、残っているメンションだけ、最長一致、画像、空白）と、入力から本文への戻し（daemon と同じ書き方）。パレットの並び（app → アプリ側 → ハーネス）と、同名のハーネスのコマンドがあるときの省略、同じ名前のハーネスのコマンドが1つになること、絞り込み。`/resume` は取り込めるハーネスがあるときだけ（スレッドと新しいスレッドの両方）、ハーネスの `resume` は出さないこと、打った `/resume` の判定（最初の単語だけ。`/resume-queue` は違う）。送信ボタンの状態（送信 / 停止 / キュー / 今すぐ反映 / 停止中 / アップロード中 / 画像を受け付けないハーネス / アーカイブ）と一時停止のキューの確認。モデル・推論・権限の既定と、プロジェクトの前回値 |
+| `TimelineTest` / `ProjectListSortingTest` / `NewProjectLogicTest` | fixture の `thread/read` から行: アクティビティのまとまりと開閉の既定、実行中の「作業中」、時刻で差し込む Interaction、ターンのない Interaction が求められた時刻のターンの後（最初のターンより前なら先頭、ターンがなければ末尾）、Item のない完了したエージェント起点のターンが区切りだけになること、古いページ、ターン不明の Item、バックグラウンドの区域の位置（会話と送信待ちの間）・開閉の既定（動いている間は開く、終わったものは畳む）・終わった順・起動したタスクの下に字下げ・常駐の数え方、outbox の送信待ち。プロジェクトの並び（最近 / 名前）・検索・集計、スレッドの未読と件数。フォルダ名の規則、clone の URL からの名前、root の中だけを上下するパス |
+| `ThreadViewModelTest` | 実際の `SyncEngine` で: バックグラウンドの区域（動いているタスクは開き、終わったものは畳む）、「停止」が outbox に `backgroundTask/stop { threadId, taskId }` を入れ、カードが送信待ちになり、ほかの変更の送信待ちには数えないこと、起動した Item のチップが区域と終わったタスクを開いてスクロールを求めること、能力 `backgroundStop` がなければ「停止」を出さないこと、停止中・確認されなかった停止の状態。`/resume`（パレットから選んでも打って送っても、スレッドのプロジェクトとハーネスで取り込みを開き、`turn/start` を作らない。取り込めるハーネスがなければパレットに出さず、打って送っても送らずに理由を出す）、キュー / 今すぐ反映 / 停止の outbox の中身、停止中の表示、一時停止のキューを消してから送る順序、キューの編集・今すぐ反映・削除・再開、設定とピン留め、パレットのコマンド（差分・アーカイブ・ピッカー・状態・新規・挿入・テンプレート）、まとまりの開閉、送信待ちのメッセージの取り消し、画像を受け付けないハーネスの下書き。台本のサーバで `command/list`、`fs/search`、メンションと画像を含む `turn/start`。daemon が `turn/start` を確定エラー（`invalidState`）で断ると、本文・メンション・画像が composer に戻り、その間に打った本文はその後の段落に残ること。断られたのが画面を離れた後でも、スレッドを開き直すと戻っていること（1回だけ） |
+| `NewProjectViewModelTest` / `NewThreadViewModelTest` / `DiffViewModelTest` | フォルダの閲覧と `project/open`、clone の進捗（`operation/updated`）・取り消し（`operation/cancel`）・やり直し・完了、エラーとオフライン。送れずに待っている `project/open` の間も戻るで画面を閉じられ（要求は残り、接続したら送られる）、「送信を取り消す」で outbox から外れてフォルダーに戻る（二度と送らない）。新しいスレッドの既定値、`/resume`（パレットからも最初のメッセージとして打っても、スレッドを作らずに選んだハーネスで取り込みを開く）、`thread/create`（設定・worktree・入力）と `project/update` の前回値、オフラインでの送信待ち、送信直後に画面を離れても `project/update` が `thread/create` の後に入ること、断られた作成で本文・メンション・画像が戻ること、画像を受け付けないハーネスに切り替えたら送れないこと、`harnessUnavailable` の作成がハーネスと理由を出して待ち（再送しない）、再確認が `harness/refresh` を送って結果を伝え、取り消すと本文が戻ること。差分のファイルとパッチの対応、blob のパッチ、1件ずつの表示、大きすぎるファイル、行のコメントが入力欄へ |
 | `ItemRenderingTest`（Robolectric + Compose） | fixture のすべての Item の描画: ユーザーのメッセージ（メンションと画像）、畳んだ思考、コマンド（状態・出力・実行中の末尾・失敗）、ファイル変更の差分とターンの差分へのリンク、ツールの入力と結果、プラン、回答、お知らせ、知らない種類。Markdown（コード・リスト・表）、差分ビューア（ファイル・hunk・行番号・バイナリ） |
 | `ComposerUiTest`（Robolectric + Compose） | `/` のパレットの表示・絞り込み（入力の置き換えでも）・挿入・ピッカー・テンプレート、開いた後に届いた daemon のコマンドが先頭に見えること、オフラインのパレット、`@` の検索と挿入、送信ボタン（無効 / 送信 / キューと長押しの今すぐ反映 / 停止） |
+| `ImportSessionViewModelTest` | 台本のサーバで: 最初に一覧するのはスレッドのハーネス（プロジェクトの既定ではない）、スレッドがなければプロジェクトの既定。同じ id を複数返すハーネスの一覧は1件ずつ（最も新しいもの）で警告が残る。一覧の失敗（`harnessUnavailable` は理由と「再確認」、サーバのエラーはその文）はその場に出て、ほかのハーネスに切り替えられる。使えないスレッドのハーネスも選択肢に残る。取り込み済みのセッションは `native/import` を送らずにスレッドを開き、新しいセッションは `native/import { projectId, harnessId, nativeSessionId }` の結果のスレッドを開く。取り込めるハーネスがなければ一覧せず、`harness/updated` で取り込めるハーネスが現れたら一覧する。使えなかった ACP のハーネス（Devin）の `/resume` で、サーバが probe して `harness/updated`（使える、能力なし）を出し `capabilityUnsupported` と答えると、Codex の一覧に移ってスナックバーで理由を出し、Devin をもう一度一覧せず、選択肢からも外す（`harness/updated` が届く前でも同じ）。ほかに取り込めるハーネスがなければ理由をその場に出し続け（再試行なし、チップなし）、Codex が使えるようになったら移る。チップを出す条件（一覧しているハーネス以外の選択肢があるとき）。この5つは直す前は落ちることを確かめた。ワークスペースが取り込めると示す2つのハーネスを両方とも断られても、1回移って止まる（行き来しない） |
+| `ImportSessionUiTest`（Robolectric + Compose） | 取り込み画面の描画: Codex が同じセッションを 3 回返しても行は1つ（`Key "019a" was already used` で落ちない。重なりを除かないとこのテストは落ちることを確かめた）、Claude の `harnessUnavailable` がその場に出て、チップで Codex に切り替えて戻れる。一覧に対応していない Devin（`capabilityUnsupported`）は「「Devin」は PC のセッションの一覧に対応していません」を「再試行」なしで出し（直す前はサーバの英語の文と、必ず失敗する「再試行」だった）、Codex が `harness/updated` で使えるようになるとその一覧に変わって Devin のチップは出ない |
+| `ResumeNavigationTest`（Robolectric + Compose） | 実際の Activity とナビゲーションで、台本のサーバにつないだアプリ: スレッドの `/resume`（ハーネスの `resume` が並ばない）→ 取り込み画面（スレッドのハーネスで一覧）→ セッションを選ぶと `native/import` → 取り込んだスレッドが開き、戻るとスレッドに戻る（取り込み画面は残らない）。取り込み済みのセッションは取り込み直さずにそのスレッドを開く。スレッド自身のセッションを選ぶと取り込み画面が閉じるだけ（戻るでプロジェクト一覧へ。同じスレッドを2回積まない） |
+| `AppVersionAndClockTest`（Robolectric + Compose） | エンジンの時計が `SystemClock.elapsedRealtime()`（`ShadowSystemClock` で進めた分だけ進む）。`versionName` が HEAD のハッシュ（または `nogit`）、`versionCode` がコミットの数（shallow なら 1）。設定 → 診断にバージョンが出ること |
 | `ProjectThreadsViewModelTest` | アーカイブのスナックバーの「元に戻す」: スレッド一覧の ViewModel が消えた後に押しても `thread/archive { archived: false }` が outbox に入る（シェルが操作をアプリのスコープで動かす前提。10.4） |
+| `BackgroundViewsTest`（Robolectric + Compose） | fixture のタスクの描画: 動いているエージェント（種類・経過・最後のツール・ツールの回数・トークン、「停止」の名前と押下）、停止中・送信待ち・確認されなかった停止、終わったシェル（終了コード、出力の末尾）とワークフロー（起動したタスク、要約、エージェントごとの状態・フェーズ・種類・モデル・トークン、使用量）、`lost` と理由、起動した Item のチップ（押すとタスクへ、タスクがなければ「バックグラウンドで続行」、終わると「バックグラウンド: 失敗」など）、エージェント起点のターンの区切り、タスクの承認のカード、停止の確認に並ぶ作業（上限と「ほか n 件」） |
+| `BackgroundScreenTest`（Robolectric + Compose） | 実際の Activity と Room で（オフライン）: スレッド一覧の「バックグラウンドで実行中 (1)」、区域の見出しの数、終わった作業を開く、「停止」の確認から outbox の `backgroundTask/stop` とカードの「停止の送信待ち」。区域を畳んだ後で、起動した Item のチップからタスクのカードへ移ること。プロセスの停止の確認に「1 件のバックグラウンド作業も止まります」とタスクの題名 |
 | `ScreensUiTest`（Robolectric + Compose） | 実際の Activity と Room で: プロジェクト → スレッド一覧（ピン留めが先、未読）と長押しのピン留め、オフラインのスレッド（キュー、承認のバナー、チップ）と送信待ちになるメッセージ、質問の通知のディープリンクで回答シート、作り直された Activity に最初の composition より前に届いた通知のタップ、新規プロジェクトのオフライン表示、拡張 FAB と要対応のバッジ（件数）のアクセシブルな名前 |
 
 - `:app:lintDebug` はエラー 0、警告 0。`OldTargetApi` は design.md の targetSdk 36 の選択なので無効にしている。依存のバージョンの新しさの検査（`GradleDependency` など）は手で行うので無効にしている（22章）。
@@ -784,7 +855,7 @@ timeout 3000 ./gradlew --max-workers=6 :app:testDebugUnitTest
 
 - **別のモジュールにした理由**: アプリの `androidTest` はアプリと同じプロセスで動くので、テストがアプリのデータを消す・止める・プロセスを殺す（プロセスの死、アプリの再起動、テストごとの新しいインストール）と、テスト自身も終わってしまう。また staging では、テストの APK が R8 で名前を変えられたり消されたりしたアプリのクラスとリンクすることになる。`:e2e`（`com.android.test`、`targetProjectPath = ":app"`）は自分自身を計装する APK（self-instrumenting）で、自分のプロセスで動き、アプリからはパッケージ名と文字列リソース（名前で引く）しか使わない。AGP が self-instrumenting の APK に自分の依存をすべて入れるのは `com.android.test` のモジュールだけ（アプリの `androidTest` ではアプリにあるもの、たとえば Kotlin の標準ライブラリを外すので、単独では起動できない）。
 - **ビルドの種類**: `:e2e` の debug は `dev.aas.android`（debug）を、staging は `dev.aas.android.staging`（staging）を操作する。gradle の `:e2e:connectedDebugAndroidTest` / `:e2e:connectedStagingAndroidTest` がアプリとテストの APK を入れて回す。release は利用者の鍵で署名し平文の接続を許さないので対象にしない（23.2 の最後で起動だけ確かめる）。`:app` 自身の `androidTest` は作らない（`androidComponents` で無効）。
-- **操作のしかた**: UI Automator でアプリとシステムの UI（通知のシェード、権限のダイアログ）を操作し、Intent（ランチャーの起動、`aas://pair` のリンク）でアプリを開き、shell のコマンド（`pm clear`、`pm grant` / `revoke`、`am force-stop`、`am kill`、`su 0 kill -9`、`dumpsys`、`cmd connectivity airplane-mode`）でアプリのデータとプロセスと端末のネットワークを扱う。機内モードではアプリは既定のネットワークがないので接続を試みない（11.3）が、テストの経路（adb、`adb reverse` の制御チャネル）は使える。プロセスで Activity が動いているかは `dumpsys activity activities` の Activity の記録が持つ `ProcessRecord{… <pid>:<パッケージ>/…}` で見る（`AppDriver.activitiesIn`）。画面の言葉はアプリの文字列リソースを名前で読むので、文言を変えてもテストは追従する。システムは Home を非同期に処理し、忙しいとその後の起動より遅れて Home が前に出るので、`goHome` はランチャーが前面になるまで待ち、`launch` はアプリが前面になるまで待つ（後から来た Home に隠されたら起動し直す。既にあるタスクを前に出すだけ）。画面の切り替わりと重なって失われうるナビゲーションのタップは、次の画面が出るまでタップし直す（`tapUntil`）。システムのダイアログ（通知の権限）は出た直後のタッチを無視することがあるので、ボタンが消えるまでタップし直す（`tapUntilGone`）。どちらも2回以上かかったら logcat に `AasE2e` で残す。
+- **操作のしかた**: UI Automator でアプリとシステムの UI（通知のシェード、権限のダイアログ）を操作し、Intent（ランチャーの起動、`aas://pair` のリンク）でアプリを開き、shell のコマンド（`pm clear`、`pm grant` / `revoke`、`am force-stop`、`am kill`、`su 0 kill -9`、`dumpsys`、`cmd connectivity airplane-mode`）でアプリのデータとプロセスと端末のネットワークを扱う。機内モードではアプリは既定のネットワークがないので接続を試みない（11.3）が、テストの経路（adb、`adb reverse` の制御チャネル）は使える。プロセスで Activity が動いているかは `dumpsys activity activities` の Activity の記録が持つ `ProcessRecord{… <pid>:<パッケージ>/…}` で見る（`AppDriver.activitiesIn`）。画面の言葉はアプリの文字列リソースを名前で読むので、文言を変えてもテストは追従する。システムは Home を非同期に処理し、忙しいとその後の起動より遅れて Home が前に出るので、`goHome` はランチャーが前面になるまで待ち、`launch` はアプリが前面になるまで待つ（後から来た Home に隠されたら起動し直す。既にあるタスクを前に出すだけ）。画面の切り替わりと重なって失われうるナビゲーションのタップは、次の画面が出るまでタップし直す（`tapUntil`）。システムのダイアログ（通知の権限）は出た直後のタッチを無視することがあるので、ボタンが消えるまでタップし直す（`tapUntilGone`）。どちらも2回以上かかったら logcat に `AasE2e` で残す。カードの中のボタン（`tapNear`）は有効になってから押す（承認のボタンは `AppPolicy.interactionArmDelayMs` の後に有効になり、それより前のタップは失われる）。
 - **アクセシビリティのキャッシュ**: UI Automator は UiAutomation の接続がキャッシュしたアクセシビリティのノードを読む。このキャッシュはアプリが送るアクセシビリティのイベントで更新されるが、Compose はアクセシビリティのサービスが「有効」と一覧されているときだけイベントを送り、テストの UiAutomation はその一覧に出ない（アプリの `AccessibilityManager.getEnabledAccessibilityServiceList` が空）。そのため、画面の中で変わった部分（`/` のパレットの絞り込み、スレッドの見出しの状態）が古いまま見える。`AppDriver.refresh()` が毎回の探索の前にキャッシュを捨てる（Android 14 以上は `UiAutomation.clearCache()`、それより前は `setServiceInfo` の副作用）。TalkBack を有効にした端末ではサービスが一覧に出るので、この現象はテストの環境だけのもの（TalkBack では確かめていない。29章）。
 - **分離**: 本物の daemon を使うテスト（`E2eTest` を継ぐもの）は、各テストの前にアプリのデータを消し（`pm clear`。インストール直後と同じ。Keystore の鍵、権限も消える）、テストサーバの `reset`（データベースを作り直す。新しい epoch）で daemon も空にしてから、アプリを最初のデバイスとしてペアリングする。プロキシは `chaos pass` に、機内モードは切に戻す（途中で失敗したテストが残したものを消す。テストの後にも同じことをする）。前のテストのデバイス、プロジェクト、スレッド、保留中の承認が残って通知やリストに出ることはない。PC のプロジェクトのフォルダは残るので、名前は一意にする（`AppFlows.unique`）。orchestrator で各テストを別の計装の実行にする（固まったり落ちたりしたテストが残りを巻き込まない）。
 - **待ち時間**: `Waits`（テストのポリシー値。動いているアプリの画面 30 秒、プロセスの起動からの最初の画面 60 秒（debug のビルドは最適化も事前のコンパイルもなく実行時に検証されるので、エミュレータで最初の Activity が出るまで 12〜24 秒かかり、PC が忙しいとそれ以上。R8 のビルドは 3〜10 秒）、接続 45 秒、ターン 90 秒、サービスの再起動 90 秒、確認の間隔 100ms）と、`AppDriver` / `HostControl` / `ReliabilityE2eTest` の名前付きの定数（理由を doc コメントに書いた）。
@@ -795,6 +866,8 @@ timeout 3000 ./gradlew --max-workers=6 :app:testDebugUnitTest
 | `PairingE2eTest` | 手入力（URL とペアリングコード）→ 確認 → 初回の準備 → 接続済み、daemon の名前が設定に出る。通知の権限を本物のシステムのダイアログで拒否（準備の画面に「通知を許可」が残り、設定に「通知がオフになっています」）と許可。アプリのプロセスを止めて起動し直してもトークン（Keystore）が使え、daemon のデバイス一覧に「（この端末）」。ペアリングの解除（daemon で失効し、ペアリング画面へ）と、もう一度のペアリング（新しいデバイスが「（この端末）」で、解除したデバイスは一覧に出ない） |
 | `ConversationE2eTest` | 新規プロジェクトの流れ（最初から始める → git init → 名前 → root の中 → ここに作成）と fake ハーネスのスレッド。思考・コマンド・ファイル変更・`@stream` の出力がそろって1回ずつ描かれ、畳まれた「3 件の操作」を開くとコマンドのカード（実行済み）とファイルの変更、ターンの差分の画面（PC の git の差分）。スレッド一覧とプロジェクト一覧に戻る。`/` のパレット（daemon の `command/list` が先頭に見える、`/sta` で絞り込み、`/status` のシート）と `@` のメンション（PC の `fs/search`、選んだパスが入力欄に入り、送ったメッセージにメンションのチップ） |
 | `ApprovalE2eTest` | 承認の通知（背面）: 通知のシェードで「許可（一度だけ）」を押すと、daemon がコマンドを実行してターンを終え、アプリに承認の記録と続きの文が出る。要対応のタブ: バッジの件数（アクセシブルな名前）、カードの「許可」でカードが消え、ターンが終わる |
+| `ResumeE2eTest` | `/resume` と取り込み: テストサーバの `native-session` で PC のセッション（fake の CLI の保存）を root の下の新しいフォルダーに作り、そのフォルダーをプロジェクトとして開いて（既存のフォルダーを使用 → パスを入力）最初のスレッドを作る。スレッドの `/resume` → 取り込み画面にそのセッション → 選ぶと取り込んだスレッドが PC の履歴で開き、スマホから続きを送れる。戻るで最初のスレッドへ。もう一度 `/resume` で「取り込み済み」、選ぶと同じスレッド（スマホから送ったメッセージがある） |
+| `BackgroundE2eTest` | 本物の daemon の fake ハーネスで `@bg dev kind=shell ms=0 npm run dev`（止めるまで動くシェル）: ターンが終わってもスレッドのバックグラウンドの区域に「実行中 1」とタスク、起動したコマンドのチップ「バックグラウンドで実行中 · 経過」、スレッド一覧に「バックグラウンドで実行中 (1)」。「停止」→ 確認 → daemon がハーネスに止めさせ、区域は「終了 1」に畳まれ、チップは「バックグラウンド: 停止」、終わった作業を開くと「シェル · 停止 · …」。一覧から「バックグラウンドで実行中」が消える |
 | `ReliabilityE2eTest` | ストリーミング（20 秒の `@stream`）中の `chaos drop`（と遅い回線）: 接続の帯が再接続中を出してから接続済みに戻り、出力が欠けず重ならない（`tok0 … tok199` がちょうど1回）。`chaos blackhole`: 生存確認で気づいて再接続し、同じく欠けない。ターンの途中の daemon の `restart`: ターンは停止として終わり、アプリは同じ epoch に再接続して次のターンが動く。3つとも、切れた時点でアプリの出力が最後のトークンまで届いていないこと（ストリームの途中で切れたこと）を確かめる（確かめないと、切る前にストリームが終わっていても通ってしまう）。背面でのプロセスの死: 承認を求めるメッセージを機内モードで送って outbox に置き、`am kill` では接続サービス（foreground）がプロセスを守り、`kill -9`（低メモリ時の終了と同じ）の後はシステムが `START_STICKY` のサービスを起動し直して foreground に戻る。そのプロセスに Activity がなく、まだ承認の通知がないことを確かめてから機内モードを切ると、Activity なしで再接続して outbox のメッセージを送り、その承認の通知を受け、シェードからの許可でターンが終わる（Activity は起動されない）。承認は殺した後のプロセスが送ったメッセージからしか生まれないので、順序は待ち時間ではなく手順で決まる |
 
 ### 23.2 動かし方（`android/scripts/`）
@@ -832,7 +905,7 @@ cd android\scripts
   - 結果: `android\e2e\build\device-test-results\<build>-round<n>\`（JUnit の XML、テストごとの logcat）と `<build>-round<n>-gradle.log`。コンソールには各回の件数と、失敗したテストの最初の行が出る。終了コードはすべて通れば 0。
 - **制御チャネル**（テスト専用）: 端末の 127.0.0.1:`controlPort` への TCP 接続1本につき1要求。テストがコマンドの行と空行を送り、スクリプトが JSON の行を返して接続を閉じる（`HostControl`）。コマンド: `chaos pass|drop|blackhole|delay <ms>`、`restart`、`reset`、`pairing-code`、`native-session ...`（そのままサーバの標準入力へ。サーバが出した行を ok / error の行まで返す）、`ready`（最新の ready 行）、`screenshot <名前>`（`adb exec-out screencap -p` で `<ScreenshotDir>\<名前>.png`。`-ScreenshotDir` がなければ何もしない）。サーバの `quit` は断る（サーバの寿命はスクリプトが持つ）。
 - スクリプトなしで `gradlew :e2e:connectedDebugAndroidTest` を回すと、daemon を使うテストは skip され（`Assume`）、`PairingWithoutDaemonTest` だけが動く。
-- 保存する画面（`-ScreenshotDir`）: `pairing-intro`、`pairing-manual`、`pairing-confirm`、`pairing-setup`、`permission-dialog`、`settings`、`projects`、`new-project-choose` / `-details` / `-location`、`new-thread`、`thread-streamed`、`thread-command-and-diff`、`diff`、`thread-list`、`composer-palette`、`approval-card`、`inbox`、`notification-approval`、`connection-reconnecting`。
+- 保存する画面（`-ScreenshotDir`）: `pairing-intro`、`pairing-manual`、`pairing-confirm`、`pairing-setup`、`permission-dialog`、`settings`、`projects`、`new-project-choose` / `-details` / `-location`、`new-thread`、`thread-streamed`、`thread-command-and-diff`、`diff`、`thread-list`、`composer-palette`、`import-session`、`thread-resumed`、`thread-background`、`thread-list-background`、`background-stop-dialog`、`thread-background-stopped`、`approval-card`、`inbox`、`notification-approval`、`connection-reconnecting`。
 
 **CI では動かさない**: daemon（テストサーバ）は Windows の Job Object などを使うので Windows で動かす必要があり、GitHub の Windows のホストランナーは入れ子の仮想化がなくエミュレータのアクセラレーション（WHPX）を使えない。この PC（Windows 11、WHPX）で手で回す。CI（`.github/workflows/ci.yml`）の Android のジョブは JVM のテスト、lint、APK のビルドまで。
 
@@ -861,6 +934,28 @@ adb -s emulator-5580 uninstall dev.aas.android                       # 残すと
 - テストとスクリプトの側で直したこと: アクセシビリティのキャッシュ（23.1。スレッドの見出しが「実行中」のまま見えたのもこれで、アプリの状態は正しかった）、テストごとの daemon の `reset`（前のテストの保留中の承認が heads-up の通知になって操作を妨げた）、画面の切り替わりと重なって失われるタップ（ナビゲーションは次の画面が出るまでタップし直す）、Home とアプリの起動の競合と、出た直後の権限のダイアログが無視したタップ（23.1）、adb のサーバが止まっているときに `adb devices` の標準エラーで PowerShell 5.1 のスクリプトが止まった（プロセスの API で呼ぶ）、Gradle がテストの前に失敗した回で前の回の結果を数えていた（各回の前に結果のフォルダを消す）。
 - アプリの初回の起動: debug のビルドは最初の Activity が出るまで 12〜24 秒かかり（R8 のビルドは 3〜10 秒）、PC が忙しいときやエミュレータを起動した直後は 30 秒を超えて、画面の待ち時間で失敗したことがあった。プロセスの起動からの最初の画面は `Waits.APP_START_MS`（60 秒）で待つ。
 
+### 23.4 実行の記録（2026-09-28、`/resume` と取り込み画面の修正の後）
+
+- 環境は 23.3 と同じ（`emulator-5580`、API 36）。テストサーバは `target\aas-test-bin\` のもの。
+- `run-device-tests.ps1 -BuildType debug -Tests dev.aas.android.e2e.ResumeE2eTest`: 1 / 1（`import-session` と `thread-resumed` の画面を目で確かめた。取り込み画面にはテストのスレッド自身のセッションも「取り込み済み」で並ぶ）。
+- `run-device-tests.ps1 -BuildType both`（17 件）: staging 17 / 17、debug 16 / 17。落ちたのは `ApprovalE2eTest.theInboxTabShowsAndAnswersAPendingApproval`: 要対応のカードが出た直後の「許可」のタップが、ボタンが有効になる前（`interactionArmDelayMs`）で失われ、カードが 90 秒残った（アプリは回答を受け取っていない。送信待ちの表示もなかった）。テストの `tapNear` が有効になったボタンだけを押すように直し、`-BuildType both -Repeat 2 -Tests dev.aas.android.e2e.ApprovalE2eTest` で debug 2 / 2、staging 2 / 2、debug 2 / 2、staging 2 / 2。
+- テストサーバは、テストの間の `reset` の直後に `ERROR aas_core::actor: storing the diff summary failed error=the database is closed` を何度か出した（前のテストのターンがまだ動いている間にデータベースを作り直すため。テストの結果には影響しなかった）。
+
+### 23.5 実行の記録（2026-09-28、バックグラウンドの作業）
+
+- 環境は 23.3 と同じ（`emulator-5580`、API 36）。テストサーバは `target\aas-test-bin\` のもの（バックグラウンドの作業に対応した daemon と fake エージェント）。
+- `run-device-tests.ps1 -BuildType debug -Tests dev.aas.android.e2e.BackgroundE2eTest`: 1 / 1。`thread-background`（区域の「実行中 1」、タスクのカードと「停止」、コマンドのチップ「バックグラウンドで実行中 · 1 秒」、ヘッダの「バックグラウンドで実行中 (1)」）、`thread-list-background`、`background-stop-dialog`、`thread-background-stopped`（「終了 1」、「シェル · 停止 · 9 秒」と結果の出力、チップ「バックグラウンド: 停止」、ヘッダは「待機中」）を目で確かめた。
+- 同じテストの staging（R8、`-BuildType staging`）: 1 / 1（R8 をかけたビルドでも同じ流れが通る）。テストの後、`stop-emulator.ps1` で `emulator-5580` を止めた。
+- JVM: `:protocol:test` 21、`:sync:test` 125（`AAS_TEST_SERVER` を指定して `RealServerTest` 15 件を含む。skip 0）、`:app:testDebugUnitTest` 232。すべて成功。`:app:lintDebug` は問題なし。
+
+### 23.6 実行の記録（2026-09-29、バックグラウンドの作業のすべてのハーネスを統合した後）
+
+- 環境は 23.3 と同じ（`emulator-5580`、API 36）。テストサーバは統合した作業ツリーから作り直した `target\aas-test-bin\` のもの。
+- `run-device-tests.ps1 -BuildType both`（全 18 件）: debug は 18 / 18。staging は 17 / 18 で、`PairingE2eTest.unpairingRevokesTheDeviceAndPairingAgainWorks` が落ちた。設定をスクロールした直後の「ペアリングを解除」のタップが、まだ動いているリストを止めるだけで終わり、確認のダイアログが開かなかった（画面の記録にダイアログがない）。テストを `openDevices` と同じく「確認が出るまでタップする」（`tapUntil`）に直した。アプリの不具合ではない。
+- 直した後の `run-device-tests.ps1 -BuildType both`: debug 18 / 18、staging 18 / 18。`thread-background` と `thread-background-stopped` の画面を目で確かめた。テストの後、`stop-emulator.ps1` で `emulator-5580` を止めた。
+- JVM（`--rerun`）: `:protocol:test` 21、`:sync:test` 125（`AAS_TEST_SERVER` を指定して `RealServerTest` 15 件を含む。skip 0）、`:app:testDebugUnitTest` 232。すべて成功。`:app:assembleDebug`、`:app:assembleRelease`、`:app:assembleStaging`、`:e2e:assembleDebug` が通り、`:app:lintDebug` は問題なし。
+
+
 ## 24. 画面とプロトコルの対応
 
 UX は `docs/ux/codex-desktop.md` 8章。画面ごとに、読むもの（エンジンの StateFlow か読み取り専用の呼び出し）と変えるもの（outbox 経由の要求）をまとめる。★ は `enqueue`（結果を待たない。確定エラーはシェルがスナックバーで出す）、☆ は `mutate`（結果を画面で使う）。
@@ -879,13 +974,17 @@ UX は `docs/ux/codex-desktop.md` 8章。画面ごとに、読むもの（エン
 
 | 表示・操作 | プロトコル |
 |---|---|
-| ピン留めが先、次に最終活動の新しい順。未読のドットと太字、状態のチップ、承認・質問・送信待ちの件数、ハーネス名、相対時刻 | `engine.workspace`（`Thread.pinned`、`pendingInteractions`、`queuedInputs`）と端末の読んだ位置 |
+| ピン留めが先、次に最終活動の新しい順。未読のドットと太字、状態のチップ（「バックグラウンドで実行中 (N)」を含む）、承認・質問・送信待ちの件数、ハーネス名、相対時刻 | `engine.workspace`（`Thread.pinned`、`pendingInteractions`、`queuedInputs`、`background.running`）と端末の読んだ位置 |
 | 右スワイプ: 既読 ↔ 未読（端末ごと） | `engine.markViewed` / `markUnread`（サーバには送らない） |
-| 左スワイプ: アーカイブ。スナックバーの「元に戻す」で解除（一覧の画面を離れた後に押しても効く。操作はアプリのスコープで動く、10.4）。プロセスがあるスレッドは「停止してアーカイブ」を確認する | `thread/archive` ★（`archived: true` / `false`） |
+| 左スワイプ: アーカイブ。スナックバーの「元に戻す」で解除（一覧の画面を離れた後に押しても効く。操作はアプリのスコープで動く、10.4）。プロセスがあるスレッドは「停止してアーカイブ」を確認する（バックグラウンドの作業が動いていれば「N 件のバックグラウンド作業も止まります」） | `thread/archive` ★（`archived: true` / `false`） |
 | 長押し: ピン留め / 外す、名前を変更、既読 / 未読、アーカイブ | `thread/update { pinned }` ★、`thread/update { title }` ★ |
 | メニュー: アーカイブ済みのスレッド（ページ送り、解除、開く） | `thread/list { projectId, includeArchived, before }`、`thread/archive { archived: false }` ★ |
-| メニュー: PC のセッションを取り込む（能力 `nativeSessions` のハーネスがあるとき） | `native/list`、`native/import` ☆（取り込み済みなら既存のスレッドを開く） |
-| 取り込み: `native/list` が `harnessUnavailable` なら「「X」を使えません: 理由」と「再確認」（`harness/refresh` のあと一覧を取り直す）。取り込みの要求がハーネスを待っていれば、その知らせ（`HarnessWaitNotice`）と「再確認」「送信を取り消す」 | `harness/refresh`、`discardOutbox` |
+| メニュー: PC のセッションを取り込む（使えて能力 `nativeSessions` を持つハーネスがあるとき）。スレッドの `/resume` からも開く（24.5） | `native/list`、`native/import` ☆（取り込み済みなら既存のスレッドを開く） |
+| 取り込み画面の最初のハーネス: `/resume` から開いたらそのスレッドのハーネス、それ以外はプロジェクトの既定のハーネス（`defaults.harnessId`）、それもなければ最初の取り込めるハーネス（`NativeSessionHarnesses.preselect`）。スレッドのハーネスとプロジェクトの既定は、能力 `nativeSessions` を持たないと分かっている（使えるのに能力がない、またはこの画面でサーバが `capabilityUnsupported` と答えた）ときだけ飛ばす。サーバが `capabilityUnsupported` と答えたハーネスは、この画面では自分から選び直さない（ワークスペースの表示が遅れていても2つのハーネスの間を行き来しない）。ワークスペースが取り込めると示す間はチップに残り、利用者は選べる。使えないハーネスは能力が分からない（protocol.md: `native/list` は `harnessUnavailable`）ので、選んだまま一覧を試し、その場で理由を出す。取り込めるハーネスが1つもなければ何も選ばずにその旨を出し、`harness/updated` で取り込めるハーネスが現れたらそれを一覧する | `engine.workspace` |
+| ハーネスの切り替え: チップ（一覧しているハーネス以外の選択肢があるとき。何も選んでいなければ1つでも出す）。選択肢は、取り込めるハーネス、一覧している（選んだ）ハーネス（状態によらない。失敗を出しているハーネスのチップも残る）、スレッドのハーネス（使えない間。サーバが `capabilityUnsupported` と答えたものは除く）。一覧の途中でも、失敗を出している間でも切り替えられる（前の一覧の結果は捨てる） | `native/list` |
+| 一覧: 新しい順。同じ `nativeSessionId` が複数あれば1件（`updatedAt` の最も新しいもの。10.4）。取り込み済みには「取り込み済み」 | `native/list` |
+| 失敗はリストの場所に出す: `harnessUnavailable` なら「「X」を使えません: 理由」と「再確認」（`harness/refresh` のあと一覧を取り直す）、`capabilityUnsupported`（使えなかったハーネスを probe したら、セッションの一覧の能力がなかった）なら、次に一覧するハーネス（`preselect`。そのハーネス自身は除く）へ移り、スナックバーで「「X」は PC のセッションの一覧に対応していないため、「Y」のセッションを表示しています」。移る先がなければ「「X」は PC のセッションの一覧に対応していません」を再試行なしで出し（同じ答えになるため）、`harness/updated` で取り込めるハーネスが現れたらそちらへ移る。それ以外はサーバの文と「再試行」、オフラインはその旨と「再試行」。ほかのハーネスのチップはそのまま使える。取り込みの要求がハーネスを待っていれば、その知らせ（`HarnessWaitNotice`）と「再確認」「送信を取り消す」 | `harness/refresh`、`discardOutbox` |
+| セッションを選ぶ: 取り込み済みならそのスレッドを開く。そうでなければ `native/import` の結果のスレッドを開く（取り込み画面をバックスタックから外す。そのスレッドが `/resume` を実行したスレッドなら画面を閉じるだけ） | `native/import` ☆ |
 
 ### 24.3 新規プロジェクト（`NewProjectRoute`、`ui/newproject/`）
 
@@ -914,8 +1013,10 @@ UX は `docs/ux/codex-desktop.md` 8章。画面ごとに、読むもの（エン
 | 通知のディープリンク `aas://thread/<id>?interactionId=<id>`: 承認はカードまでスクロール、質問は回答シート | 10.3 |
 | キュー: 一覧（プレビュー）、編集、今すぐ反映（実行中は能力 `steer` があるときだけ、実行中でなければ新しいターン）、削除。一時停止のバナーと「再開」 | `queue/update` ★、`queue/steer` ★、`queue/remove` ★、`queue/resume` ★（`Thread.queuePaused`、`queue/updated`） |
 | プランのピル（実行中のターンの最後のプラン。「プラン n / m 完了」、開くと一覧） | `plan` Item |
-| メニュー: 名前を変更、ピン留め、分岐（能力 `fork`）、変更（差分）、状態、新しいスレッド、未読にする、プロセスを停止（確認）、アーカイブ（実行中は「停止してアーカイブ」）/ 解除 | `thread/update` ★、`thread/fork` ☆（新しいスレッドを開く）、`thread/stop` ★、`thread/archive` ★ |
-| 状態のシート（`/status`）: スレッド ID、ネイティブセッション ID、ハーネス・モデル・推論・権限、プロセスの状態（`idle` はプロセスなし）、`ctx`（`Usage.context`。報告がなければ「報告していません」）、累計の使用量、作業フォルダ、worktree、分岐元、キュー、最後のエラー | `Thread` |
+| メニュー: 名前を変更、ピン留め、分岐（能力 `fork`）、変更（差分）、状態、新しいスレッド、未読にする、プロセスを停止（確認。動いているバックグラウンドの作業があれば「N 件のバックグラウンド作業も止まります」とその題名）、アーカイブ（実行中は「停止してアーカイブ」。同じ一覧付き）/ 解除 | `thread/update` ★、`thread/fork` ☆（新しいスレッドを開く）、`thread/stop` ★、`thread/archive` ★ |
+| バックグラウンドの区域（30章）: タスクごとの状態・進捗・結果、「停止」（確認）、終わったタスクの出力の全文（`TaskOutputRoute`） | `ThreadState.backgroundTasks`、`backgroundTask/stop` ★ |
+| `/resume`（アプリ側のコマンド。25章）: このスレッドのプロジェクトの「PC のセッションを取り込む」を、このスレッドのハーネスを選んだ状態で開く（24.2） | `native/list`、`native/import` ☆ |
+| 状態のシート（`/status`）: スレッド ID、ネイティブセッション ID、ハーネス・モデル・推論・権限、プロセスの状態（`idle` はプロセスなし）、バックグラウンド（実行中の数と最後に終わった作業。`Thread.background`）、`ctx`（`Usage.context`。報告がなければ「報告していません」）、累計の使用量、作業フォルダ、worktree、分岐元、キュー、最後のエラー | `Thread` |
 | 表示中は既読にし、通知を静かにする | `markViewed`、`AppVisibility`（`onVisible` / `onHidden`） |
 | ハーネスを待つ要求: 送信待ちのメッセージは吹き出しの中に「「X」を使えないため保留しています」、理由、「再確認」「送信を取り消す」。メッセージ以外（分岐、今すぐ反映など）は composer の上の知らせ | `harness/refresh`、`discardOutbox`（6.3） |
 
@@ -936,7 +1037,9 @@ UX は `docs/ux/codex-desktop.md` 8章。画面ごとに、読むもの（エン
   - `insertText`: `/query` をその文字列で置き換える（送るとハーネスがコマンドとして処理する）。
   - `method`: `thread/diff` → 変更の画面、`thread/fork` → 分岐して開く、`thread/archive` → 確認、`thread/stop` → 停止、`queue/resume` → 再開。知らないメソッドは `engine.runCommand`（`threadId` を補う）。
   - `picker`: モデル・推論 / 権限のシート。
-  - アプリ側: `/new`（同じプロジェクトとハーネスの新しいスレッド）、`/status`、`/rename`、`/pin`、`/review` と `/init`（同じ名前のハーネスのコマンドがなければ、定型の依頼文を入れる）。
+  - アプリ側: `/new`（同じプロジェクトとハーネスの新しいスレッド）、`/status`、`/rename`、`/pin`（ピン留め済みなら「外す」と説明する）、`/review` と `/init`（同じ名前のハーネスのコマンドがなければ、定型の依頼文を入れる）、`/resume`（下）。
+  - `/resume`: このプロジェクトの「PC のセッションを取り込む」を、スレッドではそのスレッドのハーネス、新しいスレッドの画面では選んでいるハーネスを最初に一覧して開く（24.2）。セッションを選ぶと取り込み（`native/import`）、そのスレッドを開く。取り込み済みならそのスレッドを開く。使えて能力 `nativeSessions` を持つハーネスがなければ出さない。
+  - ハーネスの `resume` は出さず、送らない: Claude Code や Codex の `/resume` は CLI の端末の画面でセッションを選ぶもので、daemon のセッションでは使えない。daemon は出さなくなるが、古い daemon が `command/list` に出しても、パレットはハーネスの `resume` を除く（アプリ側の `/resume` がその名前を持つ）。打って送った `/resume`（最初の単語が `/resume`。後ろの語も送らない）も `turn/start` / `thread/create` にせず、アプリ側の `/resume` を実行する（取り込めるハーネスがなければ理由を出し、何も送らない）。
   - 知らない種類のアクションは一覧に出すが実行できない。
 - **`@` メンション**: 単語の先頭の `@` にカーソルがある間、`mentionSearchDebounceMs` 待ってから `fs/search { threadId | projectId }`（並びは daemon の H1）。選ぶと `@path ` に置き換える。送信時は、本文に単語として残っている `@path` をその位置で `mention` の入力に置き換える（「see @src/a.rs please」→ text「see 」、mention、text「 please」）。daemon は mention を `@path` として本文に書き（アダプタもそのまま渡す）ので、トークンを本文にも残すと、エージェントへの依頼と吹き出しにパスが二重に出る。同じ位置に候補が複数あれば長いパスを選ぶ。キューの編集と送信待ちの表示は、入力から daemon と同じ書き方で本文に戻す（`ComposerText.textOf`）。
 - **画像**: 17章。サムネイルはアップロード中・失敗（押すと再試行）・外すを表示する。
@@ -947,7 +1050,7 @@ UX は `docs/ux/codex-desktop.md` 8章。画面ごとに、読むもの（エン
 | スレッド | 入力欄 | ボタン | 長押し | 要求 |
 |---|---|---|---|---|
 | ターンが動いていない（`lastTurn.status != running`） | 空でない | 送信 | — | `turn/start`（`delivery: auto`）。キューが一時停止していれば「送信する（キューも再開）/ キューを消去して送信 / キャンセル」を確認する |
-| ターンが動いている | 空 | 停止 | — | `turn/interrupt`。応答までは「停止しています…」で押せない |
+| ターンが動いている | 空 | 停止 | — | `turn/interrupt`。応答までは「停止しています…」で押せない。能力 `backgroundTasks` を持つハーネスでは、下に「ターンを止めます（バックグラウンドの作業は続きます）」 |
 | ターンが動いている | 空でない | 設定の既定（キューに追加 / 今すぐ反映） | もう一方 | `turn/start`（`delivery: queue` / `steer`）。能力 `steer` がなければキューだけ |
 | どれでも | アップロード中・失敗あり | 押せない | — | — |
 | どれでも | 画像があり、ハーネスが能力 `images` を持たない | 押せない（画像を外すよう案内） | — | — |
@@ -971,6 +1074,11 @@ UX は `docs/ux/codex-desktop.md` 8章。画面ごとに、読むもの（エン
   - お知らせ: 種類（情報・警告・エラー）の色とアイコン、`code`。
   - 知らない種類: 「このアプリが対応していない項目（kind）」。
   - 閉じた Interaction: 「題名 → 選んだ選択肢」、「質問済み · n 件の質問」、「（回答が提供されていません）」、「（期限切れ: 理由）」。
+- バックグラウンドの作業（30章）:
+  - 作業をバックグラウンドで続ける Item（`backgrounded`、`backgroundTaskId`）の下に、そのタスクの状態のチップ（「バックグラウンドで実行中 · 3 分」/「バックグラウンド: 完了」など。タスクを読み込んでいなければ「バックグラウンドで続行」）。押すとバックグラウンドの区域（終わったタスクなら終わった作業も）を開き、そのタスクまでスクロールする。コマンドのカードの状態は「バックグラウンドで続行」。
+  - ハーネスが理由を明示したエージェント起点のターン（`Turn.trigger`）の区切りは「バックグラウンド作業の完了を受けて · ターン N」（`scheduled` は「予約した時刻に再開」）。Item のないまま完了したそのターンは区切りだけにする（末尾のまとめを出さない）。
+  - ターンに属さない Interaction（バックグラウンドタスクが求めたもの、ターンが動いていない間に求められたもの）は、求められた時刻（`createdAt`）より前に始まった最後のターンの後に並べる。以前はすべて末尾に出していた。
+  - 会話の後、送信待ちのメッセージの前に「バックグラウンド」の区域（見出しに実行中・常駐・終了の数。タスクが1つもなければ出さない）。
 - 一覧は下から積む（`reverseLayout`）。下端にいる間は新しい行に追従し、ストリーミングで伸びる行は下端に固定されたまま上に伸びる（位置が跳ねない）。追従をやめるのは利用者のスクロールが下端以外で終わったときだけで、その間は「一番下までスクロール」のボタンを出す。送信すると下端に戻る。
 
 ## 27. オフラインと送信待ち
@@ -999,19 +1107,50 @@ UX 文書の 8章はアプリの実装と一致させてある（2026-09 に照�
 
 ## 29. 未検証・既知の制限
 
-- エミュレータ（Android 16 / API 36、Google APIs、x86_64）では、端末のテスト（23.1）で次を確かめた: 本物の daemon とのペアリング（リンクと手入力）、Keystore で暗号化したトークンがアプリの再起動をまたいで使えること、通知の権限のシステムのダイアログ、通知のシェードの「許可（一度だけ）」、`kill -9` の後の `START_STICKY` による接続サービスの再起動と foreground への復帰、drop / blackhole / daemon の再起動からの回復、R8 をかけた staging での同じ流れ。リリースの APK は入れて起動し、落ちないことまで（平文を許さないので daemon にはつながない）。実機では動かしていない。次はまだ確かめていない:
+- エミュレータ（Android 16 / API 36、Google APIs、x86_64）では、端末のテスト（23.1）で次を確かめた: 本物の daemon とのペアリング（リンクと手入力）、Keystore で暗号化したトークンがアプリの再起動をまたいで使えること、通知の権限のシステムのダイアログ、通知のシェードの「許可（一度だけ）」、`kill -9` の後の `START_STICKY` による接続サービスの再起動と foreground への復帰、drop / blackhole / daemon の再起動からの回復、R8 をかけた staging での同じ流れ、`/resume` での取り込み、バックグラウンドの作業（区域、起動した Item のチップ、一覧の「バックグラウンドで実行中 (N)」、停止の確認と停止の結果。23.5、23.6）。リリースの APK は入れて起動し、落ちないことまで（平文を許さないので daemon にはつながない）。
+- 実機: Android 11（ColorOS）の端末で、PC に常駐する本物の daemon（Codex などの本物のハーネス）とペアリングして使っている（2026-09）。取り込み画面のクラッシュ（2.3）はこの実機で見つかった。端末のテスト（23.1）はエミュレータで回していて、実機では回していない。実機で1つずつ確かめた記録がないもの:
   - 接続: 電池の最適化の有無による背面からの起動の違い、Doze の間の接続、機種独自の電池管理。
   - 通知: 画面ロック中の通知のボタン（ロック解除の要求）。
   - 鍵とカメラ: CameraX での QR の読み取り、composer のカメラ撮影（`TakePicture` と FileProvider、CAMERA の許可のダイアログ）と Photo Picker（Android 10 / 11 での Google Play 経由の代替を含む）。
   - 表示: ダークテーマと動的カラーでの差分の色、横スクロールの差分で全角以外の幅の広い文字（絵文字の一部など）の幅、TalkBack での読み上げ（23.1 の「アクセシビリティのキャッシュ」はテストの環境だけの現象と考えているが、TalkBack では確かめていない）。
   - 画像: `ContentResolver.loadThumbnail` のサムネイル（端末の MediaProvider による）、HEIC の写真の再エンコード。
   - 端末のテストの Android 13 以前での動き（`AppDriver.refresh` が `clearCache()` の代わりに `setServiceInfo` を使う経路）。エミュレータは API 36 だけで回した。
+  - バックグラウンドの作業（30章）の画面・停止・終わりの通知を、本物のハーネス（Claude Code、Codex、Devin）の作業で使うこと。アプリの側は、fake ハーネスの `@bg` を相手にした JVM のテスト・`RealServerTest`・エミュレータの端末のテストで確かめた。本物のハーネスとの対応は各アダプタの実機のテスト（docs/adapters/*.md）で確かめた。
 - 相対時刻（「3 分前」）は端末のロケールで書く（`ConnectionTexts.relative`）。アプリの文言は日本語だけなので、英語の端末（エミュレータの既定の en-US を含む）では「0 min. ago」のように英語が混ざる。
 - 「別の場所で接続中」の通知の「再接続」が背面から foreground service を起動できること（通知の操作の例外）は、Robolectric で PendingIntent の形（`getForegroundService`、`ACTION_RECONNECT`）までを確かめた。実機の背面での起動は確かめていない。
+- ディープスリープの後の生存確認（6.4）は、`:sync` のテストでスリープを模した時計（`SleepingClock`）で確かめた。実機を実際に長く眠らせての確認はしていない。
 - 本物の daemon との結合は、`:sync` の `RealServerTest`（9.2）と端末のテスト（23.1。新規プロジェクトの git init、`fs/search` のメンション、`command/list` のパレット、ターンの差分、承認、再接続）。clone の進捗と `thread/diff` の blob は台本のサーバ（`FakeServer`）でだけ確かめた。
 - Android 16 の「ローカルネットワークの権限」（現在はオプトイン）: Tailscale の tailnet のアドレス（100.64.0.0/10 と MagicDNS の名前）は対象外と考えているが、確かめていない。対象になれば `NEARBY_WIFI_DEVICES` の要求が必要になる。
 - Room の WAL の同期モードは端末の既定のまま（プロセスの終了に対しては永続。電源断に対してはその既定に従う）。
 - 下書きの添付画像はプロセスのメモリにだけある（15.3）。本文は保存状態に残るが、画像はプロセスが止められると添付し直す。
 - daemon が後から断ったメッセージを composer に戻すのは、送ったのと同じプロセスの間だけ（15.3、25章）。プロセスが止められた後に届いた拒否では戻らない（失敗の通知とスナックバーは出る。outbox の要求から本文とメンションは作り直せるが、添付画像のサムネイルの元の URI は残っていない）。
 - `discardOutbox` で外せるのは、今送っている最中でない要求だけ。応答のないまま `callTimeoutMs` を過ぎて再送待ちになった要求は外せるが、サーバがその要求をまだ処理している可能性は残る（取り消しはサーバには伝わらない。protocol.md に取り消しのメソッドはない）。
+- バックグラウンドタスクは、この端末で開いた（購読した）スレッドのものだけが保存される（workspace ストリームには要約の `Thread.background` だけが届く）。開いたことのないスレッドのタスクの承認は、題名なしで「バックグラウンドの作業から」と出る。
+- バックグラウンドのシェルのライブの出力は出さない（プロトコルに流れがない。design.md 1章の範囲外）。終わったときにハーネスが報告した `result` だけを出す。
 - 通知の上限（`notificationBudget`）はアプリが出した数を `activeNotifications` で数える。システムが足すグループの要約が数に入るかは Android の版と機種による（入る前提で余裕を取っている）。
+
+## 30. バックグラウンドの作業
+
+ハーネスがターンの外で動かす作業（Claude Code のバックグラウンドのエージェント・Bash・Workflow、Codex のバックグラウンドのターミナルとサブエージェントなど）を、ハーネスの明示的なシグナルからできた `BackgroundTask` として中継する（protocol.md 3.1、design.md 5.6）。アプリは推定をしない: 動いているか、終わったか、どう終わったか、止められるかは、すべてタスクの `status`・`endReason`・`stoppable`・`stopRequestedAt`・`stopUnconfirmedAt` と `Thread.background`、ハーネスの能力で決まる。経過時間は表示だけに使う。
+
+**データ（:sync）**
+
+- `backgroundTask/updated`（thread ストリーム）と `thread/read` の `backgroundTasks` を `background_tasks` に保存し、`ThreadState.backgroundTasks` に出す（5章、6.2）。
+- `Thread.background`（workspace と thread の両方の要約）: `running`（`ambient` でない動いているタスクの数）と `lastEnded`（`ambient` でないタスクの最後の終わり。後の終わりにだけ進む）。`lastEnded` が後の終わりに進むと `SyncSignal.BackgroundTaskFinished`（4.4。同じ終わりや前の終わりでは出ない）。
+- `backgroundTask/stop` は outbox 経由（オフラインでも送信待ちとして残る）。レーンはスレッドで、再送待ちの要求を追い越す（6.3）。
+
+**スレッドの画面**
+
+- 会話の末尾（送信待ちのメッセージの前）の「バックグラウンド」の区域。見出しは「実行中 n · 常駐 n · 終了 n」で、押すと畳む・開く。既定は、動いているタスクがあれば開き、なければ畳む（利用者が開閉したらそれに従う）。
+- 動いているタスクは開始の順に、あるタスクが起動したタスクはその下に字下げして並べる。各タスクのカード:
+  - 種類のアイコン（エージェント・シェル・ワークフロー・監視・リモート・予約・その他）、題名（ハーネスの説明文そのまま）、「種類 · 実行中 · 経過」（`startedAt` から。同じ `nativeId` の2回目以降は「n 回目」、`ambient` は「常駐」）。
+  - 起動したタスク（「「題名」から起動」）、次の実行（予約の `nextRunAt`）、進捗（最後のツール · ツールの回数 · トークン。`progress`、なければ `usage`）、ハーネスの要約（`progress.summary`）、ワークフローのエージェント（フェーズ: ラベル · 状態 · 種類 · モデル · トークン）。
+  - 「停止」: 動いていて `stoppable` で、ハーネスが能力 `backgroundStop` を持つときだけ。押すと確認（「「題名」を止めるようエージェントに求めます」）の後に `backgroundTask/stop`。outbox にある間は「停止の送信待ち」、`stopRequestedAt` の間は「停止中…」（押せない）、`stopUnconfirmedAt`（ハーネスが確認しなかった）は注意の文ともう一度の「停止」。止まったことはハーネスの報告（`status`）でだけ分かる。
+- 終わったタスクは「終了した作業 (n)」に畳み（終わった順、最新が下）、開くと「種類 · 完了 / 失敗 / 停止 / 失われました · 動いた時間」、daemon が止めたときはその理由（スレッドの停止、アイドル、サーバの停止、Windows の終了、強制終了、プロセスの入れ替え、プロセスの終了・サーバの再起動で結果不明）、ハーネスが報告した結果（要約、終了コード、出力の末尾 `display.taskOutputLines` 行、長ければ「出力の全文を表示」で `TaskOutputRoute`。blob も読む）。`lost` は題名と理由をエラーの色で出す。
+- 起動した Item のチップ、エージェント起点のターンの区切り、ターンのない承認の位置は 26章。承認・質問のカードは求めたタスクの題名を出す（13章）。
+- ターンの停止ボタンの説明、プロセスの停止とアーカイブの確認は 25章と 24.5。
+- 推論レベルの選択肢はハーネスの `effortLevels`（モデルの `effortLevels`）そのままで、Claude Code が `ultracode` を挙げればそれも選べる（アプリは足さず、隠さず、既定にもしない。トークンの量を理由に既定を変えたり警告したりしない）。
+
+**一覧・通知・設定**
+
+- スレッド一覧・プロジェクト一覧・要対応の「バックグラウンドで実行中 (N)」は 10.4。通知は 12章。設定のサーバの「実行中」は 14章。

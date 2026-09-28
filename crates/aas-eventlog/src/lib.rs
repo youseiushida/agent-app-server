@@ -10,7 +10,8 @@
 //! * Sequence numbers are cursors, not a dense range: compaction deletes old deltas of
 //!   completed items (their final content lives in `item/completed`), events whose whole
 //!   content a later event of the same entity carries (for example an older
-//!   `thread/updated`), and old `native` events; a removed thread's events are purged.
+//!   `thread/updated` or `backgroundTask/updated`), and old `native` events; a removed
+//!   thread's events are purged.
 //! * What compaction and purging need to know about an event is stored with it in explicit
 //!   columns derived from its typed content ([`event_keys`]); stored JSON is never searched.
 
@@ -146,6 +147,9 @@ pub fn event_keys(event: &Event) -> EventKeys {
         Event::ItemCompleted { item } => keyed(format!("item:{}", item.id), false),
         Event::QueueUpdated { .. } => keyed("queue".to_owned(), true),
         Event::CommandsChanged {} => keyed("commands".to_owned(), true),
+        // Every update carries the whole task, a restart (a new run) included: a later one
+        // replaces it. The last update of a task stays, whatever its state.
+        Event::BackgroundTaskUpdated { task } => keyed(format!("background:{}", task.id), true),
         // Each of these adds something no later event repeats.
         Event::TurnStarted { .. }
         | Event::TurnDiffUpdated { .. }
@@ -851,6 +855,46 @@ mod tests {
         assert_eq!(compact_superseded(&tx, 20, 3).unwrap(), 1);
         assert_eq!(compact_superseded(&tx, 20, 3).unwrap(), 0);
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn superseded_background_task_updates_are_compacted() {
+        let mut conn = db();
+        let running = examples::background_task();
+        let progressed = aas_protocol::BackgroundTask {
+            progress: None,
+            ..running.clone()
+        };
+        let ended = aas_protocol::BackgroundTask {
+            status: aas_protocol::BackgroundTaskStatus::Completed,
+            ended_at: Some(9),
+            ..running.clone()
+        };
+        let other = examples::finished_shell();
+        let tx = conn.transaction().unwrap();
+        append(
+            &tx,
+            "s",
+            1,
+            [&running, &other, &progressed, &ended]
+                .into_iter()
+                .map(|task| Event::BackgroundTaskUpdated { task: task.clone() })
+                .collect(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let tx = conn.transaction().unwrap();
+        assert_eq!(compact_superseded(&tx, 100, 100).unwrap(), 2);
+        tx.commit().unwrap();
+        let left: Vec<Event> = all(&conn, "s").into_iter().map(|(_, e)| e).collect();
+        assert_eq!(
+            left,
+            vec![
+                Event::BackgroundTaskUpdated { task: other },
+                Event::BackgroundTaskUpdated { task: ended },
+            ],
+            "the latest state of each task stays"
+        );
     }
 
     #[test]

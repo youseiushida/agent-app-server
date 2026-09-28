@@ -8,12 +8,12 @@ import dev.aas.android.protocol.ThreadStatus
 import dev.aas.android.protocol.TurnStatus
 
 /**
- * The five-word status vocabulary shared by every list, chip and notification
- * (docs/ux/codex-desktop.md §1.3, §8.1): 承認が必要 / 入力が必要 / エラー / 実行中 / 待機中.
- * Unread is a separate flag (per device).
+ * The status vocabulary shared by every list, chip and notification
+ * (docs/ux/codex-desktop.md §1.3, §8.1): 承認が必要 / 入力が必要 / エラー / 実行中 /
+ * バックグラウンドで実行中 / 待機中. Unread is a separate flag (per device).
  *
  * Every value is derived from explicit protocol state: pending interactions and their
- * `request.kind`, `Thread.status`, `lastTurn.status` and `lastError`.
+ * `request.kind`, `Thread.status`, `lastTurn.status`, `lastError` and `background.running`.
  */
 enum class ThreadActivity {
     /** A pending approval (`request.kind = approval`). */
@@ -28,12 +28,21 @@ enum class ThreadActivity {
     /** A turn runs or is about to (`queued`, `starting`, `running`, `stopping`). */
     Running,
 
+    /**
+     * No turn runs, but background work the harness reports keeps the agent busy
+     * (`Thread.background.running > 0`, protocol.md §3.1): バックグラウンドで実行中 (N).
+     */
+    Background,
+
     /** Nothing happens (`idle` / `ready`). */
     Idle,
     ;
 
     /** Needs the user (the 要対応 tab counts these). */
     val needsAction: Boolean get() = this == NeedsApproval || this == NeedsInput || this == Error
+
+    /** The agent works: a turn, or background work (listed with the running threads). */
+    val working: Boolean get() = this == Running || this == Background
 
     companion object {
         /**
@@ -50,6 +59,7 @@ enum class ThreadActivity {
                 pending.isNotEmpty() -> NeedsApproval
                 isRunning(thread) -> Running
                 hasError(thread) -> Error
+                thread.background.running > 0 -> Background
                 else -> Idle
             }
         }

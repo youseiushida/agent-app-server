@@ -159,6 +159,21 @@ interface SyncDao {
     @Query("DELETE FROM interactions")
     suspend fun clearInteractions()
 
+    @Query("SELECT * FROM background_tasks WHERE id = :id")
+    suspend fun backgroundTask(id: String): BackgroundTaskEntity?
+
+    @Upsert
+    suspend fun upsertBackgroundTask(entity: BackgroundTaskEntity)
+
+    @Query("SELECT * FROM background_tasks WHERE thread_id = :threadId ORDER BY started_at, id")
+    suspend fun backgroundTasksOf(threadId: String): List<BackgroundTaskEntity>
+
+    @Query("DELETE FROM background_tasks WHERE thread_id = :threadId")
+    suspend fun deleteBackgroundTasksOf(threadId: String)
+
+    @Query("DELETE FROM background_tasks")
+    suspend fun clearBackgroundTasks()
+
     @Query("SELECT * FROM queued WHERE thread_id = :threadId ORDER BY position")
     suspend fun queuedOf(threadId: String): List<QueuedEntity>
 

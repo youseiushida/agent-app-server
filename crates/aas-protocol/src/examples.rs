@@ -42,6 +42,9 @@ pub fn queued_id() -> QueuedInputId {
 pub fn operation_id() -> OperationId {
     OperationId::from("op_01K6A00000000000000000OP01")
 }
+pub fn background_task_id(n: u32) -> BackgroundTaskId {
+    BackgroundTaskId::from(format!("bgt_01K6A00000000000000000BG{n:02}"))
+}
 
 pub fn harness() -> Harness {
     Harness {
@@ -62,6 +65,8 @@ pub fn harness() -> Harness {
             images: true,
             model_switch_live: true,
             native_sessions: true,
+            background_tasks: true,
+            background_stop: true,
         },
         models: vec![
             Model {
@@ -150,6 +155,20 @@ pub fn turn() -> Turn {
             insertions: 40,
             deletions: 3,
         }),
+        trigger: None,
+    }
+}
+
+/// A turn the agent started by itself because a background task ended.
+pub fn triggered_turn() -> Turn {
+    Turn {
+        id: TurnId::from("trn_01K6A0000000000000000TRN02"),
+        index: 1,
+        started_at: T0 + 90_000,
+        completed_at: Some(T0 + 95_000),
+        diff: None,
+        trigger: Some(TurnTrigger::BackgroundTask),
+        ..turn()
     }
 }
 
@@ -205,6 +224,16 @@ pub fn thread() -> Thread {
         last_activity_at: T0 + 2_000,
         archived: false,
         pinned: true,
+        background: ThreadBackground {
+            running: 1,
+            last_ended: Some(BackgroundTaskEnded {
+                task_id: background_task_id(2),
+                title: "npm run build".into(),
+                kind: BackgroundTaskKind::Shell,
+                status: BackgroundTaskStatus::Completed,
+                ended_at: T0 + 88_000,
+            }),
+        },
         head: 42,
     }
 }
@@ -226,6 +255,7 @@ pub fn worktree_thread() -> Thread {
             turn_id: Some(turn_id()),
         }),
         pinned: false,
+        background: ThreadBackground::default(),
         ..thread()
     }
 }
@@ -238,6 +268,7 @@ fn item(n: u32, status: ItemStatus, body: ItemBody) -> Item {
         status,
         started_at: T0 + 2_000 + n as i64,
         completed_at: (status != ItemStatus::InProgress).then_some(T0 + 3_000 + n as i64),
+        background_task_id: None,
         body,
     }
 }
@@ -344,7 +375,148 @@ pub fn items() -> Vec<Item> {
                 code: Some("compacted".into()),
             },
         ),
+        backgrounded_item(),
     ]
+}
+
+/// The item that launched background task 1 (a sub-agent that goes on after the turn).
+pub fn backgrounded_item() -> Item {
+    Item {
+        background_task_id: Some(background_task_id(1)),
+        ..item(
+            9,
+            ItemStatus::Backgrounded,
+            ItemBody::ToolCall {
+                category: ToolCategory::Subagent,
+                name: "Agent".into(),
+                title: "Review the reconnect logic".into(),
+                server: None,
+                input: Some(
+                    json!({"description": "Review the reconnect logic", "run_in_background": true}),
+                ),
+                output: Some("Async agent launched".into()),
+                output_truncated: false,
+                output_blob_id: None,
+            },
+        )
+    }
+}
+
+/// A running background agent with progress.
+pub fn background_task() -> BackgroundTask {
+    BackgroundTask {
+        id: background_task_id(1),
+        thread_id: thread_id(),
+        native_id: "a546c1f2e9d04b7a8".into(),
+        kind: BackgroundTaskKind::Agent,
+        title: "Review the reconnect logic".into(),
+        status: BackgroundTaskStatus::Running,
+        ambient: false,
+        runs: 1,
+        turn_id: Some(turn_id()),
+        origin_item_id: Some(item_id(9)),
+        parent_task_id: None,
+        started_at: T0 + 3_100,
+        ended_at: None,
+        end_reason: None,
+        progress: Some(BackgroundProgress {
+            last_tool_name: Some("Read".into()),
+            tool_uses: Some(7),
+            tokens: Some(18_400),
+            duration_ms: Some(42_000),
+            summary: None,
+            workflow: Vec::new(),
+        }),
+        result: None,
+        usage: None,
+        stoppable: true,
+        stop_requested_at: None,
+        stop_unconfirmed_at: None,
+        next_run_at: None,
+    }
+}
+
+/// A workflow whose agents report their state, stopped on request.
+pub fn stopped_workflow() -> BackgroundTask {
+    BackgroundTask {
+        id: background_task_id(3),
+        native_id: "w7k2m9q1".into(),
+        kind: BackgroundTaskKind::Workflow,
+        title: "review-and-fix".into(),
+        status: BackgroundTaskStatus::Stopped,
+        origin_item_id: None,
+        parent_task_id: Some(background_task_id(1)),
+        ended_at: Some(T0 + 60_000),
+        end_reason: Some(BackgroundEndReason::Harness),
+        progress: Some(BackgroundProgress {
+            summary: Some("Review, then fix what the review finds".into()),
+            workflow: vec![
+                WorkflowAgent {
+                    label: "review".into(),
+                    phase: Some("analyze".into()),
+                    state: WorkflowAgentState::Done,
+                    agent_type: Some("general-purpose".into()),
+                    model: Some("haiku".into()),
+                    tokens: Some(15_751),
+                },
+                WorkflowAgent {
+                    label: "fix".into(),
+                    phase: Some("apply".into()),
+                    state: WorkflowAgentState::Progress,
+                    agent_type: None,
+                    model: None,
+                    tokens: None,
+                },
+            ],
+            ..Default::default()
+        }),
+        result: Some(BackgroundResult {
+            summary: Some("Stopped by request".into()),
+            ..Default::default()
+        }),
+        usage: Some(BackgroundUsage {
+            total_tokens: Some(31_504),
+            tool_uses: Some(12),
+            duration_ms: Some(56_900),
+            cost_usd: None,
+        }),
+        ..background_task()
+    }
+}
+
+/// A shell task that finished, with its exit code and output.
+pub fn finished_shell() -> BackgroundTask {
+    BackgroundTask {
+        id: background_task_id(2),
+        native_id: "bkomsmz3d".into(),
+        kind: BackgroundTaskKind::Shell,
+        title: "npm run build".into(),
+        status: BackgroundTaskStatus::Completed,
+        origin_item_id: None,
+        ended_at: Some(T0 + 88_000),
+        end_reason: Some(BackgroundEndReason::Harness),
+        progress: None,
+        result: Some(BackgroundResult {
+            summary: None,
+            exit_code: Some(0),
+            output: Some("built in 41.2s\n".into()),
+            output_truncated: false,
+            output_blob_id: None,
+        }),
+        ..background_task()
+    }
+}
+
+/// An approval a background agent asks for (it survives the end of the turn).
+pub fn background_approval() -> Interaction {
+    Interaction {
+        id: interaction_id(3),
+        turn_id: None,
+        item_id: None,
+        background_task_id: Some(background_task_id(1)),
+        created_at: T0 + 10_840,
+        ..approval()
+    }
 }
 
 pub fn approval() -> Interaction {
@@ -353,6 +525,7 @@ pub fn approval() -> Interaction {
         thread_id: thread_id(),
         turn_id: Some(turn_id()),
         item_id: Some(item_id(3)),
+        background_task_id: None,
         status: InteractionStatus::Pending,
         created_at: T0 + 2_500,
         resolved_at: None,
@@ -406,6 +579,7 @@ pub fn question() -> Interaction {
         thread_id: thread_id(),
         turn_id: Some(turn_id()),
         item_id: None,
+        background_task_id: None,
         status: InteractionStatus::Pending,
         created_at: T0 + 2_600,
         resolved_at: None,
@@ -619,6 +793,7 @@ pub fn request_examples() -> Vec<(ClientRequest, Value)> {
                 running_turns: 1,
                 draining: false,
                 prevent_sleep_while_running: true,
+                running_background_tasks: 1,
             }),
         ),
         (
@@ -826,10 +1001,11 @@ pub fn request_examples() -> Vec<(ClientRequest, Value)> {
             }),
             v(&ThreadReadResult {
                 thread: thread(),
-                turns: vec![turn()],
+                turns: vec![turn(), triggered_turn()],
                 items: items(),
-                interactions: vec![approval(), question()],
+                interactions: vec![approval(), question(), background_approval()],
                 queued: vec![queued()],
+                background_tasks: vec![background_task(), finished_shell(), stopped_workflow()],
                 head: 1850,
                 has_more_before: false,
             }),
@@ -1046,6 +1222,19 @@ pub fn request_examples() -> Vec<(ClientRequest, Value)> {
                 operation: cancelled_operation(),
             }),
         ),
+        (
+            ClientRequest::BackgroundTaskStop(BackgroundTaskStopParams {
+                client_request_id: crid(22),
+                thread_id: thread_id(),
+                task_id: background_task_id(1),
+            }),
+            v(&BackgroundTaskResult {
+                task: BackgroundTask {
+                    stop_requested_at: Some(T0 + 17_970),
+                    ..background_task()
+                },
+            }),
+        ),
     ]
 }
 
@@ -1131,6 +1320,9 @@ pub fn events() -> Vec<EventEnvelope> {
             queued: vec![queued()],
         }),
         env(Event::CommandsChanged {}),
+        env(Event::BackgroundTaskUpdated {
+            task: background_task(),
+        }),
         env(Event::Native {
             harness_id: "codex".into(),
             payload: json!({"method": "model/rerouted"}),
@@ -1347,6 +1539,7 @@ mod tests {
             "interaction/expired",
             "queue/updated",
             "commands/changed",
+            "backgroundTask/updated",
             "native",
         ] {
             assert!(types.contains(t), "missing example for {t}");

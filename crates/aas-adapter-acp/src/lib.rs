@@ -4,8 +4,13 @@
 //! One agent process per session. The client advertises no `fs` / `terminal` capabilities,
 //! so agents use their own tools; agent calls to such client methods are rejected with a
 //! JSON-RPC "method not found" error and surfaced as a notice.
+//!
+//! Standard ACP has no notion of work outside a prompt turn, so a plain ACP agent reports no
+//! background tasks. Devin's background sub-agents and shells are mapped from Cognition's
+//! extension when the agent confirms it (`cognition`).
 
 mod cache;
+mod cognition;
 mod elicitation;
 mod history;
 mod mapping;
@@ -18,9 +23,9 @@ use std::sync::Arc;
 
 use aas_harness::protocol::{Command, HarnessCapabilities, HarnessKind};
 use aas_harness::{
-    AdapterContext, AdapterError, CommandContext, HarnessAdapter, HarnessConfig, HarnessInfo,
-    NativeHistory, NativeSessionSummary, SessionHandle, StartGuard, StartMode, StartRequest,
-    StopReason, ThreadSettings,
+    AdapterContext, AdapterError, AdapterPolicy, CommandContext, HarnessAdapter, HarnessConfig,
+    HarnessInfo, NativeHistory, NativeSessionSet, NativeSessionSummary, SessionHandle, StartGuard,
+    StartMode, StartRequest, StopReason, ThreadSettings,
 };
 use aas_stdio::{Incoming, RpcPeer, RpcWireError};
 use aas_supervisor::{SpawnSpec, resolve_program};
@@ -205,7 +210,6 @@ impl AcpAdapter {
     }
 
     fn info_from(&self, program: PathBuf, init: &InitializeResponse) -> HarnessInfo {
-        let caps = &init.agent_capabilities;
         let cached = self.cache.get();
         let version = init.agent_info.as_ref().map(|a| {
             let name = a
@@ -224,17 +228,7 @@ impl AcpAdapter {
             unavailable_reason: None,
             version,
             executable: Some(program),
-            capabilities: HarnessCapabilities {
-                interrupt: true,
-                steer: false,
-                approvals: true,
-                questions: true,
-                resume: caps.load_session || caps.session_capabilities.resume(),
-                fork: caps.session_capabilities.fork(),
-                images: caps.prompt_capabilities.image,
-                model_switch_live: cached.options.has(SettingKind::Model),
-                native_sessions: caps.session_capabilities.list() && caps.load_session,
-            },
+            capabilities: capabilities(init, cached.options.has(SettingKind::Model)),
             models: cached.options.models(cached.defaults.model.as_deref()),
             default_model: cached.defaults.model.clone(),
             effort_levels: cached.options.effort_levels(),
@@ -243,6 +237,27 @@ impl AcpAdapter {
                 .permission_modes(cached.defaults.mode.as_deref()),
             default_permission_mode: cached.defaults.mode.clone(),
         }
+    }
+}
+
+/// What a harness can do, from its `initialize` answer. Background tasks (and stopping them)
+/// only when the agent confirmed Cognition's extension: standard ACP has no signal for work
+/// outside a turn. `model_switch_live`: a model selector was seen in an earlier session.
+fn capabilities(init: &InitializeResponse, model_switch_live: bool) -> HarnessCapabilities {
+    let caps = &init.agent_capabilities;
+    let background = cognition::confirmed(init);
+    HarnessCapabilities {
+        background_tasks: background,
+        background_stop: background,
+        interrupt: true,
+        steer: false,
+        approvals: true,
+        questions: true,
+        resume: caps.load_session || caps.session_capabilities.resume(),
+        fork: caps.session_capabilities.fork(),
+        images: caps.prompt_capabilities.image,
+        model_switch_live,
+        native_sessions: caps.session_capabilities.list() && caps.load_session,
     }
 }
 
@@ -267,23 +282,29 @@ impl ShortLived {
 /// Drains a short-lived connection, rejecting agent requests.
 async fn reject_requests(peer: RpcPeer, mut incoming: mpsc::UnboundedReceiver<Incoming>) {
     while let Some(msg) = incoming.recv().await {
-        if let Incoming::Request(req) = msg {
-            let _ = peer
+        if let Incoming::Request(req) = msg
+            && let Err(e) = peer
                 .respond_error(req.id, RpcWireError::method_not_found(&req.method))
-                .await;
+                .await
+        {
+            // The short-lived agent's stdin is closed or broken: it is ending anyway.
+            tracing::warn!(method = %req.method, error = %e, "could not refuse a request of a short-lived agent");
         }
     }
 }
 
 /// Pages through `session/list` for `cwd`. Sessions whose `cwd` differs are dropped (the
 /// request already filters; this guards against agents that ignore the filter). A repeated
-/// cursor ends the listing instead of looping forever.
+/// cursor ends the listing instead of looping forever. A session listed twice (it moved
+/// between pages while they were read) is one session ([`NativeSessionSet`]: the first
+/// position, the latest `updatedAt`). Titles are the agent's, cut to
+/// `policy.harness_title_chars`.
 async fn list_sessions(
     peer: &RpcPeer,
     cwd: &Path,
-    timeout: std::time::Duration,
+    policy: &AdapterPolicy,
 ) -> Result<Vec<NativeSessionSummary>, AdapterError> {
-    let mut out = Vec::new();
+    let mut out = NativeSessionSet::new();
     let mut cursor: Option<String> = None;
     let mut seen_cursors = std::collections::HashSet::new();
     loop {
@@ -292,17 +313,17 @@ async fn list_sessions(
             cursor: cursor.clone(),
         };
         let page: wire::ListSessionsResponse = peer
-            .request_timeout("session/list", req, timeout)
+            .request_timeout("session/list", req, policy.handshake_timeout)
             .await
             .map_err(|e| AdapterError::Harness(format!("session/list: {e}")))?;
         for s in page.sessions {
             if !same_path(&s.cwd, cwd) {
                 continue;
             }
-            out.push(NativeSessionSummary {
+            out.insert(NativeSessionSummary {
                 updated_at: s.updated_at.as_deref().and_then(rfc3339_millis),
                 native_session_id: s.session_id,
-                title: s.title.filter(|t| !t.is_empty()),
+                title: s.title.as_deref().and_then(|t| policy.harness_title(t)),
                 cwd: Some(s.cwd),
             });
         }
@@ -310,9 +331,9 @@ async fn list_sessions(
             Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
             Some(next) => {
                 tracing::warn!(cursor = %next, "session/list repeated a cursor; stopping");
-                return Ok(out);
+                return Ok(out.into_sessions());
             }
-            None => return Ok(out),
+            None => return Ok(out.into_sessions()),
         }
     }
 }
@@ -389,6 +410,15 @@ impl HarnessAdapter for AcpAdapter {
         Ok(launched.handle)
     }
 
+    /// None by name. ACP has no command that changes the session a connection works on (the
+    /// client names the session in every request, and nothing announces a new one), so an
+    /// agent's command cannot switch the session under the thread. The commands are the
+    /// agent's own (`available_commands_update`); the engine still drops a `resume`, which
+    /// would hide the app's own `/resume`.
+    fn session_switching_commands(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Commands come from `available_commands_update` of the agent's most recent session
     /// (ACP publishes them only inside a session).
     async fn commands(&self, _ctx: CommandContext) -> Result<Vec<Command>, AdapterError> {
@@ -410,7 +440,7 @@ impl HarnessAdapter for AcpAdapter {
             short.close().await;
             return Err(AdapterError::Unsupported("session/list"));
         }
-        let result = list_sessions(&short.peer, cwd, self.ctx.policy.handshake_timeout).await;
+        let result = list_sessions(&short.peer, cwd, &self.ctx.policy).await;
         short.close().await;
         result
     }
@@ -433,7 +463,12 @@ impl HarnessAdapter for AcpAdapter {
         StartGuard::for_session(launched.handle.control.clone())
             .stop(StopReason::Shutdown)
             .await;
-        Ok(launched.history.unwrap_or_default())
+        let mut history = launched.history.unwrap_or_default();
+        // The agent's title (`session_info_update`), cut like every harness title.
+        history.title = history
+            .title
+            .and_then(|t| self.ctx.policy.harness_title(&t));
+        Ok(history)
     }
 }
 
@@ -441,7 +476,7 @@ impl HarnessAdapter for AcpAdapter {
 #[doc(hidden)]
 pub mod testing {
     use super::*;
-    use aas_harness::{AdapterPolicy, ExitInfo};
+    use aas_harness::ExitInfo;
     use async_trait::async_trait;
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncWrite};
@@ -601,7 +636,7 @@ pub mod testing {
             session::peer_config("acp[test-list]", &policy),
         );
         tokio::spawn(reject_requests(peer.clone(), incoming));
-        super::list_sessions(&peer, cwd, policy.handshake_timeout).await
+        super::list_sessions(&peer, cwd, &policy).await
     }
 
     /// Converts a turn input to ACP prompt blocks (exposed for tests).
@@ -647,6 +682,25 @@ mod tests {
             r"C:\Users\me\proj2",
             Path::new(r"C:\Users\me\proj")
         ));
+    }
+
+    #[test]
+    fn background_capabilities_need_the_confirmed_extension() {
+        let init = |caps: serde_json::Value| -> InitializeResponse {
+            serde_json::from_value(
+                serde_json::json!({"protocolVersion": 1, "agentCapabilities": caps}),
+            )
+            .unwrap()
+        };
+        let plain = capabilities(&init(serde_json::json!({"loadSession": true})), false);
+        assert!(!plain.background_tasks && !plain.background_stop);
+        assert!(plain.resume && plain.interrupt && plain.approvals && plain.questions);
+        assert!(!plain.steer && !plain.model_switch_live);
+        let devin = capabilities(
+            &init(serde_json::json!({"_meta": {"cognition.ai/subagentControl": true}})),
+            true,
+        );
+        assert!(devin.background_tasks && devin.background_stop && devin.model_switch_live);
     }
 
     #[test]

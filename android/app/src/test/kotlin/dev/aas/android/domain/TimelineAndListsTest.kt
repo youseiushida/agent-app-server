@@ -4,6 +4,7 @@ import dev.aas.android.domain.timeline.PendingInput
 import dev.aas.android.domain.timeline.Timeline
 import dev.aas.android.domain.timeline.TimelineRow
 import dev.aas.android.protocol.AasJson
+import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.Delivery
 import dev.aas.android.protocol.FsRoot
 import dev.aas.android.protocol.InputPart
@@ -32,8 +33,12 @@ import kotlin.test.assertTrue
 class TimelineTest {
     private val read = Fixtures.threadRead
 
-    private fun state(turns: List<dev.aas.android.protocol.Turn> = read.turns, items: List<Item> = read.items, hasMore: Boolean = false) =
-        ThreadState(read.thread.id, ThreadSync.Live, read.thread, turns, items, read.interactions, read.queued, hasMore, 0, emptyList())
+    private fun state(
+        turns: List<dev.aas.android.protocol.Turn> = read.turns,
+        items: List<Item> = read.items,
+        hasMore: Boolean = false,
+        tasks: List<dev.aas.android.protocol.BackgroundTask> = emptyList(),
+    ) = ThreadState(read.thread.id, ThreadSync.Live, read.thread, turns, items, read.interactions, read.queued, hasMore, 0, emptyList(), backgroundTasks = tasks)
 
     private fun kinds(rows: List<TimelineRow>) = rows.map { it::class.simpleName }
 
@@ -41,7 +46,11 @@ class TimelineTest {
     fun aFinishedTurnFoldsItsActivityAndEndsWithItsSummary() {
         val rows = Timeline.build(state(), emptyList(), emptyMap())
         assertEquals(
-            listOf("TurnStart", "ItemRow", "ActivityGroup", "ItemRow", "ItemRow", "ItemRow", "InteractionRow", "InteractionRow", "TurnEnd"),
+            listOf(
+                "TurnStart", "ItemRow", "ActivityGroup", "ItemRow", "ItemRow", "ItemRow", "ItemRow", "InteractionRow", "InteractionRow", "TurnEnd",
+                // The background agent's approval (no turn), then the turn the agent started when background work finished.
+                "InteractionRow", "TurnStart",
+            ),
             kinds(rows),
         )
         val group = assertIs<TimelineRow.ActivityGroup>(rows[2])
@@ -55,12 +64,12 @@ class TimelineTest {
 
     @Test
     fun theLiveGroupOfARunningTurnIsOpenUnlessTheUserClosedIt() {
-        val running = read.turns.map { it.copy(status = TurnStatus.Running, completedAt = null) }
+        val running = listOf(read.turns.first().copy(status = TurnStatus.Running, completedAt = null))
         val rows = Timeline.build(state(turns = running), emptyList(), emptyMap())
         val group = rows.filterIsInstance<TimelineRow.ActivityGroup>().single()
         assertTrue(group.expanded)
         assertEquals(4, rows.count { it is TimelineRow.GroupedItem })
-        val working = assertIs<TimelineRow.Working>(rows.last())
+        val working = rows.filterIsInstance<TimelineRow.Working>().single()
         // What it is doing: the latest item in progress (the answer being written).
         assertIs<Item.AgentMessage>(working.current)
 
@@ -109,6 +118,72 @@ class TimelineTest {
         assertEquals(TimelineRow.LoadOlder, rows.first())
         assertEquals("item-itm_orphan", rows[rows.size - 3].key)
         assertEquals(listOf("pending-crid-1", "pending-crid-3"), rows.takeLast(2).map { it.key })
+        // With background tasks, their section sits between the conversation and the waiting messages.
+        val withTasks = Timeline.build(state(items = read.items + orphan, tasks = read.backgroundTasks), pending, emptyMap())
+        val header = withTasks.indexOfFirst { it is TimelineRow.BackgroundHeader }
+        assertEquals("item-itm_orphan", withTasks[header - 1].key)
+        assertTrue(withTasks.drop(header).takeLast(2).all { it is TimelineRow.Pending })
+    }
+
+    @Test
+    fun anInteractionOfNoTurnFollowsTheTurnItWasAskedInAndATriggeredEmptyTurnIsItsDivider() {
+        val rows = Timeline.build(state(), emptyList(), emptyMap())
+        val background = read.interactions.single { it.turnId == null }
+        val index = rows.indexOfFirst { it.key == "interaction-${background.id}" }
+        assertIs<TimelineRow.TurnEnd>(rows[index - 1], "after the turn that ran when it was asked")
+        val triggered = assertIs<TimelineRow.TurnStart>(rows[index + 1])
+        assertEquals(dev.aas.android.protocol.TurnTrigger.BackgroundTask, triggered.turn.trigger)
+        assertEquals(rows.last(), triggered, "completed without items: its divider alone")
+        // With items it has its end like any turn; failed, too.
+        val failed = read.turns.map { if (it.trigger != null) it.copy(status = TurnStatus.Failed) else it }
+        assertIs<TimelineRow.TurnEnd>(Timeline.build(state(turns = failed), emptyList(), emptyMap()).last())
+        // Asked before the first loaded turn: first.
+        val early = background.copy(createdAt = read.turns.first().startedAt - 1)
+        val first = Timeline.build(state().copy(interactions = listOf(early)), emptyList(), emptyMap()).first()
+        assertEquals("interaction-${background.id}", first.key)
+        // No turn loaded at all: with the orphans.
+        val none = Timeline.build(state(turns = emptyList(), items = emptyList()).copy(interactions = listOf(background)), emptyList(), emptyMap())
+        assertEquals(listOf("interaction-${background.id}"), none.map { it.key })
+    }
+
+    @Test
+    fun theBackgroundSectionIsOpenWhileWorkRunsWithEndedTasksFolded() {
+        val tasks = read.backgroundTasks
+        val running = tasks.single { it.status == BackgroundTaskStatus.Running }
+        val rows = Timeline.backgroundRows(tasks, emptyMap())
+        assertEquals(
+            listOf(
+                TimelineRow.BackgroundHeader(running = 1, ambient = 0, ended = 2, expanded = true),
+                TimelineRow.BackgroundTaskRow(running, 0, null),
+                TimelineRow.BackgroundEndedHeader(2, expanded = false),
+            ),
+            rows,
+        )
+        // Ended tasks open in the order they ended (the latest nearest the composer), with their parent named.
+        val open = Timeline.backgroundRows(tasks, mapOf(Timeline.BACKGROUND_ENDED to true)).filterIsInstance<TimelineRow.BackgroundTaskRow>()
+        assertEquals(listOf("bgt_01K6A00000000000000000BG01", "bgt_01K6A00000000000000000BG03", "bgt_01K6A00000000000000000BG02"), open.map { it.task.id })
+        assertEquals("Review the reconnect logic", open[1].parentTitle)
+        // Folded by the user: the header alone; nothing runs: folded by default.
+        assertEquals(1, Timeline.backgroundRows(tasks, mapOf(Timeline.BACKGROUND_SECTION to false)).size)
+        val ended = tasks.map { it.copy(status = BackgroundTaskStatus.Completed) }
+        assertEquals(listOf(TimelineRow.BackgroundHeader(0, 0, 3, expanded = false)), Timeline.backgroundRows(ended, emptyMap()))
+        assertEquals(emptyList(), Timeline.backgroundRows(emptyList(), emptyMap()))
+        assertTrue(rows.map { it.key }.toSet().size == rows.size)
+    }
+
+    @Test
+    fun runningTasksFollowTheTaskThatLaunchedThemAndAmbientOnesAreCountedApart() {
+        val parent = Samples.backgroundTask("bgt_p", startedAt = 10, title = "parent")
+        val other = Samples.backgroundTask("bgt_o", startedAt = 20)
+        val child = Samples.backgroundTask("bgt_c", startedAt = 30).copy(parentTaskId = "bgt_p")
+        val grandchild = Samples.backgroundTask("bgt_g", startedAt = 5).copy(parentTaskId = "bgt_c")
+        val monitor = Samples.backgroundTask("bgt_m", startedAt = 40).copy(ambient = true)
+        val rows = Timeline.backgroundRows(listOf(other, grandchild, monitor, child, parent), emptyMap())
+        assertEquals(TimelineRow.BackgroundHeader(running = 4, ambient = 1, ended = 0, expanded = true), rows.first())
+        val tasks = rows.filterIsInstance<TimelineRow.BackgroundTaskRow>()
+        assertEquals(listOf("bgt_p" to 0, "bgt_c" to 1, "bgt_g" to 2, "bgt_o" to 0, "bgt_m" to 0), tasks.map { it.task.id to it.depth })
+        assertEquals("parent", tasks[1].parentTitle)
+        assertTrue(rows.none { it is TimelineRow.BackgroundEndedHeader })
     }
 }
 
@@ -152,6 +227,20 @@ class ProjectListSortingTest {
         assertEquals(listOf("prj_b"), ProjectLists.projects(workspace, query = "BET").map { it.project.id })
         assertEquals(listOf("prj_a"), ProjectLists.projects(workspace, query = "p\\prj_a").map { it.project.id })
         assertTrue(ProjectLists.projects(workspace, query = "zzz").isEmpty())
+    }
+
+    @Test
+    fun backgroundWorkCountsAsRunningAndTheChipCountsItsTasks() {
+        val busy = Samples.thread("t_bg", lastActivityAt = 5, projectId = "prj_x", background = dev.aas.android.protocol.ThreadBackground(running = 3))
+            .copy(status = dev.aas.android.protocol.ThreadStatus.Ready)
+        val other = Samples.thread("t_bg2", lastActivityAt = 4, projectId = "prj_x", background = dev.aas.android.protocol.ThreadBackground(running = 1))
+            .copy(status = dev.aas.android.protocol.ThreadStatus.Ready)
+        val ws = workspace.copy(projects = listOf(Samples.project("prj_x")), threads = listOf(ThreadEntry(busy, false), ThreadEntry(other, false)), pendingInteractions = emptyList())
+        val row = ProjectLists.projects(ws).single()
+        assertEquals(ThreadActivity.Background, row.activity)
+        assertEquals(2, row.running)
+        assertEquals(4, row.backgroundRunning)
+        assertEquals(listOf(ThreadActivity.Background, ThreadActivity.Background), ProjectLists.threads(ws, "prj_x").map { it.activity })
     }
 
     @Test

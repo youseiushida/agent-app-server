@@ -58,7 +58,7 @@ class ReadsTest {
         withTimeout(TEST_TIMEOUT_MS) {
             env.connect()
             dropFirstLists(1)
-            val result = ProjectRepository(env.engine, env.reads).list("C:/work")
+            val result = ProjectRepository(env.engine, env.reads, env.lists).list("C:/work")
             assertEquals(listing, result)
             val sent = env.server.requestsFor(Methods.FsList.name)
             assertEquals(2, sent.size)
@@ -121,7 +121,7 @@ class ReadsTest {
         withTimeout(TEST_TIMEOUT_MS) {
             env.connect()
             dropFirstLists(2)
-            assertFailsWith<ConnectionLostException> { ProjectRepository(env.engine, env.reads).list("C:/work") }
+            assertFailsWith<ConnectionLostException> { ProjectRepository(env.engine, env.reads, env.lists).list("C:/work") }
             assertEquals(2, env.server.requestsFor(Methods.FsList.name).size)
         }
     }

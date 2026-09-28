@@ -11,8 +11,12 @@
 //! With `options.sessionsDir` (an absolute path) the agent keeps its sessions in that folder
 //! like a real CLI ([`store`]), and the harness offers `fork` and `nativeSessions`: the
 //! folder's sessions can be listed and imported, resumed, and branched off.
+//!
+//! Background work (`@bg`, [`background`]) is reported as background tasks (capabilities
+//! `backgroundTasks` and `backgroundStop`), with the agent's own turns when a task ends.
 
 pub mod agent;
+pub mod background;
 pub mod store;
 pub mod wire;
 
@@ -27,7 +31,7 @@ use aas_supervisor::{ChildHandle, SpawnSpec};
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use crate::agent::AgentOptions;
 use crate::store::{SessionStore, StoreError};
@@ -169,6 +173,8 @@ impl FakeAdapter {
                 images: true,
                 model_switch_live: true,
                 native_sessions: stored,
+                background_tasks: true,
+                background_stop: true,
             },
             models: vec![
                 Model {
@@ -359,7 +365,8 @@ impl HarnessAdapter for FakeAdapter {
     async fn scan_native_sessions(&self, cwd: &Path) -> Result<NativeSessionScan, AdapterError> {
         let store = self.store("nativeSessions")?;
         let cwd = cwd.to_path_buf();
-        tokio::task::spawn_blocking(move || store.scan(&cwd))
+        let policy = self.ctx.policy.clone();
+        tokio::task::spawn_blocking(move || store.scan(&cwd, &policy))
             .await
             .map_err(|e| AdapterError::Other(format!("listing sessions failed: {e}")))?
             .map_err(store_error)
@@ -373,7 +380,8 @@ impl HarnessAdapter for FakeAdapter {
         let store = self.store("nativeSessions")?;
         let cwd = cwd.to_path_buf();
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || store.history(&cwd, &id))
+        let policy = self.ctx.policy.clone();
+        tokio::task::spawn_blocking(move || store.history(&cwd, &id, &policy))
             .await
             .map_err(|e| AdapterError::Other(format!("reading the session failed: {e}")))?
             .map_err(store_error)
@@ -454,11 +462,24 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The agent's answer to a prompt (`Ev::PromptAck`): taken, or refused because a turn of its
+/// own runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromptAck {
+    accepted: bool,
+    own_run: bool,
+}
+
+/// Where the reader hands the answer to the prompt `send` waits for. Dropped (so `send` sees
+/// the session closed) when the reader ends.
+type AckSlot = Arc<parking_lot::Mutex<Option<oneshot::Sender<PromptAck>>>>;
+
 struct FakeSession {
     writer: SharedJsonLinesWriter,
     exit: ExitSource,
     policy: AdapterPolicy,
     model: Mutex<Option<String>>,
+    ack: AckSlot,
 }
 
 impl FakeSession {
@@ -530,21 +551,35 @@ impl FakeSession {
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
-        for ev in early {
-            let _ = tx.send(map_event(ev));
+        for ev in early.into_iter().filter_map(map_event) {
+            let _ = tx.send(ev);
         }
+        let ack: AckSlot = Arc::new(parking_lot::Mutex::new(None));
         let session = Arc::new(FakeSession {
             writer: SharedJsonLinesWriter::new(writer.into_inner()),
             exit: exit.clone(),
             policy,
             model: Mutex::new(settings.model),
+            ack: ack.clone(),
         });
         tokio::spawn(async move {
             loop {
                 match reader.next().await {
                     Ok(Some(ReadLine::Json(v))) => match serde_json::from_value::<Ev>(v.clone()) {
+                        // Every event before the answer (a turn the agent started by itself)
+                        // has been handed on when `send` learns the answer.
+                        Ok(Ev::PromptAck { accepted, own_run }) => match ack.lock().take() {
+                            Some(waiter) => {
+                                let _ = waiter.send(PromptAck { accepted, own_run });
+                            }
+                            None => {
+                                tracing::warn!("the fake agent answered a prompt nobody waits for")
+                            }
+                        },
                         Ok(ev) => {
-                            let _ = tx.send(map_event(ev));
+                            if let Some(ev) = map_event(ev) {
+                                let _ = tx.send(ev);
+                            }
                         }
                         Err(_) => {
                             let _ = tx.send(AdapterEvent::Native { payload: v });
@@ -567,6 +602,8 @@ impl FakeSession {
                     }
                 }
             }
+            // A prompt still waiting for its answer never gets one.
+            ack.lock().take();
             let info = exit.wait().await;
             let _ = tx.send(AdapterEvent::Exited { info });
         });
@@ -592,8 +629,11 @@ fn image_paths(input: &TurnInput) -> Vec<String> {
         .collect()
 }
 
-fn map_event(ev: Ev) -> AdapterEvent {
-    match ev {
+/// The adapter event of an agent event (`None` for the answers to prompts, which go to the
+/// waiting `send`).
+fn map_event(ev: Ev) -> Option<AdapterEvent> {
+    Some(match ev {
+        Ev::PromptAck { .. } => return None,
         Ev::Ready { session_id } => AdapterEvent::SessionIdentified {
             native_session_id: session_id,
         },
@@ -620,10 +660,12 @@ fn map_event(ev: Ev) -> AdapterEvent {
             request_id,
             request,
             item_key,
+            background_key,
         } => AdapterEvent::InteractionRequested {
             request_id,
             request,
             item_key,
+            background_key,
         },
         Ev::Withdraw { request_id } => AdapterEvent::InteractionWithdrawn { request_id },
         Ev::Usage { usage } => AdapterEvent::TurnUsage { usage },
@@ -631,27 +673,47 @@ fn map_event(ev: Ev) -> AdapterEvent {
             status,
             usage,
             error,
+            trigger,
         } => AdapterEvent::TurnCompleted {
             status,
             usage,
             error,
+            trigger,
         },
         Ev::Notice { level, message } => AdapterEvent::Notice {
             level,
             message,
             code: None,
         },
-    }
+        Ev::Background { task } => AdapterEvent::BackgroundTask {
+            task: Box::new(task),
+        },
+    })
 }
 
 #[async_trait]
 impl SessionControl for FakeSession {
+    /// Waits for the agent's answer to the prompt: a prompt refused because the agent runs a
+    /// turn of its own is [`AdapterError::TurnInProgress`] (that turn's `TurnStarted` has been
+    /// emitted before).
     async fn send(&self, input: TurnInput) -> Result<(), AdapterError> {
+        let (waiter, answer) = oneshot::channel();
+        *self.ack.lock() = Some(waiter);
         self.write(Op::Prompt {
             text: input.to_plain_text(),
             images: image_paths(&input),
         })
-        .await
+        .await?;
+        let timeout = self.policy.handshake_timeout;
+        match tokio::time::timeout(timeout, answer).await {
+            Ok(Ok(PromptAck { accepted: true, .. })) => Ok(()),
+            Ok(Ok(PromptAck { own_run: true, .. })) => Err(AdapterError::TurnInProgress),
+            Ok(Ok(_)) => Err(AdapterError::Harness("a turn is already running".into())),
+            Ok(Err(_)) => Err(AdapterError::Closed),
+            Err(_) => Err(AdapterError::Protocol(format!(
+                "the fake agent did not answer the prompt within {timeout:?}"
+            ))),
+        }
     }
 
     async fn steer(&self, input: TurnInput) -> Result<(), AdapterError> {
@@ -705,6 +767,13 @@ impl SessionControl for FakeSession {
     async fn shutdown(&self, reason: StopReason) -> ExitInfo {
         self.writer.close().await;
         self.exit.shutdown(self.policy.stop_grace, reason).await
+    }
+
+    async fn stop_background(&self, key: &str) -> Result<(), AdapterError> {
+        self.write(Op::StopBackground {
+            key: key.to_owned(),
+        })
+        .await
     }
 }
 
@@ -1192,6 +1261,119 @@ mod tests {
             let info = adapter.probe().await;
             assert!(!info.available, "{options}: {info:?}");
         }
+    }
+
+    /// `@bg` reports a task launched by an item that closes as backgrounded; the task runs on
+    /// after the turn, reports its end with an exit code, and the agent starts a turn by itself
+    /// about it (with its trigger). A prompt sent while that turn runs is refused as
+    /// `TurnInProgress`, after the turn's start was reported.
+    #[tokio::test]
+    async fn background_tasks_outlive_their_turn_and_wake_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FakeAdapter::in_process("fake", ctx(dir.path()));
+        let caps = adapter.probe().await.capabilities;
+        assert!(caps.background_tasks && caps.background_stop);
+        let mut session = start(&adapter, dir.path()).await;
+        let events = turn(
+            &mut session,
+            "@bg b1 kind=shell ms=50 progress=1 wake npm run build\n@sleep 300",
+        )
+        .await;
+        let kinds: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AdapterEvent::ItemStarted { key, .. } => Some(format!("start {key}")),
+                AdapterEvent::BackgroundTask { task } => {
+                    Some(format!("task {:?} live={}", task.state, task.live))
+                }
+                AdapterEvent::ItemCompleted { key, status, .. } => {
+                    Some(format!("done {key} {status:?}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            &kinds[..3],
+            &[
+                "start k1".to_owned(),
+                "task Running live=true".to_owned(),
+                "done k1 Backgrounded".to_owned()
+            ],
+            "{kinds:?}"
+        );
+        let ended = events
+            .iter()
+            .find_map(|e| match e {
+                AdapterEvent::BackgroundTask { task }
+                    if task.state == BackgroundState::Completed =>
+                {
+                    Some(task.clone())
+                }
+                _ => None,
+            })
+            .expect("the task ended during the turn");
+        assert!(!ended.live);
+        assert_eq!(ended.result.unwrap().exit_code, Some(0));
+        assert_eq!(ended.origin_item_key.as_deref(), Some("k1"));
+        // The agent's own turn about it starts right away; the user's prompt waits.
+        assert_eq!(
+            session.control.send(TurnInput::text("next")).await,
+            Err(AdapterError::TurnInProgress)
+        );
+        let own = next_turn(&mut session.events).await;
+        assert_eq!(own.first(), Some(&AdapterEvent::TurnStarted));
+        assert!(matches!(
+            own.last(),
+            Some(AdapterEvent::TurnCompleted {
+                trigger: Some(TurnTrigger::BackgroundTask),
+                ..
+            })
+        ));
+        let next = turn(&mut session, "next").await;
+        assert!(matches!(
+            next.last(),
+            Some(AdapterEvent::TurnCompleted { trigger: None, .. })
+        ));
+    }
+
+    /// A task that runs until it is stopped ends when the adapter asks; its approval names it;
+    /// a key nobody runs is reported, not guessed.
+    #[tokio::test]
+    async fn background_tasks_are_stopped_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FakeAdapter::in_process("fake", ctx(dir.path()));
+        let mut session = start(&adapter, dir.path()).await;
+        turn(&mut session, "@bg dev ms=0 approve detached dev server").await;
+        let request = loop {
+            match session.events.recv().await.unwrap() {
+                AdapterEvent::InteractionRequested {
+                    background_key,
+                    request_id,
+                    item_key,
+                    ..
+                } => {
+                    assert_eq!(item_key, None);
+                    break (request_id, background_key);
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(request.1.as_deref(), Some("dev"));
+        session.control.stop_background("dev").await.unwrap();
+        let stopped = loop {
+            if let AdapterEvent::BackgroundTask { task } = session.events.recv().await.unwrap()
+                && task.state.is_ended()
+            {
+                break task;
+            }
+        };
+        assert_eq!(stopped.state, BackgroundState::Stopped);
+        assert_eq!(stopped.origin_item_key, None);
+        session.control.stop_background("nobody").await.unwrap();
+        assert!(matches!(
+            session.events.recv().await.unwrap(),
+            AdapterEvent::Notice { message, .. } if message.contains("nobody")
+        ));
     }
 
     /// A recorded session is what a user of the CLI on the PC leaves behind: requests are

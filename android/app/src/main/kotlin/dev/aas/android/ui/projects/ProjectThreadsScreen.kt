@@ -57,6 +57,7 @@ import dev.aas.android.R
 import dev.aas.android.data.ProjectRepository
 import dev.aas.android.data.ThreadRepository
 import dev.aas.android.data.WorkspaceRepository
+import dev.aas.android.domain.NativeSessionHarnesses
 import dev.aas.android.domain.ProjectLists
 import dev.aas.android.domain.ThreadActivity
 import dev.aas.android.domain.ThreadRow
@@ -71,6 +72,7 @@ import dev.aas.android.ui.components.EmptyState
 import dev.aas.android.ui.components.LabeledExtendedFab
 import dev.aas.android.ui.components.TextInputDialog
 import dev.aas.android.ui.components.ThreadActivityChip
+import dev.aas.android.ui.thread.RunningBackgroundNote
 import dev.aas.android.ui.components.UnreadDot
 import dev.aas.android.ui.components.relativeTime
 import dev.aas.android.ui.icons.Archive
@@ -89,7 +91,7 @@ import kotlinx.coroutines.launch
 
 data class ProjectThreadsUiState(val project: Project?, val rows: List<ThreadRow>, val harnesses: List<Harness>, val synced: Boolean) {
     /** Some harness can list its own sessions (native/list). */
-    val canImport: Boolean get() = harnesses.any { it.available && it.capabilities.nativeSessions }
+    val canImport: Boolean get() = NativeSessionHarnesses.canImport(harnesses)
 }
 
 /**
@@ -259,6 +261,8 @@ fun ProjectThreadsScreen(vm: ProjectThreadsViewModel, navigator: AppNavigator) {
                 vm.archive(archiveRow)
             },
             onDismiss = { confirmArchive = null },
+            // Its background work stops with the process (the list knows the count, not the titles).
+            extra = archiveRow.thread.background.running.takeIf { it > 0 }?.let { count -> { RunningBackgroundNote(count, emptyList()) } },
         )
     }
     if (renamingProject && project != null) {
@@ -364,7 +368,7 @@ fun ThreadRowView(
                     )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    ThreadActivityChip(row.activity)
+                    ThreadActivityChip(row.activity, backgroundRunning = row.thread.background.running)
                     if (row.approvals > 1 || (row.approvals > 0 && row.activity != ThreadActivity.NeedsApproval)) Badge(stringResource(R.string.thread_row_approvals, row.approvals), MaterialTheme.statusColors.needsApproval)
                     if (row.questions > 0 && (row.questions > 1 || row.activity != ThreadActivity.NeedsInput)) Badge(stringResource(R.string.thread_row_questions, row.questions), MaterialTheme.statusColors.needsInput)
                     if (row.queued > 0) Badge(stringResource(R.string.thread_row_queued, row.queued), MaterialTheme.colorScheme.onSurfaceVariant)

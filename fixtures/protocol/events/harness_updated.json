@@ -4,6 +4,8 @@
       "available": true,
       "capabilities": {
         "approvals": true,
+        "backgroundStop": true,
+        "backgroundTasks": true,
         "fork": true,
         "images": true,
         "interrupt": true,

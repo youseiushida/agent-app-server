@@ -51,3 +51,56 @@ data class HarnessWait(
         fun all(outbox: List<OutboxEntry>, harnesses: List<Harness>): List<HarnessWait> = outbox.mapNotNull { of(it, harnesses) }
     }
 }
+
+/**
+ * The harnesses that can list and import their own sessions (`native/list`, `native/import`,
+ * capability `nativeSessions`), for 「PC のセッションを取り込む」 and `/resume`.
+ *
+ * The capabilities of an unavailable harness are unknown (its probe failed, protocol.md: the
+ * server answers `native/list` for it with `harnessUnavailable`), so such a harness is neither
+ * counted as importable nor dropped when it was asked for: its listing then shows why it cannot
+ * be used, with 再確認, in place.
+ *
+ * `unable` (in [choices] and [preselect]) are the harnesses the server answered
+ * `capabilityUnsupported` for on this screen: they cannot list their sessions, even while the
+ * workspace still shows them unavailable (the server probes such a harness before it answers,
+ * and the `harness/updated` it publishes can arrive after the answer). The screen never picks
+ * one of them again by itself, so each refusal moves it on to another harness and it never lists
+ * back and forth. While the workspace shows one of them importable (a newer CLI can have the
+ * capability) it is still offered, and the user can pick it.
+ */
+object NativeSessionHarnesses {
+    /** Harnesses known to list their sessions: available, with the capability. In the server's order. */
+    fun importable(harnesses: List<Harness>): List<Harness> = harnesses.filter(::canList)
+
+    /** Some harness can list its sessions: the import is offered (the thread list's menu, `/resume`). */
+    fun canImport(harnesses: List<Harness>): Boolean = harnesses.any(::canList)
+
+    /**
+     * The harnesses the import screen offers, in the server's order: the importable ones, the
+     * [selected] one whatever its state (the screen shows its listing or why that failed, so its
+     * chip stays next to the others), and [requested] (the harness of the thread `/resume` came
+     * from) while it is unavailable and not in [unable] (its capability is unknown; listing it
+     * shows why it cannot be used).
+     */
+    fun choices(harnesses: List<Harness>, selected: String?, requested: String?, unable: Set<String> = emptySet()): List<Harness> =
+        harnesses.filter { canList(it) || it.id == selected || (it.id == requested && mayList(it, unable)) }
+
+    /**
+     * The harness whose sessions the import screen lists first: [requested] (the harness of the
+     * thread `/resume` came from), else the project's default harness ([projectDefault]), else the
+     * first importable one; `null` when none can import. [requested] and [projectDefault] count
+     * when they are listed and not known to lack the capability (importable, or unavailable).
+     * Harnesses in [unable] are never picked.
+     */
+    fun preselect(harnesses: List<Harness>, requested: String?, projectDefault: String?, unable: Set<String> = emptySet()): String? {
+        val pickable = harnesses.filterNot { it.id in unable }
+        fun candidate(id: String?): String? = pickable.firstOrNull { it.id == id }?.takeIf { canList(it) || !it.available }?.id
+        return candidate(requested) ?: candidate(projectDefault) ?: importable(pickable).firstOrNull()?.id
+    }
+
+    private fun canList(harness: Harness): Boolean = harness.available && harness.capabilities.nativeSessions
+
+    /** Unavailable, so its capabilities are unknown, and the server has not said it cannot list. */
+    private fun mayList(harness: Harness, unable: Set<String>): Boolean = !harness.available && harness.id !in unable
+}

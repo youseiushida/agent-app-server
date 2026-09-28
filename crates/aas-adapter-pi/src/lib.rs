@@ -69,7 +69,12 @@ impl PiOptions {
     }
 }
 
+/// pi itself runs no work outside its runs (no sub-agents, no background shell); a run an
+/// extension starts by itself is a turn of its own (see `session.rs`), not a background task.
+/// Resources extensions keep (watchers, timers) send no signal (docs/design.md §1).
 const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
+    background_tasks: false,
+    background_stop: false,
     interrupt: true,
     steer: true,
     approvals: true,
@@ -446,6 +451,10 @@ impl HarnessAdapter for PiAdapter {
         })
     }
 
+    fn session_switching_commands(&self) -> &'static [&'static str] {
+        SESSION_SWITCHING_COMMANDS
+    }
+
     async fn commands(&self, ctx: CommandContext) -> Result<Vec<Command>, AdapterError> {
         self.options()?;
         if let Some(session) = ctx
@@ -474,7 +483,8 @@ impl HarnessAdapter for PiAdapter {
     async fn scan_native_sessions(&self, cwd: &Path) -> Result<NativeSessionScan, AdapterError> {
         let inputs = self.path_inputs();
         let cwd = cwd.to_path_buf();
-        tokio::task::spawn_blocking(move || native::list_sessions(&inputs, &cwd))
+        let policy = self.ctx.policy.clone();
+        tokio::task::spawn_blocking(move || native::list_sessions(&inputs, &cwd, &policy))
             .await
             .map_err(|e| AdapterError::Other(e.to_string()))?
     }
@@ -487,10 +497,11 @@ impl HarnessAdapter for PiAdapter {
         let inputs = self.path_inputs();
         let cwd = cwd.to_path_buf();
         let id = native_session_id.to_owned();
+        let policy = self.ctx.policy.clone();
         tokio::task::spawn_blocking(move || {
             let file = native::find_session_file(&inputs, &cwd, &id)?
                 .ok_or_else(|| AdapterError::Harness(format!("pi session {id} was not found")))?;
-            native::read_history(&file).map_err(|e| {
+            native::read_history(&file, &policy).map_err(|e| {
                 AdapterError::Harness(format!(
                     "pi session {id} could not be read from {}: {e}",
                     file.display()
@@ -526,10 +537,36 @@ fn which_bash() -> bool {
     resolve_program("bash").is_ok()
 }
 
+/// pi's session commands, by the names of its built-ins (pi's `docs/usage.md`, "Sessions";
+/// never offered, see [`HarnessAdapter::session_switching_commands`]): `new` (a new session),
+/// `resume` (another session), `fork` and `clone` (a new session file from this one), `tree`
+/// (another point of the session tree, same file). The built-ins are TUI-only and never listed
+/// by `get_commands`; an extension command registered under one of these names does the same
+/// over RPC (`ctx.newSession`, `ctx.switchSession`, `ctx.fork`, `ctx.navigateTree`).
+const SESSION_SWITCHING_COMMANDS: &[&str] = &["new", "resume", "fork", "clone", "tree"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn extension_commands_named_like_the_session_built_ins_are_the_ones_excluded() {
+        let listed: Vec<wire::PiCommand> = serde_json::from_value(json!([
+            {"name": "switch-to", "description": "An extension command", "source": "extension"},
+            {"name": "resume", "description": "Pick a session", "source": "extension"},
+            {"name": "tree", "description": "Navigate the tree", "source": "extension"},
+            {"name": "skill:review", "description": "A skill", "source": "skill"},
+        ]))
+        .unwrap();
+        let kept: Vec<String> = commands::commands(listed)
+            .into_iter()
+            .map(|c| c.name)
+            .filter(|name| !SESSION_SWITCHING_COMMANDS.contains(&name.as_str()))
+            .collect();
+        // The adapter's own `/compact` stays; a name it cannot judge (`switch-to`) is offered.
+        assert_eq!(kept, ["switch-to", "skill:review", "compact"]);
+    }
 
     #[test]
     fn options_parse_and_validate() {

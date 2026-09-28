@@ -71,6 +71,13 @@ pub struct HarnessCapabilities {
     pub images: bool,
     pub model_switch_live: bool,
     pub native_sessions: bool,
+    /// The harness reports work that runs outside the turn lifecycle (background agents,
+    /// shells, workflows, …) as background tasks (`backgroundTask/updated`).
+    #[serde(default)]
+    pub background_tasks: bool,
+    /// Single background tasks can be stopped (`backgroundTask/stop`).
+    #[serde(default)]
+    pub background_stop: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -275,8 +282,36 @@ pub struct Thread {
     /// Pinning changes neither the order of `thread/list` nor `lastActivityAt`.
     #[serde(default)]
     pub pinned: bool,
+    /// The thread's background work: how many tasks run, and the last one that ended.
+    #[serde(default)]
+    pub background: ThreadBackground,
     /// Head of the thread stream, refreshed at turn boundaries.
     pub head: u64,
+}
+
+/// Summary of a thread's background tasks (`Thread.background`). It changes when a task
+/// starts, ends or changes its `ambient` flag; progress alone does not change it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadBackground {
+    /// Tasks with status `running` that are not `ambient`.
+    pub running: u32,
+    /// The last end of a task that is not `ambient` (by `endedAt`, then task id). It only moves
+    /// on to later ends: when that task starts a new run, this stays its previous end until
+    /// the new run ends.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_ended: Option<BackgroundTaskEnded>,
+}
+
+/// The task a thread's background work ended with last (`ThreadBackground.lastEnded`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTaskEnded {
+    pub task_id: BackgroundTaskId,
+    pub title: String,
+    pub kind: BackgroundTaskKind,
+    pub status: BackgroundTaskStatus,
+    pub ended_at: Millis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -399,6 +434,37 @@ pub struct Turn {
     pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub diff: Option<DiffSummary>,
+    /// Why the harness started this run by itself, when it said so explicitly (only on turns
+    /// the agent started; see `TurnTrigger`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trigger: Option<TurnTrigger>,
+}
+
+/// What made the harness start a run by itself, as the harness reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnTrigger {
+    /// A background task ended (or reported something) and the harness took it up.
+    BackgroundTask,
+    /// A wakeup the harness had scheduled for itself came due.
+    Scheduled,
+}
+
+impl TurnTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnTrigger::BackgroundTask => "backgroundTask",
+            TurnTrigger::Scheduled => "scheduled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "backgroundTask" => TurnTrigger::BackgroundTask,
+            "scheduled" => TurnTrigger::Scheduled,
+            _ => return None,
+        })
+    }
 }
 
 impl Turn {
@@ -442,6 +508,9 @@ pub enum ItemStatus {
     Failed,
     Declined,
     Interrupted,
+    /// The item launched work that goes on as a background task (`Item.backgroundTaskId`);
+    /// the task has its own lifecycle.
+    Backgrounded,
 }
 
 impl ItemStatus {
@@ -452,6 +521,7 @@ impl ItemStatus {
             ItemStatus::Failed => "failed",
             ItemStatus::Declined => "declined",
             ItemStatus::Interrupted => "interrupted",
+            ItemStatus::Backgrounded => "backgrounded",
         }
     }
 
@@ -462,6 +532,7 @@ impl ItemStatus {
             "failed" => ItemStatus::Failed,
             "declined" => ItemStatus::Declined,
             "interrupted" => ItemStatus::Interrupted,
+            "backgrounded" => ItemStatus::Backgrounded,
             _ => return None,
         })
     }
@@ -477,6 +548,9 @@ pub struct Item {
     pub started_at: Millis,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub completed_at: Option<Millis>,
+    /// The background task this item launched (the task names the item as its origin).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub background_task_id: Option<BackgroundTaskId>,
     #[serde(flatten)]
     pub body: ItemBody,
 }
@@ -710,8 +784,13 @@ pub enum ExpireReason {
     TurnEnded,
     HarnessCancelled,
     DaemonRestarted,
+    /// The background task that asked ended before an answer.
+    TaskEnded,
 }
 
+/// An approval or a question. It belongs to exactly one of: the turn that asked (`turnId`),
+/// the background task that asked (`backgroundTaskId`), or the thread (neither: the agent
+/// asked while no turn ran and named no task). It expires with what it belongs to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Interaction {
@@ -721,6 +800,8 @@ pub struct Interaction {
     pub turn_id: Option<TurnId>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub item_id: Option<ItemId>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub background_task_id: Option<BackgroundTaskId>,
     pub status: InteractionStatus,
     pub created_at: Millis,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -853,6 +934,261 @@ pub struct QuestionAnswer {
     pub choice_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub text: Option<String>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Background tasks
+// ---------------------------------------------------------------------------------------------
+
+/// What kind of work a background task is, as the harness reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum BackgroundTaskKind {
+    /// An agent working on its own (a background sub-agent).
+    Agent,
+    /// A command left running (a background shell or terminal).
+    Shell,
+    /// A multi-agent workflow.
+    Workflow,
+    /// A watcher that reports what it observes.
+    Monitor,
+    /// Work that runs elsewhere (in the cloud) and that the harness tracks.
+    Remote,
+    /// A wakeup the harness scheduled for itself: when it comes due the harness starts a run
+    /// (`nextRunAt`).
+    Scheduled,
+    Other,
+}
+
+impl BackgroundTaskKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackgroundTaskKind::Agent => "agent",
+            BackgroundTaskKind::Shell => "shell",
+            BackgroundTaskKind::Workflow => "workflow",
+            BackgroundTaskKind::Monitor => "monitor",
+            BackgroundTaskKind::Remote => "remote",
+            BackgroundTaskKind::Scheduled => "scheduled",
+            BackgroundTaskKind::Other => "other",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "agent" => BackgroundTaskKind::Agent,
+            "shell" => BackgroundTaskKind::Shell,
+            "workflow" => BackgroundTaskKind::Workflow,
+            "monitor" => BackgroundTaskKind::Monitor,
+            "remote" => BackgroundTaskKind::Remote,
+            "scheduled" => BackgroundTaskKind::Scheduled,
+            "other" => BackgroundTaskKind::Other,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum BackgroundTaskStatus {
+    Running,
+    /// The harness reported that it finished.
+    Completed,
+    /// The harness reported that it failed.
+    Failed,
+    /// It was stopped: the harness reported it (e.g. after `backgroundTask/stop`), or the
+    /// daemon stopped the agent's process (`endReason`).
+    Stopped,
+    /// The agent's process ended unexpectedly, or the daemon restarted, while it ran: how it
+    /// ended is unknown (`endReason`).
+    Lost,
+}
+
+impl BackgroundTaskStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackgroundTaskStatus::Running => "running",
+            BackgroundTaskStatus::Completed => "completed",
+            BackgroundTaskStatus::Failed => "failed",
+            BackgroundTaskStatus::Stopped => "stopped",
+            BackgroundTaskStatus::Lost => "lost",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "running" => BackgroundTaskStatus::Running,
+            "completed" => BackgroundTaskStatus::Completed,
+            "failed" => BackgroundTaskStatus::Failed,
+            "stopped" => BackgroundTaskStatus::Stopped,
+            "lost" => BackgroundTaskStatus::Lost,
+            _ => return None,
+        })
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, BackgroundTaskStatus::Running)
+    }
+}
+
+/// Why a background task ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum BackgroundEndReason {
+    /// The harness reported the end.
+    Harness,
+    /// The agent's process was stopped by `thread/stop` or an archive.
+    ThreadStopped,
+    /// The agent's process was stopped because the thread was idle (no turn, no queued input,
+    /// no background work that keeps it alive): only `ambient` tasks, or a task reported while
+    /// the process was already stopping.
+    IdleStop,
+    /// The daemon was stopped.
+    DaemonShutdown,
+    /// Windows ended the session (sign-out, shutdown, restart) and the daemon stopped with it.
+    SystemShutdown,
+    /// The agent's process was terminated because it did not honour an interrupt.
+    ForcedStop,
+    /// The agent's process was replaced by a new one to apply the thread's settings.
+    ProcessReplaced,
+    /// The agent's process ended by itself.
+    ProcessExited,
+    /// The daemon restarted while the task ran.
+    DaemonRestarted,
+}
+
+/// A piece of work the harness runs outside the turn lifecycle: a background agent, a shell
+/// left running, a workflow, a scheduled wakeup, … Reported only from explicit signals of the
+/// harness; it can outlive turns and can start again (`runs`). Every `backgroundTask/updated`
+/// carries the whole object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTask {
+    pub id: BackgroundTaskId,
+    pub thread_id: ThreadId,
+    /// The harness's own id of the task (e.g. Claude's `task_id`, a Codex process id).
+    pub native_id: String,
+    pub kind: BackgroundTaskKind,
+    /// The harness's description of the task, verbatim.
+    pub title: String,
+    pub status: BackgroundTaskStatus,
+    /// The harness says the task is not activity: it is shown but not counted as running and
+    /// does not keep the agent's process alive.
+    pub ambient: bool,
+    /// How many times the task has started under the same `nativeId` (1 for the first run).
+    pub runs: u32,
+    /// The turn that ran when the task was first reported (or the thread's last turn).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub turn_id: Option<TurnId>,
+    /// The item that launched the task (its status is `backgrounded`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub origin_item_id: Option<ItemId>,
+    /// The background task that launched this one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent_task_id: Option<BackgroundTaskId>,
+    /// When the current run started.
+    pub started_at: Millis,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ended_at: Option<Millis>,
+    /// Present once the task ended.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub end_reason: Option<BackgroundEndReason>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub progress: Option<BackgroundProgress>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub result: Option<BackgroundResult>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub usage: Option<BackgroundUsage>,
+    /// The harness can stop this task on its own (`backgroundTask/stop`).
+    pub stoppable: bool,
+    /// Set while a `backgroundTask/stop` waits for the harness to report the end.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stop_requested_at: Option<Millis>,
+    /// The harness did not report the end within `policy.background_stop_confirm_timeout` of
+    /// the last stop request (the task goes on; nothing was escalated).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stop_unconfirmed_at: Option<Millis>,
+    /// When the harness says the task runs next (scheduled wakeups).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub next_run_at: Option<Millis>,
+}
+
+/// Progress a harness reports for a running task. Every value is the harness's own; a harness
+/// that does not report one leaves it out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundProgress {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_uses: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub duration_ms: Option<u64>,
+    /// What the task is doing, as the harness summarizes it (display only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub summary: Option<String>,
+    /// The agents of a workflow, in the harness's order.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub workflow: Vec<WorkflowAgent>,
+}
+
+/// One agent of a workflow (`BackgroundProgress.workflow`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowAgent {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub phase: Option<String>,
+    pub state: WorkflowAgentState,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub agent_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkflowAgentState {
+    Start,
+    Progress,
+    Done,
+    Error,
+}
+
+/// What a finished task produced, only from explicit fields of the harness (never parsed out
+/// of text written for people).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundResult {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exit_code: Option<i32>,
+    /// The task's output (at most `policy.max_inline_output_bytes`; the whole output is in
+    /// `outputBlobId` when it is longer).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub output_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output_blob_id: Option<BlobId>,
+}
+
+/// What a task used, as the harness reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundUsage {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_uses: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cost_usd: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1010,6 +1346,10 @@ impl OperationStatus {
     }
 }
 
+/// A native session of a harness (`native/list`). `native_session_id` is unique within one
+/// `native/list` result, for every harness: a session the CLI lists several times (Codex lists a
+/// resumed thread once per rollout) is returned once, at the position of its first entry, with
+/// the content of its latest one (`updated_at`). Clients may key their lists by it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSession {

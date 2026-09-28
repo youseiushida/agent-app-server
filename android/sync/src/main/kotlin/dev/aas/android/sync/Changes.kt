@@ -1,5 +1,6 @@
 package dev.aas.android.sync
 
+import dev.aas.android.protocol.BackgroundTask
 import dev.aas.android.protocol.Harness
 import dev.aas.android.protocol.Interaction
 import dev.aas.android.protocol.Operation
@@ -45,6 +46,8 @@ internal sealed interface StoreChange {
     data class ItemUpserted(val item: StoredItem) : StoreChange
 
     data class InteractionUpserted(val interaction: Interaction) : StoreChange
+
+    data class BackgroundTaskUpserted(val task: BackgroundTask) : StoreChange
 
     data class QueueReplaced(val threadId: ThreadId, val queued: List<QueuedInput>) : StoreChange
 
@@ -138,6 +141,11 @@ internal class RecordingTx(private val tx: SyncTx) : SyncTx by tx {
     override suspend fun upsertInteraction(interaction: Interaction) {
         tx.upsertInteraction(interaction)
         changes += StoreChange.InteractionUpserted(interaction)
+    }
+
+    override suspend fun upsertBackgroundTask(task: BackgroundTask) {
+        tx.upsertBackgroundTask(task)
+        changes += StoreChange.BackgroundTaskUpserted(task)
     }
 
     override suspend fun replaceQueued(threadId: ThreadId, queued: List<QueuedInput>) {

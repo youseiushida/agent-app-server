@@ -142,6 +142,39 @@ class AppFlows(val app: AppDriver, val control: HostControl, val server: ServerA
         app.waitFor(app.inApp(By.text(name)), "the new project's name on the new-thread screen")
     }
 
+    /**
+     * The new-project flow for a folder that exists on the PC (既存のフォルダーを使用 → パスを入力
+     * → 開く → このフォルダーを開く), ending on the new-thread screen of the project it registers
+     * (a folder without threads). [folder] is relative to the server's root; the project is named
+     * after it.
+     */
+    fun openFolderAsProject(folder: String) {
+        app.tap(app.inApp(By.desc(app.text("project_new"))), "新しいプロジェクト")
+        app.tap(app.inApp(By.text(app.text("newproject_existing"))), "既存のフォルダーを使用")
+        app.tap(app.inApp(By.text(app.text("newproject_type_path"))), "パスを入力")
+        val separator = if (server.root.endsWith("\\")) "" else "\\"
+        app.setText(app.inApp(By.clazz(EditText::class.java.name)), server.root + separator + folder, "the folder's path")
+        app.tap(app.inApp(app.button(app.text("newproject_go"))), "開く")
+        // Tapping replaces the button with the progress at once: a second tap only happens when
+        // the first one was lost.
+        app.tapUntil(
+            app.inApp(app.button(app.text("newproject_open_this"))),
+            app.inApp(By.text(app.text("newthread_title"))),
+            "このフォルダーを開く",
+        )
+        app.waitFor(app.inApp(By.text(folder)), "the project's name on the new-thread screen")
+    }
+
+    /**
+     * Runs the app's `/resume` from the composer's palette (typed partly, so the palette row is
+     * the only "/resume" on screen) and waits for 「PC のセッションを取り込む」.
+     */
+    fun resumeFromThePalette() {
+        app.setText(composer, "/resu", "the composer")
+        app.tap(app.inApp(By.text("/resume")), "/resume in the palette")
+        app.waitFor(app.inApp(By.text(app.text("import_session"))), "PC のセッションを取り込む")
+    }
+
     /** The composer (the only text field of the thread and new-thread screens). */
     val composer: BySelector get() = app.inApp(By.clazz(EditText::class.java.name))
 

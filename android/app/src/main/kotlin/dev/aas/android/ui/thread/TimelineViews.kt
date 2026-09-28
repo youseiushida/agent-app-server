@@ -42,6 +42,7 @@ import dev.aas.android.protocol.Item
 import dev.aas.android.protocol.ItemStatus
 import dev.aas.android.protocol.Turn
 import dev.aas.android.protocol.TurnStatus
+import dev.aas.android.protocol.TurnTrigger
 import dev.aas.android.protocol.Usage
 import dev.aas.android.ui.common.LocalAppPolicy
 import dev.aas.android.ui.components.rememberNow
@@ -56,13 +57,23 @@ import dev.aas.android.ui.interaction.ApprovalChoices
 import dev.aas.android.ui.theme.statusColors
 import java.util.Locale
 
-/** The start of a turn: a divider with its number and the model the CLI reported. */
+/**
+ * The start of a turn: a divider with its number and the model the CLI reported. A turn the
+ * agent started by itself says why when the harness told (`Turn.trigger`): "バックグラウンド
+ * 作業の完了を受けて" / "予約した時刻に再開".
+ */
 @Composable
 fun TurnStartRow(turn: Turn) {
+    val reason = when (turn.trigger) {
+        null -> null
+        TurnTrigger.BackgroundTask -> stringResource(R.string.turn_trigger_background)
+        TurnTrigger.Scheduled -> stringResource(R.string.turn_trigger_scheduled)
+        TurnTrigger.Unknown -> stringResource(R.string.turn_trigger_other)
+    }
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         HorizontalDivider(Modifier.weight(1f))
         Text(
-            listOfNotNull(stringResource(R.string.turn_number, turn.index + 1), turn.model).joinToString(" · "),
+            listOfNotNull(reason, stringResource(R.string.turn_number, turn.index + 1), turn.model).joinToString(" · "),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 8.dp),
@@ -218,6 +229,7 @@ fun expireReasonLabel(reason: ExpireReason?): String = stringResource(
         ExpireReason.TurnEnded -> R.string.expire_turn_ended
         ExpireReason.HarnessCancelled -> R.string.expire_harness_cancelled
         ExpireReason.DaemonRestarted -> R.string.expire_daemon_restarted
+        ExpireReason.TaskEnded -> R.string.expire_task_ended
         ExpireReason.Unknown, null -> R.string.expire_unknown
     },
 )

@@ -41,6 +41,73 @@ val releaseSigning: ReleaseSigning? = if (releaseSigningMissing.isEmpty()) {
     null
 }
 
+/**
+ * The app's version, from the git commit it is built from (docs/android.md 19.3):
+ *
+ * * versionCode: the number of commits reachable from HEAD. It grows with every commit on main,
+ *   so Android accepts a newer build as an update of an older one.
+ * * versionName: [APP_VERSION]`+`<short hash of HEAD>, with `.dirty` when files under android/
+ *   differ from that commit (tracked changes or new files), so a build of uncommitted work never
+ *   looks like the commit's own build.
+ *
+ * The same commit (and the same working tree) always gives the same values: nothing depends on
+ * the time or the machine. Without the history the values are a clear fallback, never a guess:
+ * git missing or not a repository → versionCode [FALLBACK_VERSION_CODE] and `+nogit`; a shallow
+ * clone (CI's checkout), whose commit count is not the history's → versionCode
+ * [FALLBACK_VERSION_CODE] with the hash. Either is reported as a build warning.
+ */
+data class AppVersion(val code: Int, val name: String)
+
+/** The version the app's features are at (by hand); the build adds the commit. */
+val APP_VERSION = "0.1.0"
+
+/** versionCode when the commit count is unknown (Android needs at least 1). */
+val FALLBACK_VERSION_CODE = 1
+
+/**
+ * Runs git in the repository; the trimmed output, or null when git fails or cannot run.
+ *
+ * Every call is read-only and runs with `--no-optional-locks`: this runs whenever Gradle
+ * configures :app (every build, every IDE sync, builds running side by side), and a plain
+ * `git status` refreshes the index and writes it back under `.git/index.lock`, which makes a
+ * `git add` / `git commit` started at the same moment fail with "Unable to create
+ * '.git/index.lock': File exists". The option (git 2.15+) skips that optional write; the
+ * output is the same.
+ */
+fun git(vararg args: String): String? = try {
+    val result = providers.exec {
+        workingDir = rootDir
+        commandLine(listOf("git", "--no-optional-locks") + args)
+        isIgnoreExitValue = true
+    }
+    if (result.result.get().exitValue == 0) result.standardOutput.asText.get().trim() else null
+} catch (e: Exception) {
+    // git is not installed (the process cannot start): the fallback below says so.
+    logger.info("git ${args.joinToString(" ")} could not run: ${e.message}")
+    null
+}
+
+val appVersion: AppVersion = run {
+    val hash = git("rev-parse", "--short=7", "HEAD")
+    if (hash == null) {
+        logger.warn("The git history is not available: building with versionCode $FALLBACK_VERSION_CODE and versionName $APP_VERSION+nogit.")
+        return@run AppVersion(FALLBACK_VERSION_CODE, "$APP_VERSION+nogit")
+    }
+    // Changes under android/ (the app's sources and build scripts), untracked files included.
+    // Without optional locks (git()), a stale index is only compared, never written back.
+    val status = git("status", "--porcelain", "--untracked-files=normal", "--", ".")
+    if (status == null) logger.warn("git status failed: the build is marked .dirty (its tree cannot be shown to be the commit's).")
+    val name = "$APP_VERSION+$hash" + if (status == null || status.isNotEmpty()) ".dirty" else ""
+    val shallow = git("rev-parse", "--is-shallow-repository") == "true"
+    val count = git("rev-list", "--count", "HEAD")?.toIntOrNull()
+    if (shallow || count == null) {
+        val why = if (shallow) "a shallow clone has only part of the history" else "git rev-list failed"
+        logger.warn("The commit count is unknown ($why): building with versionCode $FALLBACK_VERSION_CODE and versionName $name.")
+        return@run AppVersion(FALLBACK_VERSION_CODE, name)
+    }
+    AppVersion(count, name)
+}
+
 android {
     namespace = "dev.aas.android"
     compileSdk = 36
@@ -49,8 +116,8 @@ android {
         applicationId = "dev.aas.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = appVersion.code
+        versionName = appVersion.name
     }
 
     signingConfigs {

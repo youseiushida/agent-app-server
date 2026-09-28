@@ -33,6 +33,7 @@ fn turn_completed(
             status,
             usage,
             error,
+            ..
         } => (status, usage, error),
         other => panic!("expected TurnCompleted, got {other:?}"),
     }
@@ -141,6 +142,7 @@ async fn command_approval_accept() {
             request_id,
             request,
             item_key,
+            ..
         } => (request_id, request, item_key),
         _ => unreachable!(),
     };
@@ -579,4 +581,90 @@ async fn shutdown_mid_turn_interrupts_then_stops() {
         }
     )));
     r.finish().await.unwrap();
+}
+
+// ----- native sessions ------------------------------------------------------------------------
+
+const ROLLOUT_THREAD: &str = "01a0f1c2-0000-7000-8000-00000000000a";
+const NAMED_THREAD: &str = "01a0f1c2-0000-7000-8000-00000000000b";
+const WINDOWS_THREAD: &str = "01a0f1c2-0000-7000-8000-00000000000c";
+const UNTITLED_THREAD: &str = "01a0f1c2-0000-7000-8000-00000000000d";
+
+fn listed(
+    sessions: &[aas_harness::NativeSessionSummary],
+) -> Vec<(&str, Option<&str>, Option<i64>)> {
+    sessions
+        .iter()
+        .map(|s| {
+            (
+                s.native_session_id.as_str(),
+                s.title.as_deref(),
+                s.updated_at,
+            )
+        })
+        .collect()
+}
+
+/// Codex lists a thread once per rollout (a thread resumed in Codex desktop): the same id, name
+/// and preview with their own `updatedAt`, within one page. The listing names each thread once
+/// with its latest time, counts distinct threads against the limit, and reads further pages
+/// until it has them (here the page boundary even splits the rollouts of one thread).
+#[tokio::test]
+async fn native_sessions_list_each_thread_once_and_page_to_the_limit_of_threads() {
+    let (sessions, verdict) =
+        support::list_entries(support::script("native_list_paged.jsonl"), 3).await;
+    verdict.expect("script fully replayed");
+    let sessions = sessions.unwrap();
+    assert_eq!(
+        listed(&sessions),
+        [
+            (
+                ROLLOUT_THREAD,
+                Some("Rename the config loader and update its callers"),
+                Some(1_790_563_200_000)
+            ),
+            (
+                NAMED_THREAD,
+                Some("Retry backoff test"),
+                Some(1_790_498_000_000)
+            ),
+            (
+                WINDOWS_THREAD,
+                Some("Why does the build fail on Windows?"),
+                Some(1_790_321_000_000)
+            ),
+        ]
+    );
+    assert_eq!(sessions[0].cwd.as_deref(), Some(r"C:\WORKSPACE"));
+}
+
+/// The latest `updatedAt` of a thread is taken explicitly, not from the order of the list: a
+/// rollout listed after an older one still gives the thread its time (and the thread keeps the
+/// position of its first entry). The list ends when `nextCursor` is null.
+#[tokio::test]
+async fn native_sessions_keep_the_latest_rollout_of_each_thread_whatever_the_order() {
+    let (sessions, verdict) =
+        support::list_entries(support::script("native_list_one_page.jsonl"), 200).await;
+    verdict.expect("script fully replayed");
+    assert_eq!(
+        listed(&sessions.unwrap()),
+        [
+            (
+                ROLLOUT_THREAD,
+                Some("Rename the config loader and update its callers"),
+                Some(1_790_563_200_000)
+            ),
+            (
+                NAMED_THREAD,
+                Some("Retry backoff test"),
+                Some(1_790_498_000_000)
+            ),
+            (
+                WINDOWS_THREAD,
+                Some("Why does the build fail on Windows?"),
+                Some(1_790_330_000_000)
+            ),
+            (UNTITLED_THREAD, None, Some(1_790_200_000_000)),
+        ]
+    );
 }

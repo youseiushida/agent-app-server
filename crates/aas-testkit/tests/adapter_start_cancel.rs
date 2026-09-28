@@ -71,6 +71,7 @@ fn setup(kind: HarnessKind, id: &str) -> Setup {
             stop_grace: STOP_GRACE,
             max_line_bytes: 1 << 20,
             handshake_timeout: Duration::from_secs(120),
+            ..AdapterPolicy::default()
         },
     };
     Setup {

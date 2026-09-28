@@ -65,6 +65,9 @@ import kotlinx.serialization.json.JsonElement
  *   is in the ⋯ menu. The buttons arm only after [dev.aas.android.AppPolicy.interactionArmDelayMs].
  * * Question: the first prompt and 回答する (opens [QuestionSheet]) / スキップ (`dismissed`).
  * * [responsePending]: an answer is in the outbox (sent when connected); buttons are disabled.
+ * * A request of a background task (`Interaction.backgroundTaskId`) says which task asked:
+ *   [backgroundTaskTitle] when the task is known on this device, otherwise that it came from
+ *   background work.
  */
 @Composable
 fun InteractionCard(
@@ -74,6 +77,7 @@ fun InteractionCard(
     onOpenQuestion: () -> Unit,
     modifier: Modifier = Modifier,
     header: (@Composable () -> Unit)? = null,
+    backgroundTaskTitle: String? = null,
 ) {
     val request = interaction.request
     val accent = if (request is InteractionRequest.Question) MaterialTheme.statusColors.needsInput else MaterialTheme.statusColors.needsApproval
@@ -83,6 +87,16 @@ fun InteractionCard(
     ) {
         Column(Modifier.padding(16.dp)) {
             header?.invoke()
+            if (interaction.backgroundTaskId != null) {
+                Text(
+                    backgroundTaskTitle?.let { stringResource(R.string.interaction_from_background, it) } ?: stringResource(R.string.interaction_from_background_unknown),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.statusColors.running,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(4.dp))
+            }
             when (request) {
                 is InteractionRequest.Approval -> ApprovalContent(interaction.id, request, responsePending, onRespond)
                 is InteractionRequest.Question -> QuestionSummary(request, responsePending, onOpenQuestion, onSkip = { onRespond(InteractionResolution.Dismissed) })

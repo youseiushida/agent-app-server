@@ -46,6 +46,22 @@ class AasTestServer private constructor(
         val credentials: Credentials get() = Credentials(wsUrl, token)
     }
 
+    /**
+     * Daemon policy values for a test (the server's flags; `null`: the daemon's default):
+     * `policy.idle_process_ttl`, `background_progress_interval`, `background_stop_confirm_timeout`.
+     */
+    data class Policy(
+        val idleProcessTtlMs: Long? = null,
+        val backgroundProgressMs: Long? = null,
+        val backgroundStopConfirmMs: Long? = null,
+    ) {
+        fun args(): List<String> = buildList {
+            idleProcessTtlMs?.let { addAll(listOf("--idle-process-ttl-ms", it.toString())) }
+            backgroundProgressMs?.let { addAll(listOf("--background-progress-ms", it.toString())) }
+            backgroundStopConfirmMs?.let { addAll(listOf("--background-stop-confirm-ms", it.toString())) }
+        }
+    }
+
     /** A native session of the fake harness, as the server's ready line lists it. */
     data class NativeSessionInfo(val nativeSessionId: String, val title: String)
 
@@ -279,16 +295,24 @@ class AasTestServer private constructor(
 
         /**
          * Starts a server on a new temporary state folder (deleted by [close]) and waits for its
-         * ready line.
+         * ready line. [policy] sets daemon policy values the server exposes as flags.
          */
-        fun start(exe: File, heartbeatMs: Long = 300, clientTimeoutMs: Long = 1_500, stateDir: File? = null): AasTestServer {
+        fun start(
+            exe: File,
+            heartbeatMs: Long = 300,
+            clientTimeoutMs: Long = 1_500,
+            stateDir: File? = null,
+            policy: Policy = Policy(),
+        ): AasTestServer {
             val dir = stateDir ?: Files.createTempDirectory("aas-test-server-").toFile()
             val stderr = File(dir, STDERR_FILE)
             val process = ProcessBuilder(
-                exe.absolutePath,
-                "--state-dir", dir.absolutePath,
-                "--heartbeat-ms", heartbeatMs.toString(),
-                "--client-timeout-ms", clientTimeoutMs.toString(),
+                listOf(
+                    exe.absolutePath,
+                    "--state-dir", dir.absolutePath,
+                    "--heartbeat-ms", heartbeatMs.toString(),
+                    "--client-timeout-ms", clientTimeoutMs.toString(),
+                ) + policy.args(),
             )
                 .redirectError(ProcessBuilder.Redirect.appendTo(stderr))
                 .start()

@@ -10,9 +10,11 @@ import dev.aas.android.data.ImageUploader
 import dev.aas.android.data.ProjectRepository
 import dev.aas.android.data.ThreadRepository
 import dev.aas.android.domain.HarnessWait
+import dev.aas.android.domain.NativeSessionHarnesses
 import dev.aas.android.domain.ResultMessages
 import dev.aas.android.domain.composer.HarnessSettings
 import dev.aas.android.domain.composer.LocalCommand
+import dev.aas.android.domain.composer.Palette
 import dev.aas.android.domain.composer.PaletteContext
 import dev.aas.android.domain.composer.PaletteEntry
 import dev.aas.android.domain.composer.SendAction
@@ -50,6 +52,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -86,6 +90,9 @@ sealed interface NewThreadEvent {
     data class Created(val threadId: String) : NewThreadEvent
 
     data class OpenPicker(val kind: PickerKind) : NewThreadEvent
+
+    /** `/resume`: 「PC のセッションを取り込む」 of [projectId], listing [harnessId]'s sessions first. */
+    data class OpenImport(val projectId: String, val harnessId: String?) : NewThreadEvent
 }
 
 /**
@@ -98,7 +105,7 @@ sealed interface NewThreadEvent {
  */
 class NewThreadViewModel(
     private val route: NewThreadRoute,
-    workspace: StateFlow<WorkspaceState>,
+    private val workspace: StateFlow<WorkspaceState>,
     private val threads: ThreadRepository,
     private val projects: ProjectRepository,
     private val status: StateFlow<SyncStatus>,
@@ -129,7 +136,7 @@ class NewThreadViewModel(
         drafts = drafts,
         draftKey = ComposerDrafts.newThreadKey(route.projectId),
         templates = templates,
-        paletteContext = PaletteContext(inThread = false),
+        paletteContext = paletteContext(workspace.value),
     )
 
     val state: StateFlow<NewThreadUiState> = combine(
@@ -167,6 +174,15 @@ class NewThreadViewModel(
         choices.compareAndSet(c, c.copy(harnessId = initial.id, settings = HarnessSettings.initial(initial, project?.defaults ?: ProjectDefaults())))
         return initial
     }
+
+    init {
+        // `/resume` is offered while some harness can list its sessions.
+        viewModelScope.launch {
+            workspace.map { paletteContext(it) }.distinctUntilChanged().collect { composer.setPaletteContext(it) }
+        }
+    }
+
+    private fun paletteContext(ws: WorkspaceState) = PaletteContext(inThread = false, canImport = NativeSessionHarnesses.canImport(ws.harnesses))
 
     /** 再確認: `harness/refresh` of one harness, or of all when [harnessId] is `null`. */
     fun refreshHarness(harnessId: String?) = refresher.refresh(viewModelScope, harnessId)
@@ -253,7 +269,12 @@ class NewThreadViewModel(
             is PaletteChoice.Picker -> viewModelScope.launch { events.send(NewThreadEvent.OpenPicker(choice.kind)) }
             // Thread commands do not exist before the thread (the daemon does not list them here).
             is PaletteChoice.Method -> messages.show(UiText.of(R.string.palette_needs_thread))
-            is PaletteChoice.Local -> if (choice.command != LocalCommand.Review && choice.command != LocalCommand.Init) messages.show(UiText.of(R.string.palette_needs_thread))
+            is PaletteChoice.Local -> when (choice.command) {
+                // Inserted by the composer.
+                LocalCommand.Review, LocalCommand.Init -> Unit
+                LocalCommand.Resume -> resume()
+                LocalCommand.New, LocalCommand.Status, LocalCommand.Rename, LocalCommand.Pin -> messages.show(UiText.of(R.string.palette_needs_thread))
+            }
             is PaletteChoice.Unsupported -> messages.show(UiText.of(R.string.palette_unsupported_type, choice.type))
         }
     }
@@ -265,6 +286,12 @@ class NewThreadViewModel(
      * request cannot be queued or the daemon refuses it; never once the thread exists.
      */
     fun create() {
+        if (Palette.isResume(composer.textValue.text)) {
+            // Typed out instead of chosen: the app's `/resume`, never sent to the harness.
+            composer.setText("")
+            resume()
+            return
+        }
         val ui = state.value
         val harness = ui.harness ?: return
         if (!ui.send.enabled || creating.value) return
@@ -316,6 +343,18 @@ class NewThreadViewModel(
                 creatingId.value = null
             }
         }
+    }
+
+    /**
+     * `/resume`: continue a session of the PC instead of starting a new one — 「PC のセッションを
+     * 取り込む」 of this project, listing the chosen harness's sessions first.
+     */
+    fun resume() {
+        if (!NativeSessionHarnesses.canImport(workspace.value.harnesses)) {
+            messages.show(UiText.of(R.string.import_no_harness))
+            return
+        }
+        viewModelScope.launch { events.send(NewThreadEvent.OpenImport(route.projectId, choices.value.harnessId)) }
     }
 
     /** `project/update { defaults }` behind the `thread/create` in the project's lane. */

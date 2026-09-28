@@ -1890,3 +1890,95 @@ internal val Icons.Outlined.WarningAmber: ImageVector
     }
 
 private var _warningAmber: ImageVector? = null
+
+internal val Icons.Outlined.AccountTree: ImageVector
+    get() {
+        if (_accountTree != null) {
+            return _accountTree!!
+        }
+        _accountTree = materialIcon(name = "Outlined.AccountTree") {
+            materialPath {
+                moveTo(22.0f, 11.0f)
+                verticalLineTo(3.0f)
+                horizontalLineToRelative(-7.0f)
+                verticalLineToRelative(3.0f)
+                horizontalLineTo(9.0f)
+                verticalLineTo(3.0f)
+                horizontalLineTo(2.0f)
+                verticalLineToRelative(8.0f)
+                horizontalLineToRelative(7.0f)
+                verticalLineTo(8.0f)
+                horizontalLineToRelative(2.0f)
+                verticalLineToRelative(10.0f)
+                horizontalLineToRelative(4.0f)
+                verticalLineToRelative(3.0f)
+                horizontalLineToRelative(7.0f)
+                verticalLineToRelative(-8.0f)
+                horizontalLineToRelative(-7.0f)
+                verticalLineToRelative(3.0f)
+                horizontalLineToRelative(-2.0f)
+                verticalLineTo(8.0f)
+                horizontalLineToRelative(2.0f)
+                verticalLineToRelative(3.0f)
+                horizontalLineTo(22.0f)
+                close()
+                moveTo(7.0f, 9.0f)
+                horizontalLineTo(4.0f)
+                verticalLineTo(5.0f)
+                horizontalLineToRelative(3.0f)
+                verticalLineTo(9.0f)
+                close()
+                moveTo(17.0f, 15.0f)
+                horizontalLineToRelative(3.0f)
+                verticalLineToRelative(4.0f)
+                horizontalLineToRelative(-3.0f)
+                verticalLineTo(15.0f)
+                close()
+                moveTo(17.0f, 5.0f)
+                horizontalLineToRelative(3.0f)
+                verticalLineToRelative(4.0f)
+                horizontalLineToRelative(-3.0f)
+                verticalLineTo(5.0f)
+                close()
+            }
+        }
+        return _accountTree!!
+    }
+
+private var _accountTree: ImageVector? = null
+
+internal val Icons.Outlined.Visibility: ImageVector
+    get() {
+        if (_visibility != null) {
+            return _visibility!!
+        }
+        _visibility = materialIcon(name = "Outlined.Visibility") {
+            materialPath {
+                moveTo(12.0f, 6.0f)
+                curveToRelative(3.79f, 0.0f, 7.17f, 2.13f, 8.82f, 5.5f)
+                curveTo(19.17f, 14.87f, 15.79f, 17.0f, 12.0f, 17.0f)
+                reflectiveCurveToRelative(-7.17f, -2.13f, -8.82f, -5.5f)
+                curveTo(4.83f, 8.13f, 8.21f, 6.0f, 12.0f, 6.0f)
+                moveToRelative(0.0f, -2.0f)
+                curveTo(7.0f, 4.0f, 2.73f, 7.11f, 1.0f, 11.5f)
+                curveTo(2.73f, 15.89f, 7.0f, 19.0f, 12.0f, 19.0f)
+                reflectiveCurveToRelative(9.27f, -3.11f, 11.0f, -7.5f)
+                curveTo(21.27f, 7.11f, 17.0f, 4.0f, 12.0f, 4.0f)
+                close()
+                moveTo(12.0f, 9.0f)
+                curveToRelative(1.38f, 0.0f, 2.5f, 1.12f, 2.5f, 2.5f)
+                reflectiveCurveTo(13.38f, 14.0f, 12.0f, 14.0f)
+                reflectiveCurveToRelative(-2.5f, -1.12f, -2.5f, -2.5f)
+                reflectiveCurveTo(10.62f, 9.0f, 12.0f, 9.0f)
+                moveToRelative(0.0f, -2.0f)
+                curveToRelative(-2.48f, 0.0f, -4.5f, 2.02f, -4.5f, 4.5f)
+                reflectiveCurveTo(9.52f, 16.0f, 12.0f, 16.0f)
+                reflectiveCurveToRelative(4.5f, -2.02f, 4.5f, -4.5f)
+                reflectiveCurveTo(14.48f, 7.0f, 12.0f, 7.0f)
+                close()
+            }
+        }
+        return _visibility!!
+    }
+
+private var _visibility: ImageVector? = null

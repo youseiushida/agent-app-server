@@ -1,5 +1,10 @@
 package dev.aas.android.sync
 
+import dev.aas.android.protocol.BackgroundEndReason
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskKind
+import dev.aas.android.protocol.BackgroundTaskStatus
+import dev.aas.android.protocol.BackgroundTaskStopParams
 import dev.aas.android.protocol.ClientInfo
 import dev.aas.android.protocol.DeviceRevokeParams
 import dev.aas.android.protocol.Disposition
@@ -17,10 +22,14 @@ import dev.aas.android.protocol.ProjectInit
 import dev.aas.android.protocol.ProjectListParams
 import dev.aas.android.protocol.ProjectOpenParams
 import dev.aas.android.protocol.QuestionAnswer
+import dev.aas.android.protocol.ThreadBackground
 import dev.aas.android.protocol.ThreadCreateParams
 import dev.aas.android.protocol.ThreadForkParams
 import dev.aas.android.protocol.ThreadListParams
 import dev.aas.android.protocol.ThreadReadParams
+import dev.aas.android.protocol.ThreadStatus
+import dev.aas.android.protocol.ThreadStopParams
+import dev.aas.android.protocol.TurnTrigger
 import dev.aas.android.protocol.ThreadUpdateParams
 import dev.aas.android.protocol.Turn
 import dev.aas.android.protocol.TurnStatus
@@ -75,6 +84,16 @@ class RealServerTest {
             Assume.assumeTrue(reason, false)
         }
         server = AasTestServer.start(exe.getOrThrow(), heartbeatMs = HEARTBEAT_MS, clientTimeoutMs = CLIENT_TIMEOUT_MS)
+    }
+
+    /** Replaces the default server with one running [policy] (the agents of the first one are checked on quit too). */
+    private fun restartWith(policy: AasTestServer.Policy) {
+        val first = server
+        val agents = first.recordedAgents()
+        assertEquals(0, first.quit(), "aas-test-server exit code\n${first.stderrTail()}")
+        first.close()
+        assertTrue(agents.none { it.alive() }, "agent processes outlived the first server: $agents")
+        server = AasTestServer.start(first.exe, heartbeatMs = HEARTBEAT_MS, clientTimeoutMs = CLIENT_TIMEOUT_MS, policy = policy)
     }
 
     @After
@@ -178,7 +197,7 @@ class RealServerTest {
                         return@eventually null
                     }
                     val local = state.value
-                    diff = threadDiff(local, read.thread, read.turns, read.items, read.interactions, read.queued)
+                    diff = threadDiff(local, read.thread, read.turns, read.items, read.interactions, read.queued, read.backgroundTasks)
                     val cursor = store.state.value.cursors[threadStream(threadId)] ?: -1
                     if (diff.isEmpty() && cursor >= read.head) Unit else null.also { if (diff.isEmpty()) diff = "cursor $cursor < head ${read.head}" }
                 }
@@ -229,7 +248,9 @@ class RealServerTest {
         items: List<Item>,
         interactions: List<dev.aas.android.protocol.Interaction>,
         queued: List<dev.aas.android.protocol.QueuedInput>,
+        tasks: List<BackgroundTask>,
     ): String = buildString {
+        if (local.backgroundTasks.sortedBy { it.id } != tasks.sortedBy { it.id }) append("background tasks differ: ${local.backgroundTasks} vs $tasks; ")
         if (local.thread != thread) append("thread summary differs: ${local.thread} vs $thread; ")
         if (local.turns != turns) append("turns differ: ${local.turns} vs $turns; ")
         if (local.items != items) {
@@ -683,6 +704,179 @@ class RealServerTest {
         assertTrue(c.engine.status.value.reconnects >= 2, "the chaos forced reconnects: ${c.engine.status.value}")
     }
 
+    // ----- background work (the fake agent's `@bg`, docs/adapters/fake.md §5) ---------------------
+
+    private suspend fun task(c: Client, threadId: String, what: String, check: (BackgroundTask) -> Boolean): BackgroundTask {
+        val state = c.engine.thread(threadId) ?: throw AssertionError("thread $threadId is not open")
+        return c.waitFor(what) { state.value.backgroundTasks.firstOrNull(check) }
+    }
+
+    private suspend fun summary(c: Client, threadId: String, what: String, check: (dev.aas.android.protocol.Thread) -> Boolean) =
+        c.waitFor(what) { c.engine.workspace.value.threads.firstOrNull { it.thread.id == threadId }?.thread?.takeIf(check) }
+
+    /**
+     * A shell left running (a dev server) outlives its turn: the launching command is
+     * `backgrounded` and points at the task, the thread says 1 running, and the idle agent is
+     * not stopped while it runs (well past `idle_process_ttl`). `backgroundTask/stop` answers
+     * with `stopRequestedAt`; the harness then reports the stop, the phone is told once
+     * (BackgroundTaskFinished), and the idle agent is stopped after all.
+     */
+    @Test
+    fun aBackgroundShellKeepsItsAgentUntilItIsStoppedFromThePhone() = realTest {
+        restartWith(AasTestServer.Policy(idleProcessTtlMs = IDLE_TTL_MS))
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("background"))
+        val state = openLive(c, threadId)
+
+        val turn = c.runTurn(threadId, "@bg dev kind=shell ms=0 npm run dev")
+        assertEquals(TurnStatus.Completed, turn.status)
+        val task = task(c, threadId, "the running shell") { it.status == BackgroundTaskStatus.Running }
+        assertEquals(BackgroundTaskKind.Shell, task.kind)
+        assertEquals("npm run dev", task.title)
+        assertEquals(turn.id, task.turnId)
+        assertTrue(task.stoppable)
+        val launcher = state.value.items.filterIsInstance<Item.CommandExecution>().single()
+        assertEquals(ItemStatus.Backgrounded, launcher.status)
+        assertEquals(task.id, launcher.backgroundTaskId)
+        assertEquals(launcher.id, task.originItemId)
+        summary(c, threadId, "running 1") { it.background.running == 1 }
+
+        // Well past the idle time: the process stays because the harness reports work.
+        delay(IDLE_TTL_MS * 3)
+        val kept = c.engine.workspace.value.threads.first { it.thread.id == threadId }.thread
+        assertEquals(ThreadStatus.Ready, kept.status, "not idle-stopped while the shell runs")
+        assertEquals(BackgroundTaskStatus.Running, state.value.backgroundTasks.single().status)
+
+        val answer = c.engine.mutate(Methods.BackgroundTaskStop) { crid -> BackgroundTaskStopParams(crid, threadId, task.id) }
+        assertTrue(answer.task.stopRequestedAt != null, "the answer only says the stop was asked: ${answer.task}")
+        val stopped = task(c, threadId, "stopped") { it.id == task.id && it.status == BackgroundTaskStatus.Stopped }
+        assertEquals(BackgroundEndReason.Harness, stopped.endReason)
+        val finished = c.waitFor("finished signal") { c.signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>().firstOrNull { it.ended.taskId == task.id } }
+        assertEquals(BackgroundTaskStatus.Stopped, finished.ended.status)
+        summary(c, threadId, "nothing runs, the stopped task last") { it.background.running == 0 && it.background.lastEnded?.taskId == task.id }
+        // Nothing keeps the agent now: it is stopped when idle.
+        summary(c, threadId, "idle-stopped") { it.status == ThreadStatus.Idle }
+        assertEquals(1, c.signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>().count { it.ended.taskId == task.id })
+        c.assertThreadMatchesServer(threadId)
+        c.assertWorkspaceMatchesServer()
+    }
+
+    /**
+     * Work the harness marks as ambient (not activity) never keeps the agent: the idle agent is
+     * stopped while it runs, and it ends with the process (`idleStop`). Its end is not the end
+     * of the thread's work: the summary's `lastEnded` stays empty and the phone is not told
+     * (no "stopped" notification after every turn of such a session). A task that is not
+     * ambient still is.
+     */
+    @Test
+    fun ambientWorkEndsWithTheIdleAgentWithoutTellingThePhone() = realTest {
+        restartWith(AasTestServer.Policy(idleProcessTtlMs = IDLE_TTL_MS))
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("ambient"))
+        openLive(c, threadId)
+
+        assertEquals(TurnStatus.Completed, c.runTurn(threadId, "@bg mon kind=monitor ms=0 ambient watch the logs").status)
+        val monitor = task(c, threadId, "the ambient task") { it.status == BackgroundTaskStatus.Running }
+        assertTrue(monitor.ambient)
+        val stopped = task(c, threadId, "the monitor stopped with its agent") { it.id == monitor.id && it.status.isTerminal }
+        assertEquals(BackgroundTaskStatus.Stopped, stopped.status)
+        assertEquals(BackgroundEndReason.IdleStop, stopped.endReason)
+        summary(c, threadId, "idle-stopped although the monitor ran") { it.status == ThreadStatus.Idle }
+        c.assertThreadMatchesServer(threadId)
+        c.assertWorkspaceMatchesServer()
+        val converged = c.engine.workspace.value.threads.first { it.thread.id == threadId }.thread
+        assertEquals(ThreadBackground(running = 0, lastEnded = null), converged.background)
+        assertEquals(emptyList(), c.signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>(), "an ambient end is not reported")
+
+        // Work that is not ambient, in the same thread, is reported when it ends.
+        c.runTurn(threadId, "@bg build kind=shell ms=200 npm run build")
+        val build = task(c, threadId, "the build") { it.title == "npm run build" }
+        val finished = c.waitFor("the build's end") { c.signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>().firstOrNull { it.ended.taskId == build.id } }
+        assertEquals(BackgroundTaskStatus.Completed, finished.ended.status)
+        assertEquals(1, c.signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>().size, "${c.signals}")
+    }
+
+    /**
+     * A background agent asks for approval after its turn ended: the request belongs to the task
+     * (no turn), the signal names the task; once allowed, the task completes, the agent starts a
+     * turn about it by itself (`trigger: backgroundTask`), and the phone hears of the task's end
+     * and of that turn. A workflow reports its agents while it runs.
+     */
+    @Test
+    fun aBackgroundAgentAsksWhileNoTurnRunsAndItsEndWakesTheAgent() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("wake"))
+        val state = openLive(c, threadId)
+
+        val launch = c.runTurn(threadId, "@bg rev ms=300 wake approve Review the reconnect logic")
+        assertEquals(TurnStatus.Completed, launch.status)
+        val pending = c.waitFor("the task's approval") {
+            c.signals.filterIsInstance<SyncSignal.InteractionPending>().firstOrNull { it.interaction.backgroundTaskId != null }
+        }
+        val task = task(c, threadId, "the agent task") { it.id == pending.interaction.backgroundTaskId }
+        assertEquals(null, pending.interaction.turnId, "it outlives the turn: it belongs to the task")
+        // The task is named with the request, or right after it when the workspace stream delivered the request first.
+        val named = pending.backgroundTask ?: c.waitFor("the task named for the request") {
+            c.signals.filterIsInstance<SyncSignal.InteractionTaskKnown>().firstOrNull { it.interaction.id == pending.interaction.id }?.task
+        }
+        assertEquals("Review the reconnect logic", named.title)
+        assertEquals(BackgroundTaskKind.Agent, task.kind)
+        c.engine.mutate(Methods.InteractionRespond) { crid -> InteractionRespondParams(crid, pending.interaction.id, InteractionResolution.Approval("allow")) }
+        task(c, threadId, "completed") { it.id == task.id && it.status == BackgroundTaskStatus.Completed }
+        val woke = c.waitFor("the agent's own turn") { state.value.turns.firstOrNull { it.trigger == TurnTrigger.BackgroundTask && it.status.isTerminal } }
+        assertEquals(TurnStatus.Completed, woke.status)
+        assertTrue(state.value.items.none { it.turnId == woke.id && it is Item.UserMessage }, "no user message: the agent started it")
+        c.waitFor("finished task") { c.signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>().firstOrNull { it.ended.taskId == task.id } }
+        c.waitFor("finished turn") { c.signals.filterIsInstance<SyncSignal.TurnFinished>().firstOrNull { it.turn.id == woke.id } }
+        assertEquals(InteractionStatus.Resolved, state.value.interactions.single { it.id == pending.interaction.id }.status)
+
+        // A workflow reports its agents as it goes.
+        c.runTurn(threadId, "@bg wf kind=workflow ms=1500 progress=3 review-and-fix")
+        val workflow = task(c, threadId, "workflow progress") { it.kind == BackgroundTaskKind.Workflow && !it.progress?.workflow.isNullOrEmpty() }
+        assertEquals("review-and-fix", workflow.title)
+        task(c, threadId, "workflow done") { it.id == workflow.id && it.status == BackgroundTaskStatus.Completed }
+        c.assertThreadMatchesServer(threadId)
+    }
+
+    /**
+     * A task that ignores a stop keeps running: the stop is marked unconfirmed after the daemon's
+     * confirmation time (nothing is escalated). Stopping the thread ends it (`threadStopped`); a
+     * task running when the agent crashes is lost, and the phone is told as an error.
+     */
+    @Test
+    fun anUnconfirmedStopAThreadStopAndACrashEndTasksWithTheirReasons() = realTest {
+        restartWith(AasTestServer.Policy(backgroundStopConfirmMs = STOP_CONFIRM_MS))
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("stubborn"))
+        openLive(c, threadId)
+
+        c.runTurn(threadId, "@bg s kind=shell ms=0 stubborn tail -f log")
+        val task = task(c, threadId, "running") { it.status == BackgroundTaskStatus.Running }
+        c.engine.mutate(Methods.BackgroundTaskStop) { crid -> BackgroundTaskStopParams(crid, threadId, task.id) }
+        val unconfirmed = task(c, threadId, "unconfirmed") { it.id == task.id && it.stopUnconfirmedAt != null }
+        assertEquals(null, unconfirmed.stopRequestedAt)
+        assertEquals(BackgroundTaskStatus.Running, unconfirmed.status, "nothing was escalated")
+
+        c.engine.mutate(Methods.ThreadStop) { crid -> ThreadStopParams(crid, threadId) }
+        val stopped = task(c, threadId, "stopped with the thread") { it.id == task.id && it.status.isTerminal }
+        assertEquals(BackgroundTaskStatus.Stopped, stopped.status)
+        assertEquals(BackgroundEndReason.ThreadStopped, stopped.endReason)
+
+        c.runTurn(threadId, "@bg keep kind=agent ms=0 watcher")
+        val kept = task(c, threadId, "the second task") { it.title == "watcher" && it.status == BackgroundTaskStatus.Running }
+        c.startTurn(threadId, "@crash")
+        val lost = task(c, threadId, "lost") { it.id == kept.id && it.status.isTerminal }
+        assertEquals(BackgroundTaskStatus.Lost, lost.status)
+        assertEquals(BackgroundEndReason.ProcessExited, lost.endReason)
+        val signal = c.waitFor("lost signal") { c.signals.filterIsInstance<SyncSignal.BackgroundTaskFinished>().firstOrNull { it.ended.taskId == kept.id } }
+        assertEquals(BackgroundTaskStatus.Lost, signal.ended.status)
+        c.assertThreadMatchesServer(threadId)
+    }
+
     companion object {
         const val HARNESS = "fake"
         const val HEARTBEAT_MS = 300L
@@ -695,6 +889,12 @@ class RealServerTest {
         const val POLL_MS = 20L
         const val MAX_TURNS = 200
         const val CHAOS_TURNS = 10
+
+        /** The daemon's `idle_process_ttl` in the background tests: short, so an idle stop happens within the test. */
+        const val IDLE_TTL_MS = 1_500L
+
+        /** The daemon's `background_stop_confirm_timeout` in the unconfirmed-stop test. */
+        const val STOP_CONFIRM_MS = 800L
         val CHAOS_SCRIPTS = listOf("@stream 200 2", "@approve some-cmd", "@bigoutput 100000")
 
         /** Short client policies: the test server's timeouts are short too. */

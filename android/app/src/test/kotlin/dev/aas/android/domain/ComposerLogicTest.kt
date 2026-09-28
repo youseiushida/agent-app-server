@@ -171,6 +171,43 @@ class PaletteTest {
     }
 
     @Test
+    fun resumeIsTheAppsOwnWhileSomeHarnessCanListItsSessions() {
+        // The app's /resume in threads and in the new-thread composer, only when it can import.
+        val inThread = Palette.entries(fixture, PaletteContext(inThread = true, canImport = true))
+        val resume = inThread.single { it.name == "resume" }
+        assertEquals(PaletteSource.Local, resume.source)
+        assertEquals(PaletteAction.Local(LocalCommand.Resume), resume.action)
+        assertEquals(UiText.of(R.string.command_resume), resume.description)
+        assertTrue(Palette.entries(emptyList(), PaletteContext(inThread = false, canImport = true)).any { it.name == "resume" })
+        assertFalse(Palette.entries(fixture, PaletteContext(inThread = true, canImport = false)).any { it.name == "resume" })
+        assertFalse(Palette.entries(emptyList(), PaletteContext(inThread = false, canImport = false)).any { it.name == "resume" })
+    }
+
+    @Test
+    fun aHarnessCommandNamedResumeIsNeverOffered() {
+        // Claude Code and Codex have their own /resume (a session picker in their terminal UI).
+        val harnessResume = Command("resume", "Resume a conversation", CommandSource.Harness, action = CommandAction.InsertText("/resume "))
+        val entries = Palette.entries(fixture + harnessResume, PaletteContext(inThread = true, canImport = true))
+        assertEquals(listOf(PaletteSource.Local), entries.filter { it.name == "resume" }.map { it.source })
+        assertEquals(listOf(PaletteAction.Local(LocalCommand.Resume)), Palette.filter(entries, "resu").map { it.action })
+        // Without a harness that can import, neither the app's nor the harness's is offered.
+        assertTrue(Palette.entries(fixture + harnessResume, PaletteContext(inThread = true, canImport = false)).none { it.name == "resume" })
+    }
+
+    @Test
+    fun resumeTypedOutIsRecognisedByItsFirstWord() {
+        assertTrue(Palette.isResume("/resume"))
+        assertTrue(Palette.isResume("  /resume  "))
+        assertTrue(Palette.isResume("/resume 019a-session"))
+        assertTrue(Palette.isResume("/resume\nmore"))
+        assertFalse(Palette.isResume("/resume-queue"))
+        assertFalse(Palette.isResume("/resumes"))
+        assertFalse(Palette.isResume("please /resume"))
+        assertFalse(Palette.isResume("resume"))
+        assertFalse(Palette.isResume(""))
+    }
+
+    @Test
     fun filteringPutsPrefixMatchesFirst() {
         val entries = Palette.entries(fixture, PaletteContext(inThread = true))
         assertEquals(listOf("init", "pin"), Palette.filter(entries, "in").map { it.name })
@@ -272,6 +309,34 @@ class HarnessSettingsTest {
         assertFalse(HarnessSettings.needsConfirmation(harness, harness.permissionModes[0]))
         assertTrue(HarnessSettings.needsConfirmation(harness, harness.permissionModes[1]))
         assertEquals("Fake · Large · High", HarnessSettings.label(harness, ThreadSettings(model = "large", effort = "high")))
+    }
+
+    /**
+     * Effort levels are the harness's own list: when it lists `ultracode` (Claude Code, for models
+     * whose levels include it) the picker offers it like any level, only for those models, and
+     * the chip names it. No level is added, hidden or preferred by the app.
+     */
+    @Test
+    fun ultracodeIsOfferedExactlyWhereTheHarnessListsIt() {
+        val claude = harness.copy(
+            models = listOf(
+                dev.aas.android.protocol.Model("opus", "Opus", isDefault = true, effortLevels = listOf("low", "high", "xhigh", "ultracode")),
+                dev.aas.android.protocol.Model("haiku", "Haiku"),
+                dev.aas.android.protocol.Model("sonnet", "Sonnet", effortLevels = listOf("low", "high")),
+            ),
+            defaultModel = "opus",
+            effortLevels = listOf(
+                dev.aas.android.protocol.EffortLevel("low", "Low"),
+                dev.aas.android.protocol.EffortLevel("high", "High"),
+                dev.aas.android.protocol.EffortLevel("xhigh", "Extra high"),
+                dev.aas.android.protocol.EffortLevel("ultracode", "Ultracode"),
+            ),
+        )
+        assertEquals(listOf("low", "high", "xhigh", "ultracode"), HarnessSettings.effortLevels(claude, "opus").map { it.id })
+        assertEquals(listOf("low", "high"), HarnessSettings.effortLevels(claude, "sonnet").map { it.id })
+        assertEquals("Fake · Opus · Ultracode", HarnessSettings.label(claude, ThreadSettings(effort = "ultracode")))
+        // The harness's default applies until one is chosen.
+        assertNull(HarnessSettings.effort(claude, ThreadSettings()))
     }
 
     @Test

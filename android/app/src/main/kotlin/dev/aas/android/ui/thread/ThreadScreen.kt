@@ -61,6 +61,7 @@ import dev.aas.android.domain.composer.ComposerTrigger
 import dev.aas.android.domain.composer.HarnessSettings
 import dev.aas.android.domain.composer.SendAction
 import dev.aas.android.domain.composer.SendLogic
+import dev.aas.android.domain.timeline.Timeline
 import dev.aas.android.domain.timeline.TimelineRow
 import dev.aas.android.protocol.InteractionRequest
 import dev.aas.android.protocol.InteractionStatus
@@ -93,6 +94,7 @@ import dev.aas.android.ui.interaction.QuestionSheet
 import dev.aas.android.ui.navigation.AppNavigator
 import dev.aas.android.ui.navigation.ImageRoute
 import dev.aas.android.ui.navigation.ItemOutputRoute
+import dev.aas.android.ui.navigation.TaskOutputRoute
 import dev.aas.android.ui.navigation.ThreadRoute
 import dev.aas.android.ui.theme.statusColors
 import kotlinx.coroutines.launch
@@ -125,7 +127,16 @@ fun NavGraphBuilder.threadDestinations(navigator: AppNavigator) {
     }
     composable<ItemOutputRoute> { entry ->
         val route = entry.toRoute<ItemOutputRoute>()
-        val vm = aasViewModel(key = "${route.threadId}/${route.itemId}") { c, _ -> OutputViewModel(route, c.threadRepository, c.blobRepository, c.policy) }
+        val vm = aasViewModel(key = "${route.threadId}/${route.itemId}") { c, _ ->
+            OutputViewModel(route.threadId, OutputTarget.OfItem(route.itemId), c.threadRepository, c.blobRepository, c.policy)
+        }
+        OutputScreen(vm, navigator)
+    }
+    composable<TaskOutputRoute> { entry ->
+        val route = entry.toRoute<TaskOutputRoute>()
+        val vm = aasViewModel(key = "${route.threadId}/task/${route.taskId}") { c, _ ->
+            OutputViewModel(route.threadId, OutputTarget.OfTask(route.taskId), c.threadRepository, c.blobRepository, c.policy)
+        }
         OutputScreen(vm, navigator)
     }
     composable<ImageRoute> { entry ->
@@ -160,6 +171,9 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
     var showRename by rememberSaveable { mutableStateOf(false) }
     var confirmArchive by rememberSaveable { mutableStateOf(false) }
     var confirmStop by rememberSaveable { mutableStateOf(false) }
+    var confirmStopTask by rememberSaveable { mutableStateOf<String?>(null) }
+    // A row to show once it exists (a background task's card appears when its section opens).
+    var scrollTarget by remember { mutableStateOf<String?>(null) }
     var editQueuedId by rememberSaveable { mutableStateOf<String?>(null) }
     var pausedSend by rememberSaveable { mutableStateOf<SendAction?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
@@ -171,6 +185,7 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
             onOpenOutput = { item -> navigator.openOutput(vm.threadId, item.id) },
             onOpenTurnDiff = { turnId -> navigator.openDiff(vm.threadId, turnId) },
             onOpenImage = { blobId -> navigator.openImage(blobId) },
+            onOpenBackgroundTask = vm::openBackgroundTask,
         )
     }
     val imageSources = rememberImageSources(policy.maxImagesPerMessage, onPicked = vm::pickImages)
@@ -216,6 +231,7 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                 is ThreadEvent.OpenThread -> navigator.openThread(event.threadId)
                 is ThreadEvent.OpenDiff -> navigator.openDiff(vm.threadId, event.turnId)
                 is ThreadEvent.OpenNewThread -> navigator.newThread(event.projectId, event.harnessId)
+                is ThreadEvent.OpenImport -> navigator.importSession(event.projectId, event.harnessId)
                 is ThreadEvent.OpenPicker -> picker = event.kind
                 ThreadEvent.ShowStatus -> showStatus = true
                 ThreadEvent.ShowRename -> showRename = true
@@ -225,7 +241,17 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                     follow = true
                     listState.scrollToItem(0)
                 }
+                is ThreadEvent.ScrollToRow -> scrollTarget = event.key
             }
+        }
+    }
+    LaunchedEffect(scrollTarget, reversed) {
+        val target = scrollTarget ?: return@LaunchedEffect
+        val index = reversed.indexOfFirst { it.key == target }
+        if (index >= 0) {
+            follow = false
+            listState.animateScrollToItem(index)
+            scrollTarget = null
         }
     }
 
@@ -260,7 +286,7 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                     Column {
                         Text(thread?.title ?: stringResource(R.string.thread_loading), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            ui.activity?.let { ThreadActivityChip(it) }
+                            ui.activity?.let { ThreadActivityChip(it, backgroundRunning = thread?.background?.running ?: 0) }
                             if (thread?.pinned == true) Icon(Icons.Outlined.PushPin, stringResource(R.string.pinned), Modifier.padding(start = 6.dp).width(14.dp))
                             ui.project?.let {
                                 Text(
@@ -350,6 +376,7 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                         onSend = { action ->
                             if (vm.needsPausedQueueConfirmation(action)) pausedSend = action else vm.send(action)
                         },
+                        interruptHint = if (ui.keepsBackgroundOnInterrupt) stringResource(R.string.composer_hint_interrupt_background) else null,
                     ) {
                         val harness = ui.harness
                         if (harness != null && thread != null) {
@@ -393,7 +420,7 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                         modifier = Modifier.fillMaxSize().testTag(THREAD_LIST_TAG),
                     ) {
                         items(reversed, key = { it.key }, contentType = { it.javaClass.name }) { row ->
-                            TimelineRowView(row, ui, vm, actions, navigator, onOpenQuestion = { questionFor = it })
+                            TimelineRowView(row, ui, vm, actions, navigator, onOpenQuestion = { questionFor = it }, onStopTask = { confirmStopTask = it })
                         }
                     }
                 }
@@ -448,6 +475,9 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
             onDismiss = { showRename = false },
         )
     }
+    // The agent's process takes its background work with it: the dialogs name what runs.
+    val runningTasks = ui.runningTasks
+    val runningCount = maxOf(runningTasks.size, thread?.background?.running ?: 0)
     if (confirmArchive && thread != null) {
         val running = thread.status != ThreadStatus.Idle
         ConfirmDialog(
@@ -459,6 +489,7 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                 vm.archive()
             },
             onDismiss = { confirmArchive = false },
+            extra = if (running && runningCount > 0) ({ RunningBackgroundNote(runningCount, runningTasks.map { it.title }) }) else null,
         )
     }
     if (confirmStop) {
@@ -471,7 +502,26 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                 vm.stopProcess()
             },
             onDismiss = { confirmStop = false },
+            extra = if (runningCount > 0) ({ RunningBackgroundNote(runningCount, runningTasks.map { it.title }) }) else null,
         )
+    }
+    // Only while 停止 applies: a task that ended (or is being stopped) meanwhile closes the dialog.
+    val stoppingTask = confirmStopTask?.let { id -> ui.thread.backgroundTasks.firstOrNull { it.id == id } }
+        ?.takeIf { ui.stopOf(it) == BackgroundStop.Available || ui.stopOf(it) == BackgroundStop.Unconfirmed }
+    if (stoppingTask != null) {
+        ConfirmDialog(
+            title = stringResource(R.string.bg_stop_title),
+            text = stringResource(R.string.bg_stop_body, stoppingTask.title),
+            confirm = stringResource(R.string.bg_stop),
+            onConfirm = {
+                confirmStopTask = null
+                vm.stopBackgroundTask(stoppingTask)
+            },
+            onDismiss = { confirmStopTask = null },
+        )
+    } else if (confirmStopTask != null && state.sync == ThreadSync.Live) {
+        // The task ended, is being stopped, or is gone from the thread while the dialog was open.
+        LaunchedEffect(confirmStopTask) { confirmStopTask = null }
     }
     val editing: QueuedInput? = editQueuedId?.let { id -> ui.queued.firstOrNull { it.id == id } }
     if (editing != null) {
@@ -508,13 +558,21 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
 }
 
 @Composable
-private fun TimelineRowView(row: TimelineRow, ui: ThreadUiState, vm: ThreadViewModel, actions: ItemActions, navigator: AppNavigator, onOpenQuestion: (String) -> Unit) {
+private fun TimelineRowView(
+    row: TimelineRow,
+    ui: ThreadUiState,
+    vm: ThreadViewModel,
+    actions: ItemActions,
+    navigator: AppNavigator,
+    onOpenQuestion: (String) -> Unit,
+    onStopTask: (String) -> Unit,
+) {
     when (row) {
         TimelineRow.LoadOlder -> LoadOlderRow(ui.loadingOlder, ui.olderError?.asString(), vm::loadOlder)
         is TimelineRow.TurnStart -> TurnStartRow(row.turn)
-        is TimelineRow.ItemRow -> ItemView(row.item, actions)
+        is TimelineRow.ItemRow -> ItemView(row.item, actions, backgroundTask = row.item.backgroundTaskId?.let { ui.backgroundTasks[it] })
         is TimelineRow.ActivityGroup -> ActivityGroupRow(row.items, row.expanded) { vm.toggleGroup(row.groupKey, row.expanded) }
-        is TimelineRow.GroupedItem -> ItemView(row.item, actions, Modifier.padding(start = 16.dp))
+        is TimelineRow.GroupedItem -> ItemView(row.item, actions, Modifier.padding(start = 16.dp), backgroundTask = row.item.backgroundTaskId?.let { ui.backgroundTasks[it] })
         is TimelineRow.InteractionRow -> {
             val interaction = row.interaction
             if (interaction.status == InteractionStatus.Pending) {
@@ -524,6 +582,7 @@ private fun TimelineRowView(row: TimelineRow, ui: ThreadUiState, vm: ThreadViewM
                     onRespond = { vm.respond(interaction, it) },
                     onOpenQuestion = { onOpenQuestion(interaction.id) },
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    backgroundTaskTitle = interaction.backgroundTaskId?.let { ui.backgroundTasks[it]?.title },
                 )
             } else {
                 InteractionRecordRow(interaction)
@@ -538,6 +597,16 @@ private fun TimelineRowView(row: TimelineRow, ui: ThreadUiState, vm: ThreadViewM
             probing = row.input.waitingForHarness in ui.probing,
             onRefreshHarness = { row.input.waitingForHarness?.let(vm::refreshHarness) },
             onDiscard = { vm.discardPending(row.input.clientRequestId) },
+        )
+        is TimelineRow.BackgroundHeader -> BackgroundHeaderRow(row) { vm.toggleGroup(Timeline.BACKGROUND_SECTION, row.expanded) }
+        is TimelineRow.BackgroundEndedHeader -> BackgroundEndedHeaderRow(row) { vm.toggleGroup(Timeline.BACKGROUND_ENDED, row.expanded) }
+        is TimelineRow.BackgroundTaskRow -> BackgroundTaskCard(
+            task = row.task,
+            depth = row.depth,
+            parentTitle = row.parentTitle,
+            stop = ui.stopOf(row.task),
+            onStop = { onStopTask(row.task.id) },
+            onOpenOutput = { navigator.openTaskOutput(vm.threadId, row.task.id) },
         )
     }
 }

@@ -23,7 +23,7 @@ use aas_core::{Engine, EngineConfig, HarnessRegistry};
 use aas_harness::{AdapterContext, HarnessAdapter, HarnessConfig};
 use aas_protocol::HarnessKind;
 use aas_server::{Server, ServerOptions, ShutdownNotice, ShutdownReason};
-use aas_supervisor::{Supervisor, resolve_program};
+use aas_supervisor::{PowerGuard, PowerLease, Supervisor, resolve_program};
 use anyhow::{Context, anyhow};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -93,7 +93,7 @@ pub fn load_or_init_config(paths: &Paths) -> anyhow::Result<(Config, bool)> {
     std::fs::create_dir_all(&paths.config_dir)
         .with_context(|| format!("creating {}", paths.config_dir.display()))?;
     let config = Config::initial();
-    std::fs::write(&file, config.to_toml()?)
+    std::fs::write(&file, config.initial_text()?)
         .with_context(|| format!("writing {}", file.display()))?;
     Ok((config, true))
 }
@@ -395,6 +395,21 @@ async fn stop_engine(
     }
 }
 
+/// The lease that keeps the PC awake for the daemon's whole life with `[power] keep_awake =
+/// "always"` (design.md §4.6), or `None` with `"while_running"` (turns and busy background work
+/// take their own leases). Leases are counted, so the daemon's adds to theirs.
+fn keep_awake_lease(keep_awake: KeepAwake, power: &PowerGuard) -> Option<PowerLease> {
+    match keep_awake {
+        KeepAwake::Always => {
+            tracing::info!(
+                "keeping the PC awake while the daemon runs (power.keep_awake = \"always\")"
+            );
+            Some(power.acquire())
+        }
+        KeepAwake::WhileRunning => None,
+    }
+}
+
 /// Runs the daemon until it is stopped. Returns the exit code for a stop that went as
 /// requested; an error carries its own ([`DaemonError::exit_code`]).
 pub async fn run_daemon(
@@ -445,15 +460,7 @@ pub async fn run_daemon(
             "processes left over from a previous run were cleaned up"
         );
     }
-    let _awake = match config.power.keep_awake {
-        KeepAwake::Always => {
-            tracing::info!(
-                "keeping the PC awake while the daemon runs (power.keep_awake = \"always\")"
-            );
-            Some(supervisor.power().acquire())
-        }
-        KeepAwake::WhileRunning => None,
-    };
+    let _awake = keep_awake_lease(config.power.keep_awake, supervisor.power());
     let adapters = build_adapters(&config.harnesses, &supervisor, &config, &paths.data_dir);
     let engine = Engine::start(
         EngineConfig {
@@ -573,12 +580,15 @@ pub async fn run_daemon(
             return Err(DaemonError::Failure(why));
         }
     };
-    // 2. A drain waits for the running turns, then stops every agent while clients are still
+    // 2. A drain waits for the running turns and the background work that keeps an agent
+    //    busy (`Engine::wait_drained`), then stops every agent while clients are still
     //    connected; a later request can cut it short.
     let stop = match first {
         Some(stop) => stop,
         None => {
-            tracing::info!("draining: waiting for running turns to finish");
+            tracing::info!(
+                "draining: waiting for running turns and busy background work to finish"
+            );
             let mut escalation = level.clone();
             tokio::select! {
                 _ = engine.wait_drained() => {
@@ -705,6 +715,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `keep_awake = "always"` holds one lease for as long as the daemon keeps it (the whole
+    /// run); turns and background work add and drop theirs on top. `"while_running"` holds none.
+    /// The guard is a counter here (no request reaches the OS).
+    #[test]
+    fn keep_awake_always_holds_one_lease_for_the_daemons_life() {
+        let power = PowerGuard::new(false);
+        let daemon = keep_awake_lease(KeepAwake::Always, &power);
+        assert!(daemon.is_some());
+        assert_eq!(power.active(), 1);
+        let turn = power.acquire();
+        let background = power.acquire();
+        assert_eq!(power.active(), 3);
+        drop(turn);
+        drop(background);
+        assert_eq!(
+            power.active(),
+            1,
+            "the daemon's lease outlives turns and work"
+        );
+        drop(daemon);
+        assert_eq!(power.active(), 0);
+
+        assert!(keep_awake_lease(KeepAwake::WhileRunning, &power).is_none());
+        assert_eq!(power.active(), 0);
     }
 
     #[test]

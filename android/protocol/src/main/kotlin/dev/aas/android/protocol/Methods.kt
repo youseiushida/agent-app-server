@@ -70,8 +70,13 @@ data class ServerStatusResult(
     val runningProcesses: Int,
     val runningTurns: Int,
     val draining: Boolean,
-    /** The daemon keeps the PC awake while a turn runs (`policy.prevent_sleep_while_running`). */
+    /**
+     * The daemon keeps the PC awake while a turn runs, and while background work keeps an agent
+     * busy (`policy.prevent_sleep_while_running`).
+     */
     val preventSleepWhileRunning: Boolean = false,
+    /** Background tasks that keep an agent's process alive, over all threads. */
+    val runningBackgroundTasks: Int = 0,
 )
 
 @Serializable
@@ -199,6 +204,8 @@ data class ThreadReadResult(
     val queued: List<QueuedInput>,
     val head: Long,
     val hasMoreBefore: Boolean,
+    /** The background tasks first reported during the returned turns, and every running task (oldest first). */
+    val backgroundTasks: List<BackgroundTask> = emptyList(),
 )
 
 @Serializable
@@ -337,6 +344,19 @@ data class OperationCancelParams(val clientRequestId: String, val operationId: O
 @Serializable
 data class OperationResult(val operation: Operation)
 
+// ----- background tasks ------------------------------------------------------------------------
+
+/** Asks the harness to stop one background task (protocol.md §4 `backgroundTask/stop`). */
+@Serializable
+data class BackgroundTaskStopParams(val clientRequestId: String, val threadId: ThreadId, val taskId: BackgroundTaskId)
+
+/**
+ * The task after the stop was requested (`stopRequestedAt` set). It did not stop yet: the end
+ * arrives with `backgroundTask/updated`.
+ */
+@Serializable
+data class BackgroundTaskResult(val task: BackgroundTask)
+
 /** Every method of protocol v1, typed. */
 object Methods {
     val Initialize = RpcMethod("initialize", false, InitializeParams.serializer(), InitializeResult.serializer())
@@ -382,6 +402,8 @@ object Methods {
     val NativeImport = RpcMethod("native/import", true, NativeImportParams.serializer(), ThreadResult.serializer())
     val OperationList = RpcMethod("operation/list", false, Empty.serializer(), OperationListResult.serializer())
     val OperationCancel = RpcMethod("operation/cancel", true, OperationCancelParams.serializer(), OperationResult.serializer())
+    val BackgroundTaskStop =
+        RpcMethod("backgroundTask/stop", true, BackgroundTaskStopParams.serializer(), BackgroundTaskResult.serializer())
 
     val all: List<RpcMethod<*, *>> = listOf(
         Initialize, Subscribe, Unsubscribe, WorkspaceSnapshot, ServerStatus, DeviceList, DeviceRevoke, HarnessList,
@@ -389,6 +411,7 @@ object Methods {
         FsRoots, FsList, FsMkdir, FsSearch, ThreadList, ThreadGet, ThreadCreate, ThreadRead, ThreadUpdate, ThreadArchive,
         ThreadFork, ThreadStop, ThreadDiff, TurnStart, TurnInterrupt, QueueRemove, QueueResume, QueueUpdate, QueueSteer,
         InteractionRespond, InteractionList, CommandList, NativeList, NativeImport, OperationList, OperationCancel,
+        BackgroundTaskStop,
     )
 
     private val byName = all.associateBy { it.name }

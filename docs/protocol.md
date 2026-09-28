@@ -14,7 +14,7 @@ daemon とクライアント（Android アプリ）の間の契約。型の実�
   - 値のない任意フィールドは出力しない（`null` にしない）。
   - クライアントから送るフレームの上限は `initialize` の応答の `policy.maxClientFrameBytes`。超えた要求には、その要求の `id` で確定エラー `payloadTooLarge` が返る（outbox から外す）。サーバの読み取り上限（既定 16MiB）を超えるフレームでは、接続が close code 1009 で閉じられる。
 - 前方互換: クライアントは知らないフィールド、知らないイベントの `type`、知らない enum 値を無視する（壊れない）。v1 の範囲では、サーバは追加だけを行う。
-- 要求の順序: 同じスレッドを対象にする要求（`thread/update`、`thread/archive`、`thread/fork`、`thread/stop`、`turn/start`、`turn/interrupt`、`queue/remove`、`queue/resume`、`queue/update`、`queue/steer`）と、同じプロジェクトを対象にする要求（`thread/create`、`project/update`、`project/archive`、`project/remove`）は、到着順に1つずつ処理される。それ以外の要求は並行に処理されるので、応答の順序は送った順と一致するとは限らない（`id` で対応付ける）。
+- 要求の順序: 同じスレッドを対象にする要求（`thread/update`、`thread/archive`、`thread/fork`、`thread/stop`、`turn/start`、`turn/interrupt`、`queue/remove`、`queue/resume`、`queue/update`、`queue/steer`、`backgroundTask/stop`）と、同じプロジェクトを対象にする要求（`thread/create`、`project/update`、`project/archive`、`project/remove`）は、到着順に1つずつ処理される。それ以外の要求は並行に処理されるので、応答の順序は送った順と一致するとは限らない（`id` で対応付ける）。
 - サーバからクライアントへの JSON-RPC 要求はない。サーバが送るのは応答と通知だけ。クライアントからの通知（`id` のないメッセージ）は無視される。
 
 ### 1.1 JSON-RPC
@@ -91,7 +91,7 @@ daemon とクライアント（Android アプリ）の間の契約。型の実�
 
 - 購読ごとに、イベントは seq の昇順で届く。
 - seq は連続するとは限らない（圧縮による欠番がある）。クライアントは「適用済みの最大 seq」を読み取り位置として保存し、それ以下の seq のイベントは無視する。
-- 圧縮で消えるのは、後のイベントが内容をすべて持つイベントだけ（完了した Item の `item/delta`、同じ実体の後の `thread/updated` / `thread/upserted` / `project/upserted` / `harness/updated` / `operation/updated` / `queue/updated` / `commands/changed` がある古いもの、`item/completed` より前の `item/updated`、`turn/completed` より前の `turn/usageUpdated`、`interaction/closed` より前の `interaction/pending`）と、古い `native` イベント。古い読み取り位置から追いかけても、残ったイベントを順に適用すれば同じ状態になる（クライアントはイベントで丸ごと置き換える。7章）。消すのは一定時間（既定 24 時間）より古いものだけなので、短い切断からの再接続ではイベントがそのまま届く。
+- 圧縮で消えるのは、後のイベントが内容をすべて持つイベントだけ（完了した Item の `item/delta`、同じ実体の後の `thread/updated` / `thread/upserted` / `project/upserted` / `harness/updated` / `operation/updated` / `queue/updated` / `commands/changed` / `backgroundTask/updated` がある古いもの、`item/completed` より前の `item/updated`、`turn/completed` より前の `turn/usageUpdated`、`interaction/closed` より前の `interaction/pending`）と、古い `native` イベント。古い読み取り位置から追いかけても、残ったイベントを順に適用すれば同じ状態になる（クライアントはイベントで丸ごと置き換える。7章）。消すのは一定時間（既定 24 時間）より古いものだけなので、短い切断からの再接続ではイベントがそのまま届く。
 - 削除したスレッドのイベントは、thread ストリームごと消える（`subscribe` は `notFound`）。workspace ストリームのそのスレッドに関するイベントも消え、`thread/removed` だけが残る。
 - `seqFrom` がある場合は、`seqFrom`〜`seq` の delta を結合したもの。
 - `head` はバッチを読んだ時点のストリームの head。
@@ -102,7 +102,7 @@ daemon とクライアント（Android アプリ）の間の契約。型の実�
 ### 2.2 heartbeat
 
 - サーバは `heartbeatIntervalMs` ごとに `heartbeat` 通知と WebSocket の Ping を送る。
-- サーバは、クライアントからどのフレーム（Pong を含む）も `clientTimeoutMs` の間届かなければ、接続を閉じる（close code 4002）。
+- サーバは、クライアントからどのフレーム（Pong を含む）も `clientTimeoutMs` の間届かなければ、接続を閉じる（close code 4002）。閉じるのは最後のフレームからちょうど `clientTimeoutMs` が経った時点（フレームのたびに期限を張り直す。heartbeat の周期には依存しない）。
 - クライアントは、どのフレームも `clientTimeoutMs` の間届かなければ接続を閉じて再接続する。
 - `heartbeat.heads` は同期の遅れの表示（診断）と、届いていないバッチの検出（head が読み取り位置より先なのにバッチが来なければ再購読）に使う。消えたイベントの分の差は、空の `stream/batch`（2.1）で読み取り位置を進めることで埋まる。
 
@@ -131,6 +131,8 @@ type Harness = {
 type HarnessCapabilities = {
   interrupt: boolean; steer: boolean; approvals: boolean; questions: boolean;
   resume: boolean; fork: boolean; images: boolean; modelSwitchLive: boolean; nativeSessions: boolean;
+  backgroundTasks: boolean;                       // ターンの外で動く作業をバックグラウンドタスクとして報告する（3.1）
+  backgroundStop: boolean;                        // 1つのバックグラウンドタスクを止められる（backgroundTask/stop）
 };
 type Model = { id: string; displayName: string; description?: string; isDefault: boolean;
                effortLevels?: string[] };  // このモデルで使える推論量の id。なければハーネスのすべて
@@ -158,7 +160,12 @@ type Thread = {
   diffAvailable: boolean;                         // スレッド差分の基準（最初のスナップショット）がある
   createdAt: number; updatedAt: number; lastActivityAt: number; archived: boolean;
   pinned: boolean;                                // 利用者がピン留めした（thread/update の pinned）
+  background: ThreadBackground;                   // バックグラウンドタスクの要約（3.1）
   head: number;                                   // この要約を作った時点の thread ストリームの head（下記）
+};
+type ThreadBackground = {
+  running: number;                                // status が running で ambient でないタスクの数
+  lastEnded?: { taskId: string; title: string; kind: BackgroundTaskKind; status: BackgroundTaskStatus; endedAt: number };  // ambient でないタスクの最後の終わり。前の終わりには戻らない（3.1）
 };
 type Usage = { inputTokens: number; outputTokens: number; cachedInputTokens: number; reasoningTokens: number; costUsd?: number;
                context?: ContextUsage };          // ハーネスが明示的に報告したときだけ付く（3.1）
@@ -170,11 +177,13 @@ type Turn = {
   startedAt: number; completedAt?: number; model?: string;   // model は CLI が報告した値があればそれ
   error?: { message: string; kind: string };
   usage?: Usage; diff?: DiffSummary;
+  trigger?: "backgroundTask"|"scheduled";         // エージェントが自分で始めたターンの理由（ハーネスが明示したときだけ。3.1）
 };
 type DiffSummary = { files: number; insertions: number; deletions: number };
 
-type ItemStatus = "inProgress"|"completed"|"failed"|"declined"|"interrupted";
-type ItemBase = { id: string; threadId: string; turnId: string; status: ItemStatus; startedAt: number; completedAt?: number };
+type ItemStatus = "inProgress"|"completed"|"failed"|"declined"|"interrupted"|"backgrounded";
+type ItemBase = { id: string; threadId: string; turnId: string; status: ItemStatus; startedAt: number; completedAt?: number;
+                  backgroundTaskId?: string };   // この Item が起動したバックグラウンドタスク（3.1）
 type Item = ItemBase & (
   | { kind: "userMessage"; text: string; attachments: Attachment[]; mentions: { path: string }[]; delivery: "normal"|"steer" }
   | { kind: "agentMessage"; text: string }                       // Markdown
@@ -193,10 +202,11 @@ type ToolCategory = "read"|"search"|"fetch"|"mcp"|"subagent"|"edit"|"execute"|"t
 
 type Interaction = {
   id: string; threadId: string; turnId?: string; itemId?: string;
+  backgroundTaskId?: string;                      // 求めたバックグラウンドタスク（3.1「Interaction の所属」）
   status: "pending"|"resolved"|"expired";
   createdAt: number; resolvedAt?: number; resolvedBy?: string;   // deviceId または "system"
   request: InteractionRequest; resolution?: InteractionResolution;
-  expireReason?: "processExited"|"turnEnded"|"harnessCancelled"|"daemonRestarted";
+  expireReason?: "processExited"|"turnEnded"|"harnessCancelled"|"daemonRestarted"|"taskEnded";
 };
 type InteractionRequest =
   | { kind: "approval"; title: string; detail?: string; subject: Subject; options: ApprovalOption[] }
@@ -225,11 +235,36 @@ type CommandAction =
   | { type: "method"; method: string; params?: object }   // clientRequestId と threadId はクライアントが補う
   | { type: "picker"; picker: "model"|"effort"|"permissionMode" };
 
+type BackgroundTaskKind = "agent"|"shell"|"workflow"|"monitor"|"remote"|"scheduled"|"other";
+type BackgroundTaskStatus = "running"|"completed"|"failed"|"stopped"|"lost";
+type BackgroundTask = {
+  id: string; threadId: string;
+  nativeId: string;                               // ハーネス自身のタスク ID（Claude の task_id など）
+  kind: BackgroundTaskKind; title: string;        // title はハーネスの説明文そのまま
+  status: BackgroundTaskStatus;
+  ambient: boolean;                               // ハーネスが「活動ではない」としたもの（数えない。プロセスを保持しない）
+  runs: number;                                   // 同じ nativeId で始まった回数（最初は 1）
+  turnId?: string;                                // 最初に報告されたときに動いていたターン（なければスレッドの最後のターン）
+  originItemId?: string; parentTaskId?: string;   // 起動した Item / 起動したバックグラウンドタスク
+  startedAt: number;                              // 今の run の開始
+  endedAt?: number;
+  endReason?: "harness"|"threadStopped"|"idleStop"|"daemonShutdown"|"systemShutdown"|"forcedStop"|"processReplaced"|"processExited"|"daemonRestarted";
+  progress?: { lastToolName?: string; toolUses?: number; tokens?: number; durationMs?: number; summary?: string;
+               workflow?: { label: string; phase?: string; state: "start"|"progress"|"done"|"error";
+                            agentType?: string; model?: string; tokens?: number }[] };
+  result?: { summary?: string; exitCode?: number; output?: string; outputTruncated: boolean; outputBlobId?: string };
+  usage?: { totalTokens?: number; toolUses?: number; durationMs?: number; costUsd?: number };
+  stoppable: boolean;                             // backgroundTask/stop で止められる
+  stopRequestedAt?: number;                       // 停止を求めてからハーネスが終わりを報告するまで
+  stopUnconfirmedAt?: number;                     // policy.background_stop_confirm_timeout の間に終わりが報告されなかった
+  nextRunAt?: number;                             // 次に動く時刻（予約された起床。ハーネスが報告したもの）
+};
+
 type Operation = { id: string; kind: "gitClone"; status: "running"|"succeeded"|"failed"|"cancelled";
                    projectId?: string; message?: string;
                    progress?: string;                 // ツールが最後に出した進捗の行そのまま（running の間だけ。3.1）
                    startedAt: number; finishedAt?: number };
-type NativeSession = { nativeSessionId: string; title?: string; updatedAt?: number; cwd?: string; importedThreadId?: string };
+type NativeSession = { nativeSessionId: string; title?: string; updatedAt?: number; cwd?: string; importedThreadId?: string };  // nativeSessionId は native/list の結果の中で一意
 type Device = { id: string; name: string; platform?: string; createdAt: number; lastSeenAt?: number; current: boolean };
 type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: number; removed: number; binary: boolean };
 ```
@@ -238,7 +273,23 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 
 - **`Thread.head`**: この `Thread` を作った時点の thread ストリームの head。その `Thread` を運ぶ `thread/updated` 自身は含まない。`thread/upserted`（workspace）で受け取った要約について、「thread ストリームの `head` までの内容はこの要約に反映済み」と判断するのに使う。要約が変わるたびに更新される（delta では変わらない）。
 - **userMessage**: ユーザーの入力は、`status: "completed"` の userMessage Item として `item/started` で届く。最初から確定しているので `item/completed` は来ない。`turn/start` で steer した入力は `delivery: "steer"` で、実行中のターンに属する。
-- **エージェント起点のターン**: CLI が自分で実行を始めた場合（フックや拡張など）、userMessage なしで `turn/started` が届く。このターンは `diff` を持たない。
+- **エージェント起点のターン**: CLI が自分で実行を始めた場合（フックや拡張、バックグラウンドタスクの完了の通知など）、userMessage なしで `turn/started` が届く。このターンは `diff` を持たない。ハーネスがその理由を明示したときは、`turn/completed` の `turn.trigger` に入る（`backgroundTask`: バックグラウンドタスクが終わった（または報告した）ことを受けた、`scheduled`: ハーネスが自分で予約した起床の時刻が来た）。
+- **バックグラウンドタスク**（`BackgroundTask`、能力 `backgroundTasks`）: ハーネスがターンの外で動かす作業（バックグラウンドのサブエージェント、残して動かしているシェル、ワークフロー、監視、予約した起床など）。ハーネスの明示的なシグナルだけから作る（design.md 5.6）。
+  - ターンより長く生き、ターンをまたいで進み、同じ `nativeId` でもう一度始まることがある（`runs` が増え、`startedAt` が新しい run の開始になり、`status` が `running` に戻る）。
+  - 状態が変わるたびに thread ストリームに `backgroundTask/updated` が届く（常にタスク全体。クライアントは丸ごと置き換える）。進捗（`progress` と `usage`）だけの変化は、1 つのタスクにつき `policy.background_progress_interval`（既定 1 秒）に 1 回にまとめる（最新の状態が残り、終わりなどほかの変化はすぐに届く）。
+  - `status` は `running` から一度だけ終わりに移る（新しい run で `running` に戻るまで）。`completed` / `failed` / `stopped` はハーネスが報告したもの（`endReason: "harness"`）か、daemon がエージェントのプロセスを止めたもの（`stopped`、`endReason` にその理由）。`lost` は、プロセスが自分で終わった（`processExited`）か daemon が再起動した（`daemonRestarted`）ために、どう終わったか分からないもの。時間の経過でタスクを終わらせることはない。
+  - `result` はハーネスが明示的に報告したものだけ（人間向けの文から読み取らない）。`output` は `policy.max_inline_output_bytes` まで（超えた分は `outputTruncated: true` と `outputBlobId` の blob）。
+  - `ambient: true` のタスクは表示するが、`Thread.background.running` に数えず、プロセスを保持しない。
+  - ハーネスがタスクを「動いている」と報告している間（ハーネスのライブセット）は、エージェントのプロセスを止めない（アイドル回収しない。PC のスリープも抑える）。そのためスレッドの `status` は `ready` のまま、プロセスの枠（`policy.max_running_processes`）を使い続ける。設定の変更を反映するためにプロセスの作り直しが要るとき（CLI がその場で反映できない変更や、反映に失敗した変更。design.md 5.4）、次のターンは作業が終わる（または止められる）まで入力を送らずに待ち、`code: "waitingForBackgroundWork"` の notice の Item が付く（ターンは `turn/interrupt` で取り消せる）。
+- **`Thread.background`**: `running`（`running` で `ambient` でないタスクの数）と `lastEnded`（`ambient` でないタスクの終わりのうち最後のもの。`endedAt` の順、同じなら `taskId` の順）。タスクが始まったとき、終わったとき、`ambient` が変わったときに `thread/upserted` / `thread/updated` が出る（進捗だけでは出ない）。
+  - `ambient` のタスクは、終わっても（ハーネスの報告でも、アイドル回収やプロセスの終了で終わっても）`lastEnded` にならない。ハーネスが「活動ではない」としたものなので、スレッドの作業の終わりとして通知させない。
+  - `lastEnded` はこの順で後の終わりにだけ進み、前の終わりには戻らない。最後に終わったタスクが同じ ID で新しい run を始めても、`lastEnded` はそのタスクの前の run の終わりのまま（タスクの `status` は `running` に戻り、`running` の数に入る）。その run が終われば、その終わりに進む。終わりごとに `endedAt` は新しくなる（同じタスクの次の run の終わりは後になる）。同じ終わりの `status` や `title` があとから変わったときは、`endedAt` を変えずにそれが届く。通知は `lastEnded` がこの順で後の終わりに進んだときに作る。
+- **`backgrounded` の Item**: 作業をバックグラウンドタスクとして続ける Item（バックグラウンドで起動した Agent、Bash など）。`item/completed` が `status: "backgrounded"` で届き、`backgroundTaskId` がそのタスクを指す（タスクの `originItemId` はこの Item）。タスクの状態はタスクの側で見る。
+- **Interaction の所属**: 承認や質問は、次のどれか 1 つに属し、それが終わると `expired` になる。
+  - 求めたときに動いていたターン（`turnId`）。ターンが終わると `turnEnded`。
+  - 求めたバックグラウンドタスク（`backgroundTaskId`。ハーネスが明示したとき）。ターンが終わっても残り、タスクが終わると `taskEnded`。
+  - スレッド（`turnId` も `backgroundTaskId` もない。ターンが動いていないときに、タスクを示さずに求められたもの）。プロセスが終わるまで残る。
+  - どれも、ハーネスが取り下げれば `harnessCancelled`、プロセスが終われば `processExited`。サーバが Interaction を `expired` にするとき、プロセスが動いていればエージェントにも答え（辞退）を返すので、エージェントが答えを待ち続けることはない。
 - **`Turn.error.kind`**: `agentExited`（プロセスが想定外に終了）、`adapterError`、`spawnFailed`、`harnessUnavailable`、`forced`（中断に応じず強制終了）、`interrupted`（起動前に中断）、`stopped`（`thread/stop`、アーカイブ、アイドル回収）、`daemonShutdown`、`systemShutdown`（Windows のサインアウト・シャットダウン・再起動で daemon が止まった。design.md 18.8）、`daemonRestarted`、`forkOutdated`（fork の最初のターンを待つ間に元のスレッドが次のターンに進んだ。`thread/fork` の補足）、ハーネス由来の `harnessError`、`refusal`、`codex:<種別>` など。クライアントは知らない値を一般的な失敗として表示する。
 - **タイトル**: 指定がなければ "New thread" で作られ、最初のメッセージの1行目で置き換わる。ハーネスが名前を付けた場合はそれに置き換わる（`thread/update` で利用者が付けたタイトルは置き換えない）。
 - **`Thread.pinned`**: `thread/update { pinned }` で変える。`thread/list` の並び順と `lastActivityAt` は変わらない（ピン留めしたスレッドを先頭にまとめるのはクライアントの表示）。fork したスレッドには引き継がない。
@@ -263,7 +314,7 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 | `subscribe` | `{subscriptions:[{stream, after}]}` | `{subscriptions:[{stream, head, status:"ok"\|"notFound"}]}` |
 | `unsubscribe` | `{streams:[string]}` | `{}` |
 | `workspace/snapshot` | `{}` | `{harnesses, projects, threads, pendingInteractions, operations, head}` |
-| `server/status` | `{}` | `{uptimeMs, runningProcesses, runningTurns, draining, preventSleepWhileRunning}` |
+| `server/status` | `{}` | `{uptimeMs, runningProcesses, runningTurns, draining, preventSleepWhileRunning, runningBackgroundTasks}` |
 | `device/list` | `{}` | `{devices}` |
 | `device/revoke` ★ | `{deviceId}` | `{}` |
 
@@ -279,7 +330,7 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - 1つの読み取りトランザクションで作るので、`head` とその内容は一致している。
   - `projects` と `threads` はアーカイブされていないもの。`operations` は新しい順に最大 `policy.snapshot_operation_limit`（既定 20）件。
   - 最初のハーネスの probe が終わるまで応答を待つ。
-- `server/status` の `preventSleepWhileRunning` は daemon の `policy.prevent_sleep_while_running`（ターンの実行中は PC をスリープさせない）。アプリの設定画面で状態を表示するために使う。
+- `server/status` の `preventSleepWhileRunning` は daemon の `policy.prevent_sleep_while_running`（ターンの実行中と、バックグラウンドの作業がエージェントを動かしている間は PC をスリープさせない）。アプリの設定画面で状態を表示するために使う。`runningBackgroundTasks` は、エージェントのプロセスを保持しているバックグラウンドタスク（ハーネスのライブセットにあり `ambient` でないもの）の数（全スレッド）。
 - `device/list` は失効していないデバイス。`current` はこの接続のデバイス。
 - `device/revoke` の補足: 存在しないか失効済みなら `notFound`。失効したデバイスの接続は close code 4001 で閉じられる。
 
@@ -341,7 +392,7 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 | `thread/list` | `{projectId?, includeArchived?, limit?, before?:{lastActivityAt,id}}` | `{threads, hasMore}` |
 | `thread/get` | `{threadId}` | `{thread}` |
 | `thread/create` ★ | `{projectId, harnessId, settings?, workspace?:{kind:"local"}\|{kind:"worktree", baseRef?, branch?}, title?, input?:InputPart[]}` | `{thread, turnId?, disposition?}` |
-| `thread/read` | `{threadId, beforeTurnIndex?, limitTurns?}` | `{thread, turns, items, interactions, queued, head, hasMoreBefore}` |
+| `thread/read` | `{threadId, beforeTurnIndex?, limitTurns?}` | `{thread, turns, items, interactions, queued, backgroundTasks, head, hasMoreBefore}` |
 | `thread/update` ★ | `{threadId, title?, settings?, pinned?}` | `{thread, settingsOutcome?:"appliedLive"\|"appliesNextTurn"}` |
 | `thread/archive` ★ | `{threadId, archived, removeWorktree?, force?}` | `{thread}` |
 | `thread/fork` ★ | `{threadId, atTurnId?}` | `{thread}` |
@@ -363,7 +414,8 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - `input` を指定すると、そのままターンを開始する（プロセス数が上限なら待たせる）。このとき `turnId` と `disposition: "started"` が付く。
 - `thread/read` の補足
   - 返すのは、`beforeTurnIndex` より前の、最大 `limitTurns`（既定は `policy.thread_read_default_turns` の 20、上限は `policy.thread_read_max_turns` の 200）ターン分。
-  - `items` と `interactions` は、返したターンに属するものをターン順・発生順に並べる（Interaction はすべての状態を含む）。`queued` はキュー全体。
+  - `items` と `interactions` は、返したターンに属するものをターン順・発生順に並べる（Interaction はすべての状態を含む）。ターンに属さない Interaction（バックグラウンドタスクやスレッドに属するもの）は、求められたときに動いていたターン（なければその時点の最後のターン）と一緒に返す。加えて、保留中でターンに属さない Interaction はすべて返す。`queued` はキュー全体。
+  - `backgroundTasks` は、返したターンの間に最初に報告されたタスク（`turnId` が返したターン）と、まだ `running` のすべてのタスク（開始の古い順）。
   - `head` はこの内容と同じ時点のもので、1つのトランザクションで作る。
 - `thread/update` の補足
   - `title` は空にできない。`settings` は指定したフィールドだけを変える。
@@ -392,7 +444,7 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - 実行中でなければ、どれを指定しても新しいターンになる（`started`）。
   - 実行中の場合、`auto` と `queue` はキューに入る（`queued`、`queuedId`）。
   - `steer` は、能力があれば実行中のターンに差し込む（`steered`）。能力がなければ `capabilityUnsupported`。
-- `turn/interrupt` の補足: 実行中のターンがなければ `{interrupted: false}`。中断の完了は `turn/completed`（`interrupted`）で届く。CLI が `interruptGrace` 以内に応じなければプロセスを止め、ターンの `error.kind` は `forced` になる。
+- `turn/interrupt` の補足: 実行中のターンがなければ `{interrupted: false}`。中断の完了は `turn/completed`（`interrupted`）で届く。中断するのはターンで、バックグラウンドタスクは続く（ハーネスがそれを区別できる限り。docs/adapters/*.md）。CLI が `interruptGrace` 以内に応じなければプロセスを止め、ターンの `error.kind` は `forced` になる。ただし、バックグラウンドの作業がエージェントを動かしている間はプロセスを止めない（その作業を時間の経過で止めることはしないため）。ターンは続き、`code: "interruptNotHonoured"` の notice の Item が付く。もう一度中断を送るか、`thread/stop` ですべてを止める。
 - `queue/remove` の補足: 既に処理されたか存在しなければ `{removed: false}`。
 - `queue/update` の補足（送信待ちの入力の編集）
   - キューの中の位置を変えずに、入力を丸ごと置き換える。`input` は `turn/start` と同じ検査を受ける（空は不可、メンションは相対パス、画像は能力 `images` が必要）。
@@ -408,6 +460,16 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - `interrupted` か `failed` で終わると、キューは一時停止する（`thread.queuePaused = true`）。daemon の再起動後も、キューが残っていれば一時停止の状態で始まる。
   - 一時停止は、`queue/resume`（実行中でなければ先頭を開始し、その `turnId` を返す）、新しい `turn/start`、キューが空になったときに解除される。
   - 停止準備中はキューから次のターンを始めない。
+
+### バックグラウンドタスク
+| method | params | result |
+|---|---|---|
+| `backgroundTask/stop` ★ | `{threadId, taskId}` | `{task}` |
+
+- `backgroundTask/stop` の補足
+  - ハーネスにそのタスクを止めるよう求める。応答は求めたことを表すだけで、止まったことは表さない: 返す `task` には `stopRequestedAt` が付き、ハーネスが終わりを報告すると `backgroundTask/updated`（`status: "stopped"` など）で届く。
+  - `policy.background_stop_confirm_timeout`（既定 30 秒）の間に終わりが報告されなければ、`stopRequestedAt` を外して `stopUnconfirmedAt` を付ける（タスクはそのまま。ほかのことはしない。すべてを止めるのは `thread/stop`）。もう一度求めることができる。
+  - エラー: タスクがない（ほかのスレッドのタスクを含む）: `notFound`。動いていない（終わった、プロセスがない）: `invalidState`。タスクの `stoppable` が `false`: `invalidState`。ハーネスに能力 `backgroundStop` がない: `capabilityUnsupported`（`data.capability: "backgroundStop"`）。ハーネスが求めを受け付けなかった: `adapterError`。
 
 ### 承認・質問・コマンド・ネイティブセッション
 | method | params | result |
@@ -428,7 +490,9 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 - `command/list` の補足
   - アプリ側のコマンド（`source: "app"`）とハーネスのコマンド（`source: "harness"`）を合わせて返す。アプリ側のコマンドと同じ名前のハーネスのコマンドは返さない。
   - アプリ側のコマンド: `model` / `effort` / `permissions`（ピッカー。ハーネスに一覧があるときだけ）。スレッドを指定したときは加えて `fork`（能力があるとき）、`diff`、`stop`、`resume-queue`、`archive`（`method` アクション）。
+  - 動いているプロセスの中でネイティブセッションを切り替えるハーネスのコマンドは返さない（1つのスレッドは1つのネイティブセッション。design.md 9.5）。どのハーネスでも `resume` は返さない。ほかにハーネスごとに名前で決めたもの（Claude の `clear`、pi の `new` / `fork` / `clone` / `tree`）も返さない。クライアントは独自の `/resume`（`native/list` と `native/import` で PC のセッションを取り込む）を出してよい。
 - `native/list` の補足: 能力 `nativeSessions` が必要。そのプロジェクトのフォルダで作られたネイティブセッションを返し、取り込み済みなら `importedThreadId` を付ける。
+  - 結果の中で `nativeSessionId` は一意（どのハーネスでも）。CLI が同じセッションを何度も並べても（Codex の `thread/list` は、resume されたスレッドを rollout ごとに同じ id で並べる）、1件にまとめて返す。位置は最初に現れた位置、内容（`title`、`updatedAt`、`cwd`）は `updatedAt` が最も新しいもの。クライアントは `nativeSessionId` を一覧のキーにしてよい。
 - `native/import` の補足: 取り込み済みなら既存のスレッドを返す。履歴は完了済みのターンとして取り込まれ、差分は持たない。次の入力でネイティブセッションを resume して続きから話せる。
 - `operation/list` の補足: 新しい順に最大 `policy.operation_list_limit`（既定 50）件。終わった Operation は `policy.finished_operation_retention`（既定 7 日）の後に消える。
 - `operation/cancel` の補足
@@ -475,6 +539,7 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 | `interaction/expired` | `{interaction}` |
 | `queue/updated` | `{queued:[QueuedInput]}`（キュー全体） |
 | `commands/changed` | `{}`（`command/list` を取り直す合図） |
+| `backgroundTask/updated` | `{task}`（バックグラウンドタスクの開始・進捗・終了。常にタスク全体。3.1） |
 | `native` | `{harnessId, payload}`（アダプタが解釈しなかった生のイベント。ターンの外で届いた通知は `payload.notice` に入る。通常は表示しない） |
 
 ## 6. HTTP
@@ -499,7 +564,7 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 | `GET /v1/healthz` | なし | `{ok:true}` |
 | `POST /v1/admin/pairing-codes` | 管理 listener と管理トークン | `{code, expiresAt, pairUrl}`。`server.public_url` が未設定なら 400 `notConfigured` |
 | `GET /v1/admin/devices` / `DELETE /v1/admin/devices/{id}` | 管理 listener と管理トークン | デバイス一覧（`{devices}`）と失効（204。なければ 404） |
-| `GET /v1/admin/status` | 管理 listener と管理トークン | `{version, epoch, uptimeMs, listen, publicUrl?, runningProcesses, runningTurns, connectedDevices, draining}` |
+| `GET /v1/admin/status` | 管理 listener と管理トークン | `{version, epoch, uptimeMs, listen, publicUrl?, runningProcesses, runningTurns, runningBackgroundTasks, connectedDevices, draining}` |
 | `POST /v1/admin/harnesses/refresh` | 管理 listener と管理トークン | body `{harnessId?}`（省略可）→ `{harnesses}`（`harness/refresh` と同じ。クライアントにも `harness/updated` が届く）。未知のハーネスは 404 `notFound`。`agent-app-server harness refresh [id]` が使う |
 | `POST /v1/admin/stop` | 管理 listener と管理トークン | body `{drain}` → 202 |
 | `GET /v1/liveness` | 管理 listener（トークン不要） | watchdog の liveness の確認（design.md 18.2）。エンジンを通る往復（データベースの読み取り）が `policy.liveness_deadline`（既定 5 秒）以内に終われば `{ok:true}`、終わらなければ 503 `unavailable` |

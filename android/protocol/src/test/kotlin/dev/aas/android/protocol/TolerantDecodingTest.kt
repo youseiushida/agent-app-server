@@ -72,6 +72,67 @@ class TolerantDecodingTest {
     }
 
     @Test
+    fun backgroundWorkAdditionsHaveSafeDefaults() {
+        // An older server has no background work: nothing runs, nothing ended, nothing to stop.
+        val thread = AasJson.decodeFromString(
+            Thread.serializer(),
+            """{"id":"thr_1","projectId":"prj_1","harnessId":"fake","title":"t","cwd":"C:/p","workspace":{"kind":"local"},""" +
+                """"status":"ready","createdAt":1,"updatedAt":1,"lastActivityAt":1,"head":3}""",
+        )
+        assertEquals(ThreadBackground(running = 0, lastEnded = null), thread.background)
+        val caps = AasJson.decodeFromString(HarnessCapabilities.serializer(), """{"interrupt":true}""")
+        assertEquals(false, caps.backgroundTasks)
+        assertEquals(false, caps.backgroundStop)
+        val status = AasJson.decodeFromString(ServerStatusResult.serializer(), """{"uptimeMs":1,"runningProcesses":0,"runningTurns":0,"draining":false}""")
+        assertEquals(0, status.runningBackgroundTasks)
+        val read = AasJson.decodeFromString(
+            ThreadReadResult.serializer(),
+            """{"thread":${AasJson.encodeToString(Thread.serializer(), thread)},"turns":[],"items":[],"interactions":[],"queued":[],"head":3,"hasMoreBefore":false}""",
+        )
+        assertEquals(emptyList(), read.backgroundTasks)
+        val turn = AasJson.decodeFromString(Turn.serializer(), """{"id":"trn_1","threadId":"thr_1","index":0,"status":"completed","startedAt":1}""")
+        assertNull(turn.trigger)
+        val item = AasJson.decodeFromString(
+            Item.serializer(),
+            """{"kind":"toolCall","id":"itm_1","threadId":"thr_1","turnId":"trn_1","status":"completed","startedAt":1,"category":"subagent","name":"Agent","title":"x"}""",
+        )
+        assertNull(item.backgroundTaskId)
+    }
+
+    @Test
+    fun backgroundTaskValuesAddedLaterAreTolerated() {
+        val task = AasJson.decodeFromString(
+            BackgroundTask.serializer(),
+            """{"id":"bgt_1","threadId":"thr_1","nativeId":"n","kind":"hologram","title":"x","status":"paused","ambient":false,"runs":1,""" +
+                """"startedAt":1,"endReason":"meteor","stoppable":true,"progress":{"workflow":[{"label":"a","state":"thinking"}]}}""",
+        )
+        assertEquals(BackgroundTaskKind.Unknown, task.kind)
+        assertEquals(BackgroundTaskStatus.Unknown, task.status)
+        // A status added after this client counts as ended, never as running forever.
+        assertEquals(true, task.status.isTerminal)
+        assertEquals(false, BackgroundTaskStatus.Running.isTerminal)
+        assertEquals(BackgroundEndReason.Unknown, task.endReason)
+        assertEquals(WorkflowAgentState.Unknown, task.progress?.workflow?.single()?.state)
+        val turn = AasJson.decodeFromString(Turn.serializer(), """{"id":"trn_1","threadId":"thr_1","index":0,"status":"completed","startedAt":1,"trigger":"cron"}""")
+        assertEquals(TurnTrigger.Unknown, turn.trigger)
+        // An item kind this client does not know still says which task it launched.
+        val unknown = AasJson.decodeFromString(
+            Item.serializer(),
+            """{"kind":"hologram","id":"itm_1","threadId":"thr_1","turnId":"trn_1","status":"backgrounded","startedAt":7,"backgroundTaskId":"bgt_1"}""",
+        )
+        assertEquals(ItemStatus.Backgrounded, unknown.status)
+        assertEquals("bgt_1", unknown.backgroundTaskId)
+        val interaction = AasJson.decodeFromString(
+            Interaction.serializer(),
+            """{"id":"int_1","threadId":"thr_1","status":"expired","createdAt":1,"expireReason":"taskEnded","backgroundTaskId":"bgt_1",""" +
+                """"request":{"kind":"question","title":"q","questions":[]}}""",
+        )
+        assertEquals(ExpireReason.TaskEnded, interaction.expireReason)
+        assertEquals("bgt_1", interaction.backgroundTaskId)
+        assertNull(interaction.turnId)
+    }
+
+    @Test
     fun unknownUnionTagsAreKept() {
         val action = AasJson.decodeFromString(CommandAction.serializer(), """{"type":"teleport","to":"mars"}""")
         val unknown = assertIs<CommandAction.Unknown>(action)

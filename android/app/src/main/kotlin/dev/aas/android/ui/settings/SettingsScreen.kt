@@ -112,7 +112,7 @@ fun SettingsScreen(vm: SettingsViewModel, navigator: AppNavigator) {
             when (val status = ui.serverStatus) {
                 is Remote.Loaded -> {
                     Info(stringResource(R.string.settings_uptime), InteractionTexts.duration(res, status.value.uptimeMs))
-                    Info(stringResource(R.string.settings_running), stringResource(R.string.settings_running_value, status.value.runningTurns, status.value.runningProcesses))
+                    Info(stringResource(R.string.settings_running), stringResource(R.string.settings_running_value, status.value.runningTurns, status.value.runningBackgroundTasks, status.value.runningProcesses))
                     Info(
                         stringResource(R.string.settings_prevent_sleep),
                         stringResource(if (status.value.preventSleepWhileRunning) R.string.on else R.string.off),

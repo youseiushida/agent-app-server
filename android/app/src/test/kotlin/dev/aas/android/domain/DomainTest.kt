@@ -7,6 +7,7 @@ import dev.aas.android.protocol.InteractionRequest
 import dev.aas.android.protocol.InteractionStatus
 import dev.aas.android.protocol.Question
 import dev.aas.android.protocol.RpcError
+import dev.aas.android.protocol.ThreadBackground
 import dev.aas.android.protocol.ThreadError
 import dev.aas.android.protocol.ThreadStatus
 import dev.aas.android.protocol.TurnStatus
@@ -21,6 +22,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class ThreadActivityTest {
     private fun question(id: String, threadId: String) = Interaction(
@@ -53,6 +55,23 @@ class ThreadActivityTest {
             assertEquals(ThreadActivity.Running, ThreadActivity.of(Samples.thread("thr_1").copy(status = status), emptyList()))
         }
     }
+
+    /**
+     * A ready thread whose harness reports background work running: バックグラウンドで実行中. A turn,
+     * an error or a pending request says more and wins; an ambient-only thread (running 0) is idle.
+     */
+    @Test
+    fun backgroundWorkIsItsOwnActivityBelowTurnsErrorsAndRequests() {
+        val ready = Samples.thread("thr_1", lastTurn = Samples.turnSummary("t", 0, TurnStatus.Completed), background = ThreadBackground(running = 2))
+            .copy(status = ThreadStatus.Ready)
+        assertEquals(ThreadActivity.Background, ThreadActivity.of(ready, emptyList()))
+        assertTrue(ThreadActivity.Background.working)
+        assertTrue(!ThreadActivity.Background.needsAction)
+        assertEquals(ThreadActivity.Running, ThreadActivity.of(ready.copy(status = ThreadStatus.Running), emptyList()))
+        assertEquals(ThreadActivity.Error, ThreadActivity.of(ready.copy(lastTurn = Samples.turnSummary("t", 0, TurnStatus.Failed)), emptyList()))
+        assertEquals(ThreadActivity.NeedsApproval, ThreadActivity.of(ready, listOf(Samples.approval("int_1", threadId = "thr_1"))))
+        assertEquals(ThreadActivity.Idle, ThreadActivity.of(ready.copy(background = ThreadBackground(running = 0)), emptyList()))
+    }
 }
 
 class InboxModelTest {
@@ -69,6 +88,7 @@ class InboxModelTest {
         val running = Samples.thread("thr_run", lastActivityAt = 30).copy(status = ThreadStatus.Running)
         val unread = Samples.thread("thr_new", lastActivityAt = 20)
         val quiet = Samples.thread("thr_quiet", lastActivityAt = 10)
+        val background = Samples.thread("thr_bg", lastActivityAt = 25, background = ThreadBackground(running = 1)).copy(status = ThreadStatus.Ready)
         val archived = Samples.thread("thr_arch", lastActivityAt = 60).copy(archived = true)
         val workspace = WorkspaceState(
             synced = true,
@@ -80,6 +100,7 @@ class InboxModelTest {
                 ThreadEntry(failedUnread, unread = true),
                 ThreadEntry(failedRead, unread = false),
                 ThreadEntry(running, unread = false),
+                ThreadEntry(background, unread = false),
                 ThreadEntry(unread, unread = true),
                 ThreadEntry(quiet, unread = false),
             ),
@@ -91,7 +112,8 @@ class InboxModelTest {
         assertEquals("app", inbox.interactions[0].project?.name)
         assertNull(inbox.interactions[1].thread)
         assertEquals(listOf("thr_err"), inbox.errors.map { it.thread.id })
-        assertEquals(listOf("thr_run"), inbox.running.map { it.thread.id })
+        // Background work is listed with the running threads (the agent works; nothing needs the user).
+        assertEquals(listOf("thr_run", "thr_bg"), inbox.running.map { it.thread.id })
         assertEquals(listOf("thr_new"), inbox.unread.map { it.thread.id })
         assertEquals(3, inbox.badgeCount)
     }

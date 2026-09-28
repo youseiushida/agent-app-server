@@ -1,5 +1,7 @@
 package dev.aas.android.sync
 
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskId
 import dev.aas.android.protocol.Harness
 import dev.aas.android.protocol.Interaction
 import dev.aas.android.protocol.InteractionId
@@ -69,7 +71,8 @@ interface SyncTx {
 
     /**
      * Deletes all synced data: epoch, cursors, last sync time, harnesses, projects, threads,
-     * turns, items, interactions, queued inputs, operations, thread metadata and view states.
+     * turns, items, interactions, background tasks, queued inputs, operations, thread metadata and
+     * view states.
      * **Keeps the outbox**: requests the user made are still sent after an epoch change
      * (protocol.md §2, §7.3); the server answers them definitively if they no longer apply.
      */
@@ -97,8 +100,8 @@ interface SyncTx {
     suspend fun upsertThread(thread: Thread)
 
     /**
-     * Removes a thread and everything stored for it: turns, items, interactions, queued inputs,
-     * metadata, view state and the cursor of its stream.
+     * Removes a thread and everything stored for it: turns, items, interactions, background tasks,
+     * queued inputs, metadata, view state and the cursor of its stream.
      */
     suspend fun removeThread(id: ThreadId)
 
@@ -142,15 +145,24 @@ interface SyncTx {
     /** Interactions of a thread (every status), ascending by `createdAt`, then id. */
     suspend fun interactionsOf(threadId: ThreadId): List<Interaction>
 
+    suspend fun backgroundTask(id: BackgroundTaskId): BackgroundTask?
+
+    /** Inserts or replaces a background task (`backgroundTask/updated` carries the whole task). */
+    suspend fun upsertBackgroundTask(task: BackgroundTask)
+
+    /** Background tasks of a thread, ascending by `startedAt`, then id. */
+    suspend fun backgroundTasksOf(threadId: ThreadId): List<BackgroundTask>
+
     suspend fun queued(threadId: ThreadId): List<QueuedInput>
 
     /** Replaces the queue of a thread (`queue/updated` carries the whole queue). */
     suspend fun replaceQueued(threadId: ThreadId, queued: List<QueuedInput>)
 
     /**
-     * Drops the cached turns, items and queued inputs of a thread before a fresh `thread/read`.
-     * Interactions, the summary, metadata, view state and the cursor stay: interactions are
-     * kept current by the workspace stream as well, and the caller sets the cursor itself.
+     * Drops the cached turns, items, background tasks and queued inputs of a thread before a fresh
+     * `thread/read` (which returns the tasks of its turns and every running one). Interactions,
+     * the summary, metadata, view state and the cursor stay: interactions are kept current by the
+     * workspace stream as well, and the caller sets the cursor itself.
      */
     suspend fun clearThreadContent(threadId: ThreadId)
 

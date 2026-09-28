@@ -1,5 +1,6 @@
-//! Keeps the machine awake while leases are held: one per running turn, and one for the
-//! daemon's whole life when it is configured to keep the PC awake always.
+//! Keeps the machine awake while leases are held: one per running turn, one per thread whose
+//! background work keeps its agent busy, and one for the daemon's whole life when it is
+//! configured to keep the PC awake always.
 //!
 //! `SetThreadExecutionState` is per-thread, so a dedicated thread owns the state and applies
 //! transitions: the first lease sets `ES_CONTINUOUS | ES_SYSTEM_REQUIRED`, dropping the last
@@ -25,7 +26,8 @@ pub struct PowerGuard {
     active: Arc<AtomicUsize>,
 }
 
-/// Held while a turn runs; dropping it releases the inhibition.
+/// Held while a turn runs, while a thread's background work keeps its agent busy, or for the
+/// daemon's whole life; dropping the last one releases the inhibition.
 pub struct PowerLease {
     tx: Option<mpsc::Sender<PowerCmd>>,
     active: Arc<AtomicUsize>,

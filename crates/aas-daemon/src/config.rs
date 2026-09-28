@@ -126,8 +126,9 @@ pub struct GitSection {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeepAwake {
-    /// While at least one turn runs (`policy.prevent_sleep_while_running`). An idle PC sleeps
-    /// as its power plan says and is unreachable until it wakes.
+    /// While at least one turn runs or background work keeps an agent busy
+    /// (`policy.prevent_sleep_while_running`). An idle PC sleeps as its power plan says and is
+    /// unreachable until it wakes.
     #[default]
     WhileRunning,
     /// As long as the daemon runs, so the phone can always reach it.
@@ -385,13 +386,67 @@ impl Config {
         }
     }
 
-    /// Serialized form with a short header.
-    pub fn to_toml(&self) -> anyhow::Result<String> {
-        let body = toml::to_string_pretty(self)?;
-        Ok(format!(
-            "# agent-app-server configuration. Documentation: docs/design.md §17 and docs/adapters/*.md\n\
-             # Policy values not listed here use their defaults (docs/design.md §13).\n\n{body}"
-        ))
+    /// The file `init` writes for this configuration: only what a user must or likely will
+    /// edit — the listeners, a commented `public_url` line (required for pairing; `doctor`
+    /// prints the value for this PC), the project roots, `[power]`, `[logging]` and the
+    /// harnesses — plus comments pointing to the documentation.
+    ///
+    /// `[policy]`, `[heuristics]` and `[git]` are not written. Their defaults belong to the
+    /// daemon (docs/design.md §13): written into the file, today's defaults would stay frozen
+    /// there after an update changes them, and a key renamed or removed later would make the
+    /// file fail to load (unknown keys are errors).
+    pub fn initial_text(&self) -> anyhow::Result<String> {
+        /// `[key]` (or `[[key]]` for a list) with the fields in their declared order.
+        fn section<T: Serialize + ?Sized>(key: &str, value: &T) -> anyhow::Result<String> {
+            Ok(toml::to_string_pretty(&std::collections::BTreeMap::from(
+                [(key, value)],
+            ))?)
+        }
+        let mut out = String::from(
+            "# agent-app-server configuration (docs/design.md §17). Changes take effect when the\n\
+             # daemon restarts. Unknown keys are errors.\n\
+             #\n\
+             # Timeouts, limits and intervals live in [policy]; every key has a default, listed with\n\
+             # its reason in docs/design.md §13. Add a [policy] table with only the keys you change,\n\
+             # e.g.\n\
+             #   [policy]\n\
+             #   max_running_processes = 2\n\
+             # [git] and [heuristics] are described in §17 and §14.\n\n",
+        );
+        out.push_str(&section("server", &self.server)?);
+        if self.server.public_url.is_none() {
+            out.push_str(
+                "# URL the phone connects to (ws:// or wss://); pairing needs it. Once Tailscale is\n\
+                 # connected, `agent-app-server doctor` prints the value for this PC.\n\
+                 # public_url = \"wss://<pc>.<tailnet>.ts.net/v1/ws\"\n",
+            );
+        }
+        if self.server.name.is_none() {
+            out.push_str(
+                "# Name shown in the app (default: the computer name).\n# name = \"home-pc\"\n",
+            );
+        }
+        out.push('\n');
+        out.push_str(&section("projects", &self.projects)?);
+        out.push('\n');
+        out.push_str(
+            "# keep_awake: \"while_running\" (while a turn or busy background work runs) or \"always\" (while the daemon runs).\n",
+        );
+        out.push_str(&section("power", &self.power)?);
+        out.push('\n');
+        out.push_str("# level: a tracing filter (RUST_LOG overrides it).\n");
+        out.push_str(&section("logging", &self.logging)?);
+        out.push('\n');
+        if self.harnesses.is_empty() {
+            out.push_str(
+                "# No agent CLI (codex, claude, pi, devin) was found on PATH. Add one as\n\
+                 # [[harness]] (docs/design.md §17, options in docs/adapters/<kind>.md).\n",
+            );
+        } else {
+            out.push_str("# Agent CLIs found on PATH. Options: docs/adapters/<kind>.md.\n");
+            out.push_str(&section("harness", &self.harnesses)?);
+        }
+        Ok(out)
     }
 }
 
@@ -473,7 +528,7 @@ mod tests {
         assert_eq!(c.power.keep_awake, KeepAwake::Always);
         assert_eq!(c.harnesses[0].options["auth_hint"], "run devin auth login");
         // Round trip.
-        let again: Config = toml::from_str(&c.to_toml().unwrap()).unwrap();
+        let again: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
         assert_eq!(again, c);
     }
 
@@ -481,7 +536,7 @@ mod tests {
     fn defaults_round_trip_and_policy_keys_are_owned_once() {
         let c = Config::default();
         c.validate().unwrap();
-        let again: Config = toml::from_str(&c.to_toml().unwrap()).unwrap();
+        let again: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
         assert_eq!(again, c);
         let core = keys_of::<Policy>().unwrap();
         let server = keys_of::<ServerPolicy>().unwrap();
@@ -491,6 +546,80 @@ mod tests {
         all.sort();
         all.dedup();
         assert_eq!(all.len(), n, "a [policy] key is claimed by two structs");
+    }
+
+    /// What `init` writes loads back as the same configuration, and every policy value (and
+    /// every other section it leaves out) comes from the defaults.
+    fn assert_initial_text_round_trips(c: &Config) {
+        let text = c.initial_text().unwrap();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        let keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        for key in ["policy", "heuristics", "git"] {
+            assert!(!keys.contains(&key), "init wrote [{key}]:\n{text}");
+        }
+        let loaded: Config = toml::from_str(&text).unwrap();
+        loaded.validate().unwrap();
+        assert_eq!(loaded, *c, "{text}");
+        assert_eq!(loaded.policy, Policy::default());
+        assert_eq!(loaded.server_policy, ServerPolicy::default());
+        assert_eq!(loaded.daemon_policy, DaemonPolicy::default());
+        assert_eq!(loaded.heuristics, HeuristicsConfig::default());
+        assert_eq!(loaded.git, GitSection::default());
+        // The pairing URL is there to uncomment, with the doctor hint.
+        assert!(
+            text.contains("# public_url = \"wss://<pc>.<tailnet>.ts.net/v1/ws\""),
+            "{text}"
+        );
+        assert!(text.contains("agent-app-server doctor"), "{text}");
+        assert!(text.contains("docs/design.md §13"), "{text}");
+    }
+
+    #[test]
+    fn init_writes_only_what_users_edit_and_leaves_policy_to_the_defaults() {
+        // Whatever this machine has on PATH.
+        assert_initial_text_round_trips(&Config::initial());
+        // Every harness shape `init` can write, and roots that need escaping.
+        let with_harnesses = Config {
+            projects: ProjectsSection {
+                roots: vec![
+                    PathBuf::from(r"C:\Users\me\Documents"),
+                    PathBuf::from(r#"D:\work "quoted" 'and' ünïcode"#),
+                ],
+            },
+            harnesses: vec![
+                HarnessConfig {
+                    id: "codex".into(),
+                    kind: HarnessKind::Codex,
+                    display_name: None,
+                    command: "codex".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    options: serde_json::Value::Null,
+                },
+                HarnessConfig {
+                    id: "devin".into(),
+                    kind: HarnessKind::Acp,
+                    display_name: Some("Devin".into()),
+                    command: "devin".into(),
+                    args: vec!["acp".into()],
+                    env: Default::default(),
+                    options: serde_json::Value::Null,
+                },
+            ],
+            ..Config::default()
+        };
+        assert_initial_text_round_trips(&with_harnesses);
+        let text = with_harnesses.initial_text().unwrap();
+        assert!(text.contains("\n[[harness]]\n"), "{text}");
+        assert!(
+            text.find("\nlisten = ").unwrap() < text.find("\nadmin_listen = ").unwrap(),
+            "fields keep their declared order:\n{text}"
+        );
+        // Nothing found on PATH: a hint instead of an empty list.
+        let text = Config::default().initial_text().unwrap();
+        assert!(!text.contains("\n[[harness]]\n"), "{text}");
+        assert!(text.contains("No agent CLI"), "{text}");
+        assert_initial_text_round_trips(&Config::default());
     }
 
     #[test]

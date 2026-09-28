@@ -35,6 +35,7 @@ pub(crate) fn key_of(req: &ClientRequest) -> Option<String> {
         R::QueueResume(p) => thread(&p.thread_id),
         R::QueueUpdate(p) => thread(&p.thread_id),
         R::QueueSteer(p) => thread(&p.thread_id),
+        R::BackgroundTaskStop(p) => thread(&p.thread_id),
         R::ThreadCreate(p) => project(&p.project_id),
         R::ProjectUpdate(p) => project(&p.project_id),
         R::ProjectArchive(p) => project(&p.project_id),

@@ -112,7 +112,9 @@ fun NavGraphBuilder.projectsDestinations(navigator: AppNavigator) {
     }
     composable<ImportSessionRoute> { entry ->
         val route = entry.toRoute<ImportSessionRoute>()
-        val vm = aasViewModel(key = route.projectId) { c, _ -> ImportSessionViewModel(route.projectId, c.projectRepository, c.workspaceRepository, c.userMessages, c.engine.outbox, c.harnessRepository, c.policy) }
+        val vm = aasViewModel(key = "${route.projectId}/${route.harnessId}") { c, _ ->
+            ImportSessionViewModel(route.projectId, route.harnessId, c.projectRepository, c.workspaceRepository, c.userMessages, c.engine.outbox, c.harnessRepository, c.policy)
+        }
         ImportSessionScreen(vm, navigator)
     }
 }
@@ -322,7 +324,7 @@ private fun ProjectRowView(row: ProjectRow, onClick: () -> Unit, onRename: () ->
                     Text(row.project.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                     if (row.activity != ThreadActivity.Idle) {
                         Spacer(Modifier.width(8.dp))
-                        ThreadActivityChip(row.activity)
+                        ThreadActivityChip(row.activity, backgroundRunning = row.backgroundRunning)
                     }
                 }
                 Text(row.project.path, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)

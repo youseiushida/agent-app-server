@@ -42,6 +42,28 @@ pub struct WireThread {
     pub cwd: Option<String>,
     #[serde(default)]
     pub turns: Vec<WireTurn>,
+    /// The thread that spawned this one (sub-agent threads).
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    /// Name Codex gave a sub-agent (e.g. "Boole").
+    #[serde(default)]
+    pub agent_nickname: Option<String>,
+    /// `SessionSource`; sub-agents have `{subAgent: {thread_spawn: {agent_path, …}}}`.
+    #[serde(default)]
+    pub source: Option<Value>,
+}
+
+impl WireThread {
+    /// `source.subAgent.thread_spawn.agent_path` of a sub-agent thread (v2 multi-agent).
+    pub fn agent_path(&self) -> Option<&str> {
+        self.source
+            .as_ref()?
+            .get("subAgent")?
+            .get("thread_spawn")?
+            .get("agent_path")?
+            .as_str()
+            .filter(|p| !p.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -228,6 +250,61 @@ pub struct McpServerStatusUpdated {
 #[serde(rename_all = "camelCase")]
 pub struct ServerRequestResolved {
     pub request_id: Value,
+}
+
+/// `thread/status/changed`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStatusChanged {
+    pub status: WireThreadStatus,
+}
+
+/// `ThreadStatus`. Codex has no status for background work: `active` means a turn runs or
+/// waits for an answer (`activeFlags`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum WireThreadStatus {
+    NotLoaded,
+    Idle,
+    SystemError,
+    Active,
+    #[serde(other)]
+    Unknown,
+}
+
+/// `thread/started`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThreadStartedNotification {
+    pub thread: WireThread,
+}
+
+/// `thread/backgroundTerminals/list` (experimental API): the terminals of one thread whose
+/// process has not exited, one page.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTerminalsListResponse {
+    #[serde(default)]
+    pub data: Vec<WireBackgroundTerminal>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireBackgroundTerminal {
+    /// The commandExecution item that started the terminal.
+    pub item_id: String,
+    /// Codex's own process number (not an OS pid), the key of `…/terminate`.
+    pub process_id: String,
+    /// The command as the agent wrote it (without the shell wrapper the item shows).
+    #[serde(default)]
+    pub command: String,
+}
+
+/// `thread/backgroundTerminals/terminate` (experimental API).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerminateResponse {
+    pub terminated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

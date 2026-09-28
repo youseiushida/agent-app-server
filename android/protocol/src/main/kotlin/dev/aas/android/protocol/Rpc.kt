@@ -129,4 +129,5 @@ object JsonKeys {
     const val PROJECT_ID = "projectId"
     const val INTERACTION_ID = "interactionId"
     const val HARNESS_ID = "harnessId"
+    const val TASK_ID = "taskId"
 }

@@ -30,6 +30,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # .gitattributes stores text with LF; a file committed with CRLF (or mixed) would be
+      # rewritten on its next checkout and break byte-for-byte fixtures.
+      - name: Line endings are normalized
+        run: |
+          bad=$(git ls-files --eol | grep -E '^i/(crlf|mixed)' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::stored with CRLF line endings (see .gitattributes):"
+            echo "$bad"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -75,7 +86,10 @@ jobs:
           # :sync) are configured here. The ubuntu job builds and tests :app.
           ANDROID_HOME: ""
           ANDROID_SDK_ROOT: ""
-        run: ./gradlew :sync:test
+        # No daemon: a Gradle daemon still running at the end of the job holds the lock files
+        # under ~/.gradle/caches open, and on Windows setup-java then fails to save the Gradle
+        # cache ("Device or resource busy").
+        run: ./gradlew --no-daemon :sync:test
 
       # RealServerTest skips itself (Assume) when it cannot find the server; make sure it ran.
       - name: Check that the real-server tests ran
@@ -117,11 +131,14 @@ jobs:
         with:
           packages: platform-tools platforms;android-36 build-tools;36.0.0
 
+      # :app:assembleStaging runs R8 and resource shrinking with the release rules (signed with the
+      # debug key, so no release key is needed); :e2e:assembleDebug compiles the device tests
+      # (docs/android.md 23), which need an emulator to run and are run locally.
       - name: gradlew test, assemble and lint
         working-directory: android
         run: |
           chmod +x ./gradlew
-          ./gradlew :protocol:test :sync:test :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+          ./gradlew --no-daemon :protocol:test :sync:test :app:testDebugUnitTest :app:assembleDebug :app:assembleStaging :app:lintDebug :e2e:assembleDebug
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v7

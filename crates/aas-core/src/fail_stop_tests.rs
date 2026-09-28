@@ -266,6 +266,8 @@ fn process_info() -> HarnessInfo {
             images: false,
             model_switch_live: true,
             native_sessions: false,
+            background_tasks: false,
+            background_stop: false,
         },
         models: Vec::new(),
         default_model: None,

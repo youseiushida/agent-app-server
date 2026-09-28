@@ -19,6 +19,7 @@ object RequestLabels {
         Methods.ThreadArchive.name -> R.string.request_thread_archive
         Methods.ThreadFork.name -> R.string.request_thread_fork
         Methods.ThreadStop.name -> R.string.request_thread_stop
+        Methods.BackgroundTaskStop.name -> R.string.request_background_stop
         Methods.QueueRemove.name -> R.string.request_queue_remove
         Methods.QueueResume.name -> R.string.request_queue_resume
         Methods.QueueUpdate.name -> R.string.request_queue_update

@@ -34,6 +34,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         TurnEntity::class,
         ItemEntity::class,
         InteractionEntity::class,
+        BackgroundTaskEntity::class,
         QueuedEntity::class,
         ThreadMetaEntity::class,
         ViewStateEntity::class,
@@ -47,7 +48,7 @@ abstract class AasDatabase : RoomDatabase() {
 
     companion object {
         /** Current schema version (see the class documentation for the migration rules). */
-        const val VERSION = 2
+        const val VERSION = 3
 
         /** File name in the app's database directory (`%LOCALAPPDATA%`-like private storage). */
         const val FILE_NAME = "aas-sync.db"
@@ -83,5 +84,22 @@ object Migrations {
         }
     }
 
-    val ALL: Array<Migration> = arrayOf(MIGRATION_1_2)
+    /**
+     * 2 → 3: `background_tasks`, the background tasks of the threads (docs/android.md 15.1). It
+     * starts empty: the next `thread/read` of an open thread brings its tasks, and nothing else
+     * of the stored data changes meaning.
+     */
+    val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `background_tasks` (`id` TEXT NOT NULL, `thread_id` TEXT NOT NULL, " +
+                    "`started_at` INTEGER NOT NULL, `json` TEXT NOT NULL, PRIMARY KEY(`id`))",
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_background_tasks_thread_id_started_at` ON `background_tasks` (`thread_id`, `started_at`)",
+            )
+        }
+    }
+
+    val ALL: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
 }

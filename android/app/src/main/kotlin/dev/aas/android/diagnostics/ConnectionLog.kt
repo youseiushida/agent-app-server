@@ -48,6 +48,9 @@ class ConnectionLog(
     /** The sink handed to the sync engine. */
     val syncLogger: SyncLogger = SyncLogger { level, message, error -> add(level, SOURCE_SYNC, message, error) }
 
+    /** A sink that writes lines of [source] (e.g. [SOURCE_DATA] for the repositories). */
+    fun logger(source: String): SyncLogger = SyncLogger { level, message, error -> add(level, source, message, error) }
+
     /** All lines as plain text (copied to the clipboard from the diagnostics screen). */
     fun asText(entries: List<LogEntry> = this.entries.value): String =
         entries.joinToString("\n") { "${Instant.ofEpochMilli(it.atMs)} ${it.level} [${it.source}] ${it.message}" }
@@ -59,5 +62,8 @@ class ConnectionLog(
         const val SOURCE_NETWORK = "network"
         const val SOURCE_NOTIFY = "notify"
         const val SOURCE_PAIRING = "pairing"
+
+        /** Corrections of the daemon's data where it enters the app (data/ServerLists.kt). */
+        const val SOURCE_DATA = "data"
     }
 }

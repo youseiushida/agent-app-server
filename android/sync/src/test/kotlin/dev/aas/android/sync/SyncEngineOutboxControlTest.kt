@@ -1,6 +1,7 @@
 package dev.aas.android.sync
 
 import dev.aas.android.protocol.AasJson
+import dev.aas.android.protocol.BackgroundTaskStopParams
 import dev.aas.android.protocol.Disposition
 import dev.aas.android.protocol.ErrorKind
 import dev.aas.android.protocol.Methods
@@ -52,14 +53,18 @@ class SyncEngineOutboxControlTest {
         // Stop: sent at once although the lane's first entry waits.
         val interrupted = withTimeout(5_000) { f.engine.mutate(Methods.TurnInterrupt) { TurnInterruptParams(it, "thr_1") } }
         assertEquals(true, interrupted.interrupted)
+        // Stopping one background task goes ahead too.
+        f.engine.enqueue(Methods.BackgroundTaskStop) { BackgroundTaskStopParams(it, "thr_1", "bgt_1") }
+        eventually(what = "background stop sent") { f.server.requestsFor(Methods.BackgroundTaskStop.name).firstOrNull() }
         f.engine.enqueue(Methods.ThreadStop) { ThreadStopParams(it, "thr_1") }
         eventually(what = "stop sent") { f.server.requestsFor(Methods.ThreadStop.name).firstOrNull() }
         // Anything else of the thread keeps its place behind the waiting entry.
         f.engine.enqueue(Methods.TurnStart, turnStart("thr_1", "later"))
         delay(300)
         assertEquals(1, f.server.requestsFor(Methods.TurnStart.name).size, "the later input is not sent before the first")
-        val order = f.server.requests.map { it.second.method }.filter { it in setOf(Methods.TurnStart.name, Methods.TurnInterrupt.name, Methods.ThreadStop.name) }
-        assertEquals(listOf(Methods.TurnStart.name, Methods.TurnInterrupt.name, Methods.ThreadStop.name), order)
+        val stops = setOf(Methods.TurnStart.name, Methods.TurnInterrupt.name, Methods.BackgroundTaskStop.name, Methods.ThreadStop.name)
+        val order = f.server.requests.map { it.second.method }.filter { it in stops }
+        assertEquals(listOf(Methods.TurnStart.name, Methods.TurnInterrupt.name, Methods.BackgroundTaskStop.name, Methods.ThreadStop.name), order)
         assertEquals(listOf("follow-up", "later"), f.engine.outbox.value.filter { it.method == Methods.TurnStart.name }.map { (it.params["input"] as kotlinx.serialization.json.JsonArray).let { a -> (a[0] as JsonObject)["text"]!!.let { t -> (t as JsonPrimitive).content } } })
     }
 

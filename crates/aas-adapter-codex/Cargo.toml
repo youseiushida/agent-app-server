@@ -21,6 +21,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+aas-core.workspace = true
+dunce.workspace = true
 tempfile.workspace = true
 pretty_assertions.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -16,8 +16,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use aas_harness::{
-    AdapterError, HistoryItem, HistoryTurn, ItemBody, ItemStatus, Millis, NativeHistory,
-    NativeSessionScan, NativeSessionSummary, NoticeLevel,
+    AdapterError, AdapterPolicy, HistoryItem, HistoryTurn, ItemBody, ItemStatus, Millis,
+    NativeHistory, NativeSessionScan, NativeSessionSummary, NoticeLevel,
 };
 use aas_protocol::UserMessageDelivery;
 use serde_json::Value;
@@ -106,7 +106,11 @@ pub fn find_session_file(
 
 /// Sessions whose header `cwd` is `cwd`, most recently active first, and the files (or
 /// folders) that could not be read.
-pub fn list_sessions(inputs: &PathInputs, cwd: &Path) -> Result<NativeSessionScan, AdapterError> {
+pub fn list_sessions(
+    inputs: &PathInputs,
+    cwd: &Path,
+    policy: &AdapterPolicy,
+) -> Result<NativeSessionScan, AdapterError> {
     let candidates = inputs.candidate_files(cwd)?;
     let mut skipped = candidates.unreadable;
     let mut out = Vec::new();
@@ -129,7 +133,7 @@ pub fn list_sessions(inputs: &PathInputs, cwd: &Path) -> Result<NativeSessionSca
                 continue;
             }
         };
-        let (title, last_activity) = summarize(&lines);
+        let (title, last_activity) = summarize(&lines, policy);
         let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
             Ok(t) => t
                 .duration_since(std::time::UNIX_EPOCH)
@@ -182,7 +186,10 @@ fn read_lines(path: &Path) -> std::io::Result<Vec<Value>> {
 
 /// Title (latest `session_info` name, else the first line of the first user message) and the
 /// latest message timestamp.
-fn summarize(entries: &[Value]) -> (Option<String>, Option<Millis>) {
+/// Title and last activity of a session. The title is its name (`session_info`, cut to
+/// `policy.harness_title_chars`), else the first line of its first user message (cut to
+/// `policy.first_message_title_chars`, the engine's rule for titles made from a first message).
+fn summarize(entries: &[Value], policy: &AdapterPolicy) -> (Option<String>, Option<Millis>) {
     let mut name: Option<String> = None;
     let mut first_user: Option<String> = None;
     let mut last: Option<Millis> = None;
@@ -192,9 +199,7 @@ fn summarize(entries: &[Value]) -> (Option<String>, Option<Millis>) {
                 name = e
                     .get("name")
                     .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
+                    .and_then(|n| policy.harness_title(n));
             }
             Some("message") => {
                 if let Some(ts) = e.pointer("/message/timestamp").and_then(Value::as_i64) {
@@ -204,10 +209,7 @@ fn summarize(entries: &[Value]) -> (Option<String>, Option<Millis>) {
                     && e.pointer("/message/role").and_then(Value::as_str) == Some("user")
                 {
                     let text = content_text(e.pointer("/message/content").unwrap_or(&Value::Null));
-                    first_user = text
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .map(|l| l.trim().to_owned());
+                    first_user = policy.prompt_title(&text);
                 }
             }
             _ => {}
@@ -217,14 +219,14 @@ fn summarize(entries: &[Value]) -> (Option<String>, Option<Millis>) {
 }
 
 /// Full history of the session file at `path` (active branch only).
-pub fn read_history(path: &Path) -> std::io::Result<NativeHistory> {
+pub fn read_history(path: &Path, policy: &AdapterPolicy) -> std::io::Result<NativeHistory> {
     let entries = read_lines(path)?;
-    Ok(history_from_entries(&entries))
+    Ok(history_from_entries(&entries, policy))
 }
 
 /// Builds the history from parsed entries (header included or not).
-pub fn history_from_entries(entries: &[Value]) -> NativeHistory {
-    let (title, _) = summarize(entries);
+pub fn history_from_entries(entries: &[Value], policy: &AdapterPolicy) -> NativeHistory {
+    let (title, _) = summarize(entries, policy);
     let tree: Vec<&Value> = entries
         .iter()
         .filter(|e| e.get("type").and_then(Value::as_str) != Some("session"))
@@ -487,8 +489,17 @@ mod tests {
 
     #[test]
     fn history_follows_the_active_branch() {
-        let h = history_from_entries(&entries());
+        let h = history_from_entries(&entries(), &AdapterPolicy::default());
         assert_eq!(h.title.as_deref(), Some("My session"));
+        // The name is cut to the engine's policy value for harness titles.
+        let short = AdapterPolicy {
+            harness_title_chars: 2,
+            ..AdapterPolicy::default()
+        };
+        assert_eq!(
+            history_from_entries(&entries(), &short).title.as_deref(),
+            Some("My")
+        );
         assert_eq!(h.turns.len(), 2);
         let t1 = &h.turns[0];
         assert_eq!((t1.started_at, t1.completed_at), (Some(1000), Some(1300)));
@@ -545,7 +556,7 @@ mod tests {
             agent_dir_option: Some(agent.path().into()),
             ..Default::default()
         };
-        let scan = list_sessions(&inputs, cwd.path()).unwrap();
+        let scan = list_sessions(&inputs, cwd.path(), &AdapterPolicy::default()).unwrap();
         assert!(scan.unreadable.is_empty(), "{:?}", scan.unreadable);
         let list = scan.sessions;
         let ids: Vec<&str> = list.iter().map(|s| s.native_session_id.as_str()).collect();
@@ -584,7 +595,7 @@ mod tests {
             agent_dir_option: Some(agent.path().into()),
             ..Default::default()
         };
-        let scan = list_sessions(&inputs, cwd.path()).unwrap();
+        let scan = list_sessions(&inputs, cwd.path(), &AdapterPolicy::default()).unwrap();
         let ids: Vec<&str> = scan
             .sessions
             .iter()

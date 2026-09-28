@@ -16,6 +16,9 @@ use crate::wire::{
 
 // ----- tool calls ---------------------------------------------------------------------------
 
+/// Devin's tool that starts a sub-agent (its `cognition.ai/inferenceToolName`).
+const DEVIN_RUN_SUBAGENT: &str = "run_subagent";
+
 /// Accumulated state of one tool call (`tool_call` plus every `tool_call_update`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolState {
@@ -146,6 +149,15 @@ impl ToolState {
             .and_then(|c| i32::try_from(c).ok())
     }
 
+    /// Devin's own name of the tool (`_meta["cognition.ai/inferenceToolName"]`, e.g. `exec`,
+    /// `run_subagent`), documented in docs/adapters/acp.md.
+    pub fn inference_tool_name(&self) -> Option<&str> {
+        self.meta
+            .as_ref()?
+            .get("cognition.ai/inferenceToolName")?
+            .as_str()
+    }
+
     fn display_title(&self) -> String {
         self.title
             .clone()
@@ -201,6 +213,9 @@ impl ToolState {
                     "fetch" => ToolCategory::Fetch,
                     "think" => ToolCategory::Think,
                     "edit" | "delete" | "move" => ToolCategory::Edit,
+                    _ if self.inference_tool_name() == Some(DEVIN_RUN_SUBAGENT) => {
+                        ToolCategory::Subagent
+                    }
                     _ => ToolCategory::Other,
                 };
                 let output = self.output_text();

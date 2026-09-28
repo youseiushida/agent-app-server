@@ -175,8 +175,19 @@ data class DisplayPolicy(
      * it says "ほか n 件": a notification line fits about three short paths.
      */
     val previewFiles: Int = 3,
+    /**
+     * Running background tasks a stop or archive confirmation names (docs/android.md 30), after
+     * which it says "ほか n 件": the dialog stays readable without scrolling on a phone.
+     */
+    val dialogTaskTitles: Int = 5,
+    /**
+     * Output lines of a finished background task shown in its card (the tail); the full output
+     * has its own screen. A result summary rather than a live log, so a few lines suffice.
+     */
+    val taskOutputLines: Int = 6,
 ) {
     init {
+        require(dialogTaskTitles > 0 && taskOutputLines > 0) { "background display limits must be positive" }
         require(relativeTimeRefreshMs > 0 && workingTickMs > 0) { "refresh intervals must be positive" }
         require(commandCollapsedLines > 0 && outputRunningLines > 0 && outputExpandedLines > 0) { "command line limits must be positive" }
         require(toolInputLines > 0 && inlineDiffLines > 0 && approvalFiles > 0 && approvalInputLines > 0) { "display limits must be positive" }

@@ -2,6 +2,8 @@ package dev.aas.android.domain.timeline
 
 import dev.aas.android.domain.composer.ComposerText
 import dev.aas.android.protocol.AasJson
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.Delivery
 import dev.aas.android.protocol.InputPart
 import dev.aas.android.protocol.Interaction
@@ -66,7 +68,11 @@ sealed interface TimelineRow {
         override val key = "older"
     }
 
-    /** The start of a turn (its number and model). */
+    /**
+     * The start of a turn (its number and model). A turn the agent started by itself says why when
+     * the harness told (`Turn.trigger`, e.g. "バックグラウンド作業の完了を受けて"); such a turn
+     * that finished without any item is this divider alone.
+     */
     data class TurnStart(val turn: Turn) : TimelineRow {
         override val key = "turn-${turn.id}"
     }
@@ -111,6 +117,33 @@ sealed interface TimelineRow {
     data class Pending(val input: PendingInput) : TimelineRow {
         override val key = "pending-${input.clientRequestId}"
     }
+
+    /**
+     * The head of the バックグラウンド section (the thread's background tasks, docs/android.md
+     * 30): how many run ([running]: not ambient; [ambient]: running but not activity) and how
+     * many ended. When [expanded], the running tasks follow, then [BackgroundEndedHeader].
+     */
+    data class BackgroundHeader(val running: Int, val ambient: Int, val ended: Int, val expanded: Boolean) : TimelineRow {
+        override val key = "bg-header"
+    }
+
+    /**
+     * One background task of the section. [depth] indents a task launched by another running
+     * task under it; [parentTitle] names the task that launched it (when known).
+     */
+    data class BackgroundTaskRow(val task: BackgroundTask, val depth: Int, val parentTitle: String?) : TimelineRow {
+        override val key = backgroundTaskKey(task.id)
+    }
+
+    /** The ended tasks of the section, folded by default; when [expanded] they follow. */
+    data class BackgroundEndedHeader(val count: Int, val expanded: Boolean) : TimelineRow {
+        override val key = "bg-ended"
+    }
+
+    companion object {
+        /** The row key of a background task (a backgrounded item's chip scrolls to it). */
+        fun backgroundTaskKey(taskId: String) = "bg-task-$taskId"
+    }
 }
 
 /** The kinds folded into activity groups. */
@@ -118,40 +151,114 @@ fun Item.isActivity(): Boolean =
     this is Item.Reasoning || this is Item.CommandExecution || this is Item.FileChangeItem || this is Item.ToolCall
 
 object Timeline {
+    /** [build]'s key of the バックグラウンド section's open state (default: open while a task runs). */
+    const val BACKGROUND_SECTION = "bg-section"
+
+    /** [build]'s key of the ended tasks' open state (default: folded). */
+    const val BACKGROUND_ENDED = "bg-ended"
+
     /**
      * The rows of a thread, top to bottom.
      *
      * * Each loaded turn: its start, then its items and interactions in the order they happened
      *   (item `startedAt` / interaction `createdAt`, both the daemon's clock), then 作業中 while
-     *   it runs or its end summary once finished.
+     *   it runs or its end summary once finished. A turn the agent started by itself for a
+     *   reason the harness named (`trigger`) that completed without items is its start alone.
+     * * Interactions that belong to no turn (asked by a background task, or while no turn ran)
+     *   follow the loaded turn that started last before they were asked; before the first
+     *   loaded turn they come first.
      * * Two or more consecutive activity items form a group; an interaction or any other item
      *   ends the group. A group is expanded when [expanded] says so, otherwise when it is the
      *   last group of a running turn (the live activity stays visible).
      * * Items and interactions of turns that are not loaded (a live event before its turn) come
-     *   after the turns, then the messages still in the outbox.
+     *   after the turns, then the バックグラウンド section ([backgroundRows]), then the messages
+     *   still in the outbox.
      */
     fun build(state: ThreadState, pending: List<PendingInput>, expanded: Map<String, Boolean>): List<TimelineRow> {
         val rows = ArrayList<TimelineRow>()
         if (state.hasMoreBefore) rows += TimelineRow.LoadOlder
         val itemsByTurn = state.items.groupBy { it.turnId }
-        val interactionsByTurn = state.interactions.groupBy { it.turnId }
+        val interactionsByTurn = state.interactions.filter { it.turnId != null }.groupBy { it.turnId }
         val known = state.turns.map { it.id }.toSet()
-        for (turn in state.turns) {
+        val turnless = state.interactions.filter { it.turnId == null }.sortedWith(compareBy<Interaction> { it.createdAt }.thenBy { it.id })
+        val firstStart = state.turns.firstOrNull()?.startedAt
+        val beforeTurns = if (firstStart == null) emptyList() else turnless.filter { it.createdAt < firstStart }
+        beforeTurns.forEach { rows += TimelineRow.InteractionRow(it) }
+        state.turns.forEachIndexed { index, turn ->
             rows += TimelineRow.TurnStart(turn)
             val items = itemsByTurn[turn.id].orEmpty()
             val entries = merge(items, interactionsByTurn[turn.id].orEmpty())
+            val collapsed = turn.trigger != null && turn.status == TurnStatus.Completed && entries.isEmpty()
             appendEntries(rows, entries, expanded, running = turn.status == TurnStatus.Running)
-            if (turn.status == TurnStatus.Running) {
-                rows += TimelineRow.Working(turn, items.lastOrNull { it.status == ItemStatus.InProgress && it !is Item.UserMessage })
-            } else {
-                rows += TimelineRow.TurnEnd(turn)
+            when {
+                turn.status == TurnStatus.Running ->
+                    rows += TimelineRow.Working(turn, items.lastOrNull { it.status == ItemStatus.InProgress && it !is Item.UserMessage })
+                !collapsed -> rows += TimelineRow.TurnEnd(turn)
             }
+            val nextStart = state.turns.getOrNull(index + 1)?.startedAt
+            turnless.filter { it.createdAt >= turn.startedAt && (nextStart == null || it.createdAt < nextStart) }
+                .forEach { rows += TimelineRow.InteractionRow(it) }
         }
         val orphanItems = state.items.filter { it.turnId !in known }
-        val orphanInteractions = state.interactions.filter { it.turnId == null || it.turnId !in known }
+        val orphanInteractions = state.interactions.filter { it.turnId != null && it.turnId !in known } +
+            if (firstStart == null) turnless else emptyList()
         appendEntries(rows, merge(orphanItems, orphanInteractions), expanded, running = false)
+        rows += backgroundRows(state.backgroundTasks, expanded)
         pending.forEach { rows += TimelineRow.Pending(it) }
         return rows
+    }
+
+    /**
+     * The バックグラウンド section: nothing without tasks. Its header, and when open (by
+     * [expanded], else while a task runs) the running tasks — each followed by the running tasks
+     * it launched, indented — then the ended tasks folded under their own header (in the order
+     * they ended, the latest nearest the composer).
+     */
+    fun backgroundRows(tasks: List<BackgroundTask>, expanded: Map<String, Boolean>): List<TimelineRow> {
+        if (tasks.isEmpty()) return emptyList()
+        val byId = tasks.associateBy { it.id }
+        val running = tasks.filter { it.status == BackgroundTaskStatus.Running }
+        val ended = tasks.filter { it.status != BackgroundTaskStatus.Running }
+            .sortedWith(compareBy<BackgroundTask> { it.endedAt ?: Long.MAX_VALUE }.thenBy { it.id })
+        val open = expanded[BACKGROUND_SECTION] ?: running.isNotEmpty()
+        val endedOpen = expanded[BACKGROUND_ENDED] ?: false
+        val rows = ArrayList<TimelineRow>()
+        rows += TimelineRow.BackgroundHeader(
+            running = running.count { !it.ambient },
+            ambient = running.count { it.ambient },
+            ended = ended.size,
+            expanded = open,
+        )
+        if (!open) return rows
+        for ((task, depth) in treeOrder(running)) {
+            rows += TimelineRow.BackgroundTaskRow(task, depth, task.parentTaskId?.let { byId[it]?.title })
+        }
+        if (ended.isNotEmpty()) {
+            rows += TimelineRow.BackgroundEndedHeader(ended.size, endedOpen)
+            if (endedOpen) ended.forEach { rows += TimelineRow.BackgroundTaskRow(it, 0, it.parentTaskId?.let { id -> byId[id]?.title }) }
+        }
+        return rows
+    }
+
+    /**
+     * Tasks in start order with each one's children (`parentTaskId` among [tasks]) right after
+     * it, one level deeper. A task whose parent is not in [tasks] is a root.
+     */
+    private fun treeOrder(tasks: List<BackgroundTask>): List<Pair<BackgroundTask, Int>> {
+        val ids = tasks.map { it.id }.toSet()
+        val byStart = tasks.sortedWith(compareBy<BackgroundTask> { it.startedAt }.thenBy { it.id })
+        val children = byStart.filter { it.parentTaskId in ids }.groupBy { it.parentTaskId }
+        val out = ArrayList<Pair<BackgroundTask, Int>>(tasks.size)
+        val placed = HashSet<String>()
+        fun visit(task: BackgroundTask, depth: Int) {
+            if (!placed.add(task.id)) return
+            out += task to depth
+            children[task.id].orEmpty().forEach { visit(it, depth + 1) }
+        }
+        byStart.filter { it.parentTaskId !in ids }.forEach { visit(it, 0) }
+        // A cycle of parents (never reported by a harness) still shows every task once.
+        byStart.forEach { visit(it, 0) }
+        return out
     }
 
     private sealed interface Entry {

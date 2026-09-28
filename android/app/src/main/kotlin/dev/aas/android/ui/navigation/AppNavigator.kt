@@ -85,16 +85,28 @@ class AppNavigator(private val nav: NavHostController) {
 
     fun openArchived(projectId: String) = nav.navigate(ArchivedThreadsRoute(projectId))
 
-    fun importSession(projectId: String) = nav.navigate(ImportSessionRoute(projectId))
+    /** 「PC のセッションを取り込む」 of [projectId], listing [harnessId]'s sessions first (`/resume`). */
+    fun importSession(projectId: String, harnessId: String? = null) = nav.navigate(ImportSessionRoute(projectId, harnessId))
 
-    /** An imported session: its thread replaces the import screen. */
+    /**
+     * An imported session (or one imported before): its thread replaces the import screen. When
+     * that is the thread `/resume` came from (its own session chosen again), the import screen
+     * only closes, so the thread is not on the back stack twice.
+     */
     fun sessionImported(threadId: String) {
+        val below = nav.previousBackStackEntry
+        if (below != null && below.destination.hasRoute<ThreadRoute>() && below.toRoute<ThreadRoute>().threadId == threadId) {
+            nav.popBackStack()
+            return
+        }
         nav.navigate(ThreadRoute(threadId)) { popUpTo<ImportSessionRoute> { inclusive = true } }
     }
 
     fun openDiff(threadId: String, turnId: String?) = nav.navigate(DiffRoute(threadId, turnId))
 
     fun openOutput(threadId: String, itemId: String) = nav.navigate(ItemOutputRoute(threadId, itemId))
+
+    fun openTaskOutput(threadId: String, taskId: String) = nav.navigate(TaskOutputRoute(threadId, taskId))
 
     fun openImage(blobId: String) = nav.navigate(ImageRoute(blobId))
 

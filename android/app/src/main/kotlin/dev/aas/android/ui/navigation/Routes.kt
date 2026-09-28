@@ -40,9 +40,13 @@ data class NewThreadRoute(val projectId: String, val harnessId: String? = null)
 @Serializable
 data class ArchivedThreadsRoute(val projectId: String)
 
-/** Import a harness's own session into the project (`native/list`, `native/import`). */
+/**
+ * Import a harness's own session into the project (`native/list`, `native/import`).
+ * [harnessId]: the harness to list first (`/resume` passes its thread's); without it the
+ * project's default harness, else the first that can list its sessions.
+ */
 @Serializable
-data class ImportSessionRoute(val projectId: String)
+data class ImportSessionRoute(val projectId: String, val harnessId: String? = null)
 
 /** The diff of a turn ([turnId]) or of the whole thread (`thread/diff`). */
 @Serializable
@@ -51,6 +55,10 @@ data class DiffRoute(val threadId: String, val turnId: String? = null)
 /** The full output of a command or tool call (inline or its blob). */
 @Serializable
 data class ItemOutputRoute(val threadId: String, val itemId: String)
+
+/** The full output of a finished background task (`result.output` or its blob). */
+@Serializable
+data class TaskOutputRoute(val threadId: String, val taskId: String)
 
 /** An image attachment in full. */
 @Serializable

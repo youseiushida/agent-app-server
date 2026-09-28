@@ -4,8 +4,10 @@ pi（earendil-works/pi、`@earendil-works/pi-coding-agent`）を RPC モード�
 
 - 検証済みの環境: **pi 0.85.1 / Windows 11**
   - 実機で確認した内容: プローブ、ターン、承認ゲート、実行中のモード切り替え、終了、履歴の取り込み、resume、fork
+  - 実機で記録・確認した内容（2026-09-28）: 拡張が自分で始める実行（`sendMessage` の `triggerTurn`、`sendUserMessage`）、その実行とプロンプトの競合、`agent_settled` のハンドラから始まる実行、その実行の中断と承認ゲート、ターンの外のダイアログ（3章、6章）
 - 実装: `crates/aas-adapter-pi`
 - テスト用の記録: `crates/aas-adapter-pi/tests/fixtures/`
+- ライブテスト用の拡張: `crates/aas-adapter-pi/tests/extension/aas-live.ts`（pi に自分で実行やダイアログを始めさせる。11章）
 
 ## 1. 起動
 
@@ -49,7 +51,7 @@ pi [config.args…] --mode rpc <セッション引数> [--session-dir <options.s
 | `get_commands` | `/` コマンドの一覧 |
 | `set_model` / `set_thinking_level` | 設定の変更（すぐ反映される） |
 | `clear_queue` | ターンの終了時に届かなかった steer を捨てる |
-| `extension_ui_response` | 承認・質問への回答 |
+| `extension_ui_response` | 承認・質問への回答。エンジンが期限切れにした要求への答え（`cancelled: true`。6章） |
 
 使わないもの:
 - `follow_up`: キューはエンジンが持つ。
@@ -61,14 +63,16 @@ pi [config.args…] --mode rpc <セッション引数> [--session-dir <options.s
 
 ## 3. ターンのライフサイクル（明示的なシグナルだけで判定する）
 
+pi（0.85.1）は一度に1つの実行（run）だけを動かす。実行は `agent_start` で始まり `agent_settled`（pi の定義で「リトライ、圧縮後のリトライ、キューからの継続がもう残っていない」）で終わる。実行の中のエージェントループ（最初のものと、リトライや継続のたび）は `agent_start` から `agent_end` まで。`agent_end` のあとにはリトライや圧縮が続くことがあるので、`agent_end` だけでは終わりと判定しない。
+
+### 3.1 利用者のターン
+
 | 出来事 | 判定 |
 |---|---|
 | `prompt` の応答 `success:true`、または最初の `agent_start` | `TurnStarted`（どちらか先に来た方で1回だけ） |
-| `prompt` の応答 `success:false` | `TurnCompleted { failed, kind: "harnessError" }`（pi が開始前に拒否した） |
-| `agent_settled` | `TurnCompleted`（`get_session_stats` の応答待ちがあれば、最後の応答を受けてから） |
+| `prompt` の応答 `success:false` | `TurnCompleted { failed, kind: "harnessError" }`（pi が開始前に拒否した）。ただし 3.3 の場合を除く |
+| `agent_settled` | `TurnCompleted`（`get_session_stats` の応答待ちがあれば、最後の応答を受けてから。3.4 の場合を除く） |
 
-- `agent_settled` は、pi の定義で「リトライ、圧縮後のリトライ、キューからの継続がもう残っていない」状態。
-- `agent_end` はそのあとにリトライや圧縮が続くことがあるので、完了の判定には使わない。
 - 拡張コマンドなど、エージェントが動かずに処理される prompt には `agent_settled` が来ない。そのため次の手順で判定する。
   - `prompt` の応答を受けたら `get_state` を送る。
   - pi は、エージェントを動かす prompt に応答した直後に、同期的に `isStreaming = true` を立てる（`agent-session.js` の `preflightResult(true)` → `_runAgentPrompt` を確認済み）。
@@ -82,14 +86,57 @@ pi [config.args…] --mode rpc <セッション引数> [--session-dir <options.s
   - それ以外 → `completed`
 - 使用量は、そのターンの assistant メッセージの `usage` の合計（`TurnUsage` を `message_end` ごとに出す）。
 - ターンの終了時の処理
-  - 未回答のダイアログは `InteractionWithdrawn` にする。
   - まだ届いていない steer（`queue_update` の `steering`）があれば `clear_queue` で捨て、`Notice(steerNotDelivered)` で知らせる。
+  - 未回答のダイアログは閉じない（pi はまだ答えを待っている）。そのターンに属していたものはエンジンが期限切れにし、`expire_request` で pi に答える（6章）。
 - 実行中にプロセスが終了した場合は `Exited` だけを出す（`TurnCompleted` は出さない。ターンを失敗にするのはエンジン）。
 - `/compact` のターン（8章）: `compaction_start` か `compact` の応答のうち先に来た方で `TurnStarted`、`compact` の応答で `TurnCompleted`。
   - 成功 → `completed`（usage は応答の `usage`。要約を作ったモデル呼び出しの分）。
   - 失敗 → 中断を要求していれば `interrupted`（pi は "Compaction cancelled" で失敗させる）、そうでなければ `failed`（kind `harnessError`、メッセージは pi の `error`。例: "Nothing to compact (session too small)"）。
-  - pi の `compact()` は先に `abort()` を呼ぶが、`send` はターンが動いていないときにしか呼ばれないので、実行中のターンを止めることはない。
+  - pi の `compact()` は先に `abort()` を呼ぶ。pi が自分で始めた実行が動いている間は、`send` が `TurnInProgress` を返して `compact` を送らないので（3.2）、その実行を止めることはない。
   - このターンでは `agent_settled` を完了に使わない。
+
+### 3.2 pi が自分で始める実行（エージェント起点のターン）
+
+pi 本体にはサブエージェントもバックグラウンドの bash もない（pi の README）。ただし拡張は、プロンプトなしで実行を始められる: `pi.sendMessage(…, { triggerTurn: true })`（custom メッセージ）、`pi.sendUserMessage(…)`（ユーザーメッセージ）。タイマー、ファイル監視、イベントのハンドラなどから呼ばれる。この実行にも `agent_start` … `agent_settled` が必ず出る（実機で記録）。
+
+| 出来事 | 判定 |
+|---|---|
+| ターンがないときの `agent_start` | `TurnStarted`（入力なしのターン。design.md 5.5）。以降は通常のターンと同じに対応させる（アイテム、使用量、`get_session_stats`） |
+| その実行の `agent_settled` | `TurnCompleted`（`trigger` は付けない。pi は実行を始めた理由を明示しない） |
+| その間の `interrupt` | `abort`（実機で記録: `stopReason: aborted` → `interrupted`） |
+| その間の `send` | `AdapterError::TurnInProgress`。何も送らない（pi は実行中の prompt を拒否する。実機で記録）。エンジンは入力をこのターンのあとに送り直す |
+
+- 実行を始めたメッセージは Notice で見せる（エンジンはこのターンに userMessage を作らないため）。
+  - custom メッセージ（`display: true`）→ Notice（`extensionMessage`）。すべてのターンで同じ（4章）。
+  - ユーザーメッセージ（`sendUserMessage`）→ Notice（`extensionPrompt`）。実行の最初の assistant メッセージより前の `message_end`（role `user`）だけ。利用者が打った入力ではない実行（このターンと、拡張コマンドが始めた実行）に限る。利用者の steer は最初の assistant メッセージのあとに届くので含まれない。
+- 能力 `backgroundTasks` / `backgroundStop` は false。pi の拡張が始める作業は、ターンの外で動き続けるバックグラウンドタスクではなく、上のとおりエージェント起点のターンになる（動いている間はターンが running なので、アイドル回収もスリープもされず、スマホに見え、中断できる）。
+- 拡張が常駐させるリソース（監視、タイマー、ソケット）自体にはシグナルがないので扱わない（design.md 1章の範囲外）。
+
+### 3.3 プロンプトと、pi が自分で始めた実行の競合
+
+pi は通常の prompt に、前処理（`input` ハンドラ、自動圧縮、認証、`before_agent_start`）を終えてから応答する。その前に拡張が実行を始めると、pi は prompt を `success:false`（"Agent is already processing…"）で拒否する。記録では次の順で届いた: `agent_start`（拡張の実行）→ `turn_start` → prompt の応答 `success:false` → その実行の続き。
+
+- 通常の prompt（拡張コマンドでないもの）では、`send` は pi の応答を待ってから返る。
+- 通常の prompt では、pi は自分の実行を始める前に応答する（`preflightResult(true)` → `_runAgentPrompt`）。したがって、応答より前の `agent_start` は pi が自分で始めた実行。その時点でその実行のターンを始める（`TurnStarted`）。
+- 応答で決める（イベントの順序だけで判定し、エラー文は読まない）。
+
+| 応答 | 判定 |
+|---|---|
+| `success:false` で、その前に pi 自身の実行の `agent_start` があった | その実行はエージェント起点のターンのまま（終わっていれば、その場で `TurnCompleted`）。`send` は `TurnInProgress` を返し、エンジンが入力をそのターンのあとに送り直す |
+| `success:false` で、その前に実行がなかった | 3.1 のとおり `TurnCompleted { failed }`。`send` は `Ok` |
+| `success:true` で、その前に pi 自身の実行があった | pi は prompt を受け付けた。それまでの実行は、このターンの一部として扱う（1つのターン） |
+
+- `send` が待つのをやめる明示的なシグナル（pi が prompt を処理中で、利用者か時間が必要なもの）: 前処理のダイアログ（`input` や `before_agent_start` のハンドラが尋ねる。エンジンが中継できるように返る）、prompt の前の圧縮の `compaction_start`、pi の出力の終わり（`Closed`）。
+- 待つのをやめたあとで、実行が始まってから拒否された場合: その実行はすでにこのターンに表示されているので、このターンのまま実行の終わりで閉じ、`Notice(promptNotTaken)`（pi の `error` をそのまま付ける）で入力が受け付けられなかったことを知らせる。
+- 拡張コマンド（`get_commands` の `source: "extension"`。pi と同じく、`/` で始まり最初の空白までの名前が一致するもの）は待たない。pi は実行中でもすぐに実行し、ハンドラが終わってから応答するので、応答より前の `agent_start` はそのコマンドが始めた実行（このターンのもの）として扱う。
+
+### 3.4 実行の終わりから始まる実行
+
+拡張は `agent_settled` のハンドラから新しい実行を始められる。pi は新しい実行の `agent_start` を、古い実行の `agent_settled` より前に書く（実機で記録: `agent_end` → `agent_start` → `agent_settled` → `turn_start` …）。
+
+- エージェントループが動いている（最後の `agent_end` のあとに `agent_start` があった）ときの `agent_settled` は、それまでの実行の終わり。ターンをその場で完了させ（`get_session_stats` の応答は待たない）、動いている実行にエージェント起点のターンを始める。
+- ターンが `get_session_stats` の応答だけを待っている（実行は終わっている）ときの `agent_start` も、新しい実行。ターンをその場で完了させ、新しいターンを始める。遅れて届いた応答は古いターンのものなので、新しいターンには付けない。
+- この判定は `agent_end` が必ず出ることに依る（pi 0.85.1 の `runAgentLoop` と `handleRunFailure` で確認。記録したすべての実行で出ている）。
 
 ## 4. イベントの対応表
 
@@ -99,7 +146,9 @@ pi [config.args…] --mode rpc <セッション引数> [--session-dir <options.s
 | `message_update` の `thinking_start/delta` | `reasoning` アイテムと delta |
 | `text_end` / `thinking_end` | 最終テキストを覚えておく（完了は `message_end` で出す） |
 | `message_end`（assistant） | 各ブロックを最終内容で完了させる（`stopReason:aborted` なら `interrupted`）。usage を足す。`error` と `length` は Notice |
-| `message_end`（custom かつ `display:true`） | Notice（`extensionMessage`） |
+| `message_end`（custom かつ `display:true`） | Notice（`extensionMessage`）。`message_start` には出さない（同じメッセージが2回にならないように） |
+| `message_end`（user。利用者が打っていない実行の、最初の assistant メッセージより前） | Notice（`extensionPrompt`。3.2） |
+| `agent_start` / `agent_end` / `agent_settled` | ターンとエージェントループの境目（3章） |
 | `tool_execution_start` | ツールのアイテム（キーは `tool:<toolCallId>`、5章） |
 | `tool_execution_update` | `partialResult`（それまでの累積）との差分を delta で出す。前方一致しない場合は `ItemUpdated` で丸ごと置き換える |
 | `tool_execution_end` | 最終内容で完了。ゲートで拒否したものは `declined`、`isError` なら `failed`、それ以外は `completed` |
@@ -108,13 +157,13 @@ pi [config.args…] --mode rpc <セッション引数> [--session-dir <options.s
 | `auto_retry_start` | Notice（`autoRetry`）。失敗の `auto_retry_end` は Notice にして、ターンを failed にする |
 | `summarization_retry_scheduled` | Notice |
 | `extension_error` | Notice（`extensionError`） |
-| `turn_start/end`、`agent_end`、`queue_update`、user と toolResult の message、`toolcall_*` の delta、`summarization_retry_attempt_start/finished`、`bash_execution_update` | 無視（ほかの経路で扱っている） |
-| ターンの外で来たアイテム系のイベント、未知のイベント、JSON でない行 | `Native` |
+| `turn_start/end`、`queue_update`、user（上の場合を除く）と toolResult の message、`toolcall_*` の delta、`summarization_retry_attempt_start/finished`、`bash_execution_update` | 無視（ほかの経路で扱っている） |
+| ターンの外で来たアイテム系のイベント（実行の外で拡張が追加した custom メッセージなど）、未知のイベント、JSON でない行 | `Native` |
 
 - 次の場合は、ブロックが一度も配信されていないので、`message_end` の内容をまるごと1件として報告する。
   - ブロックの配信（ストリーミング）をしないプロバイダ
   - `_start` の来なかったブロック
-- ユーザーメッセージ（steer を含む）はエンジンが作るので、アダプタは出さない。
+- 利用者のメッセージ（steer を含む）はエンジンが作るので、アダプタは出さない（利用者が打っていない実行の入力は Notice。3.2）。
 
 ## 5. ツールの対応表
 
@@ -169,6 +218,13 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
   - ダイアログに timeout がなく、ターンの abort シグナルを渡していること
   - 閉じた理由の報告（answered / aborted）と、確認しないツールでは報告しないこと
 
+### ダイアログの所属と期限切れの答え
+
+- ダイアログは、回答（`respond`）、期限切れの答え（`expire_request`）、ゲートの `dialogClosed` の報告、プロセスの終了のどれかまで開いたまま。ターンの終わりでは閉じない。以前はターンの終わりで取り下げて（`InteractionWithdrawn`）いたが、pi は取り下げておらず答えを待ち続けるので、拡張がそこで止まったままになっていた。
+- 所属はエンジンが決める（design.md 8章）: ターンの実行中に届いたものはそのターン、ターンがないときに届いたもの（拡張のタイマーやイベントのハンドラが尋ねるもの。実機で記録）はスレッド。スレッドのものはターンをまたいで残り、利用者が答えられる。
+- 期限切れの答え: エンジンがターンの終わりでそのターンのダイアログを期限切れにすると、`expire_request` で pi に `{"type":"extension_ui_response","id":…,"cancelled":true}` を送る（辞退と同じ答え。既定の `expire_request` のまま。pi は `select` / `input` / `editor` を未回答、`confirm` を false として解決する）。pi が自分ですでに閉じたダイアログ（timeout や abort のシグナル）への答えは、pi が無視する（未知の id）。ゲートのダイアログは実行がそれを待っているので、ターンの終わりに開いていることはない（中断では `dialogClosed` で先に取り下がる）。
+- pi は拡張のダイアログに所属を付けない（どの実行やハンドラが尋ねたかの信号がない）。そのため、実行の中で届いたが実行と関係なく待たれるダイアログ（イベントのハンドラが待たずに尋ねたものなど）も、そのターンの終わりで辞退の答えになる。
+
 ### ほかの拡張のダイアログ（`method` で対応させる）
 
 | method | Interaction |
@@ -181,7 +237,7 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
 | `setStatus` / `setWidget` / `setTitle` / `set_editor_text` | 無視（TUI 専用） |
 
 - **ほかの拡張の `timeout` 付きのダイアログ**: 期限が来ると pi が既定値で自動的に解決するが、クライアントには何も通知しない（`rpc-mode.js` の `createDialogPromise`。ゲートからも観測できない）。
-  - アダプタは時間を計って取り下げたりしない（経過時間からの推定になるため）。Interaction はターンの終了（`agent_settled`）かプロセスの終了で閉じる。
+  - アダプタは時間を計って取り下げたりしない（経過時間からの推定になるため）。Interaction は、回答、エンジンによる期限切れ（ターンに属していれば、そのターンの終わり）、プロセスの終了で閉じる。
   - 質問の本文（confirm は detail）に「pi answers this dialog with its default after N s without a reply.」と書き添え、pi が自分で答えることをユーザーに知らせる（N は要求の `timeout` を秒に切り上げたもの）。
   - 期限のあとに届いた回答は、pi が捨てる（未知の id の `extension_ui_response` は無視される）。
 
@@ -214,13 +270,16 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
 - ほかの組み込みコマンド（`/model`、`/new`、`/fork` など）は、ピッカーや daemon の操作で扱うか、範囲外（`bash` の直接実行など）。RPC の `export_html`、`get_fork_messages` / `fork`（途中からの fork）、`set_session_name` は使わない（それぞれ HTML の出力は範囲外、途中からの fork は design.md の範囲外、スレッド名は daemon が持つ）。
 - ライブのセッションがあればそのプロセスに聞き、なければ `--no-session` の一時プロセスを cwd で起動して聞く。
 - TUI 専用の組み込みコマンド（`/settings` など）は RPC では動かないので含まれない（pi の仕様）。
+- セッションを切り替えるコマンド（`session_switching_commands`）: `new`、`resume`、`fork`、`clone`、`tree`。エンジンが `command/list` から除く（design.md 9.5）。
+  - pi の組み込みのセッション操作の名前（pi の docs の usage.md「Sessions」）。組み込みは TUI 専用で `get_commands` には出ないが、拡張が同じ名前でコマンドを登録すると、RPC でも `ctx.newSession` / `ctx.switchSession` / `ctx.fork` / `ctx.navigateTree` で同じことができる。スレッドの下でセッション（や木の位置）が替わると履歴が食い違うので出さない。
+  - 別の名前でこれらを呼ぶ拡張のコマンドは区別できない（説明文から推測しない）。
 
 ## 9. ネイティブセッション（取り込み）
 
 - 置き場所: `options.session_dir` → `PI_CODING_AGENT_SESSION_DIR` → 設定の `sessionDir`（`<cwd>/.pi/settings.json` を `<agentDir>/settings.json` より優先。pi のマージと同じ）→ 既定の `<agentDir>/sessions/<プロジェクトごとのフォルダ>/*.jsonl`。
 - cwd との対応付けは、各ファイルのヘッダに書かれた `cwd` で行う。フォルダ名の復号はしない。
   - Windows では大文字小文字を区別せず、正規化したパスで比較する。
-- タイトルは、最新の `session_info` の name。なければ最初のユーザーメッセージの最初の行。
+- タイトルは、最新の `session_info` の name（`policy.harness_title_chars` で切る）。なければ最初のユーザーメッセージの最初の行（`policy.first_message_title_chars` で切り、`…` を付ける。エンジンの規則と同じ）。
 - 履歴は有効なブランチだけ（ファイル順で最後のエントリから根まで。pi の `_buildIndex` と同じ）。
   - ユーザーメッセージのたびに新しいターンにする。
   - assistant のブロックは reasoning / agentMessage / ツールのアイテムにする（toolResult と組み合わせる）。
@@ -248,7 +307,7 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
   - 応答を受けたら、そのターンの使用量に context を付けた `TurnUsage` を出す。`agent_settled`（または「エージェントが動いていない」という確認）の時点で応答待ちがあれば、最後の応答を受けてからターンを完了させる。そのターンの最後の値が必ずそのターンに付く。
   - 応答を待つ上限は `policy.handshake_timeout`。それまでに答えがなければ context なしで進める（ログに警告）。
   - 実機（0.85.1）の応答の形: `{"sessionId", "userMessages", …, "tokens": {…}, "cost", "contextUsage": {"tokens": 0, "contextWindow": 262144, "percent": 0}}`。
-- 能力: interrupt, steer, approvals（ゲート）, questions, resume, fork, images, modelSwitchLive, nativeSessions が、すべて true。
+- 能力: interrupt, steer, approvals（ゲート）, questions, resume, fork, images, modelSwitchLive, nativeSessions が、すべて true。backgroundTasks と backgroundStop は false（pi の拡張が始める実行はエージェント起点のターンになる。3.2）。
 - プローブの内容
   - `pi --version` を実行する。
   - `--no-session` の一時プロセスで `get_available_models` と `get_state` を取る。
@@ -257,19 +316,22 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
 
 ## 11. テスト
 
-- 単体テスト（28件）: 対応表、ゲートのエンコードと閉じた理由の報告、timeout の注記、コマンド（`/compact` の追加と判定）、パスの解決、履歴、wire。
-- replay（20件）: 記録したトランスクリプトを duplex の上で再生する。偽の pi は `get_state`、`get_session_stats`（0.85.1 で記録した応答の形）、`clear_queue` に自分で答える。
+- 単体テスト（33件）: 対応表（custom メッセージを `message_end` でだけ Notice にすること、利用者が打っていない実行の入力の Notice）、ゲートのエンコードと閉じた理由の報告、timeout の注記、コマンド（`/compact` の追加と判定、拡張コマンドの判定、セッションを切り替える名前の除外）、パスの解決、履歴（タイトルの長さはポリシー値）、wire。
+- replay（35件）: 記録したトランスクリプトを duplex の上で再生する。偽の pi は `get_state`、`get_session_stats`（0.85.1 で記録した応答の形）、`clear_queue` に自分で答える。
   - 通常のターン（コンテキストの使用量が `TurnUsage` と `TurnCompleted` に付く）、ゲートでの許可、フィードバック付きの拒否、steer、中断（`agent_start` の前の中断は、その `agent_start` でもう一度送ること）
   - 動かずに終わる prompt、拒否された prompt、二重の send
   - ターン中のプロセス終了、shutdown、ハンドシェイク（`CommandsChanged` に `compact` が入る）
-  - timeout 付きのダイアログを時間で取り下げないこと（ターンの終了で取り下げる）
+  - timeout 付きのダイアログを時間で取り下げないこと（ターンの終わりでも取り下げず、エンジンの期限切れで `cancelled: true` を答える）
   - ゲートの `dialogClosed`（aborted）の報告で取り下げ、中断の要求だけでは取り下げないこと
   - `agent_settled` が `get_session_stats` の応答を待つこと、`tokens: null` なら context を付けないこと
   - `/compact`（成功、実機で記録した "Nothing to compact" の失敗、中断）、pi 自身に `compact` コマンドがあるときは横取りしないこと
+  - pi が自分で始める実行（2026-09-28 に実機で記録した `agent_*.jsonl`、`dialog_outside_turn.jsonl`。応答の id は `resp-<n>` に置き換えた）: custom メッセージとユーザーメッセージで始まる実行が入力なしのターンになること、その間の `send` が何も書かずに `TurnInProgress` を返すこと、競合（拒否 → `TurnInProgress`、先に終わった実行、受け付け → 1つのターン、待つのをやめたあとの拒否 → `promptNotTaken`）、`agent_settled` のハンドラから始まる実行が別のターンになること、context の応答待ちの間に始まる実行、中断、実行の中の承認ゲート、ターンの外のダイアログとその回答、ターンをまたいで残るダイアログ
+  - `send` の待ち: 応答まで待つこと、前処理のダイアログと圧縮で待つのをやめること、pi の終了で `Closed` になること
 - ゲートの拡張のテスト（TypeScript、12件）: 6章。
-- live（`AAS_LIVE_TESTS=1 cargo test -p aas-adapter-pi --test live -- --ignored`）
-  - 本物の pi でプローブ → 3ターン（通常、ゲートでの承認、auto に切り替え）→ コマンド → 終了 → 一覧 → 履歴 → resume → fork を確かめる。
-  - セッションは一時フォルダ（`session_dir`）に作るので、ユーザーのセッション一覧は汚さない。
+- live（`AAS_LIVE_TESTS=1 cargo test -p aas-adapter-pi --test live -- --ignored`）。セッションは一時フォルダ（`session_dir`）に作るので、ユーザーのセッション一覧は汚さない。
+  - `live_session_lifecycle`: 本物の pi でプローブ → 3ターン（通常、ゲートでの承認、auto に切り替え）→ コマンド → 終了 → 一覧 → 履歴 → resume → fork を確かめる。
+  - `live_runs_pi_starts_by_itself`: テスト用の拡張 `tests/extension/aas-live.ts` を `-e` で読み込み、pi に自分で実行を始めさせて、3章の対応（エージェント起点のターン、その間の `TurnInProgress`、競合、`agent_settled` からの実行、ユーザーメッセージの Notice、中断、実行の中の承認、ターンの外のダイアログ）を確かめる。すべての子プロセスが終わったことも確かめる。
+  - 2026-09-28 に pi 0.85.1（モデル orcarouter/deepseek/deepseek-v4.1-flash、effort low）で2件とも成功した（54 秒）。
 
 ## 12. 制限事項
 
@@ -277,9 +339,14 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
 - `write` はファイルを新規作成したのか上書きしたのか区別できない（常に update、diff なし）。正確な差分はエンジンの git 差分で見る。
 - 取り込んだ履歴の画像は blob にしない（テキストだけ）。
 - steer で送ったメッセージは、取り込んだ履歴では独立したターンになる（ファイルに steer の目印がないため）。
-- 拡張コマンドが prompt の応答のあとに非同期で始めた実行は、ターンにならず `Native` で流す。
+- 拡張が常駐させるリソース（監視、タイマー、ソケット）にはシグナルがないので、それを理由にプロセスを保持しない（design.md 1章の範囲外）。アイドル回収でプロセスが止まるとリソースも止まり、次の起動で拡張が作り直す。
+- 通常の prompt の `send` は pi の応答を待つ（3.3）。その上限はエンジンの `send` の期限（`policy.handshake_timeout`）。ダイアログも圧縮もないまま前処理がそれより長くかかる（遅い `before_agent_start` ハンドラ、認証の更新など）と、エンジンはターンをタイムアウトで失敗にする。pi がそのあと prompt を実行すると、その実行はエージェント起点のターンとして記録される。
+- `get_commands` を読んだあとで拡張が登録したコマンドは、通常の prompt として応答を待つ（そのハンドラがダイアログも圧縮もなく長く動くと、上と同じになる）。
+- pi 自身の競合: prompt が「実行中か」の確認を通ったあとで拡張が実行を始めると、pi は prompt を受け付けたうえで、自分の実行を二重に始められずに prompt を捨てる（pi 0.85.1 の `agent.prompt` の二重起動。信号がない）。アダプタは受け付けの応答どおり、動いている実行を利用者のターンとして扱う。
+- `/compact` を送った直後に拡張が実行を始めると、pi の `compact()` がその実行を中断してから圧縮する。その実行はこの `/compact` のターンに表示される（`compact` の応答は待たないため）。
+- 拡張のダイアログがどの実行に属するかの信号はない。実行の中で届いたダイアログは、そのターンの終わりで辞退の答えになる（6章）。
 - 承認ゲートの対象は組み込みの `bash` / `powershell` / `edit` / `write` だけ。ほかの拡張が追加したツールは確認しない。
 - `allowSession` はプロセスが再起動すると消える。
 - `<cwd>/.pi/settings.json` の `sessionDir` は、プロジェクトの信頼状態に関係なくマージする（pi 側で信頼の要否が変わる場合は、`session_dir` を明示すると確実）。
-- ほかの拡張の `timeout` 付きのダイアログは、pi が期限で閉じても知らせがないので、ターンが終わるまで開いたまま見える（6章）。
+- ほかの拡張の `timeout` 付きのダイアログは、pi が期限で閉じても知らせがないので、ターンが終わるまで開いたまま見える。ターンの外で届いたものは、答えるかプロセスが終わるまで見える（6章）。
 - コンテキストの使用量は assistant のメッセージが終わるたびに更新される（ツールの実行中は変わらない）。

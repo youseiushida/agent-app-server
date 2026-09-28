@@ -273,6 +273,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
             println!("uptime:            {}s", s.uptime_ms / 1000);
             println!("agent processes:   {}", s.running_processes);
             println!("running turns:     {}", s.running_turns);
+            println!("background work:   {}", s.running_background_tasks);
             println!("connected devices: {}", s.connected_devices);
             println!("draining:          {}", s.draining);
             Ok(0)
@@ -284,7 +285,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
             println!(
                 "{}",
                 if drain {
-                    "stopping after running turns finish"
+                    "stopping after running turns and background work finish"
                 } else {
                     "stopping"
                 }

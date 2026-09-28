@@ -33,6 +33,10 @@ pub struct ClientCapabilities {
     pub terminal: bool,
     /// Both elicitation modes are relayed to the user as questions (see `crate::elicitation`).
     pub elicitation: ElicitationCapabilities,
+    /// Custom capabilities (ACP extensibility: advertised in the capability object's `_meta`,
+    /// ignored by agents that do not know them). See `crate::cognition::client_meta`.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// `{"form": {}, "url": {}}`: an empty object advertises a mode.
@@ -86,6 +90,10 @@ pub struct AgentCapabilities {
     pub prompt_capabilities: PromptCapabilities,
     #[serde(default)]
     pub session_capabilities: SessionCapabilities,
+    /// The agent's custom capabilities (ACP extensibility). Read only for the extensions this
+    /// adapter implements (`crate::cognition::confirmed`).
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]

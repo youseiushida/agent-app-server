@@ -90,6 +90,21 @@ data class InteractionEntity(
     val json: String,
 )
 
+/**
+ * A background task of a thread (schema version 3). [startedAt] is the start of its current run:
+ * the store lists a thread's tasks by it, then by id.
+ */
+@Entity(
+    tableName = "background_tasks",
+    indices = [Index(value = ["thread_id", "started_at"])],
+)
+data class BackgroundTaskEntity(
+    @PrimaryKey val id: String,
+    @ColumnInfo(name = "thread_id") val threadId: String,
+    @ColumnInfo(name = "started_at") val startedAt: Long,
+    val json: String,
+)
+
 /** One queued input of a thread; [position] is its index in the queue. */
 @Entity(tableName = "queued", primaryKeys = ["thread_id", "position"])
 data class QueuedEntity(

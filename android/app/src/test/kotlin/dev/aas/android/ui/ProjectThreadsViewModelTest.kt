@@ -58,7 +58,7 @@ class ProjectThreadsViewModelTest {
         env.seed(read, projects = listOf(Samples.project(projectId)))
         env.startOffline()
         val vm = withContext(Dispatchers.Main) {
-            ProjectThreadsViewModel(projectId, WorkspaceRepository(env.engine), ThreadRepository(env.engine, env.reads), ProjectRepository(env.engine, env.reads), messages, 0L)
+            ProjectThreadsViewModel(projectId, WorkspaceRepository(env.engine), ThreadRepository(env.engine, env.reads, env.lists), ProjectRepository(env.engine, env.reads, env.lists), messages, 0L)
         }
         jobs += CoroutineScope(Dispatchers.Default).launch { vm.state.collect {} }
         val row = eventually(what = "the thread row") { vm.state.value.rows.singleOrNull() }

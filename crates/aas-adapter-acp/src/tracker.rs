@@ -116,11 +116,45 @@ impl Tracker {
         true
     }
 
-    /// Applies the tool call carried by a permission request and returns its item key.
-    pub fn permission_tool(&mut self, fields: &ToolCallFields, out: &mut Vec<Emit>) -> String {
+    /// Applies a tool call's fields as an item of the turn (starting the item when the call is
+    /// new) and returns its item key. Used for the tool call a permission request carries and
+    /// for a command that moves to the background.
+    pub fn tool_item(&mut self, fields: &ToolCallFields, out: &mut Vec<Emit>) -> String {
         self.close_run(out);
         self.apply_tool(fields, out);
         self.tools[&fields.tool_call_id].key.clone()
+    }
+
+    /// The state a tool call has with `fields` applied, without changing anything (for a
+    /// request about a tool call that is not an item of the running turn).
+    pub fn peek_tool(&self, fields: &ToolCallFields) -> ToolState {
+        let mut state = self
+            .tools
+            .get(&fields.tool_call_id)
+            .map(|t| t.state.clone())
+            .unwrap_or_else(|| ToolState::new(&fields.tool_call_id));
+        state.merge(fields);
+        state
+    }
+
+    /// Whether the tool call is an item that is still open.
+    pub fn is_open(&self, id: &str) -> bool {
+        self.tools.get(id).is_some_and(|t| t.open)
+    }
+
+    /// Closes an open tool call item as [`ItemStatus::Backgrounded`]: its work goes on as a
+    /// background task (which the caller has already reported, naming this item).
+    pub fn close_backgrounded(&mut self, id: &str, out: &mut Vec<Emit>) {
+        if let Some(t) = self.tools.get_mut(id)
+            && t.open
+        {
+            t.open = false;
+            out.push(Emit::Event(AdapterEvent::ItemCompleted {
+                key: t.key.clone(),
+                body: Some(t.last_body.clone()),
+                status: ItemStatus::Backgrounded,
+            }));
+        }
     }
 
     fn chunk(&mut self, kind: RunKind, chunk: &ContentChunk, out: &mut Vec<Emit>) {

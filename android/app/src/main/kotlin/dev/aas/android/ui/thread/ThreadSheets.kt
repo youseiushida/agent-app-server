@@ -30,7 +30,8 @@ import dev.aas.android.ui.components.relativeTime
 
 /**
  * `/status` (docs/ux/codex-desktop.md §8.5): the thread id, the harness's native session id, the
- * context use, the process state (`idle`: no process) and where the thread works.
+ * context use, the process state (`idle`: no process), its background work (`Thread.background`)
+ * and where the thread works.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -44,6 +45,14 @@ fun StatusSheet(thread: Thread, harness: Harness?, context: ContextUsage?, onDis
             InfoRow(stringResource(R.string.status_harness), HarnessSettings.label(harness, thread.settings).ifEmpty { thread.harnessId })
             HarnessSettings.permission(harness, thread.settings)?.let { InfoRow(stringResource(R.string.status_permission), it.label) }
             InfoRow(stringResource(R.string.status_process), processLabel(thread.status))
+            val background = thread.background
+            if (background.running > 0 || background.lastEnded != null) {
+                val parts = buildList {
+                    add(stringResource(R.string.status_background_value, background.running))
+                    background.lastEnded?.let { add(stringResource(R.string.status_background_last, it.title, backgroundStatusWord(it.status))) }
+                }
+                InfoRow(stringResource(R.string.status_background), parts.joinToString("\n"))
+            }
             InfoRow(
                 stringResource(R.string.status_context),
                 context?.let { stringResource(R.string.status_context_value, compactNumber(it.usedTokens), compactNumber(it.windowTokens), contextPercent(it)) }

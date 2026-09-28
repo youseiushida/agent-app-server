@@ -81,9 +81,17 @@ interface Clock {
     /** Unix epoch milliseconds. */
     fun nowMs(): Long
 
-    /** Milliseconds of a monotonic clock (only differences are meaningful). */
+    /**
+     * Milliseconds of a monotonic clock (only differences are meaningful) that keeps counting
+     * while the device sleeps. The watchdog measures a connection's silence with it (protocol.md
+     * §2.2): a clock that stops in deep sleep (`System.nanoTime` on Android) hides the silence of
+     * a socket that died while the phone slept, and the app would show the connection as live
+     * after waking. The Android app passes `SystemClock.elapsedRealtime`; [System] uses
+     * `System.nanoTime`, which is right on the JVM (tests), where the machine does not sleep.
+     */
     fun monotonicMs(): Long
 
+    /** The JVM's clocks (tests and tools; the Android app injects its own, see [monotonicMs]). */
     companion object System : Clock {
         override fun nowMs(): Long = java.lang.System.currentTimeMillis()
 

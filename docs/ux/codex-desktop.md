@@ -464,11 +464,11 @@ item 型は Codex の ThreadItem v2 から取った：`userMessage, hookPrompt, 
 | 承認の選択肢（一度だけ / この会話で / 類似コマンド / すべての編集 / 拒否）と説明文 | そのまま使う。選択肢は daemon が harness 固有のものを正規化して渡すので（`ApprovalOption.kind`）、UI は受け取った選択肢を描画して `interaction/respond` で答えるだけ |
 | 質問パネル（複数の質問、おすすめ、その他の自由記述、スキップ） | ボトムシートで1問ずつページ送りする（単一・複数選択、自由記述）。スキップは `interaction/respond` の `dismissed` |
 | 権限ピッカー（承認を依頼 / 代わりに承認 / フルアクセス＋3 項目の警告ダイアログ） | ボトムシート。選択肢はハーネスの `permissionModes`（空なら出さない）で、変更は `thread/update` の `settings.permissionMode`。`PermissionMode` には危険度がない（id・名前・説明・既定かどうかだけ）ので、「フルアクセス＋3 項目の警告」の代わりに、既定以外のモードを選ぶときはそのモードの説明を出して確認する（id から危険度を推測しない） |
-| モデルと推論のピッカー | ボトムシート。モデルはハーネスの `models`、推論レベルは `effortLevels`（モデルに `effortLevels` があればそれに絞る）。変更は `thread/update` の `settings`（応答の `settingsOutcome` で即時反映か次のターンからかを表示する） |
+| モデルと推論のピッカー | ボトムシート。モデルはハーネスの `models`、推論レベルは `effortLevels`（モデルに `effortLevels` があればそれに絞る）。変更は `thread/update` の `settings`（応答の `settingsOutcome` で即時反映か次のターンからかを表示する）。Claude Code が挙げる `ultracode`（`xhigh` を持つモデルだけ）もほかのレベルと同じく選べる。アプリは選択肢を足さず、隠さず、既定にもしない（トークンの量を理由に既定を変えたり警告したりしない） |
 | `/` メニュー（アプリ側のコマンドと harness 固有のコマンドを統合）、`@` ファイル、`$` スキル | 入力欄の直上に一覧を出す（composer の一部なので IME の上に残る）。`/` は本文の先頭の単語にカーソルがある間、`@` は単語の先頭の `@` にカーソルがある間に開く。`/` の一覧は `command/list`（daemon のアプリ用コマンドとハーネスのコマンド）とアプリ側のコマンド（§8.5）で、前方一致、部分一致の順に絞り込む。Codex のスキルは `$名前` を挿入するハーネスのコマンドとして `/` の一覧に入る（`$` で開く一覧は持たない）。`@` は `fs/search`（打鍵が止まってから問い合わせる）。`commands/changed` を受けたら取り直す |
 | 接続状態の語彙とバナー（再接続中 n/max、接続済み、切断、ホストがオフライン） | アプリ側。画面上部の接続バー（色のドット、状態、詳細「n 回目の再試行 · 送信待ち n 件 · 最終同期 n 分前」、再試行待ちなら「再接続」。押すと診断画面）と、操作が必要なときの注意のバナー（別の場所で接続中 →「この端末で接続」、失効・トークンの拒否 →「ペアリング」など）。スレッド画面はオフラインのとき、端末に保存した内容を表示していると出す。**スマホ側がオフライン**と**PC 側に届かない**を区別して表示する。再試行は上限なしでバックオフしながら続けるので、回数だけを出す（desktop の n/max の max はない） |
 | ペアリング（QR、手動コード）とデバイス管理（最終接続日、取り消し） | カメラで QR を読むか、コードを入力する（`POST /v1/pair`）。デバイスの一覧（最終接続日時、この端末に印）と取り消しは `device/list` / `device/revoke`（daemon の CLI の `devices` / `revoke` でもできる） |
-| 「実行中はスリープしない」 | daemon の設定（`policy.prevent_sleep_while_running`）。アプリの設定では `server/status` の `preventSleepWhileRunning` を表示する |
+| 「実行中はスリープしない」 | daemon の設定（`policy.prevent_sleep_while_running`。ターンの実行中と、バックグラウンドの作業がエージェントを動かしている間）。アプリの設定では `server/status` の `preventSleepWhileRunning` と、動いているバックグラウンドの作業の数（`runningBackgroundTasks`）を表示する |
 | 通知の種類（承認 / 質問 / ターン完了の「常に / 見ていないときだけ / 通知しない」） | アプリ側。通知チャンネルを種類ごとに分け、承認・質問・エラーのオン・オフとターン完了の「常に / 見ていないときだけ（既定）/ 通知しない」をアプリの設定に置く（§8.3） |
 
 ### 8.2 スマホ向けに作り直す
@@ -504,7 +504,15 @@ item 型は Codex の ThreadItem v2 から取った：`userMessage, hookPrompt, 
   3. 作成すると最初のスレッドの作成画面へ進む。既存のフォルダを開いた場合は、スレッドのないプロジェクトのときだけ進む（アーカイブから戻ったプロジェクトなど、スレッドがあればスレッド一覧を出す）。
   - ソースフォルダを複数持つ構成は落とす（理由は §8.4）。
 - **スレッド作成時の指定**：harness、モデル、推論レベル、権限、実行場所（ローカル / 新しい Worktree。git リポジトリのときだけ）を 1 つの画面で選び、同じ画面で最初のメッセージを書く（`thread/create` の `harnessId` / `settings` / `workspace` / `input`）。既定値はプロジェクトの `defaults` から取り、作成したらアプリが `project/update` で `defaults` を今回の値に更新する（「前回値を引き継ぐ」）。
-- **サブエージェントとバックグラウンドのプロセス**：サブエージェントは `toolCall`（category `subagent`）の Item として読み取り専用で表示する。`すべて停止` はスレッドのメニューの「プロセスを停止」（確認あり）と `/stop` で、`thread/stop`（エージェントと、エージェントが起動したプロセスをツリーごと止める。次の入力で再開できる）。個々のプロセスの一覧は持たない（§8.4）。
+- **サブエージェントとバックグラウンドの作業**（desktop の bottom panel の「バックグラウンド」に当たる）：
+  - ターンの中で動くサブエージェントは `toolCall`（category `subagent`）の Item として読み取り専用で表示する。
+  - ハーネスがターンの外で動かす作業（Claude Code のバックグラウンドのエージェント・Bash・Workflow（ultracode）・予約した起床、Codex のバックグラウンドのターミナルとサブエージェント、Devin のバックグラウンドのサブエージェントとシェル。`BackgroundTask`、能力 `backgroundTasks`）は、スレッド画面の末尾の **「バックグラウンド」の区域**に出す。見出しは「実行中 n · 常駐 n · 終了 n」。各タスクは種類のアイコン、題名（ハーネスの説明文そのまま）、状態と経過時間、進捗（最後のツール · ツールの回数 · トークン）、ワークフローのエージェントごとの状態。終わったタスクは「終了した作業 (n)」に畳み、状態と理由、ハーネスが報告した結果（要約、終了コード、出力の末尾と全文）を出す。どれもハーネスの明示的な報告のままで、アプリは推定しない（経過時間は表示だけ）。
+  - 作業を起動した Item（`status: backgrounded`）には、そのタスクの状態のチップ（「バックグラウンドで実行中 · 経過」「バックグラウンド: 停止」など）を付け、押すと区域のそのタスクへ移る。
+  - 1 つだけ止めるのはタスクの「停止」（確認あり、`backgroundTask/stop`）。タスクの `stoppable` とハーネスの能力 `backgroundStop` があるときだけ出す。止まったことはハーネスの報告でだけ分かるので、それまでは「停止中…」、確認されなければ（`stopUnconfirmedAt`）注意の文ともう一度の「停止」。
+  - `すべて停止` はスレッドのメニューの「プロセスを停止」（確認あり。動いている作業を「N 件のバックグラウンド作業も止まります」と並べる）と `/stop` で、`thread/stop`（エージェントと、エージェントが起動したプロセスをツリーごと止める。次の入力で再開できる）。ターンの停止ボタンはターンだけを止める（「ターンを止めます（バックグラウンドの作業は続きます）」）。
+  - 作業が動いている間、daemon はエージェントのプロセスを止めず（時間では止めない）、PC のスリープも抑える。スレッドとプロジェクトの一覧には「バックグラウンドで実行中 (N)」を出す。
+  - エージェントがタスクの終わりを受けて自分で始めたターンは、区切り「バックグラウンド作業の完了を受けて」（`Turn.trigger`）で示す。
+  - Job Object の中の個々のプロセス（ハーネスが報告しないもの）の一覧は持たない（§8.4）。
 - **入力**：音声入力は OS の IME のものを使う（独自の音声機能は持たない）。画像はカメラかギャラリーから添付する（1 通に `AppPolicy.maxImagesPerMessage` 枚まで。PNG / WebP / GIF で上限以下ならそのまま、JPEG は向きを反映して位置情報などのメタデータを落として作り直し、それ以外と上限を超えるものは長辺 2048px 以下の JPEG にしてから `POST /v1/blobs` → `InputPart` の `image`）。ハーネスの能力 `images` がなければ添付ボタンを出さず、添付したあとで画像を受け付けないハーネスに切り替えたら、画像を外すまで送信できない。
 
 ### 8.3 通知の設計（desktop の設定を翻訳）
@@ -515,11 +523,11 @@ item 型は Codex の ThreadItem v2 から取った：`userMessage, hookPrompt, 
 |---|---|---|---|
 | `approvals` | HIGH（heads-up） | コマンド / ファイル / 権限 / MCP の承認要求（`interaction/pending`）。本文に題名、詳細、対象（コマンド 1 行、ファイル数と名前、ツール名など）。ロック画面には詳細を出さない | 拒否 / 許可（一度だけ）/ 開く（承認カードまでスクロール） |
 | `questions` | HIGH | エージェントからの質問 | 開く（シートへ直接） |
-| `turns` | DEFAULT | ターンの完了（「{time}間作業しました」。`startedAt` と `completedAt` から）と中断、clone の完了（アプリが背面のとき）。設定は「常に / アプリを見ていないときだけ（既定）/ 通知しない」 | 開く |
-| `errors` | DEFAULT | ターンの失敗（エージェントのクラッシュ、再開の失敗など。`Turn.error.kind`、`Thread.lastError`）、clone の失敗、アプリが背面のときにサーバが確定エラーで断った要求、通知のボタンの回答を送信待ちにできなかった場合 | 開く |
+| `turns` | DEFAULT | ターンの完了（「{time}間作業しました」。`startedAt` と `completedAt` から）と中断、バックグラウンドの作業の完了・失敗・停止（`Thread.background.lastEnded` の変化。「バックグラウンドの作業が完了しました: 題名」）、clone の完了（アプリが背面のとき）。設定は「常に / アプリを見ていないときだけ（既定）/ 通知しない」 | 開く |
+| `errors` | DEFAULT | ターンの失敗（エージェントのクラッシュ、再開の失敗など。`Turn.error.kind`、`Thread.lastError`）、結果が分からなくなったバックグラウンドの作業（`lost`）、clone の失敗、アプリが背面のときにサーバが確定エラーで断った要求、通知のボタンの回答を送信待ちにできなかった場合 | 開く |
 | `connection` | LOW（常駐） | foreground service の常駐通知：接続バーと同じ文言（接続済み / 再試行待ちと次の試行までのカウントダウン / 送信待ち n 件（outbox）など） | 今すぐ再接続 |
 
-- ターンの通知はスレッドごとに 1 つで、次のターンの通知で置き換わる。承認・質問は Interaction ごとに 1 つ、断られた要求はスレッドごとに 1 つ（最新の失敗）。本文は BigTextStyle で出す。
+- ターンの通知はスレッドごとに 1 つで、次のターンの通知で置き換わる。バックグラウンドの作業の終わりも同じ通知を使うので、それを受けてエージェントが始めたターンの完了で置き換わる（2 つ並ばない）。バックグラウンドの作業が求めた承認・質問は、本文の先頭に「バックグラウンドの作業「題名」から」と出す。承認・質問は Interaction ごとに 1 つ、断られた要求はスレッドごとに 1 つ（最新の失敗）。本文は BigTextStyle で出す。
 - 承認が解決・失効したら、別の端末で解決した場合も含めて、該当する通知を消す（`interaction/closed`）。スレッドを開いた・既読にしたら、そのスレッドのターン・エラー・断られた要求の通知を消す。
 - 表示中のスレッドの承認・質問は、音と heads-up なしで出す（画面のカードで見える）。
 - Android はパッケージごとに 50 件を超える通知を黙って捨てるので、`AppPolicy.notificationBudget`（40 件）を超えたら古いターン・エラー・clone・断られた要求の通知から消す（承認・質問と常駐通知は消さない）。
@@ -532,13 +540,13 @@ item 型は Codex の ThreadItem v2 から取った：`userMessage, hookPrompt, 
 | git の書き込み操作：ハンク・ファイル単位のステージ / ステージ解除 / 戻す、ターン差分の「元に戻す / 再適用」、コミット、プッシュ、PR の作成・マージ、ブランチの切り替え | design.md 1章の範囲外（git の書き込み操作の UI）。エージェントに頼めば実行でき、スマホでの誤操作は取り返しがつきにくい。差分の閲覧は §8.2 のとおり持つ |
 | ブラウザパネル、Computer Use、appshot、ペット、音声チャット、画像プレイグラウンド、Work モード、ChatGPT のチャットやメモリ、プラグインのマーケット | coding agent の遠隔操作という目的の外にある |
 | クラウド実行と `/cloud` | 実行するのは自宅 PC の daemon だけ。クラウドは別製品の範囲 |
-| 予定済みタスク（automations） | daemon 側にスケジューラが必要で、今回の対象外（design.md の範囲外） |
+| 予定済みタスク（automations） | daemon 側にスケジューラが必要で、今回の対象外（design.md の範囲外）。ハーネスが自分で予約した起床（Claude Code の `CronCreate` / `/loop` など）は、バックグラウンドの作業（種類「予約」）として §8.2 の区域に出る |
 | 複数ソースフォルダのプロジェクト、リモートホストの選択 | daemon は 1 台の PC だけ。harness の多くは cwd を 1 つしか扱えない（プライマリフォルダ 1 つに相当） |
 | `/side`（サイドチャット）、タブ、ペイン、新しいウィンドウで開く | 単一カラムの画面では意味がない。「新しいスレッドで続ける」で代用する |
 | 自動レビュー（guardian）と `/approve` | Codex 固有で、harness を問わない形では実現できない。Codex のスレッドでは、権限ピッカーに「代わりに承認」に当たるモードがあれば、それが `permissionModes` に出る |
 | `/goal`（ゴール）と `/mcp`（MCP サーバの状態） | ハーネス固有で、ハーネスをまたいで正規化できるシグナルがない（design.md の範囲外）。アダプタがハーネスのコマンドとして公開すれば、`/` メニューに `insertText` のコマンドとして出る |
 | ブロックしない質問のカウントダウンと自動クローズ | 締め切りを報告するハーネスがなく、アプリが時間を計ると推測になる（design.md の範囲外）。ハーネスが取り下げたら `interaction/expired` で閉じる |
-| バックグラウンドのプロセスの一覧 | Job Object の中のプロセスはハーネスをまたいで意味のある名前を持たない（design.md の範囲外）。実行中の commandExecution / toolCall の Item を表示し、止めるのは `thread/stop` |
+| ハーネスが報告しないバックグラウンドのプロセスの一覧（Job Object の中のプロセス、エージェントが切り離したプロセス） | ハーネスをまたいで意味のある名前を持たず、エージェントが起動したと言える明示的なシグナルもない（design.md の範囲外）。ハーネスが報告するバックグラウンドの作業は §8.2 のとおり一覧にして 1 つずつ止められる。すべてを止めるのは `thread/stop` |
 | 高速モードと `/fast`、パーソナリティ、`/memories`、`/ide-context`、`/share`、`/feedback`、`/usage`、`/pet` | 特定のサービスに依存するか、desktop 固有 |
 | git blame、定義へ移動、リッチプレビュー（PDF など） | スマホでの差分レビューの範囲を超える |
 | Sources パネル（参照した情報源の一覧） | プロトコルに情報源を正規化した型がなく、ハーネスをまたいで集められない。Item の本文や URL から拾い集めるのは推測（ヒューリスティック）になる。検索・取得は toolCall（category `search` / `fetch`）の Item として会話に出る |
@@ -551,9 +559,9 @@ item 型は Codex の ThreadItem v2 から取った：`userMessage, hookPrompt, 
 |---|---|---|
 | `/new` | 同じプロジェクト・同じ harness の新しいスレッドの composer を開く。最初の送信で `thread/create`（`input` 付き）を呼ぶ | アプリ側 |
 | `/fork` | 分岐する（`command/list` の `fork`。harness の能力 `fork` があるときだけ入っている） | method `thread/fork` |
-| `/compact` | ハーネスのコマンド（Codex はアダプタが `thread/compact/start` を呼ぶ、Claude は CLI のスラッシュコマンド。pi は公開していない）。実行中に送ると通常の入力と同じくキューに入る | insertText `/compact` |
+| `/compact` | ハーネスのコマンド（Codex はアダプタが `thread/compact/start` を呼ぶ、Claude は CLI のスラッシュコマンド、pi はアダプタが RPC の `compact` を呼ぶ（`/compact <指示>` の指示は `customInstructions`。docs/adapters/pi.md）。ACP はエージェントが `available_commands_update` で挙げたときだけ）。実行中に送ると通常の入力と同じくキューに入る | insertText `/compact` |
 | `/model` | モデルのピッカー（`command/list` の `model`。ハーネスにモデルの一覧があるときだけ入っている） | picker `model` |
-| `/effort`（desktop の `/reasoning`） | 推論レベルのピッカー（`command/list` の `effort`。ハーネスに推論レベルがあるときだけ入っている） | picker `effort` |
+| `/effort`（desktop の `/reasoning`） | 推論レベルのピッカー（`command/list` の `effort`。ハーネスに推論レベルがあるときだけ入っている）。Claude Code の `ultracode` も、ハーネスが挙げればここで選べる | picker `effort` |
 | `/permissions` | 権限モードのピッカー（`command/list` の `permissions`。ハーネスに権限モードがあるときだけ入っている） | picker `permissionMode` |
 | `/plan` | `/` メニューには入れない（専用のメソッドはない）。Claude のプランモードは権限モード `plan` なので、`/permissions` で選ぶ（`thread/update` の `settings.permissionMode`） | —（`/permissions` の picker `permissionMode`） |
 | `/review` | Codex はハーネスのコマンド `review`（アダプタが `review/start` を呼ぶ）。他の harness ではアプリが定型のレビュー依頼文を composer に挿入する | insertText（Codex）/ アプリ側 |
@@ -564,5 +572,6 @@ item 型は Codex の ThreadItem v2 から取った：`userMessage, hookPrompt, 
 | `/stop` | プロセスを停止する（再開は可能）。Codex にはないが、我々の daemon が管理しているので追加する（`command/list` の `stop`） | method `thread/stop` |
 | `/diff` | スレッド全体の差分を開く（`command/list` の `diff`） | method `thread/diff`（`scope: thread`） |
 | `/resume-queue` | 一時停止したキューを再開する（`command/list` の `resume-queue`） | method `queue/resume` |
+| `/resume` | 「PC のセッションを取り込む」画面を、そのプロジェクトとハーネスを選んだ状態で開く（`native/list` → `native/import`。取り込んだセッションは新しいスレッドになり、取り込み済みならそのスレッドを開く）。ネイティブセッションを一覧できるハーネス（能力 `nativeSessions`）があるときだけ出す。ハーネスの `/resume`（CLI の端末でセッションを選ぶもの）は daemon が `command/list` に入れない（design.md 9.5）。1つのスレッドは1つのネイティブセッションなので、今のスレッドのセッションを替えるのではなく、別のスレッドとして開く。入力欄に `/resume` と打って送った場合も、ハーネスには送らずこのコマンドを実行する | アプリ側 |
 | `/init` | Claude はハーネスのコマンド `/init`。Codex は AGENTS.md を生成する定型のプロンプトをアプリが挿入する | insertText（Claude）/ アプリ側 |
-| harness 固有のコマンド | Claude の init にある `slash_commands`、pi の `get_commands`、ACP の `available_commands_update`、Codex の `skills/list`（`$名前`）。すべて `command/list` の `source: "harness"` | insertText（`/name ` / `$name `） |
+| harness 固有のコマンド | Claude の init にある `slash_commands`、pi の `get_commands`、ACP の `available_commands_update`、Codex の `skills/list`（`$名前`）。すべて `command/list` の `source: "harness"`。ただし、スレッドのネイティブセッションを切り替えるもの（どのハーネスでも `resume`、Claude の `clear`、pi の `new` / `fork` / `clone` / `tree`）は入らない（design.md 9.5） | insertText（`/name ` / `$name `） |

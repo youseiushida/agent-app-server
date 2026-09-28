@@ -589,8 +589,13 @@ pub fn tool_key(tool_call_id: &str) -> String {
     format!("tool:{tool_call_id}")
 }
 
-/// Text of a pi `custom` message meant for display (used for extension-injected messages).
+/// A pi `custom` message meant for display (an extension's `sendMessage` with `display: true`),
+/// as a notice. pi reports every message with `message_start` and `message_end`; only the
+/// `message_end`, which carries the final message, is relayed.
 pub fn custom_message_notice(ev: &Value) -> Option<AdapterEvent> {
+    if ev.get("type").and_then(Value::as_str) != Some("message_end") {
+        return None;
+    }
     let msg = ev.get("message")?;
     if msg.get("role").and_then(Value::as_str) != Some("custom")
         || msg.get("display").and_then(Value::as_bool) != Some(true)
@@ -599,6 +604,18 @@ pub fn custom_message_notice(ev: &Value) -> Option<AdapterEvent> {
     }
     let text = content_text(msg.get("content").unwrap_or(&Value::Null));
     (!text.is_empty()).then(|| notice(NoticeLevel::Info, text, "extensionMessage"))
+}
+
+/// A user message that opens a run the user did not type (an extension's `sendUserMessage`, or
+/// a run an extension command started), as a notice: the engine records such a run as a turn
+/// without input, so this is where the phone sees what the run answers. Only the `message_end`
+/// of a `user` message; the session decides whether the message opens such a run.
+pub fn run_input_notice(ev: &Value) -> Option<AdapterEvent> {
+    if ev.get("type").and_then(Value::as_str) != Some("message_end") || role(ev) != Some("user") {
+        return None;
+    }
+    let text = content_text(ev.pointer("/message/content").unwrap_or(&Value::Null));
+    (!text.is_empty()).then(|| notice(NoticeLevel::Info, text, "extensionPrompt"))
 }
 
 /// Payload used when pi prints a line that is not JSON.
@@ -857,5 +874,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn extension_messages_are_relayed_once_at_their_end() {
+        // Recorded from pi 0.85.1: an extension's `sendMessage(..., { triggerTurn: true })`.
+        let message = json!({"role":"custom","customType":"aas-live","content":"Reply with exactly: WOKE",
+            "display":true,"timestamp":1790600517945_u64});
+        let start = json!({"type":"message_start","message":message});
+        let end = json!({"type":"message_end","message":message});
+        assert_eq!(custom_message_notice(&start), None);
+        assert_eq!(
+            custom_message_notice(&end),
+            Some(AdapterEvent::Notice {
+                level: NoticeLevel::Info,
+                message: "Reply with exactly: WOKE".into(),
+                code: Some("extensionMessage".into()),
+            })
+        );
+        let mut hidden = end.clone();
+        hidden["message"]["display"] = json!(false);
+        assert_eq!(custom_message_notice(&hidden), None);
+
+        // An extension's `sendUserMessage`.
+        let user = json!({"role":"user","content":[{"type":"text","text":"Reply with exactly: WOKE-USER"}],
+            "timestamp":1790600521219_u64});
+        assert_eq!(
+            run_input_notice(&json!({"type":"message_start","message":user})),
+            None
+        );
+        assert_eq!(
+            run_input_notice(&json!({"type":"message_end","message":user})),
+            Some(AdapterEvent::Notice {
+                level: NoticeLevel::Info,
+                message: "Reply with exactly: WOKE-USER".into(),
+                code: Some("extensionPrompt".into()),
+            })
+        );
+        assert_eq!(run_input_notice(&end), None, "not a user message");
     }
 }

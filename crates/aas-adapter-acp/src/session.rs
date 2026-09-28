@@ -10,6 +10,11 @@
 //! `session/update`s before it resolves the `session/prompt` response, therefore draining
 //! guarantees that a turn's items are emitted before its `TurnCompleted` (and that updates
 //! replayed by `session/load` are classified as history before the session goes live).
+//!
+//! Requests of the agent (permissions, elicitations) are never left unanswered: one that
+//! arrives while no turn runs is shown to the user (it belongs to the thread, or to the
+//! background task it names), and one the engine expires is answered `cancelled`
+//! (`SessionControl::expire_request`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aas_harness::protocol::{
-    ContextUsage, InteractionResolution, NoticeLevel, TurnError, TurnStatus,
+    ContextUsage, ExpireReason, InteractionResolution, NoticeLevel, TurnError, TurnStatus,
 };
 use aas_harness::{
     AdapterError, AdapterEvent, AdapterPolicy, ExitInfo, NativeHistory, SessionControl,
@@ -32,6 +37,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use crate::cache::OptionsCache;
+use crate::cognition::{self, Background, Routed};
 use crate::elicitation::{self, Elicitation, Form};
 use crate::history::HistoryBuilder;
 use crate::mapping::{self, SessionOptions, SettingKind};
@@ -108,7 +114,10 @@ pub struct Launched {
 pub fn client_init() -> wire::InitializeRequest {
     wire::InitializeRequest {
         protocol_version: wire::PROTOCOL_VERSION,
-        client_capabilities: wire::ClientCapabilities::default(),
+        client_capabilities: wire::ClientCapabilities {
+            meta: Some(cognition::client_meta()),
+            ..wire::ClientCapabilities::default()
+        },
         client_info: wire::Implementation {
             name: "agent-app-server".into(),
             title: Some("agent-app-server".into()),
@@ -207,6 +216,7 @@ where
         tx: events_tx,
         self_tx: cmd_tx.clone(),
         tracker: Tracker::new(),
+        background: None,
         history: collect.then(|| (Tracker::new(), HistoryBuilder::new())),
         live: false,
         session_id: None,
@@ -214,6 +224,7 @@ where
         last_info: None,
         last_session_info: None,
         pending: HashMap::new(),
+        deferred: Vec::new(),
         perm_seq: 0,
         turn: None,
         turn_lost: false,
@@ -303,6 +314,16 @@ async fn handshake(
             .await
             .map_err(|e| setup_error("authenticate", e, p.agent_name, p.options, Some(&init)))?;
     }
+    // The router must know the confirmed extensions before the session exists: `session/load`
+    // replays updates right away.
+    let (reply, rx) = oneshot::channel();
+    cmd_tx
+        .send(Cmd::Initialized {
+            background: cognition::confirmed(&init),
+            reply,
+        })
+        .map_err(|_| AdapterError::Closed)?;
+    rx.await.map_err(|_| AdapterError::Closed)?;
 
     let caps = &init.agent_capabilities;
     let cwd = path_string(p.cwd);
@@ -439,6 +460,12 @@ pub async fn prompt_blocks(
 // ----- router ---------------------------------------------------------------------------------
 
 enum Cmd {
+    /// `initialize` answered; `background`: the agent confirmed Cognition's background
+    /// extension (`crate::cognition`).
+    Initialized {
+        background: bool,
+        reply: oneshot::Sender<()>,
+    },
     SetupDone {
         session_id: String,
         setup: SessionSetupResponse,
@@ -474,6 +501,16 @@ enum Cmd {
     PromptDone {
         result: Result<Value, RpcCallError>,
     },
+    /// `SessionControl::stop_background`.
+    StopBackground {
+        key: String,
+        reply: oneshot::Sender<Result<(), AdapterError>>,
+    },
+    /// `SessionControl::expire_request`.
+    Expire {
+        request_id: String,
+        reply: oneshot::Sender<Result<(), AdapterError>>,
+    },
 }
 
 /// An agent request waiting for the user.
@@ -502,6 +539,14 @@ impl Pending {
     fn rpc_id(&self) -> &Value {
         match self {
             Pending::Permission { rpc_id, .. } | Pending::Elicitation { rpc_id, .. } => rpc_id,
+        }
+    }
+
+    /// The method of the agent's request.
+    fn method(&self) -> &'static str {
+        match self {
+            Pending::Permission { .. } => "session/request_permission",
+            Pending::Elicitation { .. } => "elicitation/create",
         }
     }
 }
@@ -540,6 +585,8 @@ struct Router {
     tx: mpsc::UnboundedSender<AdapterEvent>,
     self_tx: mpsc::UnboundedSender<Cmd>,
     tracker: Tracker,
+    /// Background work, when the agent confirmed Cognition's extension (`crate::cognition`).
+    background: Option<Background>,
     /// Present while collecting a replay for `read_native_history`.
     history: Option<(Tracker, HistoryBuilder)>,
     /// `false` until the setup response has been handled.
@@ -549,6 +596,9 @@ struct Router {
     last_info: Option<(Option<String>, Option<String>, Option<String>)>,
     last_session_info: Option<Value>,
     pending: HashMap<String, Pending>,
+    /// Session-scoped requests of the agent that arrived before the session was set up; they
+    /// are handled when it is (their session id and scope are known only then).
+    deferred: Vec<IncomingRequest>,
     /// Sequence of interaction request ids (`perm-N`, `elic-N`).
     perm_seq: u64,
     turn: Option<TurnState>,
@@ -687,11 +737,20 @@ impl Router {
             self.native(json!({ "foreignSession": n.session_id, "update": n.update }));
             return;
         }
-        let update = SessionUpdate::parse(n.update);
+        let raw = n.update;
+        let meta = raw.get("_meta").cloned();
+        let update = SessionUpdate::parse(raw.clone());
 
         // Item-producing updates.
         if !self.live {
             if let Some((tracker, builder)) = &mut self.history {
+                if self.background.is_some()
+                    && is_item_update(&update)
+                    && cognition::is_sub_agent_update(meta.as_ref())
+                {
+                    // A sub-agent's own work is not part of the conversation's history.
+                    return;
+                }
                 let mut out = Vec::new();
                 if tracker.on_update(&update, &mut out) {
                     for e in out {
@@ -707,8 +766,31 @@ impl Router {
             if matches!(update, SessionUpdate::UserMessageChunk(_)) {
                 return;
             }
+            if let Some(background) = self.background.as_mut() {
+                let mut out = Vec::new();
+                let routed = background.on_update(
+                    &update,
+                    meta.as_ref(),
+                    &mut self.tracker,
+                    self.turn.is_some(),
+                    &mut out,
+                );
+                self.emit_all(out);
+                match routed {
+                    Routed::Root => {}
+                    Routed::Handled => return,
+                    Routed::Hidden => {
+                        tracing::trace!(label = %self.label, "a sub-agent's own text or plan; not an item of the turn");
+                        return;
+                    }
+                    Routed::Unmapped => {
+                        self.native(json!({ "subAgentUpdate": raw }));
+                        return;
+                    }
+                }
+            }
             if self.turn.is_none() {
-                self.native(json!({ "outsideTurn": update_value(&update) }));
+                self.native(json!({ "outsideTurn": raw }));
                 return;
             }
             let mut out = Vec::new();
@@ -750,6 +832,15 @@ impl Router {
                 }
             }
             SessionUpdate::Usage(u) => {
+                if let Some(background) = self.background.as_mut() {
+                    let mut out = Vec::new();
+                    let sub_agent = background.on_usage(meta.as_ref(), &mut out);
+                    self.emit_all(out);
+                    if sub_agent {
+                        // A sub-agent's usage: never the root agent's context or cost.
+                        return;
+                    }
+                }
                 if let Some(turn) = self.turn.as_mut()
                     && let Some(context) = mapping::context_usage(&u)
                 {
@@ -793,9 +884,8 @@ impl Router {
             return;
         }
         let err = RpcWireError::method_not_found(&req.method);
-        if let Err(e) = self.peer.respond_error(req.id, err).await {
-            tracing::debug!(label = %self.label, error = %e, "could not answer agent request");
-        }
+        let written = self.peer.respond_error(req.id, err).await;
+        self.log_unanswered(&req.method, "method not found", written);
         if !req.method.starts_with('_') {
             self.notice(
                 NoticeLevel::Warning,
@@ -809,43 +899,87 @@ impl Router {
         let params = match serde_json::from_value::<RequestPermissionParams>(req.params.clone()) {
             Ok(p) => p,
             Err(e) => {
-                let _ = self
+                let written = self
                     .peer
                     .respond_error(
                         req.id,
                         RpcWireError::new(-32602, format!("invalid params: {e}")),
                     )
                     .await;
+                self.log_unanswered(&req.method, "invalid params", written);
                 self.native(json!({ "method": req.method, "params": req.params }));
                 return;
             }
         };
-        let cancelled = self.turn.as_ref().is_none_or(|t| t.cancel_requested) || !self.live;
-        if cancelled {
-            // No turn to attach it to, or the turn is being cancelled: ACP requires answering
-            // `cancelled` after `session/cancel`.
-            let _ = self
+        if !self.live && self.history.is_none() {
+            // The session is being set up: handled once it is (`Cmd::SetupDone`).
+            self.deferred.push(req);
+            return;
+        }
+        let foreign = !params.session_id.is_empty()
+            && self
+                .session_id
+                .as_ref()
+                .is_some_and(|ours| *ours != params.session_id);
+        if !self.live || foreign {
+            // Nothing can show it: the process only replays a session's history (nobody
+            // answers there), or it is about another session.
+            let written = self
                 .peer
                 .respond(req.id, wire::permission_cancelled())
                 .await;
-            if self.turn.is_none() {
-                self.notice(
-                    NoticeLevel::Warning,
-                    "The agent asked for permission outside of a turn; the request was cancelled."
-                        .into(),
-                    "permissionOutsideTurn",
-                );
-            }
+            self.log_unanswered(&req.method, "cancelled", written);
+            let (reason, code) = if foreign {
+                ("for another session", "permissionOutsideSession")
+            } else {
+                (
+                    "while its history was being read",
+                    "permissionDuringHistoryRead",
+                )
+            };
+            self.notice(
+                NoticeLevel::Warning,
+                format!("The agent asked for permission {reason}; the request was cancelled."),
+                code,
+            );
             return;
         }
-        let mut out = Vec::new();
-        let key = self.tracker.permission_tool(&params.tool_call, &mut out);
-        self.emit_all(out);
-        let tool = self
-            .tracker
-            .tool(&params.tool_call.tool_call_id)
-            .cloned()
-            .unwrap_or_default();
+        if self.turn.as_ref().is_some_and(|t| t.cancel_requested) {
+            // ACP: after `session/cancel` the client answers every permission request
+            // `cancelled`. Recorded, as the agent's request is not shown.
+            let written = self
+                .peer
+                .respond(req.id, wire::permission_cancelled())
+                .await;
+            self.log_unanswered(&req.method, "cancelled", written);
+            self.native(json!({ "method": req.method, "params": req.params, "answered": "cancelled", "reason": "turnCancelled" }));
+            return;
+        }
+        // Whom it belongs to: the background task it names explicitly (a background shell's
+        // or a background sub-agent's tool call), else the running turn (as an item of it),
+        // else the thread.
+        let background_key = self
+            .background
+            .as_mut()
+            .and_then(|b| b.task_of_tool(&params.tool_call));
+        let (item_key, tool) = if self.turn.is_some() && background_key.is_none() {
+            let mut out = Vec::new();
+            let key = self.tracker.tool_item(&params.tool_call, &mut out);
+            self.emit_all(out);
+            let tool = self
+                .tracker
+                .tool(&params.tool_call.tool_call_id)
+                .cloned()
+                .unwrap_or_default();
+            (Some(key), tool)
+        } else {
+            let tool = self
+                .background
+                .as_ref()
+                .and_then(|b| b.tool_view(&params.tool_call))
+                .unwrap_or_else(|| self.tracker.peek_tool(&params.tool_call));
+            (None, tool)
+        };
         let (request, dropped) = mapping::permission_request(&tool, &params.options);
         if !dropped.is_empty() {
             self.notice(
@@ -863,7 +997,8 @@ impl Router {
                 Some(id) => wire::permission_selected(&id),
                 None => wire::permission_cancelled(),
             };
-            let _ = self.peer.respond(req.id, body).await;
+            let written = self.peer.respond(req.id, body).await;
+            self.log_unanswered(&req.method, "no option to show", written);
             return;
         }
         self.perm_seq += 1;
@@ -878,55 +1013,86 @@ impl Router {
         self.emit(AdapterEvent::InteractionRequested {
             request_id,
             request,
-            item_key: Some(key),
+            item_key,
+            background_key,
         });
     }
 
-    /// `elicitation/create`: shown as a question while a turn of this session runs; otherwise
-    /// (request scope, another session, no turn, a cancelled turn, a mode that cannot be shown)
-    /// answered with `cancel`.
+    /// `elicitation/create`: shown as a question when it is about this session (it belongs to
+    /// the background task of its tool call, the running turn, or the thread; one that arrives
+    /// while the session is being set up waits until it is). Answered with `cancel` when
+    /// nothing can show it (request scope, another session, a process that only reads a
+    /// session's history, a mode that cannot be shown) or the turn is being cancelled.
     async fn on_elicitation(&mut self, req: IncomingRequest) {
         let params =
             match serde_json::from_value::<wire::CreateElicitationParams>(req.params.clone()) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = self
+                    let written = self
                         .peer
                         .respond_error(
                             req.id,
                             RpcWireError::new(-32602, format!("invalid params: {e}")),
                         )
                         .await;
+                    self.log_unanswered(&req.method, "invalid params", written);
                     self.native(json!({ "method": req.method, "params": req.params }));
                     return;
                 }
             };
+        // Nothing can show a request outside this session: request scope (before a session
+        // exists, e.g. during authentication, while the start waits for the answer), another
+        // session, or a process that only replays a session's history.
         let outside = match (&params.session_id, &self.session_id) {
-            (None, _) => Some("outside of a session"),
-            (Some(theirs), Some(ours)) if theirs != ours => Some("for another session"),
-            _ if !self.live || self.turn.is_none() => Some("outside of a turn"),
+            (None, _) => Some(("outside of a session", "elicitationOutsideSession")),
+            (Some(theirs), Some(ours)) if theirs != ours => {
+                Some(("for another session", "elicitationOutsideSession"))
+            }
+            _ if !self.live && self.history.is_some() => Some((
+                "while its history was being read",
+                "elicitationDuringHistoryRead",
+            )),
+            _ if !self.live => {
+                // The session is being set up: handled once it is (`Cmd::SetupDone`).
+                self.deferred.push(req);
+                return;
+            }
             _ => None,
         };
-        // ACP: after `session/cancel`, requests are answered as cancelled.
-        let cancelling = self.turn.as_ref().is_some_and(|t| t.cancel_requested);
-        if outside.is_some() || cancelling {
-            let _ = self.peer.respond(req.id, elicitation::cancelled()).await;
-            if let Some(reason) = outside {
-                self.notice(
-                    NoticeLevel::Warning,
-                    format!("The agent asked for input {reason}; the request was cancelled."),
-                    "elicitationOutsideTurn",
-                );
-            }
+        if let Some((reason, code)) = outside {
+            let written = self.peer.respond(req.id, elicitation::cancelled()).await;
+            self.log_unanswered(&req.method, "cancelled", written);
+            self.notice(
+                NoticeLevel::Warning,
+                format!("The agent asked for input {reason}; the request was cancelled."),
+                code,
+            );
+            return;
+        }
+        if self.turn.as_ref().is_some_and(|t| t.cancel_requested) {
+            // ACP: after `session/cancel`, requests are answered as cancelled.
+            let written = self.peer.respond(req.id, elicitation::cancelled()).await;
+            self.log_unanswered(&req.method, "cancelled", written);
+            self.native(json!({ "method": req.method, "params": req.params, "answered": "cancel", "reason": "turnCancelled" }));
             return;
         }
         match elicitation::request(&params) {
             Elicitation::Ask { request, form } => {
                 self.perm_seq += 1;
                 let request_id = format!("elic-{}", self.perm_seq);
+                // Whom it belongs to, as for permissions: the background task of its tool
+                // call, else the running turn, else the thread.
+                let background_key = match (&params.tool_call_id, self.background.as_mut()) {
+                    (Some(id), Some(b)) => b.task_of_tool(&wire::ToolCallFields {
+                        tool_call_id: id.clone(),
+                        ..wire::ToolCallFields::default()
+                    }),
+                    _ => None,
+                };
                 let item_key = params
                     .tool_call_id
                     .as_deref()
+                    .filter(|_| self.turn.is_some() && background_key.is_none())
                     .and_then(|id| self.tracker.tool_key(id));
                 let elicitation_id = (form == Form::Url)
                     .then(|| params.elicitation_id.clone())
@@ -943,10 +1109,12 @@ impl Router {
                     request_id,
                     request,
                     item_key,
+                    background_key,
                 });
             }
             Elicitation::UnknownMode(mode) => {
-                let _ = self.peer.respond(req.id, elicitation::cancelled()).await;
+                let written = self.peer.respond(req.id, elicitation::cancelled()).await;
+                self.log_unanswered(&req.method, "cancelled (unknown mode)", written);
                 self.notice(
                     NoticeLevel::Warning,
                     format!("The agent asked for input in a form agent-app-server cannot show (mode `{mode}`); it was cancelled."),
@@ -973,10 +1141,11 @@ impl Router {
             return;
         };
         if let Some(p) = self.pending.remove(&request_id) {
-            let _ = self
+            let written = self
                 .peer
                 .respond(p.rpc_id().clone(), elicitation::accepted())
                 .await;
+            self.log_unanswered(p.method(), "accepted on elicitation/complete", written);
             self.emit(AdapterEvent::InteractionWithdrawn { request_id });
         }
     }
@@ -986,8 +1155,18 @@ impl Router {
         let pending: Vec<(String, Pending)> = self.pending.drain().collect();
         for (request_id, p) in pending {
             let body = p.cancelled();
-            let _ = self.peer.respond(p.rpc_id().clone(), body).await;
+            let written = self.peer.respond(p.rpc_id().clone(), body).await;
+            self.log_unanswered(p.method(), "cancelled", written);
             self.emit(AdapterEvent::InteractionWithdrawn { request_id });
+        }
+    }
+
+    /// Logs an answer to an agent request that could not be written: the agent's stdin is
+    /// closed or broken, so the process is ending (its exit is reported on its own). Such a
+    /// failure is never dropped silently.
+    fn log_unanswered(&self, method: &str, answer: &str, written: Result<(), RpcCallError>) {
+        if let Err(e) = written {
+            tracing::warn!(label = %self.label, method, answer, error = %e, "could not answer an agent request");
         }
     }
 
@@ -1002,6 +1181,17 @@ impl Router {
 
     async fn on_cmd(&mut self, cmd: Cmd) {
         match cmd {
+            Cmd::Initialized { background, reply } => {
+                if background {
+                    self.background = Some(Background::new());
+                }
+                let _ = reply.send(());
+            }
+            Cmd::StopBackground { key, reply } => self.stop_background(key, reply),
+            Cmd::Expire { request_id, reply } => {
+                let result = self.expire(&request_id).await;
+                let _ = reply.send(result);
+            }
             Cmd::SetupDone {
                 session_id,
                 setup,
@@ -1032,6 +1222,10 @@ impl Router {
                 });
                 self.live = true;
                 self.publish_info();
+                // Requests the agent made while the session was being set up.
+                for req in std::mem::take(&mut self.deferred) {
+                    self.on_request(req).await;
+                }
                 let _ = reply.send(history);
             }
             Cmd::Send { blocks, reply } => {
@@ -1098,6 +1292,57 @@ impl Router {
                 let _ = reply.send(());
             }
         }
+    }
+
+    /// Asks the agent to stop background task `key` (Cognition's extension). The request is
+    /// sent from its own task so the router keeps serving the agent meanwhile; `{}` means the
+    /// agent took it, the end arrives as the task's end signal.
+    fn stop_background(&mut self, key: String, reply: oneshot::Sender<Result<(), AdapterError>>) {
+        let Some(background) = &self.background else {
+            let _ = reply.send(Err(AdapterError::Unsupported("backgroundStop")));
+            return;
+        };
+        let target = match background.stop_target(&key) {
+            Ok(target) => target,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        let Some(session_id) = self.session_id.clone() else {
+            let _ = reply.send(Err(AdapterError::Closed));
+            return;
+        };
+        let (method, params) = target.request(&session_id);
+        let peer = self.peer.clone();
+        let timeout = self.request_timeout;
+        tokio::spawn(async move {
+            let result = peer
+                .request_timeout::<_, Value>(method, params, timeout)
+                .await
+                .map(|_| ())
+                .map_err(|e| match e {
+                    RpcCallError::Closed => AdapterError::Closed,
+                    other => AdapterError::Harness(format!("{method}: {other}")),
+                });
+            let _ = reply.send(result);
+        });
+    }
+
+    /// The engine expired a request (its turn or background task ended) and no longer waits
+    /// for the user: answer the agent `cancelled` (the ACP answer for a request the client
+    /// abandons), so that it does not wait either.
+    async fn expire(&mut self, request_id: &str) -> Result<(), AdapterError> {
+        let Some(p) = self.pending.remove(request_id) else {
+            return Err(AdapterError::UnknownRequest(request_id.to_owned()));
+        };
+        self.peer
+            .respond(p.rpc_id().clone(), p.cancelled())
+            .await
+            .map_err(|e| match e {
+                RpcCallError::Closed => AdapterError::Closed,
+                other => AdapterError::Other(other.to_string()),
+            })
     }
 
     async fn request_cancel(&mut self) -> Result<(), AdapterError> {
@@ -1211,10 +1456,13 @@ impl Router {
         if let Some((level, message, code)) = notice {
             self.notice(level, message, &code);
         }
-        self.withdraw_all();
+        // Requests still pending stay pending: the engine expires those of this turn and has
+        // them answered (`expire_request`); those of the thread or of a background task
+        // outlive the turn.
         self.turn = None;
         self.turn_lost = false;
         self.emit(AdapterEvent::TurnCompleted {
+            trigger: None,
             status,
             usage,
             error,
@@ -1443,17 +1691,15 @@ fn is_item_update(u: &SessionUpdate) -> bool {
     )
 }
 
-fn update_value(u: &SessionUpdate) -> Value {
-    match u {
-        SessionUpdate::Unknown(v) => v.clone(),
-        other => Value::String(format!("{other:?}")),
-    }
-}
-
 fn reply_closed(cmd: Cmd) {
     match cmd {
         Cmd::SetupDone { reply, .. } => drop(reply),
-        Cmd::Send { reply, .. } | Cmd::Interrupt { reply } | Cmd::Respond { reply, .. } => {
+        Cmd::Initialized { reply, .. } => drop(reply),
+        Cmd::Send { reply, .. }
+        | Cmd::Interrupt { reply }
+        | Cmd::Respond { reply, .. }
+        | Cmd::StopBackground { reply, .. }
+        | Cmd::Expire { reply, .. } => {
             let _ = reply.send(Err(AdapterError::Closed));
         }
         Cmd::ApplySettings { reply, .. } | Cmd::SettingsDone { reply, .. } => {
@@ -1539,6 +1785,23 @@ impl SessionControl for AcpControl {
             reply,
         })
         .await?
+    }
+
+    async fn stop_background(&self, key: &str) -> Result<(), AdapterError> {
+        let key = key.to_owned();
+        self.call(|reply| Cmd::StopBackground { key, reply })
+            .await?
+    }
+
+    /// Answers the agent `cancelled` (permission) or `{action: "cancel"}` (elicitation): the
+    /// ACP answers for a request the client abandons, whatever ended it.
+    async fn expire_request(
+        &self,
+        request_id: &str,
+        _reason: ExpireReason,
+    ) -> Result<(), AdapterError> {
+        let request_id = request_id.to_owned();
+        self.call(|reply| Cmd::Expire { request_id, reply }).await?
     }
 
     async fn shutdown(&self, reason: StopReason) -> ExitInfo {

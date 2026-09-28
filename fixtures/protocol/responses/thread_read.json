@@ -2,6 +2,91 @@
   "id": 24,
   "jsonrpc": "2.0",
   "result": {
+    "backgroundTasks": [
+      {
+        "ambient": false,
+        "id": "bgt_01K6A00000000000000000BG01",
+        "kind": "agent",
+        "nativeId": "a546c1f2e9d04b7a8",
+        "originItemId": "itm_01K6A00000000000000000IT09",
+        "progress": {
+          "durationMs": 42000,
+          "lastToolName": "Read",
+          "tokens": 18400,
+          "toolUses": 7
+        },
+        "runs": 1,
+        "startedAt": 1790000003100,
+        "status": "running",
+        "stoppable": true,
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "title": "Review the reconnect logic",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "ambient": false,
+        "endReason": "harness",
+        "endedAt": 1790000088000,
+        "id": "bgt_01K6A00000000000000000BG02",
+        "kind": "shell",
+        "nativeId": "bkomsmz3d",
+        "result": {
+          "exitCode": 0,
+          "output": "built in 41.2s\n",
+          "outputTruncated": false
+        },
+        "runs": 1,
+        "startedAt": 1790000003100,
+        "status": "completed",
+        "stoppable": true,
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "title": "npm run build",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "ambient": false,
+        "endReason": "harness",
+        "endedAt": 1790000060000,
+        "id": "bgt_01K6A00000000000000000BG03",
+        "kind": "workflow",
+        "nativeId": "w7k2m9q1",
+        "parentTaskId": "bgt_01K6A00000000000000000BG01",
+        "progress": {
+          "summary": "Review, then fix what the review finds",
+          "workflow": [
+            {
+              "agentType": "general-purpose",
+              "label": "review",
+              "model": "haiku",
+              "phase": "analyze",
+              "state": "done",
+              "tokens": 15751
+            },
+            {
+              "label": "fix",
+              "phase": "apply",
+              "state": "progress"
+            }
+          ]
+        },
+        "result": {
+          "outputTruncated": false,
+          "summary": "Stopped by request"
+        },
+        "runs": 1,
+        "startedAt": 1790000003100,
+        "status": "stopped",
+        "stoppable": true,
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "title": "review-and-fix",
+        "turnId": "trn_01K6A0000000000000000TRN01",
+        "usage": {
+          "durationMs": 56900,
+          "toolUses": 12,
+          "totalTokens": 31504
+        }
+      }
+    ],
     "hasMoreBefore": false,
     "head": 1850,
     "interactions": [
@@ -71,6 +156,40 @@
         "status": "pending",
         "threadId": "thr_01K6A0000000000000000THR01",
         "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "backgroundTaskId": "bgt_01K6A00000000000000000BG01",
+        "createdAt": 1790000010840,
+        "id": "int_01K6A00000000000000000IN03",
+        "request": {
+          "detail": "The agent wants to run a shell command.",
+          "kind": "approval",
+          "options": [
+            {
+              "id": "allow",
+              "kind": "allowOnce",
+              "label": "Allow"
+            },
+            {
+              "id": "allow_session",
+              "kind": "allowForSession",
+              "label": "Allow for this session"
+            },
+            {
+              "id": "deny",
+              "kind": "deny",
+              "label": "Deny"
+            }
+          ],
+          "subject": {
+            "command": "cargo test -p aas-server",
+            "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+            "type": "command"
+          },
+          "title": "Run command?"
+        },
+        "status": "pending",
+        "threadId": "thr_01K6A0000000000000000THR01"
       }
     ],
     "items": [
@@ -201,6 +320,25 @@
         "status": "completed",
         "threadId": "thr_01K6A0000000000000000THR01",
         "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "backgroundTaskId": "bgt_01K6A00000000000000000BG01",
+        "category": "subagent",
+        "completedAt": 1790000003009,
+        "id": "itm_01K6A00000000000000000IT09",
+        "input": {
+          "description": "Review the reconnect logic",
+          "run_in_background": true
+        },
+        "kind": "toolCall",
+        "name": "Agent",
+        "output": "Async agent launched",
+        "outputTruncated": false,
+        "startedAt": 1790000002009,
+        "status": "backgrounded",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "title": "Review the reconnect logic",
+        "turnId": "trn_01K6A0000000000000000TRN01"
       }
     ],
     "queued": [
@@ -219,6 +357,16 @@
     ],
     "thread": {
       "archived": false,
+      "background": {
+        "lastEnded": {
+          "endedAt": 1790000088000,
+          "kind": "shell",
+          "status": "completed",
+          "taskId": "bgt_01K6A00000000000000000BG02",
+          "title": "npm run build"
+        },
+        "running": 1
+      },
       "createdAt": 1790000000000,
       "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
       "diffAvailable": true,
@@ -280,6 +428,27 @@
         "startedAt": 1790000002000,
         "status": "completed",
         "threadId": "thr_01K6A0000000000000000THR01",
+        "usage": {
+          "cachedInputTokens": 8000,
+          "context": {
+            "usedTokens": 84000,
+            "windowTokens": 200000
+          },
+          "costUsd": 0.12,
+          "inputTokens": 12000,
+          "outputTokens": 900,
+          "reasoningTokens": 300
+        }
+      },
+      {
+        "completedAt": 1790000095000,
+        "id": "trn_01K6A0000000000000000TRN02",
+        "index": 1,
+        "model": "opus",
+        "startedAt": 1790000090000,
+        "status": "completed",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "trigger": "backgroundTask",
         "usage": {
           "cachedInputTokens": 8000,
           "context": {

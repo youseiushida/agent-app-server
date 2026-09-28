@@ -97,7 +97,7 @@ class NewProjectViewModelTest {
     private val project = Samples.project("prj_new", name = "new-app")
 
     private suspend fun viewModel(): NewProjectViewModel {
-        val vm = onMain { NewProjectViewModel(ProjectRepository(env.engine, env.reads), env.engine.workspace) }
+        val vm = onMain { NewProjectViewModel(ProjectRepository(env.engine, env.reads, env.lists), env.engine.workspace) }
         jobs += CoroutineScope(Dispatchers.Default).launch { vm.eventFlow.collect { events += it } }
         return vm
     }
@@ -319,6 +319,7 @@ class NewThreadViewModelTest {
 
     private val env = TestEngine()
     private val jobs = mutableListOf<Job>()
+    private val viewModels = mutableListOf<NewThreadViewModel>()
     private val harness = TestEngine.fakeHarness()
     private val project = Samples.project("prj_1").copy(
         defaults = ProjectDefaults(harnessId = "fake", model = "large", effort = "high", permissionMode = "full"),
@@ -334,8 +335,9 @@ class NewThreadViewModelTest {
 
     private suspend fun viewModel(route: NewThreadRoute = NewThreadRoute("prj_1")): NewThreadViewModel {
         val vm = onMain {
-            NewThreadViewModel(route, env.engine.workspace, ThreadRepository(env.engine, env.reads), ProjectRepository(env.engine, env.reads), env.engine.status, messages, drafts, FakeUploader(), AppPolicy(), PromptTemplates("R", "I"), env.engine.outbox, HarnessRepository(env.engine))
+            NewThreadViewModel(route, env.engine.workspace, ThreadRepository(env.engine, env.reads, env.lists), ProjectRepository(env.engine, env.reads, env.lists), env.engine.status, messages, drafts, FakeUploader(), AppPolicy(), PromptTemplates("R", "I"), env.engine.outbox, HarnessRepository(env.engine))
         }
+        viewModels += vm
         jobs += CoroutineScope(Dispatchers.Default).launch { vm.state.collect {} }
         eventually(what = "harness") { vm.state.value.harness }
         return vm
@@ -344,6 +346,7 @@ class NewThreadViewModelTest {
     @After
     fun tearDown() {
         jobs.forEach { it.cancel() }
+        dev.aas.android.testing.clearViewModels(viewModels)
         env.close()
     }
 
@@ -389,6 +392,32 @@ class NewThreadViewModelTest {
         eventually(what = "the draft back") { vm.composer.state.value.value.text.takeIf { it == "Build the thing" } }
         eventually(what = "no longer waiting") { vm.state.value.takeIf { it.waiting == null && !it.creating } }
         assertEquals(1, env.requests(Methods.ThreadCreate.name).size, "never resent while the harness is unavailable")
+    }
+
+    /** `/resume` in the first message: the import of this project with the chosen harness, never a thread. */
+    @Test
+    fun resumeOpensTheImportInsteadOfCreatingAThread() = blockingTest {
+        val importing = harness.copy(capabilities = harness.capabilities.copy(nativeSessions = true))
+        env.serve(null, harnesses = listOf(importing), projects = listOf(project))
+        env.connect()
+        val vm = viewModel()
+        val events = java.util.concurrent.CopyOnWriteArrayList<NewThreadEvent>()
+        jobs += CoroutineScope(Dispatchers.Default).launch { vm.eventFlow.collect { events += it } }
+
+        onMain { vm.composer.setText("/resu") }
+        val entry = eventually(what = "/resume in the palette") { vm.composer.state.value.palette.firstOrNull { it.name == "resume" } }
+        onMain { vm.choose(entry) }
+        assertEquals(NewThreadEvent.OpenImport("prj_1", "fake"), eventually(what = "the import opened") { events.firstOrNull() })
+
+        onMain {
+            vm.composer.setText("/resume")
+            vm.create()
+        }
+        eventually(what = "the import opened again") { events.takeIf { it.size == 2 } }
+        assertEquals(NewThreadEvent.OpenImport("prj_1", "fake"), events[1])
+        assertEquals("", vm.composer.textValue.text)
+        assertTrue(env.requests(Methods.ThreadCreate.name).isEmpty())
+        assertTrue(env.engine.outbox.value.isEmpty(), "${env.engine.outbox.value}")
     }
 
     @Test
@@ -549,7 +578,7 @@ class DiffViewModelTest {
         val cache = BlobCache(temp.newFolder("blobs"), 1024 * 1024, Dispatchers.IO)
         cache.put("blb_patch", ("diff --git a/big.kt b/big.kt\n--- a/big.kt\n+++ b/big.kt\n@@ -1 +1,3 @@\n-a\n+b\n+c\n+d\n").toByteArray())
         val blobs = BlobRepository(dev.aas.android.sync.AasHttp(okhttp3.OkHttpClient()), { null }, cache) { _, e -> throw AssertionError(e) }
-        return onMain { DiffViewModel(DiffRoute("thr_1", turnId), ThreadRepository(env.engine, env.reads), blobs, policy, drafts, UserMessages(), env.engine.status) }
+        return onMain { DiffViewModel(DiffRoute("thr_1", turnId), ThreadRepository(env.engine, env.reads, env.lists), blobs, policy, drafts, UserMessages(), env.engine.status) }
     }
 
     @After

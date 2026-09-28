@@ -25,6 +25,50 @@
 //! * Every child process is spawned through [`AdapterContext::supervisor`].
 //! * Anything the adapter cannot map is forwarded as [`AdapterEvent::Native`] instead of
 //!   being dropped or guessed.
+//! * [`AdapterEvent::TurnCompleted::trigger`] is set only when the harness says explicitly why
+//!   it started a run by itself (e.g. Claude's `result.origin`).
+//! * [`SessionControl::send`] fails with [`AdapterError::TurnInProgress`] (and nothing else)
+//!   when the adapter has seen the CLI start a run by itself that is still going on; the
+//!   adapter emits that run's [`AdapterEvent::TurnStarted`] before it returns the error. The
+//!   engine then sends the input again once that run has completed.
+//!
+//! # Background work
+//!
+//! Work the harness runs outside the turn lifecycle (background agents, shells, workflows,
+//! monitors, scheduled wakeups, …) is reported as background tasks
+//! ([`AdapterEvent::BackgroundTask`], capability `backgroundTasks`):
+//!
+//! * Every event carries the whole state of one task ([`BackgroundTaskInfo`]); sending the same
+//!   state again changes nothing. Tasks are identified by the harness's own id (`key`), unique
+//!   within the session.
+//! * Whether the session is busy comes only from the harness's live set (a level signal, e.g.
+//!   Claude's `background_tasks_changed`, Codex's background terminal list): the tasks with
+//!   `live && !ambient` are exactly the harness's live set of work that counts as activity. A
+//!   harness that replaces its set with every report is mirrored by setting `live` on every
+//!   task in it and clearing it on every other one ([`BackgroundTasks::replace_live`]). The
+//!   engine keeps the process alive (no idle stop), holds a sleep lease and makes a drain wait
+//!   while such a task exists. `ambient` tasks ("not activity") never do.
+//! * `state` comes from the harness's start / end signals. A task ends only by an explicit
+//!   terminal signal of the harness, or with the process ([`AdapterEvent::Exited`] ends every
+//!   task that has not ended; the engine records how). Adapters never end a task because of
+//!   elapsed time, and never infer a result from text written for people.
+//! * A task that starts again under the same key after it ended is a new run: `runs` goes up
+//!   by one and `state` is `Running` again.
+//! * An item whose work goes on as a task: the adapter emits the task (with
+//!   `origin_item_key`) before it closes the item with [`ItemStatus::Backgrounded`], and both
+//!   before the turn's [`AdapterEvent::TurnCompleted`].
+//! * [`AdapterEvent::InteractionRequested::background_key`] names the task that asks. Such a
+//!   request belongs to the task, not to the turn: it outlives the turn and expires when the
+//!   task ends.
+//! * [`SessionControl::stop_background`] only asks: `Ok` means the harness accepted the request.
+//!   The end arrives as a task in a terminal state (or with `Exited`).
+//!
+//! # Requests the engine no longer needs answered
+//!
+//! When a request expires in the engine while the process lives (its turn or its background
+//! task ended), the engine calls [`SessionControl::expire_request`] so that the adapter answers
+//! the CLI, which would otherwise wait for an answer forever. A request the CLI withdrew
+//! ([`AdapterEvent::InteractionWithdrawn`]) needs no answer.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -40,9 +84,11 @@ use tokio::sync::mpsc;
 
 pub use aas_protocol as protocol;
 pub use aas_protocol::{
-    Command, ContextUsage, DeltaField, EffortLevel, HarnessCapabilities, HarnessKind,
-    InteractionRequest, InteractionResolution, ItemBody, ItemStatus, Millis, Model, NoticeLevel,
-    PermissionMode, ThreadId, ThreadSettings, TurnError, TurnStatus, Usage,
+    BackgroundProgress, BackgroundTaskKind, BackgroundUsage, Command, ContextUsage, DeltaField,
+    EffortLevel, ExpireReason, HarnessCapabilities, HarnessKind, InteractionRequest,
+    InteractionResolution, ItemBody, ItemStatus, Millis, Model, NoticeLevel, PermissionMode,
+    ThreadId, ThreadSettings, TurnError, TurnStatus, TurnTrigger, Usage, WorkflowAgent,
+    WorkflowAgentState,
 };
 pub use aas_supervisor::{ExitInfo, StopReason, Supervisor};
 
@@ -82,6 +128,14 @@ pub struct AdapterPolicy {
     /// applying settings). The engine bounds those calls with it too. Default 60 s: the first
     /// start of a Node.js CLI can be slow (cold cache, antivirus scan).
     pub handshake_timeout: Duration,
+    /// Characters of a native session title made from the first line of its first prompt
+    /// (`policy.first_message_title_chars`, the rule the engine applies to thread titles).
+    /// Default 80: fits one line of the phone's thread list.
+    pub first_message_title_chars: usize,
+    /// Characters kept of a title the harness gave a native session (`policy.harness_title_chars`,
+    /// the rule the engine applies to `SessionTitle`). Default 200: harnesses write whole
+    /// sentences, and more than two lines of the list is noise.
+    pub harness_title_chars: usize,
 }
 
 impl Default for AdapterPolicy {
@@ -90,8 +144,47 @@ impl Default for AdapterPolicy {
             stop_grace: Duration::from_secs(5),
             max_line_bytes: 64 * 1024 * 1024,
             handshake_timeout: Duration::from_secs(60),
+            first_message_title_chars: 80,
+            harness_title_chars: 200,
         }
     }
+}
+
+impl AdapterPolicy {
+    /// Title of a native session made from its first prompt (see [`title_from_first_line`]).
+    pub fn prompt_title(&self, prompt: &str) -> Option<String> {
+        let title = title_from_first_line(prompt, self.first_message_title_chars);
+        (!title.is_empty()).then_some(title)
+    }
+
+    /// Title a harness gave a native session (see [`harness_title`]).
+    pub fn harness_title(&self, title: &str) -> Option<String> {
+        let title = harness_title(title, self.harness_title_chars);
+        (!title.is_empty()).then_some(title)
+    }
+}
+
+/// A title from the first non-empty line of `text`, trimmed, at most `max_chars` characters; a
+/// longer line is cut and ends with `…`. The one rule for titles made from a message: the engine
+/// uses it for thread titles and adapters for native sessions without a name.
+pub fn title_from_first_line(text: &str, max_chars: usize) -> String {
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut title: String = first.chars().take(max_chars).collect();
+    if first.chars().count() > max_chars {
+        title.push('…');
+    }
+    title
+}
+
+/// A title a harness gave a session, trimmed and cut to `max_chars` characters. The one rule
+/// for harness-given titles: the engine uses it for `SessionTitle`, adapters for native
+/// session names.
+pub fn harness_title(title: &str, max_chars: usize) -> String {
+    title.trim().chars().take(max_chars).collect()
 }
 
 /// Dependencies injected into adapters.
@@ -222,6 +315,256 @@ pub enum SettingsApplied {
     RequiresRestart,
 }
 
+/// Lifecycle state of a background task, from the harness's start and end signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackgroundState {
+    Running,
+    Completed,
+    Failed,
+    /// Stopped (on request, or by the harness itself).
+    Stopped,
+}
+
+impl BackgroundState {
+    pub fn is_ended(self) -> bool {
+        !matches!(self, BackgroundState::Running)
+    }
+}
+
+/// What a background task produced, only from explicit fields of the harness.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundOutcome {
+    /// The harness's summary of what the task did, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Exit code of a command, when the harness reports it in a field of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The whole output (the engine keeps `policy.max_inline_output_bytes` inline and moves
+    /// the rest to a blob).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+/// Work the harness runs outside the turn lifecycle, as the adapter knows it (whole state; see
+/// the crate docs, "Background work").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTaskInfo {
+    /// The harness's id of the task, unique within the session (Claude `task_id`, Codex
+    /// process id or child thread id).
+    pub key: String,
+    pub kind: BackgroundTaskKind,
+    /// The harness's description, verbatim.
+    pub title: String,
+    /// Member of the harness's live set (a level signal).
+    pub live: bool,
+    /// The harness says the task is not activity: it never keeps the session busy.
+    #[serde(default)]
+    pub ambient: bool,
+    pub state: BackgroundState,
+    /// Starts under this key (1 for the first run).
+    pub runs: u32,
+    /// Key of the item that launched the task (in the turn that ran then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_item_key: Option<String>,
+    /// Key of the background task that launched this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<BackgroundProgress>,
+    /// Present once the harness reported what the task produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<BackgroundOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<BackgroundUsage>,
+    /// [`SessionControl::stop_background`] can stop this task.
+    #[serde(default)]
+    pub stoppable: bool,
+    /// When the harness says the task runs next (scheduled wakeups), as the harness reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<Millis>,
+}
+
+impl BackgroundTaskInfo {
+    /// A task that just started: running, live, first run, nothing reported yet.
+    pub fn new(key: impl Into<String>, kind: BackgroundTaskKind, title: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            kind,
+            title: title.into(),
+            live: true,
+            ambient: false,
+            state: BackgroundState::Running,
+            runs: 1,
+            origin_item_key: None,
+            parent_key: None,
+            progress: None,
+            result: None,
+            usage: None,
+            stoppable: false,
+            next_run_at: None,
+        }
+    }
+
+    /// Whether the task keeps the session busy: in the harness's live set and not ambient.
+    pub fn keeps_busy(&self) -> bool {
+        self.live && !self.ambient
+    }
+}
+
+/// An entry of a harness's live set (see [`BackgroundTasks::replace_live`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEntry {
+    pub key: String,
+    pub ambient: bool,
+}
+
+/// The background tasks of one session as an adapter tracks them. It applies the harness's
+/// signals — starts, ends and live-set reports — with the rules of the contract (crate docs,
+/// "Background work") and returns the whole state of every task that changed, for the adapter
+/// to emit as [`AdapterEvent::BackgroundTask`]. It never ends a task by itself.
+#[derive(Debug, Clone, Default)]
+pub struct BackgroundTasks {
+    tasks: BTreeMap<String, BackgroundTaskInfo>,
+}
+
+impl BackgroundTasks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&BackgroundTaskInfo> {
+        self.tasks.get(key)
+    }
+
+    /// Every task the session reported, ended ones included (by key).
+    pub fn iter(&self) -> impl Iterator<Item = &BackgroundTaskInfo> {
+        self.tasks.values()
+    }
+
+    /// Whether any task keeps the session busy.
+    pub fn any_busy(&self) -> bool {
+        self.tasks.values().any(BackgroundTaskInfo::keeps_busy)
+    }
+
+    /// The harness reported that a task started. A key that is not known yet is added as it
+    /// is. A known key that had ended starts a new run (`runs` + 1, running, no result). A
+    /// known running key takes the new details. The live set is the harness's level signal:
+    /// for a known key `live` and `ambient` stay as the last report said. Returns the task's
+    /// new state when it changed.
+    pub fn started(&mut self, task: BackgroundTaskInfo) -> Option<BackgroundTaskInfo> {
+        let Some(known) = self.tasks.get_mut(&task.key) else {
+            let task = BackgroundTaskInfo {
+                runs: task.runs.max(1),
+                ..task
+            };
+            self.tasks.insert(task.key.clone(), task.clone());
+            return Some(task);
+        };
+        let before = known.clone();
+        // A new run starts from scratch; a repeated start of the running task only adds what
+        // it carries.
+        let restart = before.state.is_ended();
+        fn keep<T>(restart: bool, new: Option<T>, old: Option<T>) -> Option<T> {
+            if restart { new } else { new.or(old) }
+        }
+        *known = BackgroundTaskInfo {
+            key: task.key,
+            kind: task.kind,
+            title: task.title,
+            live: before.live,
+            ambient: before.ambient,
+            state: BackgroundState::Running,
+            runs: if restart {
+                before.runs + 1
+            } else {
+                before.runs
+            },
+            origin_item_key: task.origin_item_key.or(before.origin_item_key.clone()),
+            parent_key: task.parent_key.or(before.parent_key.clone()),
+            progress: keep(restart, task.progress, before.progress.clone()),
+            result: keep(restart, task.result, before.result.clone()),
+            usage: keep(restart, task.usage, before.usage),
+            stoppable: task.stoppable,
+            next_run_at: keep(restart, task.next_run_at, before.next_run_at),
+        };
+        (*known != before).then(|| known.clone())
+    }
+
+    /// Applies `change` to a known task. Returns its new state when it changed (`None` for an
+    /// unknown key, which is left alone).
+    pub fn update(
+        &mut self,
+        key: &str,
+        change: impl FnOnce(&mut BackgroundTaskInfo),
+    ) -> Option<BackgroundTaskInfo> {
+        let task = self.tasks.get_mut(key)?;
+        let before = task.clone();
+        change(task);
+        (*task != before).then(|| task.clone())
+    }
+
+    /// The harness reported the end of a task (`state` is not `Running`), with what it
+    /// produced. Returns the new state when it changed.
+    pub fn ended(
+        &mut self,
+        key: &str,
+        state: BackgroundState,
+        result: Option<BackgroundOutcome>,
+    ) -> Option<BackgroundTaskInfo> {
+        debug_assert!(state.is_ended(), "an end must be a terminal state");
+        self.update(key, |task| {
+            task.state = state;
+            if result.is_some() {
+                task.result = result;
+            }
+        })
+    }
+
+    /// The harness reported its live set: exactly the tasks of `live` are live now (with
+    /// their `ambient` flag), every other task is not. A key that is not known yet is added
+    /// as `unknown` makes it (the live set may arrive before the start signal). Returns every
+    /// task whose state changed.
+    pub fn replace_live(
+        &mut self,
+        live: impl IntoIterator<Item = LiveEntry>,
+        mut unknown: impl FnMut(&LiveEntry) -> BackgroundTaskInfo,
+    ) -> Vec<BackgroundTaskInfo> {
+        let live: BTreeMap<String, LiveEntry> =
+            live.into_iter().map(|e| (e.key.clone(), e)).collect();
+        let mut changed = Vec::new();
+        for (key, entry) in &live {
+            if !self.tasks.contains_key(key) {
+                let task = BackgroundTaskInfo {
+                    key: key.clone(),
+                    live: true,
+                    ambient: entry.ambient,
+                    ..unknown(entry)
+                };
+                self.tasks.insert(key.clone(), task.clone());
+                changed.push(task);
+            }
+        }
+        for (key, task) in self.tasks.iter_mut() {
+            let (now_live, now_ambient) = match live.get(key) {
+                Some(entry) => (true, entry.ambient),
+                None => (false, task.ambient),
+            };
+            if task.live != now_live || task.ambient != now_ambient {
+                task.live = now_live;
+                task.ambient = now_ambient;
+                if !changed.iter().any(|c: &BackgroundTaskInfo| &c.key == key) {
+                    changed.push(task.clone());
+                }
+            }
+        }
+        changed
+    }
+}
+
 /// Normalized events emitted by a session. Items are identified by an adapter-chosen `key`
 /// (unique within the session); the engine maps keys to protocol item ids.
 #[derive(Debug, Clone, PartialEq)]
@@ -274,6 +617,11 @@ pub enum AdapterEvent {
         request_id: String,
         request: InteractionRequest,
         item_key: Option<String>,
+        /// The background task that asks (its key), when the harness says so explicitly
+        /// (e.g. Claude's `can_use_tool.agent_id`). The request then belongs to that task: it
+        /// outlives the turn and expires when the task ends. `None`: it belongs to the running
+        /// turn, or to the thread when no turn runs.
+        background_key: Option<String>,
     },
     /// The CLI withdrew a pending request (it no longer needs an answer).
     InteractionWithdrawn {
@@ -291,6 +639,13 @@ pub enum AdapterEvent {
         status: TurnStatus,
         usage: Option<Usage>,
         error: Option<TurnError>,
+        /// Why the harness started this run by itself, when it says so explicitly.
+        trigger: Option<TurnTrigger>,
+    },
+    /// The whole current state of one background task (see the crate docs, "Background
+    /// work"). Idempotent. Boxed: the state is large next to the other events.
+    BackgroundTask {
+        task: Box<BackgroundTaskInfo>,
     },
     /// Shown to the user as a notice item.
     Notice {
@@ -333,6 +688,10 @@ pub enum AdapterError {
     Closed,
     #[error("unknown request id {0}")]
     UnknownRequest(String),
+    /// [`SessionControl::send`] found the CLI running a turn it started by itself (the
+    /// adapter has emitted that turn's `TurnStarted`); the input was not taken.
+    #[error("the agent is running a turn it started by itself")]
+    TurnInProgress,
     #[error("{0}")]
     Other(String),
 }
@@ -351,6 +710,76 @@ pub struct NativeSessionSummary {
     pub title: Option<String>,
     pub updated_at: Option<Millis>,
     pub cwd: Option<String>,
+}
+
+/// Native sessions with each `native_session_id` once.
+///
+/// A native session is one conversation, and a thread imports one native session, so a listing
+/// names each session once (`native/list` promises clients unique `nativeSessionId`s). Some CLIs
+/// list a session several times — Codex's `thread/list` has one entry per rollout file of a
+/// resumed thread, with the same id. For each id this keeps the position of its first entry
+/// and the content of its entry with the latest `updated_at` (an entry with a time is later
+/// than one without; on a tie the earlier entry stays).
+#[derive(Debug, Default)]
+pub struct NativeSessionSet {
+    sessions: Vec<NativeSessionSummary>,
+    positions: std::collections::HashMap<String, usize>,
+    repeated: usize,
+}
+
+impl NativeSessionSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds `session`, or merges it into the entry of the same id. Returns whether the id is
+    /// new.
+    pub fn insert(&mut self, session: NativeSessionSummary) -> bool {
+        match self.positions.get(&session.native_session_id) {
+            Some(&at) => {
+                self.repeated += 1;
+                let kept = &mut self.sessions[at];
+                if session.updated_at > kept.updated_at {
+                    *kept = session;
+                }
+                false
+            }
+            None => {
+                self.positions
+                    .insert(session.native_session_id.clone(), self.sessions.len());
+                self.sessions.push(session);
+                true
+            }
+        }
+    }
+
+    /// Number of distinct sessions.
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    /// Number of entries that repeated an id already present (and were merged into it).
+    pub fn repeated(&self) -> usize {
+        self.repeated
+    }
+
+    pub fn into_sessions(self) -> Vec<NativeSessionSummary> {
+        self.sessions
+    }
+}
+
+impl FromIterator<NativeSessionSummary> for NativeSessionSet {
+    fn from_iter<I: IntoIterator<Item = NativeSessionSummary>>(iter: I) -> Self {
+        let mut set = Self::new();
+        for session in iter {
+            set.insert(session);
+        }
+        set
+    }
 }
 
 /// A native session that exists but could not be read (e.g. a transcript file that cannot be
@@ -423,7 +852,21 @@ pub trait HarnessAdapter: Send + Sync + 'static {
     /// Harness-native commands for the composer's `/` menu.
     async fn commands(&self, ctx: CommandContext) -> Result<Vec<Command>, AdapterError>;
 
-    /// Native sessions whose working directory is `cwd` (capability `nativeSessions`).
+    /// Names of harness commands (from [`commands`](Self::commands) and
+    /// [`AdapterEvent::CommandsChanged`]) whose effect is to switch the native session inside
+    /// the running process: start a new one, open another one, or move to another branch of
+    /// it. The engine never offers them in `command/list`: a thread is one native session, and
+    /// a switch under a running thread would leave its history, turns, diffs and interactions
+    /// describing a conversation the agent no longer has. Each adapter lists its CLI's
+    /// commands by explicit name, with the reason; the default is none.
+    fn session_switching_commands(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Native sessions whose working directory is `cwd` (capability `nativeSessions`), each
+    /// `native_session_id` once: a CLI that lists a session several times is merged by the
+    /// adapter ([`NativeSessionSet`]). The engine enforces the same rule on every result and
+    /// logs a warning when an adapter repeats an id (an adapter defect).
     /// Sessions that exist but cannot be read are skipped and logged with their location;
     /// [`scan_native_sessions`](Self::scan_native_sessions) returns them to the caller.
     async fn list_native_sessions(
@@ -477,6 +920,31 @@ pub trait SessionControl: Send + Sync {
     /// Staged stop (protocol-level cancel when needed → close stdin → grace → terminate the
     /// tree). Idempotent; returns how the process ended.
     async fn shutdown(&self, reason: StopReason) -> ExitInfo;
+
+    /// Asks the harness to stop background task `key` (capability `backgroundStop`). `Ok`
+    /// means the request was accepted, not that the task has stopped: its end arrives as an
+    /// [`AdapterEvent::BackgroundTask`] in a terminal state (or with `Exited`). Bounded by
+    /// `handshake_timeout` like the other requests.
+    async fn stop_background(&self, key: &str) -> Result<(), AdapterError> {
+        let _ = key;
+        Err(AdapterError::Unsupported("backgroundStop"))
+    }
+
+    /// The engine expired request `request_id` while the process lives (`reason`: its turn or
+    /// its background task ended) and no longer waits for an answer: answer the CLI so that it
+    /// does not wait either. [`AdapterError::UnknownRequest`] when the request is not pending
+    /// any more (answered, withdrawn). The default answers like a dismissal
+    /// ([`InteractionResolution::Dismissed`], which every adapter maps to its CLI's decline or
+    /// cancel); adapters whose CLI has a dedicated answer for this override it.
+    async fn expire_request(
+        &self,
+        request_id: &str,
+        reason: ExpireReason,
+    ) -> Result<(), AdapterError> {
+        let _ = reason;
+        self.respond(request_id, &InteractionResolution::Dismissed)
+            .await
+    }
 }
 
 type StopFn = Box<dyn FnOnce(StopReason) -> Pin<Box<dyn Future<Output = ExitInfo> + Send>> + Send>;
@@ -637,6 +1105,223 @@ mod tests {
             .await;
         assert_eq!(info.stopped, Some(StopReason::Shutdown));
         assert_eq!(*session.stops.lock().unwrap(), vec![StopReason::Shutdown]);
+    }
+
+    fn native(id: &str, title: &str, updated_at: Option<Millis>) -> NativeSessionSummary {
+        NativeSessionSummary {
+            native_session_id: id.into(),
+            title: Some(title.into()),
+            updated_at,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn a_native_session_set_keeps_each_id_once_with_its_latest_entry() {
+        let set: NativeSessionSet = [
+            native("a", "a (older rollout)", Some(10)),
+            native("b", "b", Some(30)),
+            // Later than the first entry of `a`: its content wins, the position stays.
+            native("a", "a (latest rollout)", Some(40)),
+            // Older than the kept entry: ignored.
+            native("a", "a (oldest rollout)", Some(5)),
+            native("c", "c", None),
+            // An entry with a time is later than one without.
+            native("c", "c (timed)", Some(1)),
+            // A tie keeps the earlier entry.
+            native("b", "b (tie)", Some(30)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(set.len(), 3);
+        assert_eq!(set.repeated(), 4);
+        assert_eq!(
+            set.into_sessions(),
+            vec![
+                native("a", "a (latest rollout)", Some(40)),
+                native("b", "b", Some(30)),
+                native("c", "c (timed)", Some(1)),
+            ]
+        );
+        let mut set = NativeSessionSet::new();
+        assert!(set.is_empty());
+        assert!(set.insert(native("x", "x", None)));
+        assert!(!set.insert(native("x", "x", None)));
+        assert_eq!((set.len(), set.repeated()), (1, 1));
+    }
+
+    #[test]
+    fn titles_follow_the_policy() {
+        let policy = AdapterPolicy {
+            first_message_title_chars: 5,
+            harness_title_chars: 4,
+            ..AdapterPolicy::default()
+        };
+        assert_eq!(
+            policy.prompt_title("\n  hello world  \nsecond").as_deref(),
+            Some("hello…")
+        );
+        assert_eq!(policy.prompt_title("  hi \n").as_deref(), Some("hi"));
+        assert_eq!(policy.prompt_title(" \n \n"), None);
+        assert_eq!(policy.harness_title("  named  ").as_deref(), Some("name"));
+        assert_eq!(policy.harness_title("   "), None);
+        // Characters, not bytes.
+        assert_eq!(title_from_first_line("日本語のタイトル", 3), "日本語…");
+        assert_eq!(harness_title("日本語のタイトル", 3), "日本語");
+        let defaults = AdapterPolicy::default();
+        assert_eq!(
+            (
+                defaults.first_message_title_chars,
+                defaults.harness_title_chars
+            ),
+            (80, 200)
+        );
+    }
+
+    fn agent(key: &str) -> BackgroundTaskInfo {
+        BackgroundTaskInfo::new(key, BackgroundTaskKind::Agent, format!("task {key}"))
+    }
+
+    #[test]
+    fn a_task_that_starts_again_after_its_end_is_a_new_run() {
+        let mut tasks = BackgroundTasks::new();
+        let first = tasks
+            .started(BackgroundTaskInfo {
+                origin_item_key: Some("tool1".into()),
+                ..agent("a")
+            })
+            .unwrap();
+        assert_eq!((first.runs, first.state), (1, BackgroundState::Running));
+        // A repeated start of the running task adds nothing new: no event.
+        assert_eq!(tasks.started(agent("a")), None);
+        let done = tasks
+            .ended(
+                "a",
+                BackgroundState::Completed,
+                Some(BackgroundOutcome {
+                    summary: Some("done".into()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(done.state, BackgroundState::Completed);
+        assert_eq!(
+            done.result.as_ref().unwrap().summary.as_deref(),
+            Some("done")
+        );
+        let again = tasks.started(agent("a")).unwrap();
+        assert_eq!((again.runs, again.state), (2, BackgroundState::Running));
+        assert_eq!(again.result, None, "a new run has no result yet");
+        assert_eq!(
+            again.origin_item_key.as_deref(),
+            Some("tool1"),
+            "the origin stays"
+        );
+        assert_eq!(
+            tasks.ended("unknown", BackgroundState::Failed, None),
+            None,
+            "unknown keys are left alone"
+        );
+    }
+
+    #[test]
+    fn the_live_set_replaces_itself_and_is_kept_by_later_starts() {
+        let mut tasks = BackgroundTasks::new();
+        tasks.started(agent("a"));
+        // The level report may name a task before its start signal.
+        let changed = tasks.replace_live(
+            [
+                LiveEntry {
+                    key: "a".into(),
+                    ambient: false,
+                },
+                LiveEntry {
+                    key: "m".into(),
+                    ambient: true,
+                },
+            ],
+            |e| BackgroundTaskInfo::new(e.key.clone(), BackgroundTaskKind::Monitor, "monitor"),
+        );
+        assert_eq!(changed.len(), 1, "only the new entry changed: {changed:?}");
+        assert!(changed[0].live && changed[0].ambient);
+        assert!(tasks.any_busy());
+        // The start of a known task keeps what the level said.
+        tasks.started(BackgroundTaskInfo {
+            live: false,
+            ..agent("a")
+        });
+        assert!(tasks.get("a").unwrap().live);
+        // A report without `a`: it is not live any more (still running as far as the edges
+        // say); the ambient monitor never keeps the session busy.
+        let changed = tasks.replace_live(
+            [LiveEntry {
+                key: "m".into(),
+                ambient: true,
+            }],
+            |_| unreachable!(),
+        );
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].key, "a");
+        assert!(!changed[0].live && changed[0].state == BackgroundState::Running);
+        assert!(!tasks.any_busy());
+        assert!(tasks.replace_live([], |_| unreachable!()).len() == 1);
+        assert!(tasks.iter().all(|t| !t.live));
+    }
+
+    #[tokio::test]
+    async fn an_expired_request_is_answered_like_a_dismissal_by_default() {
+        #[derive(Default)]
+        struct Answers(std::sync::Mutex<Vec<(String, InteractionResolution)>>);
+        #[async_trait]
+        impl SessionControl for Answers {
+            async fn send(&self, _input: TurnInput) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn steer(&self, _input: TurnInput) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn interrupt(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn respond(
+                &self,
+                request_id: &str,
+                resolution: &InteractionResolution,
+            ) -> Result<(), AdapterError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((request_id.to_owned(), resolution.clone()));
+                Ok(())
+            }
+            async fn apply_settings(
+                &self,
+                _settings: &ThreadSettings,
+            ) -> Result<SettingsApplied, AdapterError> {
+                Ok(SettingsApplied::Live)
+            }
+            async fn shutdown(&self, reason: StopReason) -> ExitInfo {
+                ExitInfo {
+                    code: Some(0),
+                    stopped: Some(reason),
+                    stderr_tail: String::new(),
+                    exited_at_ms: 0,
+                }
+            }
+        }
+        let session = Answers::default();
+        session
+            .expire_request("r1", ExpireReason::TaskEnded)
+            .await
+            .unwrap();
+        assert_eq!(
+            *session.0.lock().unwrap(),
+            vec![("r1".to_owned(), InteractionResolution::Dismissed)]
+        );
+        assert_eq!(
+            session.stop_background("k").await,
+            Err(AdapterError::Unsupported("backgroundStop"))
+        );
     }
 
     #[test]

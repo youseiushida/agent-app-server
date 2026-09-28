@@ -68,26 +68,30 @@ fun ThreadActivity.color(): Color {
         ThreadActivity.NeedsApproval -> colors.needsApproval
         ThreadActivity.NeedsInput -> colors.needsInput
         ThreadActivity.Error -> colors.error
-        ThreadActivity.Running -> colors.running
+        ThreadActivity.Running, ThreadActivity.Background -> colors.running
         ThreadActivity.Idle -> colors.idle
     }
 }
 
-/** The word of a [ThreadActivity] (実行中 / 承認が必要 / 入力が必要 / エラー / 待機中). */
+/**
+ * The words of a [ThreadActivity] (実行中 / 承認が必要 / 入力が必要 / エラー /
+ * バックグラウンドで実行中 (N) / 待機中). [backgroundRunning] is N, the running background tasks
+ * (`Thread.background.running`, or their sum over a project's threads); it is shown when positive.
+ */
 @Composable
-fun ThreadActivity.label(): String = stringResource(
-    when (this) {
-        ThreadActivity.NeedsApproval -> R.string.activity_needs_approval
-        ThreadActivity.NeedsInput -> R.string.activity_needs_input
-        ThreadActivity.Error -> R.string.activity_error
-        ThreadActivity.Running -> R.string.activity_running
-        ThreadActivity.Idle -> R.string.activity_idle
-    },
-)
+fun ThreadActivity.label(backgroundRunning: Int = 0): String = when (this) {
+    ThreadActivity.NeedsApproval -> stringResource(R.string.activity_needs_approval)
+    ThreadActivity.NeedsInput -> stringResource(R.string.activity_needs_input)
+    ThreadActivity.Error -> stringResource(R.string.activity_error)
+    ThreadActivity.Running -> stringResource(R.string.activity_running)
+    ThreadActivity.Background ->
+        if (backgroundRunning > 0) stringResource(R.string.activity_background_count, backgroundRunning) else stringResource(R.string.activity_background)
+    ThreadActivity.Idle -> stringResource(R.string.activity_idle)
+}
 
-/** A small tinted chip with the status word. */
+/** A small tinted chip with the status words ([backgroundRunning]: see [label]). */
 @Composable
-fun ThreadActivityChip(activity: ThreadActivity, modifier: Modifier = Modifier) {
+fun ThreadActivityChip(activity: ThreadActivity, modifier: Modifier = Modifier, backgroundRunning: Int = 0) {
     val color = activity.color()
     Row(
         modifier = modifier
@@ -97,7 +101,7 @@ fun ThreadActivityChip(activity: ThreadActivity, modifier: Modifier = Modifier) 
     ) {
         StatusDot(color, size = 6)
         Spacer(Modifier.size(4.dp))
-        Text(activity.label(), style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1)
+        Text(activity.label(backgroundRunning), style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1)
     }
 }
 
@@ -181,7 +185,7 @@ fun Banner(
     }
 }
 
-/** A yes/no dialog. */
+/** A yes/no dialog; [extra] adds content under the text (e.g. the background work a stop takes along). */
 @Composable
 fun ConfirmDialog(
     title: String,
@@ -190,11 +194,22 @@ fun ConfirmDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
     dismiss: String = stringResource(R.string.cancel),
+    extra: (@Composable () -> Unit)? = null,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
-        text = { Text(text) },
+        text = {
+            if (extra == null) {
+                Text(text)
+            } else {
+                Column {
+                    Text(text)
+                    Spacer(Modifier.size(8.dp))
+                    extra()
+                }
+            }
+        },
         confirmButton = { TextButton(onClick = onConfirm) { Text(confirm) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(dismiss) } },
     )

@@ -53,6 +53,8 @@ import dev.aas.android.domain.InteractionTexts
 import dev.aas.android.domain.diff.UnifiedDiff
 import dev.aas.android.protocol.AasJson
 import dev.aas.android.protocol.Attachment
+import dev.aas.android.protocol.BackgroundTask
+import dev.aas.android.protocol.BackgroundTaskId
 import dev.aas.android.protocol.BlobId
 import dev.aas.android.protocol.FileChange
 import dev.aas.android.protocol.FileChangeKind
@@ -94,6 +96,8 @@ data class ItemActions(
     val onOpenTurnDiff: (TurnId) -> Unit,
     /** An image attachment in full. */
     val onOpenImage: (BlobId) -> Unit,
+    /** The background task an item launched, in the thread's バックグラウンド section. */
+    val onOpenBackgroundTask: (BackgroundTaskId) -> Unit = {},
 ) {
     companion object {
         val None = ItemActions({}, {}, {})
@@ -104,9 +108,11 @@ data class ItemActions(
  * One item of the conversation, by kind (docs/ux/codex-desktop.md §3.2): the user's message
  * with its images, the agent's Markdown answer, folded reasoning, shell-like command cards with
  * streamed output, file changes with their diffs, tool calls, the plan checklist and notices.
+ * An item whose work goes on in the background ([Item.backgroundTaskId]) carries a chip bound to
+ * that task's live status ([backgroundTask], when loaded).
  */
 @Composable
-fun ItemView(item: Item, actions: ItemActions, modifier: Modifier = Modifier) {
+fun ItemView(item: Item, actions: ItemActions, modifier: Modifier = Modifier, backgroundTask: BackgroundTask? = null) {
     Column(modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
         when (item) {
             is Item.UserMessage -> UserMessageView(item, actions)
@@ -120,6 +126,7 @@ fun ItemView(item: Item, actions: ItemActions, modifier: Modifier = Modifier) {
             is Item.Unknown -> Text(stringResource(R.string.item_unknown, item.kind), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         ItemStatusLabel(item)
+        item.backgroundTaskId?.let { taskId -> BackgroundChip(taskId, backgroundTask?.takeIf { it.id == taskId }, actions.onOpenBackgroundTask) }
     }
 }
 
@@ -131,6 +138,7 @@ private fun ItemStatusLabel(item: Item) {
         ItemStatus.Failed -> R.string.item_failed
         ItemStatus.Declined -> R.string.item_declined
         ItemStatus.Interrupted -> R.string.item_interrupted
+        // Backgrounded: the chip of its task says how the work goes on.
         else -> return
     }
     Text(stringResource(label), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.statusColors.error)
@@ -288,6 +296,7 @@ private fun commandStatus(item: Item.CommandExecution): Pair<String, Color?> = w
     ItemStatus.Failed -> (item.exitCode?.let { stringResource(R.string.item_command_exit, it) } ?: stringResource(R.string.item_failed)) to MaterialTheme.statusColors.error
     ItemStatus.Declined -> stringResource(R.string.item_declined) to MaterialTheme.statusColors.error
     ItemStatus.Interrupted -> stringResource(R.string.item_command_stopped) to MaterialTheme.statusColors.needsApproval
+    ItemStatus.Backgrounded -> stringResource(R.string.item_backgrounded) to MaterialTheme.statusColors.running
     ItemStatus.Unknown -> stringResource(R.string.item_command_done) to null
 }
 

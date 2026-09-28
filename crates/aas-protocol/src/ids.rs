@@ -99,6 +99,12 @@ id_type!(
     DeviceId,
     "dev_"
 );
+id_type!(
+    /// Identifier of a background task: work the harness runs outside the turn lifecycle
+    /// (`bgt_…`).
+    BackgroundTaskId,
+    "bgt_"
+);
 
 /// Identifier of a blob: `blb_` followed by the lowercase hex SHA-256 of its content.
 #[derive(

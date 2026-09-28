@@ -332,6 +332,7 @@ pub fn thread_view(conn: &Connection, t: &ThreadRow) -> CoreResult<Thread> {
         |r| r.get(0),
     )?;
     let last_turn = last_turn(conn, &t.id)?.map(|row| row.turn.summary());
+    let background = thread_background(conn, &t.id)?;
     Ok(Thread {
         id: t.id.clone(),
         project_id: t.project_id.clone(),
@@ -355,6 +356,7 @@ pub fn thread_view(conn: &Connection, t: &ThreadRow) -> CoreResult<Thread> {
         last_activity_at: t.last_activity_at,
         archived: t.archived,
         pinned: t.pinned,
+        background,
         head: t.head,
     })
 }
@@ -478,9 +480,13 @@ pub struct TurnRow {
     pub end_tree: Option<String>,
 }
 
-const TURN_COLS: &str = "id, thread_id, idx, status, started_at, completed_at, model, error, usage, diff, base_tree, end_tree";
+const TURN_COLS: &str = "id, thread_id, idx, status, started_at, completed_at, model, error, usage, diff, base_tree, end_tree, start_trigger";
 
-fn turn_row(r: &Row<'_>) -> rusqlite::Result<(TurnRow, [Option<String>; 3], String)> {
+/// A turn row as stored: the row without its JSON and enum columns, those columns (error,
+/// usage, diff), the status and the trigger.
+type RawTurn = (TurnRow, [Option<String>; 3], String, Option<String>);
+
+fn turn_row(r: &Row<'_>) -> rusqlite::Result<RawTurn> {
     Ok((
         TurnRow {
             turn: Turn {
@@ -494,29 +500,36 @@ fn turn_row(r: &Row<'_>) -> rusqlite::Result<(TurnRow, [Option<String>; 3], Stri
                 error: None,
                 usage: None,
                 diff: None,
+                trigger: None,
             },
             base_tree: r.get(10)?,
             end_tree: r.get(11)?,
         },
         [r.get(7)?, r.get(8)?, r.get(9)?],
         r.get(3)?,
+        r.get(12)?,
     ))
 }
 
-fn finish_turn(
-    (mut row, [error, usage, diff], status): (TurnRow, [Option<String>; 3], String),
-) -> CoreResult<TurnRow> {
+fn finish_turn((mut row, [error, usage, diff], status, trigger): RawTurn) -> CoreResult<TurnRow> {
     row.turn.status = TurnStatus::parse(&status)
         .ok_or_else(|| CoreError::Corrupt(format!("turn status {status}")))?;
     row.turn.error = opt_json(error)?;
     row.turn.usage = opt_json(usage)?;
     row.turn.diff = opt_json(diff)?;
+    row.turn.trigger = trigger
+        .map(|t| {
+            TurnTrigger::parse(&t).ok_or_else(|| CoreError::Corrupt(format!("turn trigger {t}")))
+        })
+        .transpose()?;
     Ok(row)
 }
 
 pub fn insert_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
     conn.execute(
-        &format!("INSERT INTO turns ({TURN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"),
+        &format!(
+            "INSERT INTO turns ({TURN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+        ),
         params![
             t.turn.id.as_str(),
             t.turn.thread_id.as_str(),
@@ -530,6 +543,7 @@ pub fn insert_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
             t.turn.diff.as_ref().map(to_json),
             t.base_tree,
             t.end_tree,
+            t.turn.trigger.map(TurnTrigger::as_str),
         ],
     )?;
     Ok(())
@@ -538,7 +552,7 @@ pub fn insert_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
 pub fn update_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
     conn.execute(
         "UPDATE turns SET status = ?2, completed_at = ?3, model = ?4, error = ?5, usage = ?6, diff = ?7, base_tree = ?8,
-            end_tree = ?9
+            end_tree = ?9, start_trigger = ?10
          WHERE id = ?1",
         params![
             t.turn.id.as_str(),
@@ -550,6 +564,7 @@ pub fn update_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
             t.turn.diff.as_ref().map(to_json),
             t.base_tree,
             t.end_tree,
+            t.turn.trigger.map(TurnTrigger::as_str),
         ],
     )?;
     Ok(())
@@ -640,10 +655,20 @@ pub fn next_turn_index(conn: &Connection, thread: &ThreadId) -> CoreResult<u32> 
 
 // ----- items ------------------------------------------------------------------------------------
 
-const ITEM_COLS: &str = "id, thread_id, turn_id, status, started_at, completed_at, body";
+const ITEM_COLS: &str =
+    "id, thread_id, turn_id, status, started_at, completed_at, body, background_task_id";
 
-/// An item row as stored (id, thread, turn, status, started, completed, body).
-type RawItem = (String, String, String, String, i64, Option<i64>, String);
+/// An item row as stored (id, thread, turn, status, started, completed, body, background task).
+type RawItem = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    String,
+    Option<String>,
+);
 
 fn item_row(r: &Row<'_>) -> rusqlite::Result<RawItem> {
     Ok((
@@ -654,10 +679,13 @@ fn item_row(r: &Row<'_>) -> rusqlite::Result<RawItem> {
         r.get(4)?,
         r.get(5)?,
         r.get(6)?,
+        r.get(7)?,
     ))
 }
 
-fn finish_item((id, thread, turn, status, started, completed, body): RawItem) -> CoreResult<Item> {
+fn finish_item(
+    (id, thread, turn, status, started, completed, body, task): RawItem,
+) -> CoreResult<Item> {
     Ok(Item {
         id: ItemId::from(id),
         thread_id: ThreadId::from(thread),
@@ -666,6 +694,7 @@ fn finish_item((id, thread, turn, status, started, completed, body): RawItem) ->
             .ok_or_else(|| CoreError::Corrupt(format!("item status {status}")))?,
         started_at: started,
         completed_at: completed,
+        background_task_id: task.map(BackgroundTaskId::from),
         body: from_json(&body)?,
     })
 }
@@ -678,7 +707,7 @@ pub fn insert_item(conn: &Connection, item: &Item) -> CoreResult<()> {
         |r| r.get(0),
     )?;
     conn.execute(
-        &format!("INSERT INTO items ({ITEM_COLS}, ord) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"),
+        &format!("INSERT INTO items ({ITEM_COLS}, ord) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"),
         params![
             item.id.as_str(),
             item.thread_id.as_str(),
@@ -687,6 +716,7 @@ pub fn insert_item(conn: &Connection, item: &Item) -> CoreResult<()> {
             item.started_at,
             item.completed_at,
             to_json(&item.body),
+            item.background_task_id.as_ref().map(|t| t.as_str()),
             ord,
         ],
     )?;
@@ -696,12 +726,13 @@ pub fn insert_item(conn: &Connection, item: &Item) -> CoreResult<()> {
 pub fn update_item(conn: &Connection, item: &Item) -> CoreResult<()> {
     sync_item_blob_refs(conn, item)?;
     conn.execute(
-        "UPDATE items SET status = ?2, completed_at = ?3, body = ?4 WHERE id = ?1",
+        "UPDATE items SET status = ?2, completed_at = ?3, body = ?4, background_task_id = ?5 WHERE id = ?1",
         params![
             item.id.as_str(),
             item.status.as_str(),
             item.completed_at,
-            to_json(&item.body)
+            to_json(&item.body),
+            item.background_task_id.as_ref().map(|t| t.as_str()),
         ],
     )?;
     Ok(())
@@ -739,9 +770,13 @@ pub fn items_in_progress(conn: &Connection) -> CoreResult<Vec<Item>> {
 pub struct InteractionRow {
     pub interaction: Interaction,
     pub adapter_request_id: String,
+    /// For an interaction that belongs to no turn (a background task's, or the thread's): the
+    /// turn that ran when it was asked, or else the thread's last turn. `thread/read` returns
+    /// the interaction with that turn.
+    pub anchor_turn_id: Option<TurnId>,
 }
 
-const INTERACTION_COLS: &str = "id, thread_id, turn_id, item_id, status, created_at, resolved_at, resolved_by, request, resolution, expire_reason, adapter_request_id";
+const INTERACTION_COLS: &str = "id, thread_id, turn_id, item_id, status, created_at, resolved_at, resolved_by, request, resolution, expire_reason, adapter_request_id, background_task_id, anchor_turn_id";
 
 type RawInteraction = (
     String,
@@ -756,6 +791,8 @@ type RawInteraction = (
     Option<String>,
     Option<String>,
     String,
+    Option<String>,
+    Option<String>,
 );
 
 fn interaction_row(r: &Row<'_>) -> rusqlite::Result<RawInteraction> {
@@ -772,6 +809,8 @@ fn interaction_row(r: &Row<'_>) -> rusqlite::Result<RawInteraction> {
         r.get(9)?,
         r.get(10)?,
         r.get(11)?,
+        r.get(12)?,
+        r.get(13)?,
     ))
 }
 
@@ -789,6 +828,8 @@ fn finish_interaction(raw: RawInteraction) -> CoreResult<InteractionRow> {
         resolution,
         expire,
         adapter,
+        task,
+        anchor,
     ) = raw;
     Ok(InteractionRow {
         interaction: Interaction {
@@ -796,6 +837,7 @@ fn finish_interaction(raw: RawInteraction) -> CoreResult<InteractionRow> {
             thread_id: ThreadId::from(thread),
             turn_id: turn.map(TurnId::from),
             item_id: item.map(ItemId::from),
+            background_task_id: task.map(BackgroundTaskId::from),
             status: InteractionStatus::parse(&status)
                 .ok_or_else(|| CoreError::Corrupt(format!("interaction status {status}")))?,
             created_at: created,
@@ -806,6 +848,7 @@ fn finish_interaction(raw: RawInteraction) -> CoreResult<InteractionRow> {
             expire_reason: expire.map(|e| from_json(&format!("\"{e}\""))).transpose()?,
         },
         adapter_request_id: adapter,
+        anchor_turn_id: anchor.map(TurnId::from),
     })
 }
 
@@ -816,7 +859,7 @@ fn expire_reason_str(r: &ExpireReason) -> String {
 pub fn insert_interaction(conn: &Connection, row: &InteractionRow) -> CoreResult<()> {
     let i = &row.interaction;
     conn.execute(
-        &format!("INSERT INTO interactions ({INTERACTION_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"),
+        &format!("INSERT INTO interactions ({INTERACTION_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
         params![
             i.id.as_str(),
             i.thread_id.as_str(),
@@ -830,6 +873,8 @@ pub fn insert_interaction(conn: &Connection, row: &InteractionRow) -> CoreResult
             i.resolution.as_ref().map(to_json),
             i.expire_reason.as_ref().map(expire_reason_str),
             row.adapter_request_id,
+            i.background_task_id.as_ref().map(|t| t.as_str()),
+            row.anchor_turn_id.as_ref().map(|t| t.as_str()),
         ],
     )?;
     Ok(())
@@ -877,18 +922,209 @@ pub fn pending_interactions(conn: &Connection) -> CoreResult<Vec<InteractionRow>
     Ok(out)
 }
 
-pub fn interactions_of_turns(conn: &Connection, turns: &[TurnId]) -> CoreResult<Vec<Interaction>> {
+/// The interactions `thread/read` returns with `turns` (in turn order, each turn's in the order
+/// they were asked): those of the turns, those asked during them that belong to a background
+/// task or to the thread, and then every other pending one of the thread that belongs to no
+/// turn (asked during a turn outside the page, it still waits for an answer).
+pub fn interactions_for_read(
+    conn: &Connection,
+    thread: &ThreadId,
+    turns: &[TurnId],
+) -> CoreResult<Vec<Interaction>> {
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {INTERACTION_COLS} FROM interactions WHERE turn_id = ?1 ORDER BY created_at"
+        "SELECT {INTERACTION_COLS} FROM interactions WHERE turn_id = ?1 OR anchor_turn_id = ?1 ORDER BY created_at, id"
     ))?;
     for turn in turns {
         let rows = stmt.query_map([turn.as_str()], interaction_row)?;
         for row in rows {
-            out.push(finish_interaction(row?)?.interaction);
+            let interaction = finish_interaction(row?)?.interaction;
+            if seen.insert(interaction.id.clone()) {
+                out.push(interaction);
+            }
+        }
+    }
+    let mut pending = conn.prepare_cached(&format!(
+        "SELECT {INTERACTION_COLS} FROM interactions
+         WHERE thread_id = ?1 AND status = 'pending' AND turn_id IS NULL ORDER BY created_at, id"
+    ))?;
+    let rows = pending.query_map([thread.as_str()], interaction_row)?;
+    for row in rows {
+        let interaction = finish_interaction(row?)?.interaction;
+        if seen.insert(interaction.id.clone()) {
+            out.push(interaction);
         }
     }
     Ok(out)
+}
+
+// ----- background tasks -------------------------------------------------------------------------
+
+/// Inserts a background task or replaces the stored state of one (whole object), with the
+/// reference to its spilled output. An ended task's end becomes the thread's last one
+/// ([`thread_background`]) unless the thread has a later one.
+pub fn upsert_background_task(conn: &Connection, task: &BackgroundTask) -> CoreResult<()> {
+    note_background_end(conn, task)?;
+    conn.execute(
+        "INSERT INTO background_tasks (id, thread_id, status, ambient, turn_id, started_at, ended_at, task)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(id) DO UPDATE SET status = excluded.status, ambient = excluded.ambient,
+           turn_id = excluded.turn_id, started_at = excluded.started_at, ended_at = excluded.ended_at,
+           task = excluded.task",
+        params![
+            task.id.as_str(),
+            task.thread_id.as_str(),
+            task.status.as_str(),
+            task.ambient,
+            task.turn_id.as_ref().map(|t| t.as_str()),
+            task.started_at,
+            task.ended_at,
+            to_json(task),
+        ],
+    )?;
+    let blobs: Vec<BlobId> = task
+        .result
+        .as_ref()
+        .and_then(|r| r.output_blob_id.clone())
+        .into_iter()
+        .collect();
+    set_blob_refs(
+        conn,
+        BlobOwner::BackgroundTask,
+        task.id.as_str(),
+        &task.thread_id,
+        &blobs,
+        now_ms(),
+    )
+}
+
+fn background_tasks_where(
+    conn: &Connection,
+    condition: &str,
+    params: impl rusqlite::Params,
+) -> CoreResult<Vec<BackgroundTask>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT task FROM background_tasks WHERE {condition} ORDER BY started_at, id"
+    ))?;
+    let rows = stmt.query_map(params, |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(from_json(&row?)?);
+    }
+    Ok(out)
+}
+
+pub fn get_background_task(
+    conn: &Connection,
+    id: &BackgroundTaskId,
+) -> CoreResult<Option<BackgroundTask>> {
+    Ok(background_tasks_where(conn, "id = ?1", [id.as_str()])?
+        .into_iter()
+        .next())
+}
+
+/// The background tasks `thread/read` returns with `turns`: those first reported during them,
+/// and every task of the thread that is still running (oldest first).
+pub fn background_tasks_for_read(
+    conn: &Connection,
+    thread: &ThreadId,
+    turns: &[TurnId],
+) -> CoreResult<Vec<BackgroundTask>> {
+    let mut out = background_tasks_where(
+        conn,
+        "thread_id = ?1 AND status = 'running'",
+        [thread.as_str()],
+    )?;
+    let mut seen: std::collections::HashSet<BackgroundTaskId> =
+        out.iter().map(|t| t.id.clone()).collect();
+    for turn in turns {
+        for task in background_tasks_where(conn, "turn_id = ?1", [turn.as_str()])? {
+            if seen.insert(task.id.clone()) {
+                out.push(task);
+            }
+        }
+    }
+    out.sort_by(|a, b| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
+    Ok(out)
+}
+
+/// Every task still marked running (startup recovery).
+pub fn running_background_tasks(conn: &Connection) -> CoreResult<Vec<BackgroundTask>> {
+    background_tasks_where(conn, "status = 'running'", [])
+}
+
+/// Records the end of `task` as its thread's last end (`Thread.background.lastEnded`) when the
+/// task has ended, is not ambient, and the thread has no later end: the latest `endedAt`, then
+/// the greatest task id (a total order, so the same ends give the same answer in any order of
+/// writing). A repeated write of the same end replaces it (its status or title may still
+/// change).
+///
+/// * The record is kept apart from the task because a task that starts a new run under the
+///   same id clears its own `ended_at`: the summary must not go back to an older end then, or
+///   clients — which announce a finished task when `lastEnded` changes — would announce that
+///   older end again (design.md §5.6).
+/// * Ambient work is left out: the harness says it is not activity (hosts keep it out of
+///   activity indicators), so its end — reported by the harness, or with the process when it
+///   is reaped idle or lost — must not be reported as the end of the thread's work.
+fn note_background_end(conn: &Connection, task: &BackgroundTask) -> CoreResult<()> {
+    let Some(ended_at) = task
+        .ended_at
+        .filter(|_| task.status.is_terminal() && !task.ambient)
+    else {
+        return Ok(());
+    };
+    let ended = BackgroundTaskEnded {
+        task_id: task.id.clone(),
+        title: task.title.clone(),
+        kind: task.kind,
+        status: task.status,
+        ended_at,
+    };
+    conn.execute(
+        "INSERT INTO background_last_ended (thread_id, ended_at, task_id, ended) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(thread_id) DO UPDATE SET ended_at = excluded.ended_at,
+           task_id = excluded.task_id, ended = excluded.ended
+         WHERE (excluded.ended_at, excluded.task_id)
+           >= (background_last_ended.ended_at, background_last_ended.task_id)",
+        params![
+            task.thread_id.as_str(),
+            ended_at,
+            task.id.as_str(),
+            to_json(&ended),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Fills the threads' last ends from the tasks stored before they were kept apart (schema v5).
+pub fn backfill_background_last_ended(conn: &Connection) -> CoreResult<()> {
+    for task in background_tasks_where(conn, "ended_at IS NOT NULL", [])? {
+        note_background_end(conn, &task)?;
+    }
+    Ok(())
+}
+
+/// `Thread.background`: the running tasks that are not ambient, and the last end the thread's
+/// background work reached ([`note_background_end`]: never an ambient task's, and never older
+/// than an end already reported).
+pub fn thread_background(conn: &Connection, thread: &ThreadId) -> CoreResult<ThreadBackground> {
+    let running: i64 = conn.query_row(
+        "SELECT count(*) FROM background_tasks WHERE thread_id = ?1 AND status = 'running' AND ambient = 0",
+        [thread.as_str()],
+        |r| r.get(0),
+    )?;
+    let last: Option<String> = conn
+        .query_row(
+            "SELECT ended FROM background_last_ended WHERE thread_id = ?1",
+            [thread.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(ThreadBackground {
+        running: running as u32,
+        last_ended: opt_json(last)?,
+    })
 }
 
 // ----- queued inputs ----------------------------------------------------------------------------
@@ -1128,6 +1364,8 @@ pub enum BlobOwner {
     Item,
     /// A queued input's image.
     Queued,
+    /// A background task's spilled output.
+    BackgroundTask,
 }
 
 impl BlobOwner {
@@ -1135,6 +1373,7 @@ impl BlobOwner {
         match self {
             BlobOwner::Item => "item",
             BlobOwner::Queued => "queued",
+            BlobOwner::BackgroundTask => "backgroundTask",
         }
     }
 }
@@ -1560,13 +1799,14 @@ pub struct PurgeCounts {
     pub items: usize,
     pub interactions: usize,
     pub queued: usize,
+    pub background_tasks: usize,
     pub events: usize,
 }
 
 /// Deletes everything stored about thread `id`: its turns, items, interactions, queued
-/// inputs and blob references (a blob left without any starts its grace period), its event
-/// stream and its workspace events other than `thread/removed` (which offline clients still
-/// need), and the thread itself.
+/// inputs, background tasks (and their last end) and blob references (a blob left without
+/// any starts its grace period), its event stream and its workspace events other than
+/// `thread/removed` (which offline clients still need), and the thread itself.
 pub fn purge_thread(
     tx: &rusqlite::Transaction<'_>,
     id: &ThreadId,
@@ -1591,6 +1831,10 @@ pub fn purge_thread(
             "DELETE FROM queued_inputs WHERE thread_id = ?1",
             [id.as_str()],
         )?,
+        background_tasks: tx.execute(
+            "DELETE FROM background_tasks WHERE thread_id = ?1",
+            [id.as_str()],
+        )?,
         events: aas_eventlog::delete_stream(tx, &thread_stream(id))?
             + aas_eventlog::delete_thread_events(
                 tx,
@@ -1599,6 +1843,10 @@ pub fn purge_thread(
                 "thread/removed",
             )?,
     };
+    tx.execute(
+        "DELETE FROM background_last_ended WHERE thread_id = ?1",
+        [id.as_str()],
+    )?;
     tx.execute("DELETE FROM threads WHERE id = ?1", [id.as_str()])?;
     Ok(counts)
 }

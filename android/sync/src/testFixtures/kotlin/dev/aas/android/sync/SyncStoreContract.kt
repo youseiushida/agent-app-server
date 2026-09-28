@@ -1,5 +1,9 @@
 package dev.aas.android.sync
 
+import dev.aas.android.protocol.BackgroundProgress
+import dev.aas.android.protocol.BackgroundResult
+import dev.aas.android.protocol.BackgroundTaskKind
+import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.Harness
 import dev.aas.android.protocol.HarnessKind
 import dev.aas.android.protocol.InteractionStatus
@@ -107,6 +111,7 @@ abstract class SyncStoreContract {
             tx.upsertTurn(Samples.turn("trn_1"))
             tx.upsertItem(StoredItem(Samples.agentMessage("itm_1", "a"), ItemPosition(0, 1)))
             tx.upsertInteraction(Samples.approval("int_1"))
+            tx.upsertBackgroundTask(Samples.backgroundTask("bgt_1"))
             tx.replaceQueued("thr_1", listOf(Samples.queued("que_1")))
             tx.upsertOperation(Samples.operation("op_1", OperationStatus.Running))
             tx.setThreadMeta("thr_1", ThreadMeta(hasMoreBefore = true, commandsVersion = 2))
@@ -122,6 +127,8 @@ abstract class SyncStoreContract {
             assertTrue(tx.turnsOf("thr_1").isEmpty())
             assertTrue(tx.itemsOf("thr_1").isEmpty())
             assertTrue(tx.interactionsOf("thr_1").isEmpty())
+            assertTrue(tx.backgroundTasksOf("thr_1").isEmpty())
+            assertNull(tx.backgroundTask("bgt_1"))
             assertTrue(tx.queued("thr_1").isEmpty())
             assertTrue(tx.operations().isEmpty())
             assertEquals(ThreadMeta(), tx.threadMeta("thr_1"))
@@ -138,6 +145,7 @@ abstract class SyncStoreContract {
                 tx.upsertTurn(Samples.turn("trn_$t", threadId = t))
                 tx.upsertItem(StoredItem(Samples.agentMessage("itm_$t", "a", threadId = t, turnId = "trn_$t"), ItemPosition(0, 1)))
                 tx.upsertInteraction(Samples.approval("int_$t", threadId = t))
+                tx.upsertBackgroundTask(Samples.backgroundTask("bgt_$t", threadId = t, turnId = "trn_$t"))
                 tx.replaceQueued(t, listOf(Samples.queued("que_$t", threadId = t)))
                 tx.setThreadMeta(t, ThreadMeta(commandsVersion = 1))
                 tx.setViewState(t, ThreadViewState(1))
@@ -150,6 +158,8 @@ abstract class SyncStoreContract {
             assertTrue(tx.turnsOf("thr_1").isEmpty())
             assertNull(tx.item("itm_thr_1"))
             assertNull(tx.interaction("int_thr_1"))
+            assertNull(tx.backgroundTask("bgt_thr_1"))
+            assertEquals(listOf("bgt_thr_2"), tx.backgroundTasksOf("thr_2").map { it.id })
             assertTrue(tx.queued("thr_1").isEmpty())
             assertEquals(ThreadMeta(), tx.threadMeta("thr_1"))
             assertNull(tx.viewState("thr_1"))
@@ -167,12 +177,17 @@ abstract class SyncStoreContract {
             tx.upsertTurn(Samples.turn("trn_1"))
             tx.upsertItem(StoredItem(Samples.agentMessage("itm_1", "a"), ItemPosition(0, 1)))
             tx.upsertInteraction(Samples.approval("int_1"))
+            tx.upsertBackgroundTask(Samples.backgroundTask("bgt_1"))
+            tx.upsertBackgroundTask(Samples.backgroundTask("bgt_other", threadId = "thr_2"))
             tx.replaceQueued("thr_1", listOf(Samples.queued("que_1")))
             tx.setThreadMeta("thr_1", ThreadMeta(commandsVersion = 3))
             tx.setCursor(threadStream("thr_1"), 4)
             tx.clearThreadContent("thr_1")
             assertTrue(tx.turnsOf("thr_1").isEmpty())
             assertTrue(tx.itemsOf("thr_1").isEmpty())
+            // A fresh thread/read brings the tasks of its turns and every running one again.
+            assertTrue(tx.backgroundTasksOf("thr_1").isEmpty())
+            assertEquals(listOf("bgt_other"), tx.backgroundTasksOf("thr_2").map { it.id })
             assertTrue(tx.queued("thr_1").isEmpty())
             assertEquals(1, tx.interactionsOf("thr_1").size)
             assertEquals("thr_1", tx.thread("thr_1")?.id)
@@ -202,6 +217,29 @@ abstract class SyncStoreContract {
             assertEquals(listOf("itm_old", "itm_read1", "itm_read2", "itm_live", "itm_orphan"), tx.itemsOf("thr_1").map { it.item.id })
             assertEquals("updated", (tx.item("itm_read1")!!.item as dev.aas.android.protocol.Item.AgentMessage).text)
             assertEquals(listOf("int_1", "int_2"), tx.interactionsOf("thr_1").map { it.id })
+        }
+    }
+
+    @Test
+    fun backgroundTasksAreReplacedWholeAndListedByStart() = test { store ->
+        val shell = Samples.backgroundTask("bgt_b", kind = BackgroundTaskKind.Shell, startedAt = 5)
+        store.transaction { tx ->
+            tx.upsertBackgroundTask(shell)
+            tx.upsertBackgroundTask(Samples.backgroundTask("bgt_c", startedAt = 2))
+            tx.upsertBackgroundTask(Samples.backgroundTask("bgt_a", startedAt = 5))
+            tx.upsertBackgroundTask(Samples.backgroundTask("bgt_x", threadId = "thr_2", startedAt = 1))
+        }
+        val ended = shell.copy(
+            status = BackgroundTaskStatus.Completed,
+            endedAt = 9,
+            progress = BackgroundProgress(lastToolName = "Bash", toolUses = 3),
+            result = BackgroundResult(exitCode = 0, output = "ok\n"),
+        )
+        store.transaction { tx -> tx.upsertBackgroundTask(ended) }
+        store.transaction { tx ->
+            assertEquals(listOf("bgt_c", "bgt_a", "bgt_b"), tx.backgroundTasksOf("thr_1").map { it.id })
+            assertEquals(ended, tx.backgroundTask("bgt_b"), "the whole task, as last written")
+            assertNull(tx.backgroundTask("bgt_missing"))
         }
     }
 

@@ -24,18 +24,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use aas_harness::{
-    HistoryItem, HistoryTurn, Millis, NativeHistory, NativeSessionScan, NativeSessionSummary,
-    UnreadableNativeSession,
+    AdapterPolicy, HistoryItem, HistoryTurn, Millis, NativeHistory, NativeSessionScan,
+    NativeSessionSummary, UnreadableNativeSession,
 };
 use aas_protocol::types::{ItemBody, ItemStatus, TurnStatus};
 use serde::{Deserialize, Serialize};
 
 /// Extension of a session transcript.
 const TRANSCRIPT_EXTENSION: &str = "jsonl";
-
-/// Most characters of a title made from the first prompt of a session; a longer first line is
-/// cut and ends with `…` (the rule the Claude adapter applies to untitled sessions).
-const PROMPT_TITLE_MAX_CHARS: usize = 80;
 
 /// One line of a transcript.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,8 +111,10 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// The session's title: the first line of its first user message.
-    pub fn title(&self) -> Option<String> {
+    /// The session's title: the first line of its first user message, cut to
+    /// `policy.first_message_title_chars` (the engine's rule for titles made from a first
+    /// message, which the other adapters apply to sessions without a name).
+    pub fn title(&self, policy: &AdapterPolicy) -> Option<String> {
         let prompt = self
             .turns
             .iter()
@@ -125,12 +123,7 @@ impl Transcript {
                 ItemBody::UserMessage { text, .. } => Some(text.as_str()),
                 _ => None,
             })?;
-        let first = prompt.lines().find(|l| !l.trim().is_empty())?.trim();
-        let mut title: String = first.chars().take(PROMPT_TITLE_MAX_CHARS).collect();
-        if first.chars().count() > PROMPT_TITLE_MAX_CHARS {
-            title.push('…');
-        }
-        Some(title)
+        policy.prompt_title(prompt)
     }
 
     /// When the session last changed: the end of its last turn, else its creation.
@@ -140,18 +133,18 @@ impl Transcript {
             .map_or(self.created_at, |t| t.completed_at)
     }
 
-    pub fn summary(&self) -> NativeSessionSummary {
+    pub fn summary(&self, policy: &AdapterPolicy) -> NativeSessionSummary {
         NativeSessionSummary {
             native_session_id: self.id.clone(),
-            title: self.title(),
+            title: self.title(policy),
             updated_at: Some(self.updated_at()),
             cwd: Some(self.cwd.clone()),
         }
     }
 
-    pub fn history(&self) -> NativeHistory {
+    pub fn history(&self, policy: &AdapterPolicy) -> NativeHistory {
         NativeHistory {
-            title: self.title(),
+            title: self.title(policy),
             turns: self
                 .turns
                 .iter()
@@ -307,7 +300,12 @@ impl SessionStore {
     }
 
     /// The history of `id`, which must have been recorded for `cwd`.
-    pub fn history(&self, cwd: &Path, id: &str) -> Result<NativeHistory, StoreError> {
+    pub fn history(
+        &self,
+        cwd: &Path,
+        id: &str,
+        policy: &AdapterPolicy,
+    ) -> Result<NativeHistory, StoreError> {
         let transcript = self.read(id)?;
         let wanted = cwd.display().to_string();
         if !same_folder(&transcript.cwd, &wanted) {
@@ -317,14 +315,18 @@ impl SessionStore {
                 wanted,
             });
         }
-        Ok(transcript.history())
+        Ok(transcript.history(policy))
     }
 
     /// Sessions recorded for `cwd` that have at least one turn (a session nobody prompted has
     /// nothing to import), most recently updated first, and the transcripts that could not be
     /// read. A store that does not exist yet holds no sessions; a store that cannot be read at
     /// all is an error.
-    pub fn scan(&self, cwd: &Path) -> Result<NativeSessionScan, StoreError> {
+    pub fn scan(
+        &self,
+        cwd: &Path,
+        policy: &AdapterPolicy,
+    ) -> Result<NativeSessionScan, StoreError> {
         let wanted = cwd.display().to_string();
         let mut scan = NativeSessionScan::default();
         let entries = match std::fs::read_dir(&self.dir) {
@@ -349,7 +351,7 @@ impl SessionStore {
             match read_transcript(&path) {
                 Ok(t) => {
                     if same_folder(&t.cwd, &wanted) && !t.turns.is_empty() {
-                        scan.sessions.push(t.summary());
+                        scan.sessions.push(t.summary(policy));
                     }
                 }
                 Err(e) => scan.unreadable.push(UnreadableNativeSession {
@@ -474,7 +476,7 @@ mod tests {
         } else {
             work.clone()
         };
-        let scan = store.scan(&asked).unwrap();
+        let scan = store.scan(&asked, &AdapterPolicy::default()).unwrap();
         assert!(scan.unreadable.is_empty(), "{:?}", scan.unreadable);
         let ids: Vec<&str> = scan
             .sessions
@@ -485,16 +487,18 @@ mod tests {
         assert_eq!(scan.sessions[1].title.as_deref(), Some("First line"));
         assert_eq!(scan.sessions[1].updated_at, Some(110));
 
-        let history = store.history(&work, "a").unwrap();
+        let history = store
+            .history(&work, "a", &AdapterPolicy::default())
+            .unwrap();
         assert_eq!(history.title.as_deref(), Some("First line"));
         assert_eq!(history.turns.len(), 1);
         assert_eq!(history.turns[0].items.len(), 2);
         assert!(matches!(
-            store.history(&work, "c"),
+            store.history(&work, "c", &AdapterPolicy::default()),
             Err(StoreError::OtherFolder { .. })
         ));
         assert!(matches!(
-            store.history(&work, "zzz"),
+            store.history(&work, "zzz", &AdapterPolicy::default()),
             Err(StoreError::NotFound(_))
         ));
     }
@@ -512,7 +516,7 @@ mod tests {
         let copy = store.read("copy").unwrap();
         assert_eq!(copy.forked_from.as_deref(), Some("src"));
         let prompts: Vec<String> = copy
-            .history()
+            .history(&AdapterPolicy::default())
             .turns
             .iter()
             .map(|t| match &t.items[0].body {
@@ -557,7 +561,7 @@ mod tests {
         let broken = dir.path().join("broken.jsonl");
         std::fs::write(&broken, "{\"type\":\"turn\"\n").unwrap();
         std::fs::write(dir.path().join("notes.txt"), "not a transcript").unwrap();
-        let scan = store.scan(&work).unwrap();
+        let scan = store.scan(&work, &AdapterPolicy::default()).unwrap();
         assert_eq!(scan.sessions.len(), 1);
         assert_eq!(scan.unreadable.len(), 1, "{:?}", scan.unreadable);
         assert_eq!(scan.unreadable[0].location, broken.display().to_string());
@@ -567,7 +571,7 @@ mod tests {
         ));
         // A store that does not exist yet has no sessions.
         let none = SessionStore::new(dir.path().join("missing"))
-            .scan(&work)
+            .scan(&work, &AdapterPolicy::default())
             .unwrap();
         assert_eq!(none, NativeSessionScan::default());
     }

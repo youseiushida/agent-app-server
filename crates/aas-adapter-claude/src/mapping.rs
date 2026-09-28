@@ -2,13 +2,16 @@
 //! normalized model of `aas-harness`. Every table here is fixed and documented in
 //! `docs/adapters/claude.md`; nothing is inferred from human-readable text.
 
+use aas_harness::BackgroundTaskKind;
 use aas_harness::protocol::{
     ApprovalOption, ApprovalOptionKind, Command, CommandAction, CommandSource, ContextUsage,
-    EffortLevel, FileChange, FileChangeKind, InteractionRequest, InteractionResolution, ItemBody,
-    ItemStatus, Model, PermissionMode, PlanEntry, PlanEntryStatus, Question, QuestionChoice,
-    Subject, ToolCategory, TurnError, TurnStatus, Usage,
+    EffortLevel, ExpireReason, FileChange, FileChangeKind, InteractionRequest,
+    InteractionResolution, ItemBody, ItemStatus, Model, PermissionMode, PlanEntry, PlanEntryStatus,
+    Question, QuestionChoice, Subject, ToolCategory, TurnError, TurnStatus, TurnTrigger, Usage,
 };
 use serde_json::{Map, Value, json};
+
+use crate::background::{Cron, Launch, task_kind};
 
 // ---------------------------------------------------------------------------------------------
 // Tools
@@ -49,7 +52,7 @@ pub fn classify_tool(name: &str) -> ToolClass {
             ToolClass::Generic(ToolCategory::Search)
         }
         "WebFetch" => ToolClass::Generic(ToolCategory::Fetch),
-        "Task" | "Agent" => ToolClass::Generic(ToolCategory::Subagent),
+        "Task" | "Agent" | "Workflow" => ToolClass::Generic(ToolCategory::Subagent),
         "BashOutput" | "KillShell" | "KillBash" | "TaskStop" | "Monitor" => {
             ToolClass::Generic(ToolCategory::Execute)
         }
@@ -378,8 +381,15 @@ pub fn tool_completed(
             ..
         } => ItemBody::ToolCall {
             category,
+            // A workflow is known by the name its script gives it, which only the launch
+            // result carries (`workflowName`).
+            title: match structured.and_then(|s| str_field(s, "workflowName")) {
+                Some(workflow) if name == "Workflow" && !workflow.is_empty() => {
+                    format!("Workflow: {workflow}")
+                }
+                _ => title,
+            },
             name: tool_name,
-            title,
             server,
             input,
             output: Some(result.text.clone()),
@@ -389,6 +399,103 @@ pub fn tool_completed(
         other => other,
     };
     (body, status)
+}
+
+/// What a finished tool call did to the session's background work, from the fields of its
+/// structured result (`tool_use_result`) only.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackgroundEffect {
+    /// The tool left work running as a background task: `status: "async_launched"` with
+    /// `agentId` (Agent) or `taskId` (Workflow, with `taskType`), `status: "remote_launched"`
+    /// with `taskId`, or `backgroundTaskId` (Bash, PowerShell run in the background).
+    Task(Launch),
+    /// `CronCreate` scheduled a wakeup (`{id, humanSchedule, recurring, durable}`).
+    Cron(Cron),
+    /// `CronDelete` cancelled the wakeup with this id (`{id}`).
+    CronDeleted(String),
+    /// `CronList` listed every pending wakeup (`{jobs: [...]}`).
+    CronList(Vec<Cron>),
+}
+
+/// See [`BackgroundEffect`]. A failed or denied call has none.
+pub fn background_effect(
+    name: &str,
+    input: &Value,
+    result: &ToolResult,
+) -> Option<BackgroundEffect> {
+    if result.is_error || result.denied_by_user {
+        return None;
+    }
+    let s = result.structured.as_ref().filter(|v| v.is_object())?;
+    match name {
+        "CronCreate" => {
+            let id = str_field(s, "id")?;
+            let human = str_field(s, "humanSchedule");
+            return Some(BackgroundEffect::Cron(Cron {
+                id: id.to_owned(),
+                prompt: str_field(input, "prompt").unwrap_or_default().to_owned(),
+                schedule: human
+                    .or_else(|| str_field(input, "cron"))
+                    .map(str::to_owned),
+                human_schedule: human.is_some(),
+                recurring: s
+                    .get("recurring")
+                    .or_else(|| input.get("recurring"))
+                    .and_then(Value::as_bool)
+                    == Some(true),
+            }));
+        }
+        "CronDelete" => {
+            return str_field(s, "id").map(|id| BackgroundEffect::CronDeleted(id.to_owned()));
+        }
+        "CronList" => {
+            let jobs = s.get("jobs")?.as_array()?;
+            return Some(BackgroundEffect::CronList(
+                jobs.iter().filter_map(Cron::from_entry).collect(),
+            ));
+        }
+        _ => {}
+    }
+    let title = |fallback: &str| {
+        str_field(s, "description")
+            .or_else(|| str_field(s, "summary"))
+            .or_else(|| str_field(input, "description"))
+            .unwrap_or(fallback)
+            .to_owned()
+    };
+    let launch = match str_field(s, "status") {
+        Some("async_launched") => {
+            let id = str_field(s, "agentId").or_else(|| str_field(s, "taskId"))?;
+            let kind = match str_field(s, "taskType") {
+                Some(task_type) => task_kind(task_type),
+                None if name == "Workflow" => BackgroundTaskKind::Workflow,
+                None => BackgroundTaskKind::Agent,
+            };
+            Launch {
+                task_id: id.to_owned(),
+                kind,
+                title: title(name),
+            }
+        }
+        Some("remote_launched") => Launch {
+            task_id: str_field(s, "taskId")?.to_owned(),
+            kind: BackgroundTaskKind::Remote,
+            title: title(name),
+        },
+        _ => {
+            let id = str_field(s, "backgroundTaskId")?;
+            Launch {
+                task_id: id.to_owned(),
+                kind: match classify_tool(name) {
+                    ToolClass::Command => BackgroundTaskKind::Shell,
+                    _ if name == "Monitor" => BackgroundTaskKind::Monitor,
+                    _ => BackgroundTaskKind::Other,
+                },
+                title: title(str_field(input, "command").unwrap_or(name)),
+            }
+        }
+    };
+    Some(BackgroundEffect::Task(launch))
 }
 
 fn completed_file_changes(
@@ -809,6 +916,23 @@ pub fn permission_response(
     }
 }
 
+/// The answer to a permission request or question that expired unanswered (the engine calls
+/// `expire_request`): a denial whose message tells the model why.
+pub fn expiry_response(reason: ExpireReason) -> Value {
+    let message = match reason {
+        ExpireReason::TurnEnded => {
+            "The request expired unanswered: the turn it belonged to ended before the user answered."
+        }
+        ExpireReason::TaskEnded => {
+            "The request expired unanswered: the background task that asked ended before the user answered."
+        }
+        ExpireReason::HarnessCancelled
+        | ExpireReason::ProcessExited
+        | ExpireReason::DaemonRestarted => "The request expired before the user answered.",
+    };
+    json!({ "behavior": "deny", "message": message })
+}
+
 // ---------------------------------------------------------------------------------------------
 // AskUserQuestion
 // ---------------------------------------------------------------------------------------------
@@ -956,6 +1080,15 @@ pub fn context_from_usage_response(response: &Value) -> Option<ContextUsage> {
     })
 }
 
+/// Why the CLI started a run by itself, from its `result.origin`: `task-notification` (the run
+/// takes up background tasks that ended). Other origins and none give no trigger.
+pub fn turn_trigger(result: &Value) -> Option<TurnTrigger> {
+    match result.pointer("/origin/kind").and_then(Value::as_str) {
+        Some("task-notification") => Some(TurnTrigger::BackgroundTask),
+        _ => None,
+    }
+}
+
 /// Status and error of a finished turn.
 pub fn turn_outcome(result: &Value, interrupt_requested: bool) -> (TurnStatus, Option<TurnError>) {
     let terminal = str_field(result, "terminal_reason");
@@ -993,6 +1126,9 @@ pub fn turn_outcome(result: &Value, interrupt_requested: bool) -> (TurnStatus, O
 // Initialize response: models, commands, permission modes
 // ---------------------------------------------------------------------------------------------
 
+/// The ultracode effort level: xhigh effort plus standing dynamic-workflow orchestration.
+pub const ULTRACODE: &str = "ultracode";
+
 /// Canonical order and labels of Claude Code's effort levels.
 pub const EFFORT_LEVELS: &[(&str, &str)] = &[
     ("low", "Low"),
@@ -1000,10 +1136,26 @@ pub const EFFORT_LEVELS: &[(&str, &str)] = &[
     ("high", "High"),
     ("xhigh", "Extra high"),
     ("max", "Max"),
+    (ULTRACODE, "Ultracode"),
 ];
 
+/// `apply_flag_settings.settings` for the effort level `effort` (`None`: the CLI's default).
+/// Ultracode is asked for as the effort level `ultracode` and left by setting another level
+/// (both recorded with 2.1.283); leaving it for the default also clears the `ultracode` flag,
+/// as the CLI's own effort picker does. `get_settings` confirms the outcome (see
+/// `Inner::confirm_effort`).
+pub fn effort_flag_settings(effort: Option<&str>, was_ultracode: bool) -> Value {
+    match effort {
+        Some(level) => json!({ "effortLevel": level }),
+        None if was_ultracode => json!({ "effortLevel": null, "ultracode": false }),
+        None => json!({ "effortLevel": null }),
+    }
+}
+
 /// Models from the `initialize` response (`models[]`: `value`, `displayName`, `description`,
-/// `supportedEffortLevels`). The pseudo-model `default` is the CLI's own default.
+/// `supportedEffortLevels`). The pseudo-model `default` is the CLI's own default. Ultracode is
+/// offered for the models that list `xhigh`: it runs at xhigh effort, and the CLI refuses it
+/// for a model without it ("Ultracode runs at xhigh effort, which <model> doesn't support").
 pub fn models_from_initialize(init: &Value) -> Vec<Model> {
     init.get("models")
         .and_then(Value::as_array)
@@ -1019,9 +1171,15 @@ pub fn models_from_initialize(init: &Value) -> Vec<Model> {
                 .get("supportedEffortLevels")
                 .and_then(Value::as_array)
                 .map(|l| {
-                    l.iter()
+                    let mut levels: Vec<String> = l
+                        .iter()
                         .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect::<Vec<_>>()
+                        .collect();
+                    if levels.iter().any(|x| x == "xhigh") && !levels.iter().any(|x| x == ULTRACODE)
+                    {
+                        levels.push(ULTRACODE.to_owned());
+                    }
+                    levels
                 });
             Some(Model {
                 display_name: str_field(m, "displayName").unwrap_or(&id).to_owned(),
@@ -1038,17 +1196,22 @@ pub fn models_from_initialize(init: &Value) -> Vec<Model> {
         .collect()
 }
 
-/// Effort levels offered by at least one model, in canonical order.
+/// Effort levels offered by at least one model, in canonical order. Ultracode only for a model
+/// that lists xhigh (a model without a list of levels does not name it).
 pub fn effort_levels(models: &[Model]) -> Vec<EffortLevel> {
     EFFORT_LEVELS
         .iter()
         .filter(|(id, _)| {
+            let listed = |l: &Vec<String>| l.iter().any(|x| x == id);
+            if *id == ULTRACODE {
+                return models
+                    .iter()
+                    .any(|m| m.effort_levels.as_ref().is_some_and(listed));
+            }
             models.is_empty()
-                || models.iter().any(|m| {
-                    m.effort_levels
-                        .as_ref()
-                        .is_none_or(|l| l.iter().any(|x| x == id))
-                })
+                || models
+                    .iter()
+                    .any(|m| m.effort_levels.as_ref().is_none_or(listed))
         })
         .map(|(id, label)| EffortLevel {
             id: (*id).to_owned(),
@@ -1575,7 +1738,17 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert!(models[0].is_default);
         assert_eq!(models[1].effort_levels, Some(vec![]));
-        assert_eq!(effort_levels(&models).len(), 5);
+        // Ultracode for the model that lists xhigh.
+        assert_eq!(
+            models[0]
+                .effort_levels
+                .as_ref()
+                .unwrap()
+                .last()
+                .map(String::as_str),
+            Some(ULTRACODE)
+        );
+        assert_eq!(effort_levels(&models).len(), 6);
         let cmds = commands_from_initialize(&init);
         assert_eq!(cmds.len(), 1);
         assert_eq!(
@@ -1609,5 +1782,194 @@ mod tests {
             strip_ansi("\u{1b}[1;31mred\u{1b}[0m plain \u{1b}]0;title\u{7}x"),
             "red plain x"
         );
+    }
+
+    fn done(structured: Value) -> ToolResult {
+        ToolResult {
+            text: String::new(),
+            is_error: false,
+            structured: Some(structured),
+            denied_by_user: false,
+        }
+    }
+
+    #[test]
+    fn launches_come_from_the_structured_result() {
+        // Agent (claude-live E1).
+        let agent = done(json!({"isAsync": true, "status": "async_launched",
+            "agentId": "a5462215479566a35", "description": "Sleep 40 seconds then respond",
+            "resolvedModel": "claude-haiku-4-5-20251001", "prompt": "…", "outputFile": "x"}));
+        assert_eq!(
+            background_effect("Agent", &json!({}), &agent),
+            Some(BackgroundEffect::Task(Launch {
+                task_id: "a5462215479566a35".into(),
+                kind: BackgroundTaskKind::Agent,
+                title: "Sleep 40 seconds then respond".into()
+            }))
+        );
+        // Workflow (claude-live E3a).
+        let workflow = done(json!({"status": "async_launched", "taskId": "wia92dx1s",
+            "taskType": "local_workflow", "workflowName": "simple-parallel-test",
+            "runId": "wf_b93f111a-425", "summary": "Run two agents in parallel"}));
+        assert_eq!(
+            background_effect("Workflow", &json!({"script": "…"}), &workflow),
+            Some(BackgroundEffect::Task(Launch {
+                task_id: "wia92dx1s".into(),
+                kind: BackgroundTaskKind::Workflow,
+                title: "Run two agents in parallel".into()
+            }))
+        );
+        // Bash in the background (claude-live E2).
+        let bash = done(json!({"stdout": "", "stderr": "", "interrupted": false,
+            "isImage": false, "noOutputExpected": false, "backgroundTaskId": "bkomsmz3d"}));
+        let input = json!({"command": "sleep 30 && echo done-B",
+            "description": "Sleep for 30 seconds then output done-B", "run_in_background": true});
+        assert_eq!(
+            background_effect("Bash", &input, &bash),
+            Some(BackgroundEffect::Task(Launch {
+                task_id: "bkomsmz3d".into(),
+                kind: BackgroundTaskKind::Shell,
+                title: "Sleep for 30 seconds then output done-B".into()
+            }))
+        );
+        // A remote agent (the 2.1.283 bundle's result shape).
+        let remote = done(json!({"status": "remote_launched", "taskId": "r1",
+            "sessionUrl": "https://example.invalid", "description": "remote work"}));
+        assert!(matches!(
+            background_effect("Agent", &json!({}), &remote),
+            Some(BackgroundEffect::Task(Launch {
+                kind: BackgroundTaskKind::Remote,
+                ..
+            }))
+        ));
+        // A foreground command, a failed or denied call: nothing.
+        let fg = done(json!({"stdout": "hi", "stderr": "", "interrupted": false}));
+        assert_eq!(background_effect("Bash", &input, &fg), None);
+        let failed = ToolResult {
+            is_error: true,
+            ..bash.clone()
+        };
+        assert_eq!(background_effect("Bash", &input, &failed), None);
+        let denied = ToolResult {
+            denied_by_user: true,
+            ..bash
+        };
+        assert_eq!(background_effect("Bash", &input, &denied), None);
+    }
+
+    #[test]
+    fn cron_tools_change_the_scheduled_wakeups() {
+        // Recorded w4.
+        let create = done(json!({"id": "47a7861e", "humanSchedule": "Every minute",
+            "recurring": true, "durable": false}));
+        let input = json!({"cron": "* * * * *", "prompt": "Reply with exactly: tick",
+            "recurring": true, "durable": false});
+        assert_eq!(
+            background_effect("CronCreate", &input, &create),
+            Some(BackgroundEffect::Cron(Cron {
+                id: "47a7861e".into(),
+                prompt: "Reply with exactly: tick".into(),
+                schedule: Some("Every minute".into()),
+                human_schedule: true,
+                recurring: true
+            }))
+        );
+        assert_eq!(
+            background_effect(
+                "CronDelete",
+                &json!({"id": "47a7861e"}),
+                &done(json!({"id": "47a7861e"}))
+            ),
+            Some(BackgroundEffect::CronDeleted("47a7861e".into()))
+        );
+        let list = done(json!({"jobs": [{"id": "47a7861e", "cron": "* * * * *",
+            "humanSchedule": "Every minute", "prompt": "Reply with exactly: tick",
+            "recurring": true, "durable": false}]}));
+        assert!(matches!(
+            background_effect("CronList", &json!({}), &list),
+            Some(BackgroundEffect::CronList(jobs)) if jobs.len() == 1
+        ));
+        // ScheduleWakeup names no id (recorded w1): nothing to key a task by.
+        let wakeup = done(
+            json!({"scheduledFor": 1790596080000u64, "clampedDelaySeconds": 60,
+            "wasClamped": false}),
+        );
+        assert_eq!(
+            background_effect("ScheduleWakeup", &json!({}), &wakeup),
+            None
+        );
+    }
+
+    #[test]
+    fn a_workflow_item_is_titled_with_the_workflow_name() {
+        let input = json!({"script": "export const meta = {name: 'x'}"});
+        let started = tool_started_body("Workflow", &input).unwrap();
+        assert!(matches!(
+            &started,
+            ItemBody::ToolCall { category: ToolCategory::Subagent, title, .. } if title == "Workflow"
+        ));
+        let result = done(json!({"status": "async_launched", "taskId": "w1",
+            "taskType": "local_workflow", "workflowName": "parallel-ping-test"}));
+        let (body, _) = tool_completed("Workflow", &input, &started, &result);
+        assert!(matches!(
+            body,
+            ItemBody::ToolCall { title, .. } if title == "Workflow: parallel-ping-test"
+        ));
+    }
+
+    #[test]
+    fn triggers_come_from_the_result_origin() {
+        assert_eq!(
+            turn_trigger(&json!({"origin": {"kind": "task-notification"}})),
+            Some(TurnTrigger::BackgroundTask)
+        );
+        assert_eq!(turn_trigger(&json!({"origin": {"kind": "human"}})), None);
+        assert_eq!(turn_trigger(&json!({"subtype": "success"})), None);
+    }
+
+    #[test]
+    fn expiry_answers_say_why() {
+        for reason in [
+            ExpireReason::TurnEnded,
+            ExpireReason::TaskEnded,
+            ExpireReason::HarnessCancelled,
+            ExpireReason::ProcessExited,
+            ExpireReason::DaemonRestarted,
+        ] {
+            let body = expiry_response(reason);
+            assert_eq!(body["behavior"], "deny");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("The request expired")
+            );
+        }
+    }
+
+    #[test]
+    fn effort_flags_for_ultracode() {
+        assert_eq!(
+            effort_flag_settings(Some(ULTRACODE), false),
+            json!({"effortLevel": "ultracode"})
+        );
+        assert_eq!(
+            effort_flag_settings(Some("high"), true),
+            json!({"effortLevel": "high"})
+        );
+        assert_eq!(
+            effort_flag_settings(None, true),
+            json!({"effortLevel": null, "ultracode": false})
+        );
+        assert_eq!(
+            effort_flag_settings(None, false),
+            json!({"effortLevel": null})
+        );
+        // A model without effort levels (haiku) and one without a list are not offered it.
+        let models = models_from_initialize(&json!({"models": [
+            {"value": "haiku", "supportsEffort": false, "supportedEffortLevels": null},
+            {"value": "x", "supportsEffort": true}
+        ]}));
+        assert!(!effort_levels(&models).iter().any(|l| l.id == ULTRACODE));
     }
 }

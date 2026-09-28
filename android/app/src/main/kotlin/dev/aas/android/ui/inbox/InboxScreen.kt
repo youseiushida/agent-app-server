@@ -62,7 +62,11 @@ import dev.aas.android.ui.interaction.QuestionSheet
 import dev.aas.android.ui.navigation.AppNavigator
 import dev.aas.android.ui.navigation.InboxRoute
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.mapLatest
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -74,14 +78,35 @@ fun NavGraphBuilder.inboxDestinations(navigator: AppNavigator) {
     }
 }
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class InboxViewModel(
     private val workspace: WorkspaceRepository,
     private val interactions: InteractionRepository,
     private val messages: UserMessages,
     container: AppContainer,
 ) : ViewModel() {
-    val inbox: StateFlow<InboxModel> = workspace.inbox
+    val inbox: StateFlow<InboxModel> = combine(workspace.inbox, workspace.interactionTasksKnown.onStart { emit(Unit) }) { model, _ -> model }
+        .mapLatest { withTaskTitles(it) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(container.policy.uiStopTimeoutMs), InboxModel.Empty)
+
+    /**
+     * Names the background task that asked each approval or question, when this device stores
+     * it (its thread was followed here). A failure of the local store is shown; the cards then
+     * say only that background work asked.
+     */
+    private suspend fun withTaskTitles(model: InboxModel): InboxModel {
+        val ids = model.interactions.mapNotNull { it.interaction.backgroundTaskId }
+        if (ids.isEmpty()) return model
+        val tasks = try {
+            workspace.backgroundTasks(ids)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            messages.show(UiText.of(R.string.error_local_store, e.message ?: e.javaClass.simpleName))
+            emptyMap()
+        }
+        return model.copy(interactions = model.interactions.map { row -> row.copy(backgroundTaskTitle = row.interaction.backgroundTaskId?.let { tasks[it]?.title }) })
+    }
 
     /** Queues the answer in the outbox (sent now, or as soon as the connection is back). */
     fun respond(interaction: Interaction, resolution: InteractionResolution) {
@@ -149,6 +174,7 @@ fun InboxScreen(vm: InboxViewModel, navigator: AppNavigator) {
                         onOpenQuestion = { questionFor = row.interaction.id },
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                         header = { InteractionHeader(row) { navigator.openThread(row.interaction.threadId, row.interaction.id) } },
+                        backgroundTaskTitle = row.backgroundTaskTitle,
                     )
                 }
             }
@@ -205,7 +231,7 @@ private fun InboxThreadRow(row: InboxThread, onOpen: () -> Unit, onMarkRead: () 
         Column(Modifier.weight(1f)) {
             Text(row.thread.title, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Row(verticalAlignment = Alignment.CenterVertically) {
-                ThreadActivityChip(row.activity)
+                ThreadActivityChip(row.activity, backgroundRunning = row.thread.background.running)
                 Spacer(Modifier.width(8.dp))
                 Text(
                     listOfNotNull(row.project?.name, relativeTime(row.thread.lastActivityAt)).joinToString(" · "),

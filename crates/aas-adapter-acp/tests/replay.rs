@@ -310,7 +310,8 @@ async fn devin_recorded_turns() {
     let init = &client[0];
     assert_eq!(
         init["params"]["clientCapabilities"],
-        json!({"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "elicitation": {"form": {}, "url": {}}})
+        json!({"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "elicitation": {"form": {}, "url": {}},
+               "_meta": {"cognition.ai/subagentSupport": true, "cognition.ai/subagentControl": true}})
     );
     let prompt = client
         .iter()
@@ -795,6 +796,7 @@ async fn form_elicitation_is_answered_through_a_question() {
         request_id,
         request,
         item_key,
+        ..
     } = ev
     else {
         unreachable!()
@@ -968,7 +970,10 @@ async fn elicitations_that_cannot_be_shown_are_cancelled() {
         assert_eq!(reply["result"], json!({"action": "cancel"}), "{id}");
     }
     let codes: Vec<&str> = f.notices.iter().filter_map(|n| n.2.as_deref()).collect();
-    assert_eq!(codes, ["elicitationOutsideTurn", "unsupportedElicitation"]);
+    assert_eq!(
+        codes,
+        ["elicitationOutsideSession", "unsupportedElicitation"]
+    );
     assert!(
         f.natives
             .iter()

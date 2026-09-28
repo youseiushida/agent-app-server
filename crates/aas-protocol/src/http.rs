@@ -87,6 +87,9 @@ pub struct AdminStatusResponse {
     pub public_url: Option<String>,
     pub running_processes: u32,
     pub running_turns: u32,
+    /// Background tasks that keep an agent's process alive (see `server/status`).
+    #[serde(default)]
+    pub running_background_tasks: u32,
     pub connected_devices: u32,
     pub draining: bool,
 }

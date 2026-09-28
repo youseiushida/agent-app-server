@@ -5,6 +5,16 @@
     "settingsOutcome": "appliesNextTurn",
     "thread": {
       "archived": false,
+      "background": {
+        "lastEnded": {
+          "endedAt": 1790000088000,
+          "kind": "shell",
+          "status": "completed",
+          "taskId": "bgt_01K6A00000000000000000BG02",
+          "title": "npm run build"
+        },
+        "running": 1
+      },
       "createdAt": 1790000000000,
       "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
       "diffAvailable": true,

@@ -1,0 +1,27 @@
+{
+  "data": {
+    "task": {
+      "ambient": false,
+      "id": "bgt_01K6A00000000000000000BG01",
+      "kind": "agent",
+      "nativeId": "a546c1f2e9d04b7a8",
+      "originItemId": "itm_01K6A00000000000000000IT09",
+      "progress": {
+        "durationMs": 42000,
+        "lastToolName": "Read",
+        "tokens": 18400,
+        "toolUses": 7
+      },
+      "runs": 1,
+      "startedAt": 1790000003100,
+      "status": "running",
+      "stoppable": true,
+      "threadId": "thr_01K6A0000000000000000THR01",
+      "title": "Review the reconnect logic",
+      "turnId": "trn_01K6A0000000000000000TRN01"
+    }
+  },
+  "seq": 122,
+  "ts": 1790000000122,
+  "type": "backgroundTask/updated"
+}

@@ -4,6 +4,9 @@
 //! All state changes of a thread go through its actor, so they are applied in arrival order.
 //! Adapter events are applied in batches: whatever is available when the actor wakes up is
 //! written in one transaction (no timers involved).
+//!
+//! The actor also tracks the background tasks of its agent process (design.md §5.6): they keep
+//! the process alive while the harness reports them busy, and they end with the process.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -13,8 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aas_harness::{
-    AdapterError, AdapterEvent, SessionControl, SessionHandle, SettingsApplied, StartMode,
-    StartRequest, TurnInput, TurnInputPart,
+    AdapterError, AdapterEvent, BackgroundTaskInfo, SessionControl, SessionHandle, SettingsApplied,
+    StartMode, StartRequest, TurnInput, TurnInputPart,
 };
 use aas_protocol::events::Event;
 use aas_protocol::methods::*;
@@ -24,6 +27,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
+use crate::background::{self, Background, Tracked};
 use crate::blobs::{BlobPin, Spill};
 use crate::capacity::Permit;
 use crate::emit::{Emitter, thread_changed};
@@ -109,6 +113,12 @@ pub enum Msg {
     Commands {
         reply: oneshot::Sender<Option<Vec<Command>>>,
     },
+    /// `backgroundTask/stop`: asks the harness to stop one background task.
+    StopBackground {
+        task_id: BackgroundTaskId,
+        idem: Option<Idem>,
+        reply: Reply<BackgroundTaskResult>,
+    },
     /// Daemon shutdown: stop the process (if any) and exit the actor.
     Shutdown { reply: oneshot::Sender<()> },
 }
@@ -139,13 +149,14 @@ impl ActorHandle {
 }
 
 /// Spawns the actor of `row`. `persisted = false` for a thread that is inserted by its first
-/// `StartTurn { create: true }`.
+/// `StartTurn { create: true }`. `last_turn` is the thread's latest turn.
 pub fn spawn(
     sh: Arc<Shared>,
     row: ThreadRow,
     persisted: bool,
     queue_len: usize,
     next_turn_index: u32,
+    last_turn: Option<TurnId>,
 ) -> ActorHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let harness_id: Arc<str> = Arc::from(row.harness_id.as_str());
@@ -171,6 +182,11 @@ pub fn spawn(
         retired: false,
         held: std::collections::VecDeque::new(),
         exit_waiters: Vec::new(),
+        background: Background::default(),
+        pending: HashMap::new(),
+        last_turn,
+        background_lease: None,
+        background_busy: 0,
     };
     tokio::spawn(actor.run());
     ActorHandle { tx, harness_id }
@@ -187,9 +203,26 @@ struct Live {
 }
 
 struct OpenItem {
+    /// The adapter's key of the item.
+    key: String,
     item: Item,
     spill: Option<Spill>,
     truncated: bool,
+}
+
+/// What a pending interaction belongs to: it expires with it (design.md §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Scope {
+    Turn(TurnId),
+    Task(BackgroundTaskId),
+    /// The agent asked while no turn ran and named no background task.
+    Thread,
+}
+
+/// An interaction that waits for an answer, by the adapter's request id.
+struct PendingInteraction {
+    id: InteractionId,
+    scope: Scope,
 }
 
 struct ActiveTurn {
@@ -201,13 +234,18 @@ struct ActiveTurn {
     sent: bool,
     items: HashMap<String, OpenItem>,
     order: Vec<String>,
-    /// Adapter request id → interaction id.
-    pending: HashMap<String, InteractionId>,
+    /// Item ids of every item of the turn by the adapter's key, closed ones included (a
+    /// background task names the item that launched it by its key).
+    keys: HashMap<String, ItemId>,
     usage: Option<Usage>,
     base_tree: Option<String>,
     _lease: Option<PowerLease>,
     interrupt_requested: bool,
     forced: bool,
+    /// Why the harness started this run by itself (reported with its completion).
+    trigger: Option<TurnTrigger>,
+    /// The notice that the turn waits for background work has been added.
+    background_notice: bool,
 }
 
 enum Phase {
@@ -312,6 +350,8 @@ struct Uow {
     queued_insert: Vec<QueuedInput>,
     queued_update: Vec<(QueuedInputId, Vec<InputPart>)>,
     queued_delete: Vec<QueuedInputId>,
+    /// Background tasks to store (whole state; a later entry of the same task wins).
+    background: Vec<BackgroundTask>,
     blobs: Vec<(BlobId, String, u64)>,
     events: Vec<Event>,
     ws_events: Vec<Event>,
@@ -324,6 +364,9 @@ struct Uow {
     /// Blobs this commit refers to, kept from deletion until it has committed. Taken out
     /// before the changes are handed to the database (a pin must never drop inside it).
     pins: Vec<BlobPin>,
+    /// Requests of the agent that expire in this commit while its process lives: the adapter
+    /// answers each once the commit is stored (design.md §8).
+    answers: Vec<(String, ExpireReason)>,
 }
 
 impl Uow {
@@ -339,6 +382,7 @@ impl Uow {
             && self.queued_insert.is_empty()
             && self.queued_update.is_empty()
             && self.queued_delete.is_empty()
+            && self.background.is_empty()
             && self.blobs.is_empty()
             && self.events.is_empty()
             && self.ws_events.is_empty()
@@ -347,6 +391,7 @@ impl Uow {
             && self.idem_values.is_empty()
             && self.idem_thread.is_empty()
             && self.idem_create.is_none()
+            && self.answers.is_empty()
     }
 
     fn update_item(&mut self, item: Item) {
@@ -406,6 +451,17 @@ struct Actor {
     /// the mailbox closing right after a `Shutdown` (the engine drops its handles) cannot
     /// discard a waiter.
     exit_waiters: Vec<oneshot::Sender<()>>,
+    /// Background tasks of the current process.
+    background: Background,
+    /// Interactions waiting for an answer, by the adapter's request id.
+    pending: HashMap<String, PendingInteraction>,
+    /// The thread's latest turn (running or not): what a background task or an interaction
+    /// that belongs to no turn is shown with.
+    last_turn: Option<TurnId>,
+    /// Held while background work keeps the agent busy (`policy.prevent_sleep_while_running`).
+    background_lease: Option<PowerLease>,
+    /// The busy background tasks this actor counts in `Shared::running_background`.
+    background_busy: usize,
 }
 
 /// Input validated and converted for the adapter, with pins on the blobs it refers to.
@@ -472,7 +528,12 @@ fn send_reply<T>(reply: Reply<T>, result: CoreResult<T>) {
 impl Actor {
     async fn run(mut self) {
         loop {
+            // Biased: what is already queued goes first — requests, then the agent's events —
+            // before any timer. An event the agent sent before the idle deadline passed (a run
+            // it starts by itself, background work it reports) is applied before the idle stop
+            // is considered, and the stop re-checks what it may stop.
             tokio::select! {
+                biased;
                 msg = self.rx.recv(), if !self.rx_closed => match msg {
                     Some(msg) => {
                         self.on_msg(msg).await;
@@ -496,10 +557,14 @@ impl Actor {
                 },
                 ev = recv_live(&mut self.live) => self.on_events(ev).await,
                 step = poll_launch(&mut self.launch) => self.on_launch_step(step).await,
-                _ = sleep_opt(self.idle_deadline) => self.on_idle_deadline().await,
                 _ = sleep_opt(self.interrupt_deadline) => self.on_interrupt_deadline().await,
+                _ = sleep_opt(self.background.next_deadline()) => self.on_background_deadline().await,
+                _ = sleep_opt(self.idle_deadline) => self.on_idle_deadline().await,
             }
             if self.shutting_down && self.live.is_none() && self.launch.is_none() {
+                // Without a process nothing keeps the agent busy (every task ended with it).
+                self.background.clear();
+                self.refresh_background_hold();
                 for waiter in self.exit_waiters.drain(..) {
                     let _ = waiter.send(());
                 }
@@ -527,12 +592,29 @@ impl Actor {
         }
     }
 
-    /// Whether a process may be idle-reaped: nothing runs and nothing will start by itself
-    /// (a paused queue waits for the user, who may take any time).
+    /// Whether a process may be idle-reaped: nothing runs, nothing will start by itself (a
+    /// paused queue waits for the user, who may take any time), and no background task keeps
+    /// the agent busy (the harness's live set holds nothing but ambient work). Background work
+    /// is never stopped because of time (design.md §4.7).
     fn reapable(&self) -> bool {
         self.desired_status() == ThreadStatus::Ready
             && (self.queue_len == 0 || self.row.queue_paused)
             && self.stopping.is_none()
+            && self.background.busy() == 0
+    }
+
+    /// Keeps the daemon's count of busy background tasks and this thread's sleep lease in line
+    /// with the tasks of the process.
+    fn refresh_background_hold(&mut self) {
+        let busy = self.background.busy();
+        self.sh.background_busy_changed(self.background_busy, busy);
+        self.background_busy = busy;
+        let hold = busy > 0 && self.sh.config.policy.prevent_sleep_while_running;
+        if hold && self.background_lease.is_none() {
+            self.background_lease = Some(self.sh.supervisor.power().acquire());
+        } else if !hold {
+            self.background_lease = None;
+        }
     }
 
     fn refresh_status(&mut self, uow: &mut Uow) {
@@ -541,7 +623,8 @@ impl Actor {
             self.row.status = desired;
             uow.thread_changed = true;
         }
-        // Idle reaping: arm when the process sits idle, disarm otherwise.
+        // Idle reaping: armed when the process becomes idle (from then on), disarmed as soon as
+        // it is not (a turn, a queued input, busy background work).
         if self.reapable() {
             if self.idle_deadline.is_none() {
                 self.idle_deadline = Some(Instant::now() + self.sh.config.policy.idle_process_ttl);
@@ -549,6 +632,7 @@ impl Actor {
         } else {
             self.idle_deadline = None;
         }
+        self.refresh_background_hold();
     }
 
     /// Persists `uow` (with the thread's current row) in one transaction. A storage failure
@@ -561,6 +645,7 @@ impl Actor {
         self.refresh_status(&mut uow);
         // Released only after the commit (see `Uow::pins`).
         let pins = std::mem::take(&mut uow.pins);
+        let answers = std::mem::take(&mut uow.answers);
         if uow.is_empty() {
             return Ok(None);
         }
@@ -582,7 +667,37 @@ impl Actor {
         let (view, head) = result?;
         self.row.head = head;
         self.persisted = true;
+        self.answer_expired(answers).await;
         Ok(view)
+    }
+
+    /// Answers the agent's requests that expired while its process lives (their turn or
+    /// background task ended), so that the CLI does not wait for them (design.md §8). A request
+    /// the adapter no longer knows was answered or withdrawn meanwhile.
+    async fn answer_expired(&mut self, answers: Vec<(String, ExpireReason)>) {
+        let Some(control) = self.live.as_ref().map(|l| l.control.clone()) else {
+            return;
+        };
+        for (request_id, reason) in answers {
+            let deadline = self.request_deadline();
+            match bounded(
+                deadline,
+                "an expired request",
+                control.expire_request(&request_id, reason),
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::debug!(thread = %self.row.id, request_id, ?reason, "answered an expired request")
+                }
+                Err(AdapterError::UnknownRequest(_) | AdapterError::Closed) => {
+                    tracing::debug!(thread = %self.row.id, request_id, "the expired request is no longer pending")
+                }
+                Err(e) => {
+                    tracing::warn!(thread = %self.row.id, request_id, error = %e, "answering an expired request failed")
+                }
+            }
+        }
     }
 
     /// Commits where no reply is waiting. A failure has already taken the fail-stop path
@@ -717,6 +832,14 @@ impl Actor {
             Msg::Commands { reply } => {
                 let _ = reply.send(self.commands.clone());
             }
+            Msg::StopBackground {
+                task_id,
+                idem,
+                reply,
+            } => {
+                let r = self.stop_background(task_id, idem).await;
+                send_reply(reply, r);
+            }
             Msg::Shutdown { reply } => self.on_shutdown(Some(reply)).await,
         }
     }
@@ -766,6 +889,9 @@ impl Actor {
                 let _ = reply.send(Err(gone()));
             }
             Msg::SteerQueued { reply, .. } => {
+                let _ = reply.send(Err(gone()));
+            }
+            Msg::StopBackground { reply, .. } => {
                 let _ = reply.send(Err(gone()));
             }
             Msg::Stop { reply, .. } | Msg::Archive { reply, .. } => {
@@ -1034,6 +1160,9 @@ fn apply_uow(
     for t in &uow.turn_updates {
         store::update_turn(tx, t)?;
     }
+    for task in &uow.background {
+        store::upsert_background_task(tx, task)?;
+    }
     for e in &uow.events {
         em.thread(&thread_id, e.clone());
     }
@@ -1196,6 +1325,7 @@ impl Actor {
             error: None,
             usage: None,
             diff: None,
+            trigger: None,
         };
         let user_item = Item {
             id: ItemId::generate(),
@@ -1204,6 +1334,7 @@ impl Actor {
             status: ItemStatus::Completed,
             started_at: now,
             completed_at: Some(now),
+            background_task_id: None,
             body: ItemBody::UserMessage {
                 text: text.clone(),
                 attachments,
@@ -1236,6 +1367,7 @@ impl Actor {
             .prevent_sleep_while_running
             .then(|| self.sh.supervisor.power().acquire());
         self.sh.turn_started();
+        self.last_turn = Some(turn.id.clone());
         self.turn = Some(ActiveTurn {
             id: turn.id.clone(),
             index,
@@ -1244,12 +1376,14 @@ impl Actor {
             sent: false,
             items: HashMap::new(),
             order: Vec::new(),
-            pending: HashMap::new(),
+            keys: HashMap::new(),
             usage: None,
             base_tree: None,
             _lease: lease,
             interrupt_requested: false,
             forced: false,
+            trigger: None,
+            background_notice: false,
         });
         TurnStartResult {
             disposition: Disposition::Started,
@@ -1277,6 +1411,7 @@ impl Actor {
             error: None,
             usage: None,
             diff: None,
+            trigger: None,
         };
         self.row.last_activity_at = now;
         uow.thread_changed = true;
@@ -1293,6 +1428,7 @@ impl Actor {
             .prevent_sleep_while_running
             .then(|| self.sh.supervisor.power().acquire());
         self.sh.turn_started();
+        self.last_turn = Some(turn.id.clone());
         self.turn = Some(ActiveTurn {
             id: turn.id,
             index,
@@ -1301,12 +1437,14 @@ impl Actor {
             sent: true,
             items: HashMap::new(),
             order: Vec::new(),
-            pending: HashMap::new(),
+            keys: HashMap::new(),
             usage: None,
             base_tree: None,
             _lease: lease,
             interrupt_requested: false,
             forced: false,
+            trigger: None,
+            background_notice: false,
         });
         tracing::info!(thread = %self.row.id, "agent started a turn by itself");
     }
@@ -1358,6 +1496,7 @@ impl Actor {
             status: ItemStatus::Completed,
             started_at: now,
             completed_at: Some(now),
+            background_task_id: None,
             body: ItemBody::UserMessage {
                 text,
                 attachments,
@@ -1752,15 +1891,19 @@ impl Actor {
                         thread_id: self.row.id.clone(),
                         status: InteractionStatus::Resolved,
                     });
-                    if let Some(turn) = self.turn.as_mut() {
-                        turn.pending.retain(|_, v| v != &interaction.id);
-                    }
+                    self.pending.retain(|_, p| p.id != interaction.id);
                 }
-                Err(AdapterError::Closed) | Err(AdapterError::UnknownRequest(_)) => {
-                    uow.expire
-                        .push((interaction.id.clone(), ExpireReason::ProcessExited));
+                Err(e @ (AdapterError::Closed | AdapterError::UnknownRequest(_))) => {
+                    // The process is gone, or the agent no longer waits for this request (it
+                    // withdrew it): nothing can take the answer.
+                    let reason = match e {
+                        AdapterError::Closed => ExpireReason::ProcessExited,
+                        _ => ExpireReason::HarnessCancelled,
+                    };
+                    self.pending.retain(|_, p| p.id != interaction.id);
+                    uow.expire.push((interaction.id.clone(), reason));
                     interaction.status = InteractionStatus::Expired;
-                    interaction.expire_reason = Some(ExpireReason::ProcessExited);
+                    interaction.expire_reason = Some(reason);
                     interaction.resolved_at = Some(now);
                     interaction.resolved_by = Some("system".into());
                 }
@@ -2155,6 +2298,27 @@ impl Actor {
             }
             _ => false,
         };
+        if forced && self.background.busy() > 0 {
+            // Stopping the process would kill the background work it runs, and work the
+            // harness reports as running is never killed because of time (design.md §4.3):
+            // the turn goes on; the user can interrupt again or stop the thread.
+            let mut uow = Uow::default();
+            if let Some(turn) = self.turn.as_mut() {
+                turn.forced = false;
+                turn.interrupt_requested = false;
+                let turn_id = turn.id.clone();
+                tracing::warn!(thread = %self.row.id, "agent did not honour the interrupt; its process is kept for its background work");
+                self.core_notice(
+                    &turn_id,
+                    NoticeLevel::Warning,
+                    "The agent did not stop the turn in time. Its process is kept because it runs background work; interrupt again, or stop the thread to stop everything.",
+                    "interruptNotHonoured",
+                    &mut uow,
+                );
+            }
+            self.commit_logged(uow).await;
+            return;
+        }
         if forced {
             tracing::warn!(thread = %self.row.id, "agent did not honour the interrupt; stopping its process");
             let mut uow = Uow::default();
@@ -2233,8 +2397,22 @@ impl Actor {
         let settings = self.row.settings.clone();
         let abort = Arc::new(AtomicBool::new(false));
         let restart = self.restart_pending && self.live.is_some();
+        let mut uow = Uow::default();
+        if restart && self.background.busy() > 0 {
+            // The process must be replaced for the thread's settings, but background work
+            // keeps it busy, and that work is never killed for a restart: the turn waits until
+            // the work has ended (or the user stops it; `resume_after_background`).
+            self.note_waiting_for_background(&mut uow);
+            self.commit_logged(uow).await;
+            return;
+        }
         self.restart_pending = false;
         let (kind, phase) = if restart {
+            // What the old process still ran (ambient work) ends with it.
+            self.end_background(
+                ProcessEnd::Stopped(BackgroundEndReason::ProcessReplaced),
+                &mut uow,
+            );
             // Settings require a new process: reuse the old process's capacity permit
             // (waiting for a new one while holding it could deadlock at capacity 1).
             let old = self.live.take().expect("live session");
@@ -2277,7 +2455,72 @@ impl Actor {
             settings,
             abort,
         });
-        self.commit_logged(Uow::default()).await;
+        self.commit_logged(uow).await;
+    }
+
+    /// Adds a notice to the unsent turn (once) saying that it waits for background work: the
+    /// process must be replaced to apply the thread's settings first.
+    fn note_waiting_for_background(&mut self, uow: &mut Uow) {
+        let Some(turn) = self
+            .turn
+            .as_mut()
+            .filter(|t| !t.sent && !t.background_notice)
+        else {
+            return;
+        };
+        turn.background_notice = true;
+        let turn_id = turn.id.clone();
+        tracing::info!(thread = %self.row.id, "the next turn waits for background work before the process is replaced");
+        self.core_notice(
+            &turn_id,
+            NoticeLevel::Info,
+            "The agent must be restarted to apply the thread's new settings. The turn starts when its background work has ended; stop the background work to start it now.",
+            "waitingForBackgroundWork",
+            uow,
+        );
+    }
+
+    /// A notice item the engine adds to turn `turn_id` (complete from the start).
+    fn core_notice(
+        &mut self,
+        turn_id: &TurnId,
+        level: NoticeLevel,
+        message: &str,
+        code: &str,
+        uow: &mut Uow,
+    ) {
+        let now = now_ms();
+        let item = Item {
+            id: ItemId::generate(),
+            thread_id: self.row.id.clone(),
+            turn_id: turn_id.clone(),
+            status: ItemStatus::Completed,
+            started_at: now,
+            completed_at: Some(now),
+            background_task_id: None,
+            body: ItemBody::Notice {
+                level,
+                message: message.into(),
+                code: Some(code.into()),
+            },
+        };
+        uow.items_insert.push(item.clone());
+        uow.events.push(Event::ItemStarted { item });
+    }
+
+    /// A turn that waited for background work before the process could be replaced (see
+    /// [`note_waiting_for_background`](Self::note_waiting_for_background)) starts once no
+    /// background work keeps the agent busy any more.
+    async fn resume_after_background(&mut self) {
+        let waiting = self.restart_pending
+            && self.live.is_some()
+            && self.launch.is_none()
+            && self.stopping.is_none()
+            && self.turn.as_ref().is_some_and(|t| !t.sent)
+            && self.background.busy() == 0;
+        if waiting {
+            self.begin_launch(None).await;
+        }
     }
 
     fn launching_future(
@@ -2545,6 +2788,14 @@ impl Actor {
                 tracing::info!(thread = %self.row.id, "the agent process ended before the input was sent; the turn waits for a new process");
                 self.commit_logged(uow).await;
             }
+            Err(AdapterError::TurnInProgress) if self.live.is_some() => {
+                // The agent started a run by itself and did not take the input; its
+                // `TurnStarted` is already on its way (the adapter emits it first). That run
+                // becomes a turn of its own and this one follows it (the deferral in
+                // `apply_event`), instead of failing.
+                tracing::info!(thread = %self.row.id, "the agent is running a turn of its own; the user's turn waits for it");
+                self.commit_logged(uow).await;
+            }
             Err(e) => {
                 let message = e.to_string();
                 self.finish_turn(
@@ -2634,6 +2885,8 @@ impl Actor {
         self.run_after(after).await;
         if let Some(info) = exited {
             self.on_exited(info).await;
+        } else {
+            self.resume_after_background().await;
         }
     }
 
@@ -2655,11 +2908,8 @@ impl Actor {
                 uow.events.push(Event::CommandsChanged {});
             }
             AdapterEvent::SessionTitle { title } => {
-                let title: String = title
-                    .trim()
-                    .chars()
-                    .take(self.sh.config.policy.harness_title_chars)
-                    .collect();
+                let title =
+                    aas_harness::harness_title(&title, self.sh.config.policy.harness_title_chars);
                 let replaceable = matches!(
                     self.row.title_source.as_str(),
                     "default" | "firstMessage" | "harness"
@@ -2705,15 +2955,16 @@ impl Actor {
                 request_id,
                 request,
                 item_key,
-            } => self.interaction_requested(request_id, request, item_key, uow),
+                background_key,
+            } => self.interaction_requested(request_id, request, item_key, background_key, uow),
             AdapterEvent::InteractionWithdrawn { request_id } => {
-                if let Some(turn) = self.turn.as_mut().filter(|t| t.sent)
-                    && let Some(id) = turn.pending.remove(&request_id)
-                {
-                    uow.expire.push((id, ExpireReason::HarnessCancelled));
+                // The agent no longer needs the answer, whatever the request belongs to.
+                if let Some(p) = self.pending.remove(&request_id) {
+                    uow.expire.push((p.id, ExpireReason::HarnessCancelled));
                     uow.thread_changed = true;
                 }
             }
+            AdapterEvent::BackgroundTask { task } => self.background_task(*task, uow),
             AdapterEvent::TurnUsage { usage } => {
                 // Recorded with the running turn and relayed as it comes, so the client sees
                 // the context occupancy grow during a long turn.
@@ -2738,12 +2989,14 @@ impl Actor {
                 status,
                 usage,
                 error,
+                trigger,
             } => {
                 // A turn whose input was not sent yet cannot be the one that completed.
-                if !self.turn.as_ref().is_some_and(|t| t.sent) {
+                let Some(turn) = self.turn.as_mut().filter(|t| t.sent) else {
                     tracing::warn!(thread = %self.row.id, "TurnCompleted without a running turn; ignored");
                     return;
-                }
+                };
+                turn.trigger = trigger;
                 // When we asked the process to stop, an interruption reported by the agent
                 // records why (the stop request is a known fact, not an inference).
                 let error = error.or_else(|| match (&self.stopping, status) {
@@ -2804,14 +3057,17 @@ impl Actor {
             status: ItemStatus::InProgress,
             started_at: now,
             completed_at: None,
+            background_task_id: None,
             body,
         };
         uow.items_insert.push(item.clone());
         uow.events.push(Event::ItemStarted { item: item.clone() });
         turn.order.push(key.clone());
+        turn.keys.insert(key.clone(), item.id.clone());
         turn.items.insert(
-            key,
+            key.clone(),
             OpenItem {
+                key,
                 item,
                 spill: None,
                 truncated: false,
@@ -2970,6 +3226,13 @@ impl Actor {
         uow: &mut Uow,
     ) -> Item {
         let max_inline = self.sh.config.policy.max_inline_output_bytes;
+        // The background task this item launched, if one names it as its origin.
+        if open.item.background_task_id.is_none() {
+            open.item.background_task_id = self.background.launched_by(&open.key);
+        }
+        if status == ItemStatus::Backgrounded && open.item.background_task_id.is_none() {
+            tracing::warn!(thread = %self.row.id, key = %open.key, "an item was closed as backgrounded before any background task named it");
+        }
         if let Some(mut final_body) = body {
             if open.truncated {
                 // Our spill has the full output; keep our inline prefix.
@@ -3014,26 +3277,45 @@ impl Actor {
         open.item
     }
 
+    /// Records a request of the agent. It belongs to the background task that asks (named by
+    /// the adapter), else to the running turn, else to the thread; it is never dropped, and it
+    /// expires with what it belongs to (design.md §8).
     fn interaction_requested(
         &mut self,
         request_id: String,
         request: InteractionRequest,
         item_key: Option<String>,
+        background_key: Option<String>,
         uow: &mut Uow,
     ) {
-        let Some(turn) = self.turn.as_mut().filter(|t| t.sent) else {
-            tracing::warn!(thread = %self.row.id, request_id, "interaction outside a turn; declined");
-            return;
+        let task = background_key
+            .as_deref()
+            .and_then(|key| self.background.get(key))
+            .filter(|t| !t.ended())
+            .map(|t| t.view.id.clone());
+        if let (Some(key), None) = (&background_key, &task) {
+            tracing::warn!(thread = %self.row.id, request_id, key, "a request names a background task that is not running; it belongs to the thread");
+        }
+        let sent_turn = self.turn.as_ref().filter(|t| t.sent);
+        let (scope, turn_id, item_id) = match (&task, sent_turn) {
+            (Some(task), _) => (Scope::Task(task.clone()), None, None),
+            (None, Some(turn)) if background_key.is_none() => (
+                Scope::Turn(turn.id.clone()),
+                Some(turn.id.clone()),
+                item_key.as_ref().and_then(|k| turn.keys.get(k)).cloned(),
+            ),
+            _ => (Scope::Thread, None, None),
         };
-        let item_id = item_key
-            .as_ref()
-            .and_then(|k| turn.items.get(k))
-            .map(|o| o.item.id.clone());
+        let anchor_turn_id = match scope {
+            Scope::Turn(_) => None,
+            Scope::Task(_) | Scope::Thread => self.anchor_turn(),
+        };
         let interaction = Interaction {
             id: InteractionId::generate(),
             thread_id: self.row.id.clone(),
-            turn_id: Some(turn.id.clone()),
+            turn_id,
             item_id,
+            background_task_id: task,
             status: InteractionStatus::Pending,
             created_at: now_ms(),
             resolved_at: None,
@@ -3042,11 +3324,17 @@ impl Actor {
             resolution: None,
             expire_reason: None,
         };
-        turn.pending
-            .insert(request_id.clone(), interaction.id.clone());
+        self.pending.insert(
+            request_id.clone(),
+            PendingInteraction {
+                id: interaction.id.clone(),
+                scope,
+            },
+        );
         uow.interactions_insert.push(InteractionRow {
             interaction: interaction.clone(),
             adapter_request_id: request_id,
+            anchor_turn_id,
         });
         uow.events.push(Event::InteractionRequested {
             interaction: interaction.clone(),
@@ -3073,6 +3361,7 @@ impl Actor {
                 error: None,
                 usage: t.usage,
                 diff: None,
+                trigger: t.trigger,
             },
             base_tree: t.base_tree.clone(),
             end_tree: None,
@@ -3117,9 +3406,8 @@ impl Actor {
                 uow.events.push(Event::ItemCompleted { item });
             }
         }
-        for (_, id) in turn.pending.drain() {
-            uow.expire.push((id, expire_reason));
-        }
+        let scope = Scope::Turn(turn.id.clone());
+        self.expire_pending(|s| *s == scope, expire_reason, uow);
         let now = now_ms();
         // A final usage without the context occupancy keeps the one the turn last reported.
         let usage = match (usage, turn.usage) {
@@ -3383,9 +3671,22 @@ impl Actor {
         if self.turn.is_none() {
             self.turn = self.deferred.take();
         }
-        if stop_reason.is_none() && !info.is_clean() {
+        // Background work ends with the process: stopped when we stopped it, lost otherwise.
+        let end = match stop_reason {
+            Some(reason) => ProcessEnd::Stopped(background_end_reason(reason, &self.sh)),
+            None => ProcessEnd::Lost,
+        };
+        let lost = self.end_background(end, &mut uow);
+        if stop_reason.is_none() && (!info.is_clean() || lost > 0) {
+            let mut message = exit_message(&info, self.sh.config.policy.exit_message_stderr_lines);
+            if lost > 0 {
+                message.push_str(&format!(
+                    " ({lost} background task{} lost)",
+                    if lost == 1 { " was" } else { "s were" }
+                ));
+            }
             self.row.last_error = Some(ThreadError {
-                message: exit_message(&info, self.sh.config.policy.exit_message_stderr_lines),
+                message,
                 kind: "agentExited".into(),
                 at: now_ms(),
             });
@@ -3476,6 +3777,419 @@ impl Actor {
     }
 }
 
+impl Actor {
+    // ----- background tasks and pending interactions ---------------------------------------------
+
+    /// The turn a background task or an interaction that belongs to no turn is shown with: the
+    /// running turn, else the thread's latest turn.
+    fn anchor_turn(&self) -> Option<TurnId> {
+        self.turn
+            .as_ref()
+            .filter(|t| t.sent)
+            .map(|t| t.id.clone())
+            .or_else(|| self.last_turn.clone())
+    }
+
+    /// Applies the adapter's report of one background task (its whole state; the same state
+    /// twice changes nothing).
+    fn background_task(&mut self, info: BackgroundTaskInfo, uow: &mut Uow) {
+        if self
+            .background
+            .get(&info.key)
+            .is_some_and(|known| known.info == info)
+        {
+            return;
+        }
+        let now = now_ms();
+        let status = background::status_of(info.state);
+        let ended = status.is_terminal();
+        let runs = info.runs.max(1);
+        let prev = self.background.get(&info.key).map(|t| t.view.clone());
+        // Whether the report continues the run clients know. A new run starts when `runs` goes
+        // up, or when a task that ended runs again.
+        let same_run = prev
+            .as_ref()
+            .is_some_and(|v| v.runs == runs && !(v.status.is_terminal() && !ended));
+        let prev_ended = same_run && prev.as_ref().is_some_and(|v| v.status.is_terminal());
+        let started_at = match &prev {
+            Some(v) if same_run => v.started_at,
+            _ => now,
+        };
+        let ended_at = match &prev {
+            _ if !ended => None,
+            Some(v) if prev_ended => v.ended_at.or(Some(now)),
+            _ => Some(now),
+        };
+        let result = self.background_result(&info, uow);
+        let origin_item_id = prev
+            .as_ref()
+            .and_then(|v| v.origin_item_id.clone())
+            .or_else(|| {
+                let key = info.origin_item_key.as_ref()?;
+                self.turn.as_ref()?.keys.get(key).cloned()
+            });
+        let parent_task_id = prev
+            .as_ref()
+            .and_then(|v| v.parent_task_id.clone())
+            .or_else(|| {
+                let key = info.parent_key.as_deref()?;
+                self.background.get(key).map(|t| t.view.id.clone())
+            });
+        if let (Some(key), None) = (&info.origin_item_key, &origin_item_id) {
+            tracing::debug!(thread = %self.row.id, task = %info.key, item = %key, "the item that launched a background task is not an item of the running turn");
+        }
+        let view = BackgroundTask {
+            id: prev
+                .as_ref()
+                .map(|v| v.id.clone())
+                .unwrap_or_else(BackgroundTaskId::generate),
+            thread_id: self.row.id.clone(),
+            native_id: info.key.clone(),
+            kind: info.kind,
+            title: info.title.clone(),
+            status,
+            ambient: info.ambient,
+            runs,
+            turn_id: prev
+                .as_ref()
+                .and_then(|v| v.turn_id.clone())
+                .or_else(|| self.anchor_turn()),
+            origin_item_id,
+            parent_task_id,
+            started_at,
+            ended_at,
+            end_reason: ended.then_some(BackgroundEndReason::Harness),
+            progress: info.progress.clone(),
+            result,
+            usage: info.usage,
+            stoppable: info.stoppable,
+            stop_requested_at: prev
+                .as_ref()
+                .filter(|_| same_run && !ended)
+                .and_then(|v| v.stop_requested_at),
+            stop_unconfirmed_at: prev
+                .as_ref()
+                .filter(|_| same_run && !ended)
+                .and_then(|v| v.stop_unconfirmed_at),
+            next_run_at: info.next_run_at,
+        };
+        if background::changes_summary(prev.as_ref(), &view) {
+            uow.thread_changed = true;
+        }
+        let key = info.key.clone();
+        let task_id = view.id.clone();
+        let interval = self.sh.config.policy.background_progress_interval;
+        match self.background.get_mut(&key) {
+            Some(tracked) => {
+                let at = Instant::now();
+                // Progress of a running task is written at most once per interval; the latest
+                // state waits (`on_background_deadline`), and any other change writes it.
+                let wait = tracked
+                    .written
+                    .as_ref()
+                    .is_some_and(|w| background::progress_only(w, &view))
+                    && tracked.written_at.is_some_and(|w| at < w + interval);
+                tracked.info = info;
+                tracked.view = view;
+                if ended || !same_run {
+                    tracked.stop_deadline = None;
+                }
+                if !wait {
+                    self.write_task(&key, uow);
+                } else if tracked.written.as_ref() != Some(&tracked.view) {
+                    tracked.flush_at = tracked
+                        .flush_at
+                        .or_else(|| tracked.written_at.map(|w| w + interval));
+                }
+            }
+            None => {
+                self.background.insert(Tracked {
+                    info,
+                    view,
+                    written: None,
+                    written_at: None,
+                    flush_at: None,
+                    stop_deadline: None,
+                });
+                self.write_task(&key, uow);
+            }
+        }
+        if ended && !prev_ended {
+            let scope = Scope::Task(task_id);
+            self.expire_pending(|s| *s == scope, ExpireReason::TaskEnded, uow);
+        }
+    }
+
+    /// What a task produced, as clients see it: an output longer than
+    /// `policy.max_inline_output_bytes` is kept whole in a blob (written once per output).
+    fn background_result(
+        &self,
+        info: &BackgroundTaskInfo,
+        uow: &mut Uow,
+    ) -> Option<BackgroundResult> {
+        let reported = info.result.as_ref()?;
+        if let Some(known) = self.background.get(&info.key)
+            && let Some(prev) = &known.view.result
+            && known.info.result.as_ref().map(|r| &r.output) == Some(&reported.output)
+        {
+            return Some(BackgroundResult {
+                summary: reported.summary.clone(),
+                exit_code: reported.exit_code,
+                ..prev.clone()
+            });
+        }
+        let max_inline = self.sh.config.policy.max_inline_output_bytes;
+        let (output, output_truncated, output_blob_id) = match &reported.output {
+            None => (None, false, None),
+            Some(text) if text.len() <= max_inline => (Some(text.clone()), false, None),
+            Some(text) => {
+                let blob = self.spill_text(text, uow);
+                let cut = floor_char_boundary(text, max_inline);
+                (Some(text[..cut].to_owned()), true, blob)
+            }
+        };
+        Some(BackgroundResult {
+            summary: reported.summary.clone(),
+            exit_code: reported.exit_code,
+            output,
+            output_truncated,
+            output_blob_id,
+        })
+    }
+
+    /// Stores `text` as a blob referenced by this commit.
+    fn spill_text(&self, text: &str, uow: &mut Uow) -> Option<BlobId> {
+        let mut spill = match self.sh.blobs.spill() {
+            Ok(spill) => spill,
+            Err(e) => {
+                tracing::error!(error = %e, "creating a spill file failed; the output is kept cut");
+                return None;
+            }
+        };
+        if let Err(e) = spill.write(text.as_bytes()) {
+            tracing::error!(error = %e, "writing spilled output failed; the output is kept cut");
+            return None;
+        }
+        match spill.finish(&self.sh.blobs) {
+            Ok((id, size, pin)) => {
+                uow.blobs
+                    .push((id.clone(), "text/plain; charset=utf-8".into(), size));
+                uow.pins.push(pin);
+                Some(id)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "storing spilled output failed; the output is kept cut");
+                None
+            }
+        }
+    }
+
+    /// Writes the current state of task `key` (when it differs from what clients know).
+    fn write_task(&mut self, key: &str, uow: &mut Uow) {
+        let Some(tracked) = self.background.get_mut(key) else {
+            return;
+        };
+        tracked.flush_at = None;
+        if tracked.written.as_ref() == Some(&tracked.view) {
+            return;
+        }
+        tracked.written = Some(tracked.view.clone());
+        tracked.written_at = Some(Instant::now());
+        uow.background.push(tracked.view.clone());
+        uow.events.push(Event::BackgroundTaskUpdated {
+            task: tracked.view.clone(),
+        });
+    }
+
+    /// A coalesced progress update is due, or a stop request went unconfirmed.
+    async fn on_background_deadline(&mut self) {
+        let now = Instant::now();
+        let mut uow = Uow::default();
+        for key in self.background.due(now) {
+            if let Some(tracked) = self.background.get_mut(&key)
+                && tracked.stop_deadline.is_some_and(|d| d <= now)
+            {
+                tracked.stop_deadline = None;
+                if !tracked.ended() {
+                    // Nothing is escalated: the task goes on, and the user may ask again or stop
+                    // the thread.
+                    tracing::warn!(thread = %self.row.id, task = %tracked.view.id, "the harness did not confirm the stop of a background task in time");
+                    tracked.view.stop_requested_at = None;
+                    tracked.view.stop_unconfirmed_at = Some(now_ms());
+                }
+            }
+            self.write_task(&key, &mut uow);
+        }
+        self.commit_logged(uow).await;
+    }
+
+    /// Ends every background task of the process that has not ended (the process ends, or is
+    /// replaced), and expires what waited for an answer from it outside a turn. Returns how
+    /// many tasks that were not ambient were lost.
+    fn end_background(&mut self, end: ProcessEnd, uow: &mut Uow) -> usize {
+        let now = now_ms();
+        let mut lost = 0;
+        for key in self.background.unfinished() {
+            let Some(tracked) = self.background.get_mut(&key) else {
+                continue;
+            };
+            let (status, reason) = match end {
+                ProcessEnd::Stopped(reason) => (BackgroundTaskStatus::Stopped, reason),
+                ProcessEnd::Lost => {
+                    if !tracked.view.ambient {
+                        lost += 1;
+                    }
+                    (
+                        BackgroundTaskStatus::Lost,
+                        BackgroundEndReason::ProcessExited,
+                    )
+                }
+            };
+            tracked.info.live = false;
+            tracked.view.status = status;
+            tracked.view.ended_at = Some(now);
+            tracked.view.end_reason = Some(reason);
+            tracked.view.stop_requested_at = None;
+            tracked.stop_deadline = None;
+            self.write_task(&key, uow);
+            uow.thread_changed = true;
+        }
+        self.expire_pending(
+            |s| !matches!(s, Scope::Turn(_)),
+            ExpireReason::ProcessExited,
+            uow,
+        );
+        self.background.clear();
+        lost
+    }
+
+    /// Expires the pending interactions whose scope matches. When the process lives and the
+    /// request expired because what it belonged to ended, the adapter answers the agent after
+    /// the commit (`Uow::answers`), so that it does not wait for an answer that never comes.
+    fn expire_pending(
+        &mut self,
+        matches: impl Fn(&Scope) -> bool,
+        reason: ExpireReason,
+        uow: &mut Uow,
+    ) {
+        let answer = self.live.is_some()
+            && matches!(reason, ExpireReason::TurnEnded | ExpireReason::TaskEnded);
+        let expired: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| matches(&p.scope))
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in expired {
+            if let Some(p) = self.pending.remove(&request_id) {
+                uow.expire.push((p.id, reason));
+                uow.thread_changed = true;
+                if answer {
+                    uow.answers.push((request_id, reason));
+                }
+            }
+        }
+    }
+
+    /// `backgroundTask/stop`: asks the harness to stop task `task_id`. The request only asks;
+    /// the end arrives from the harness (design.md §5.6).
+    async fn stop_background(
+        &mut self,
+        task_id: BackgroundTaskId,
+        idem: Option<Idem>,
+    ) -> CoreResult<BackgroundTaskResult> {
+        let Some(key) = self.background.key_of(&task_id).map(str::to_owned) else {
+            // Not a task of the running process: one that ended with an earlier process, or
+            // none of this thread.
+            let (id, thread) = (task_id.clone(), self.row.id.clone());
+            let stored = self
+                .sh
+                .db
+                .read(move |tx| store::get_background_task(tx, &id))
+                .await?;
+            return Err(match stored {
+                Some(t) if t.thread_id == thread => {
+                    invalid_state("the background task is not running")
+                }
+                _ => not_found("backgroundTask", &task_id),
+            });
+        };
+        let tracked = self
+            .background
+            .get(&key)
+            .expect("the key of a tracked task");
+        if tracked.ended() {
+            return Err(invalid_state("the background task is not running"));
+        }
+        if let Some(info) = self.sh.registry.info(&self.row.harness_id)
+            && info.available
+            && !info.capabilities.background_stop
+        {
+            return Err(rpc(
+                ErrorKind::CapabilityUnsupported,
+                "this harness cannot stop single background tasks",
+            )
+            .with("capability", "backgroundStop"));
+        }
+        if !tracked.info.stoppable {
+            return Err(invalid_state(
+                "the harness cannot stop this background task on its own; stop the thread to stop everything",
+            ));
+        }
+        let control = self
+            .live
+            .as_ref()
+            .map(|l| l.control.clone())
+            .ok_or_else(|| invalid_state("the agent is not running"))?;
+        let deadline = self.request_deadline();
+        bounded(deadline, "the stop request", control.stop_background(&key))
+            .await
+            .map_err(adapter_err(&self.row.harness_id))?;
+        let confirm = self.sh.config.policy.background_stop_confirm_timeout;
+        let mut uow = Uow::default();
+        let tracked = self
+            .background
+            .get_mut(&key)
+            .expect("the key of a tracked task");
+        tracked.view.stop_requested_at = Some(now_ms());
+        tracked.view.stop_unconfirmed_at = None;
+        tracked.stop_deadline = Some(Instant::now() + confirm);
+        let task = tracked.view.clone();
+        self.write_task(&key, &mut uow);
+        let result = BackgroundTaskResult { task };
+        if let Some(idem) = idem {
+            uow.idem_values.push((idem, serde_json::to_value(&result)?));
+        }
+        self.commit(uow).await?;
+        Ok(result)
+    }
+}
+
+/// How background work ends with its process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessEnd {
+    /// We stopped the process, for this reason.
+    Stopped(BackgroundEndReason),
+    /// The process ended by itself: how its work ended is unknown.
+    Lost,
+}
+
+/// Why background work ended when we stopped its process for `reason`.
+fn background_end_reason(reason: StopReason, sh: &Shared) -> BackgroundEndReason {
+    match reason {
+        StopReason::User | StopReason::Abandoned => BackgroundEndReason::ThreadStopped,
+        StopReason::Idle => BackgroundEndReason::IdleStop,
+        StopReason::InterruptTimeout => BackgroundEndReason::ForcedStop,
+        StopReason::Shutdown => {
+            if sh.session_ending.load(std::sync::atomic::Ordering::SeqCst) {
+                BackgroundEndReason::SystemShutdown
+            } else {
+                BackgroundEndReason::DaemonShutdown
+            }
+        }
+    }
+}
+
 /// Error recorded on a turn the daemon's shutdown ended: `systemShutdown` when Windows ends
 /// the session, else `daemonShutdown`.
 fn shutdown_error(sh: &Shared) -> TurnError {
@@ -3531,18 +4245,10 @@ fn exit_message(info: &ExitInfo, stderr_lines: usize) -> String {
 }
 
 /// A thread title from the first non-empty line of `text`, at most `max_chars` characters
-/// (`policy.first_message_title_chars`).
+/// (`policy.first_message_title_chars`). The same rule adapters apply to native sessions
+/// without a name ([`aas_harness::title_from_first_line`]).
 fn title_from(text: &str, max_chars: usize) -> String {
-    let first = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    let mut t: String = first.chars().take(max_chars).collect();
-    if first.chars().count() > max_chars {
-        t.push('…');
-    }
-    t
+    aas_harness::title_from_first_line(text, max_chars)
 }
 
 fn adapter_err(harness: &str) -> impl Fn(AdapterError) -> CoreError + '_ {

@@ -121,9 +121,10 @@ async fn the_end_of_the_session_waits_only_its_grace_and_the_next_start_records_
             settings: None,
             workspace: None,
             title: None,
-            // An agent that ignores the end of its input and every interrupt.
+            // An agent that ignores the end of its input and every interrupt, with background
+            // work that runs until it is stopped.
             input: Some(vec![InputPart::Text {
-                text: "@text hanging now\n@hang 600000".into(),
+                text: "@bg dev kind=shell ms=0 npm run dev\n@text hanging now\n@hang 600000".into(),
             }]),
         },
     )
@@ -157,6 +158,15 @@ async fn the_end_of_the_session_waits_only_its_grace_and_the_next_start_records_
     assert_eq!(
         turn.error.as_ref().map(|e| e.kind.as_str()),
         Some("systemShutdown")
+    );
+    // The background work ended with the session too, for the same reason.
+    let task = &read.background_tasks[0];
+    assert_eq!(
+        (task.status, task.end_reason),
+        (
+            BackgroundTaskStatus::Stopped,
+            Some(BackgroundEndReason::SystemShutdown)
+        )
     );
     engine.shutdown(false).await;
     engine.close().await.unwrap();

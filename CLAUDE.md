@@ -34,6 +34,7 @@
 - 実行ファイルは「設定の明示パス → PATH と PATHEXT の探索」の順で解決する。npm の `.cmd` シムの中身はパースしない。
 - パスは `PathBuf` で扱い、文字列を連結して作らない。Windows のパスの比較は大文字小文字を区別しない。
 - 子プロセスとの JSON Lines の区切りは LF。stdout は UTF-8 として扱う。
+- リポジトリのテキストは LF で保存し、作業ツリーも LF にする（`.gitattributes`。`core.autocrlf` によらない）。`.bat` / `.cmd` / `.ps1` だけ作業ツリーで CRLF。バイナリ（`.jar`、`.apk`、画像、鍵ストアなど）は `binary`。
 
 ## リポジトリ構成
 ```

@@ -96,7 +96,14 @@ class PairingE2eTest : E2eTest() {
         val first = AppFlows.unique("e2e-unpair")
         flows.pairFresh(first)
         flows.openSettings()
-        app.scrollTo(app.inApp(app.button(app.text("settings_unpair"))), "ペアリングを解除").click()
+        app.scrollTo(app.inApp(app.button(app.text("settings_unpair"))), "ペアリングを解除")
+        // A tap while the settings still settle after the scroll only stops the list (it was lost
+        // once on staging): tap until the confirmation shows, as openDevices does.
+        app.tapUntil(
+            app.inApp(app.button(app.text("settings_unpair"))),
+            app.inApp(By.text(app.text("unpair_confirm_title"))),
+            "opening the unpairing confirmation",
+        )
         app.tapNear(
             app.inApp(By.text(app.text("unpair_confirm_title"))),
             app.button(app.text("settings_unpair")),

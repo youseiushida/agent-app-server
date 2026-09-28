@@ -16,6 +16,8 @@ import dev.aas.android.domain.composer.SendBlock
 import dev.aas.android.domain.timeline.TimelineRow
 import dev.aas.android.notify.AppVisibility
 import dev.aas.android.protocol.AasJson
+import dev.aas.android.protocol.BackgroundTaskStatus
+import dev.aas.android.protocol.BackgroundTaskStopParams
 import dev.aas.android.protocol.CommandListResult
 import dev.aas.android.protocol.Delivery
 import dev.aas.android.protocol.ErrorKind
@@ -47,6 +49,7 @@ import dev.aas.android.ui.composer.CommandsState
 import dev.aas.android.ui.composer.MentionSearch
 import dev.aas.android.ui.composer.PromptTemplates
 import dev.aas.android.ui.navigation.ThreadRoute
+import dev.aas.android.ui.thread.BackgroundStop
 import dev.aas.android.ui.thread.ThreadEvent
 import dev.aas.android.ui.thread.ThreadViewModel
 import androidx.lifecycle.viewModelScope
@@ -82,6 +85,7 @@ class ThreadViewModelTest {
     private val sentDrafts = SentDrafts(env.scope, drafts)
     private val uploader = FakeUploader()
     private val jobs = mutableListOf<Job>()
+    private val viewModels = mutableListOf<ThreadViewModel>()
 
     /** The fixture thread with the claude harness of the fixture (steer capable) and [running] state. */
     private fun read(running: Boolean = true, paused: Boolean = false): ThreadReadResult {
@@ -92,11 +96,16 @@ class ThreadViewModelTest {
 
     private val harness = TestEngine.fakeHarness().copy(id = "claude")
 
+    private companion object {
+        /** Upper bound for a view model's message to be posted. */
+        const val MESSAGE_TIMEOUT_MS = 10_000L
+    }
+
     private suspend fun viewModel(read: ThreadReadResult): ThreadViewModel {
         val vm = withContext(Dispatchers.Main) {
             ThreadViewModel(
                 route = ThreadRoute(read.thread.id),
-                threads = ThreadRepository(env.engine, env.reads),
+                threads = ThreadRepository(env.engine, env.reads, env.lists),
                 interactions = InteractionRepository(env.engine),
                 workspace = env.engine.workspace,
                 outbox = env.engine.outbox,
@@ -113,6 +122,7 @@ class ThreadViewModelTest {
                 harnesses = HarnessRepository(env.engine),
             )
         }
+        viewModels += vm
         jobs += CoroutineScope(Dispatchers.Default).launch { vm.state.collect {} }
         eventually(what = "the thread") { vm.state.value.thread.thread }
         return vm
@@ -135,7 +145,77 @@ class ThreadViewModelTest {
     @After
     fun tearDown() {
         jobs.forEach { it.cancel() }
+        dev.aas.android.testing.clearViewModels(viewModels)
         env.close()
+    }
+
+    /**
+     * The バックグラウンド section of a harness that reports background work: the running task open
+     * with 停止, the ended ones folded; 停止 puts `backgroundTask/stop { threadId, taskId }` in the
+     * outbox (the card then says it waits to be sent); a backgrounded item's chip opens the section
+     * where its task is and scrolls to it; the stop button's hint says background work goes on.
+     */
+    @Test
+    fun backgroundTasksAreListedStoppedAndOpenedFromTheirItem() = blockingTest {
+        val read = read(running = false)
+        env.seed(read, harnesses = listOf(harness.copy(capabilities = TestEngine.fakeHarness(background = true).capabilities)))
+        env.startOffline()
+        eventually(what = "the workspace") { env.engine.workspace.value.harnesses.takeIf { it.isNotEmpty() } }
+        val vm = viewModel(read)
+        val events = mutableListOf<ThreadEvent>()
+        jobs += CoroutineScope(Dispatchers.Default).launch { vm.eventFlow.collect { events += it } }
+
+        val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running }
+        val ui = eventually(what = "the section") { vm.state.value.takeIf { it.rows.any { r -> r is TimelineRow.BackgroundHeader } } }
+        assertEquals(TimelineRow.BackgroundHeader(running = 1, ambient = 0, ended = 2, expanded = true), ui.rows.filterIsInstance<TimelineRow.BackgroundHeader>().single())
+        assertEquals(listOf(agent.id), ui.rows.filterIsInstance<TimelineRow.BackgroundTaskRow>().map { it.task.id }, "ended tasks are folded")
+        assertEquals(BackgroundStop.Available, ui.stopOf(agent))
+        assertEquals(listOf(agent), ui.runningTasks)
+        assertTrue(ui.keepsBackgroundOnInterrupt)
+        // The approval the background agent asked names it.
+        val asked = ui.pendingInteractions.single { it.backgroundTaskId != null }
+        assertEquals("Review the reconnect logic", ui.backgroundTasks[asked.backgroundTaskId]?.title)
+
+        main { vm.stopBackgroundTask(agent) }
+        val stop = awaitOutbox(Methods.BackgroundTaskStop.name, BackgroundTaskStopParams.serializer()).single()
+        assertEquals(read.thread.id, stop.threadId)
+        assertEquals(agent.id, stop.taskId)
+        eventually(what = "queued stop") { vm.state.value.takeIf { it.stopOf(agent) == BackgroundStop.Queued } }
+        kotlinx.coroutines.withTimeout(MESSAGE_TIMEOUT_MS) {
+            messages.messages.first { it.text == dev.aas.android.ui.common.UiText.of(dev.aas.android.R.string.bg_stop_offline, agent.title) }
+        }
+        assertEquals(0, vm.state.value.otherPending, "a stop shows on its card, not as another pending change")
+
+        // An ended task opened from its item: the section and its ended tasks open, the list scrolls to it.
+        val ended = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Completed }
+        main { vm.toggleGroup(dev.aas.android.domain.timeline.Timeline.BACKGROUND_SECTION, expandedNow = true) }
+        eventually(what = "folded") { vm.state.value.rows.takeIf { rows -> rows.none { it is TimelineRow.BackgroundTaskRow } } }
+        main { vm.openBackgroundTask(ended.id) }
+        eventually(what = "the ended task shown") {
+            vm.state.value.rows.filterIsInstance<TimelineRow.BackgroundTaskRow>().firstOrNull { it.task.id == ended.id }
+        }
+        val scroll = eventually(what = "scroll event") { events.filterIsInstance<ThreadEvent.ScrollToRow>().firstOrNull() }
+        assertEquals(TimelineRow.backgroundTaskKey(ended.id), scroll.key)
+        // A task that is not known: nothing happens.
+        main { vm.openBackgroundTask("bgt_unknown") }
+        assertEquals(1, events.filterIsInstance<ThreadEvent.ScrollToRow>().size)
+    }
+
+    /** Without the harness's capability there is no 停止 (the daemon would refuse `capabilityUnsupported`). */
+    @Test
+    fun aHarnessThatCannotStopOneTaskOffersNoStop() = blockingTest {
+        val read = read(running = false)
+        val vm = offline(read)
+        val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running }
+        val ui = eventually(what = "the section") { vm.state.value.takeIf { it.rows.any { r -> r is TimelineRow.BackgroundTaskRow } } }
+        assertEquals(BackgroundStop.None, ui.stopOf(agent))
+        assertTrue(!ui.keepsBackgroundOnInterrupt)
+        // A task that did not confirm its last stop can be asked again; one being stopped cannot.
+        val capable = ui.copy(harness = harness.copy(capabilities = TestEngine.fakeHarness(background = true).capabilities))
+        assertEquals(BackgroundStop.Requested, capable.stopOf(agent.copy(stopRequestedAt = 5)))
+        assertEquals(BackgroundStop.Unconfirmed, capable.stopOf(agent.copy(stopUnconfirmedAt = 9)))
+        assertEquals(BackgroundStop.None, capable.stopOf(agent.copy(stoppable = false)))
+        assertEquals(BackgroundStop.None, capable.stopOf(agent.copy(status = BackgroundTaskStatus.Stopped)))
     }
 
     @Test
@@ -343,6 +423,55 @@ class ThreadViewModelTest {
             vm.choose(entries.first { it.action == PaletteAction.Local(dev.aas.android.domain.composer.LocalCommand.Review) })
         }
         assertEquals("REVIEW", vm.composer.textValue.text)
+    }
+
+    /**
+     * `/resume` is the app's: from the palette or typed out and sent, it opens 「PC のセッションを
+     * 取り込む」 for the thread's project with the thread's harness, and nothing reaches the harness.
+     */
+    @Test
+    fun resumeOpensTheImportForTheThreadsProjectAndHarnessAndIsNeverSent() = blockingTest {
+        val read = read(running = false)
+        env.seed(read, harnesses = listOf(harness.copy(capabilities = harness.capabilities.copy(nativeSessions = true))))
+        env.startOffline()
+        eventually(what = "the workspace") { env.engine.workspace.value.harnesses.takeIf { it.isNotEmpty() } }
+        val vm = viewModel(read)
+        val events = java.util.concurrent.CopyOnWriteArrayList<ThreadEvent>()
+        jobs += CoroutineScope(Dispatchers.Default).launch { vm.eventFlow.collect { events += it } }
+        val expected = ThreadEvent.OpenImport(read.thread.projectId, "claude")
+
+        main { vm.composer.setText("/res") }
+        val entry = eventually(what = "/resume in the palette") { vm.composer.state.value.palette.firstOrNull { it.name == "resume" } }
+        assertEquals(PaletteAction.Local(dev.aas.android.domain.composer.LocalCommand.Resume), entry.action)
+        main { vm.choose(entry) }
+        assertEquals(expected, eventually(what = "the import opened") { events.firstOrNull() })
+        assertEquals("", vm.composer.textValue.text)
+
+        // Typed out and sent: the same, and no message is queued for the harness.
+        main {
+            vm.composer.setText("/resume")
+            vm.send(SendAction.Start)
+        }
+        eventually(what = "the import opened again") { events.takeIf { it.size == 2 } }
+        assertEquals(expected, events[1])
+        assertEquals("", vm.composer.textValue.text)
+        assertTrue(env.engine.outbox.value.none { it.method == Methods.TurnStart.name }, "${env.engine.outbox.value}")
+    }
+
+    @Test
+    fun withoutAHarnessThatCanListSessionsResumeIsHiddenAndTypedOutStillNotSent() = blockingTest {
+        val vm = offline(read(running = false))
+        main { vm.composer.setText("/re") }
+        val palette = eventually(what = "the palette") { vm.composer.state.value.palette.takeIf { entries -> entries.any { it.name == "review" } } }
+        assertTrue(palette.none { it.name == "resume" }, palette.map { it.name }.toString())
+
+        main {
+            vm.composer.setText("/resume")
+            vm.send(SendAction.Start)
+        }
+        val message = kotlinx.coroutines.withTimeout(MESSAGE_TIMEOUT_MS) { messages.messages.first() }
+        assertEquals(dev.aas.android.ui.common.UiText.of(dev.aas.android.R.string.import_no_harness), message.text)
+        assertTrue(env.engine.outbox.value.none { it.method == Methods.TurnStart.name }, "${env.engine.outbox.value}")
     }
 
     @Test

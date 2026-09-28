@@ -73,7 +73,6 @@ import dev.aas.android.ui.icons.BrokenImage
 import dev.aas.android.ui.icons.Terminal
 import dev.aas.android.ui.icons.WrapText
 import dev.aas.android.ui.navigation.AppNavigator
-import dev.aas.android.ui.navigation.ItemOutputRoute
 import dev.aas.android.ui.theme.codeStyle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -83,7 +82,16 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
-/** The full output of a command or tool call. */
+/** Whose output [OutputViewModel] shows. */
+sealed interface OutputTarget {
+    /** A command or tool call. */
+    data class OfItem(val itemId: String) : OutputTarget
+
+    /** A finished background task (`BackgroundTask.result`). */
+    data class OfTask(val taskId: String) : OutputTarget
+}
+
+/** The full output of a command, a tool call or a background task. */
 data class OutputUiState(
     val title: String?,
     val lines: List<String>?,
@@ -95,11 +103,13 @@ data class OutputUiState(
 )
 
 /**
- * Loads the output of one item: the inline text, or the blob the daemon stored when the output
- * was larger than its inline limit (`outputBlobId`, protocol.md §5 `item/completed`).
+ * Loads the output of one item or background task: the inline text, or the blob the daemon
+ * stored when the output was larger than its inline limit (`outputBlobId`, protocol.md §5
+ * `item/completed`, §3.1 `BackgroundTask.result`).
  */
 class OutputViewModel(
-    private val route: ItemOutputRoute,
+    threadId: String,
+    private val target: OutputTarget,
     threads: ThreadRepository,
     private val blobs: BlobRepository,
     private val policy: AppPolicy,
@@ -109,13 +119,24 @@ class OutputViewModel(
     private val error = MutableStateFlow<UiText?>(null)
     private var requestedBlob: String? = null
 
-    val state: StateFlow<OutputUiState> = combine(threads.observe(route.threadId), blobText, loading, error) { thread, blob, busy, failure ->
-        val item = thread.items.firstOrNull { it.id == route.itemId }
-        val (title, inline, blobId, truncated) = when (item) {
-            is Item.CommandExecution -> Quad("$ ${item.command}", item.output, item.outputBlobId, item.outputTruncated)
-            is Item.ToolCall -> Quad(item.title.ifEmpty { item.name }, item.output.orEmpty(), item.outputBlobId, item.outputTruncated)
-            else -> Quad(null, null, null, false)
+    val state: StateFlow<OutputUiState> = combine(threads.observe(threadId), blobText, loading, error) { thread, blob, busy, failure ->
+        val (found, output) = when (target) {
+            is OutputTarget.OfItem -> {
+                val item = thread.items.firstOrNull { it.id == target.itemId }
+                item to when (item) {
+                    is Item.CommandExecution -> Quad("$ ${item.command}", item.output, item.outputBlobId, item.outputTruncated)
+                    is Item.ToolCall -> Quad(item.title.ifEmpty { item.name }, item.output.orEmpty(), item.outputBlobId, item.outputTruncated)
+                    else -> Quad(null, null, null, false)
+                }
+            }
+            is OutputTarget.OfTask -> {
+                val task = thread.backgroundTasks.firstOrNull { it.id == target.taskId }
+                val result = task?.result
+                task to Quad(task?.title, result?.output.orEmpty().takeIf { task != null }, result?.outputBlobId, result?.outputTruncated ?: false)
+            }
         }
+        val (title, inline, blobId, truncated) = output
+        val item = found
         if (blobId != null && requestedBlob != blobId) load(blobId)
         val text = if (blobId != null) blob?.takeIf { it.first == blobId }?.second else inline
         OutputUiState(
