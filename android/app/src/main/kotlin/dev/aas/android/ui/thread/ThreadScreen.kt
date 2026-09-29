@@ -20,7 +20,6 @@ import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -56,15 +55,18 @@ import androidx.navigation.NavGraphBuilder
 import androidx.navigation.compose.composable
 import androidx.navigation.toRoute
 import dev.aas.android.R
+import dev.aas.android.domain.PlanChoices
 import dev.aas.android.domain.composer.ComposerText
 import dev.aas.android.domain.composer.ComposerTrigger
 import dev.aas.android.domain.composer.HarnessSettings
 import dev.aas.android.domain.composer.SendAction
+import dev.aas.android.domain.composer.SendConfirmation
 import dev.aas.android.domain.composer.SendLogic
 import dev.aas.android.domain.timeline.Timeline
 import dev.aas.android.domain.timeline.TimelineRow
 import dev.aas.android.protocol.InteractionRequest
 import dev.aas.android.protocol.InteractionStatus
+import dev.aas.android.protocol.Item
 import dev.aas.android.protocol.PickerKind
 import dev.aas.android.protocol.QueuedInput
 import dev.aas.android.protocol.ThreadSettings
@@ -159,6 +161,8 @@ const val THREAD_LIST_TAG = "thread-list"
 fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
     val ui by vm.state.collectAsStateWithLifecycle()
     val composer by vm.composer.state.collectAsStateWithLifecycle()
+    val sideQuestion by vm.sideQuestion.collectAsStateWithLifecycle()
+    val harnessStatus by vm.harnessStatus.collectAsStateWithLifecycle()
     val focusHandled by vm.focusHandled.collectAsStateWithLifecycle()
     val policy = LocalAppContainer.current.policy
     val state = ui.thread
@@ -167,15 +171,19 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
     val scope = rememberCoroutineScope()
     var questionFor by rememberSaveable { mutableStateOf<String?>(null) }
     var picker by rememberSaveable { mutableStateOf<PickerKind?>(null) }
+    // The model the model sheet opens with (`/model <id>` whose model needs another effort).
+    var pickerModel by rememberSaveable { mutableStateOf<String?>(null) }
     var showStatus by rememberSaveable { mutableStateOf(false) }
     var showRename by rememberSaveable { mutableStateOf(false) }
     var confirmArchive by rememberSaveable { mutableStateOf(false) }
     var confirmStop by rememberSaveable { mutableStateOf(false) }
     var confirmStopTask by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmExitPlan by rememberSaveable { mutableStateOf(false) }
     // A row to show once it exists (a background task's card appears when its section opens).
     var scrollTarget by remember { mutableStateOf<String?>(null) }
     var editQueuedId by rememberSaveable { mutableStateOf<String?>(null) }
     var pausedSend by rememberSaveable { mutableStateOf<SendAction?>(null) }
+    var planSend by rememberSaveable { mutableStateOf<SendAction?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateAsState()
     val resumed = lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
@@ -186,6 +194,9 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
             onOpenTurnDiff = { turnId -> navigator.openDiff(vm.threadId, turnId) },
             onOpenImage = { blobId -> navigator.openImage(blobId) },
             onOpenBackgroundTask = vm::openBackgroundTask,
+            onMoveToBackground = vm::moveToBackground,
+            onImplementPlan = vm::implementPlan,
+            onImplementPlanInNewThread = vm::implementPlanInNewThread,
         )
     }
     val imageSources = rememberImageSources(policy.maxImagesPerMessage, onPicked = vm::pickImages)
@@ -232,10 +243,14 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                 is ThreadEvent.OpenDiff -> navigator.openDiff(vm.threadId, event.turnId)
                 is ThreadEvent.OpenNewThread -> navigator.newThread(event.projectId, event.harnessId)
                 is ThreadEvent.OpenImport -> navigator.importSession(event.projectId, event.harnessId)
-                is ThreadEvent.OpenPicker -> picker = event.kind
+                is ThreadEvent.OpenPicker -> {
+                    pickerModel = event.model
+                    picker = event.kind
+                }
                 ThreadEvent.ShowStatus -> showStatus = true
                 ThreadEvent.ShowRename -> showRename = true
                 ThreadEvent.ConfirmArchive -> confirmArchive = true
+                ThreadEvent.ConfirmStop -> confirmStop = true
                 ThreadEvent.Leave -> navigator.back()
                 ThreadEvent.ScrollToBottom -> {
                     follow = true
@@ -331,13 +346,16 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
         bottomBar = {
             if (state.sync != ThreadSync.Removed) {
                 Column(Modifier.fillMaxWidth().imePadding()) {
-                    HorizontalDivider()
                     ui.plan?.let { PlanPill(it) }
                     if (thread != null && thread.queuePaused && ui.queued.isNotEmpty() && !SendLogic.turnActive(thread)) {
                         PausedQueueBanner(ui.queued.size, onResume = vm::resumeQueue)
                     }
                     if (ui.queued.isNotEmpty()) {
                         QueuedList(ui.queued, ui.canSendQueuedNow, onEdit = { editQueuedId = it.id }, onSendNow = vm::steerQueued, onRemove = vm::removeQueued)
+                    }
+                    val harness = ui.harness
+                    if (ui.trustUndecided && harness != null && thread?.archived == false) {
+                        ProjectTrustBanner(harness.displayName, onTrust = { vm.setTrust(true) }, onDistrust = { vm.setTrust(false) })
                     }
                     ui.harnessWaits.forEach { wait ->
                         HarnessWaitNotice(
@@ -359,6 +377,15 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                             }
                         }
                     }
+                    ui.insertOffer?.let { text ->
+                        ComposerInsertOffer(
+                            text = text,
+                            composerEmpty = vm.composer.textValue.text.isBlank(),
+                            onReplace = { vm.acceptInsert(replace = true) },
+                            onAppend = { vm.acceptInsert(replace = false) },
+                            onDismiss = vm::dismissInsert,
+                        )
+                    }
                     ComposerBar(
                         value = vm.composer.textValue,
                         state = composer,
@@ -374,17 +401,34 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                         onRemoveAttachment = vm.composer::removeAttachment,
                         onRetryAttachment = vm.composer::retryAttachment,
                         onSend = { action ->
-                            if (vm.needsPausedQueueConfirmation(action)) pausedSend = action else vm.send(action)
+                            when (vm.sendConfirmation(action)) {
+                                is SendConfirmation.PlanAhead -> planSend = action
+                                is SendConfirmation.PausedQueue -> pausedSend = action
+                                null -> vm.send(action)
+                            }
                         },
                         interruptHint = if (ui.keepsBackgroundOnInterrupt) stringResource(R.string.composer_hint_interrupt_background) else null,
                     ) {
-                        val harness = ui.harness
+                        if (thread?.modes?.plan == true) {
+                            // Plan mode (the app's /plan, or the harness entered it): tapping offers to leave it.
+                            ComposerChip(
+                                stringResource(R.string.plan_chip),
+                                onClick = if (ui.features.planMode != null) ({ confirmExitPlan = true }) else null,
+                                emphasized = true,
+                            )
+                        }
                         if (harness != null && thread != null) {
                             ComposerChip(
                                 HarnessSettings.label(harness, thread.settings),
                                 onClick = if (harness.models.isNotEmpty() || harness.effortLevels.isNotEmpty()) ({ picker = PickerKind.Model }) else null,
                             )
                             HarnessSettings.permission(harness, thread.settings)?.let { mode -> ComposerChip(mode.label, onClick = { picker = PickerKind.PermissionMode }) }
+                        }
+                        if (thread?.modes?.fast == true) {
+                            ComposerChip(
+                                thread.fastModeState?.let { stringResource(R.string.fast_chip_state, it) } ?: stringResource(R.string.fast_chip),
+                                onClick = { picker = PickerKind.Model },
+                            )
                         }
                         ui.context?.let { ComposerChip(stringResource(R.string.composer_context, contextPercent(it)), onClick = { showStatus = true }) }
                         if (ui.otherPending > 0) ComposerChip(stringResource(R.string.composer_pending_changes, ui.otherPending), onClick = null)
@@ -454,14 +498,48 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                 harness,
                 thread.settings,
                 allowDefaultEffort = thread.settings.effort == null,
-                onApply = { model, effort -> vm.applySettings(ThreadViewModel.settingsChange(harness, thread.settings, model, effort)) },
-                onDismiss = { picker = null },
+                onApply = { model, effort, fast ->
+                    vm.applySettings(ThreadViewModel.settingsChange(harness, thread.settings, model, effort), ThreadViewModel.fastChange(thread.modes, fast))
+                },
+                onDismiss = {
+                    picker = null
+                    pickerModel = null
+                },
+                initialModel = pickerModel,
+                fastMode = if (harness.features.fastModeModels.isNotEmpty()) thread.modes.fast else null,
+                fastModeState = thread.fastModeState,
             )
             PickerKind.PermissionMode -> PermissionSheet(harness, thread.settings, onApply = { vm.applySettings(ThreadSettings(permissionMode = it.id)) }, onDismiss = { picker = null })
             PickerKind.Unknown, null -> Unit
         }
     }
-    if (showStatus && thread != null) StatusSheet(thread, harness, ui.context, onDismiss = { showStatus = false })
+    LaunchedEffect(showStatus) {
+        if (showStatus) vm.loadHarnessStatus()
+    }
+    if (showStatus && thread != null) {
+        StatusSheet(
+            thread,
+            harness,
+            ui.context,
+            onDismiss = { showStatus = false },
+            harnessStatus = harnessStatus,
+            trust = ui.trust,
+            onSetTrust = vm::setTrust,
+        )
+    }
+    sideQuestion?.let { SideQuestionSheet(it, onDismiss = vm::dismissSideQuestion) }
+    if (confirmExitPlan) {
+        ConfirmDialog(
+            title = stringResource(R.string.plan_exit_title),
+            text = stringResource(R.string.plan_exit_body),
+            confirm = stringResource(R.string.plan_exit_confirm),
+            onConfirm = {
+                confirmExitPlan = false
+                vm.exitPlanMode()
+            },
+            onDismiss = { confirmExitPlan = false },
+        )
+    }
     if (showRename && thread != null) {
         TextInputDialog(
             title = stringResource(R.string.thread_rename_title),
@@ -541,6 +619,31 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
         // It left the queue while the dialog was open.
         LaunchedEffect(editQueuedId) { editQueuedId = null }
     }
+    planSend?.let { action ->
+        val ahead = vm.sendConfirmation(action) as? SendConfirmation.PlanAhead
+        if (ahead == null) {
+            // Nothing starts before the request any more (the queue moved on, the draft changed):
+            // the user sends again, now without the question.
+            LaunchedEffect(action) { planSend = null }
+        } else {
+            PlanAheadDialog(
+                ahead = ahead,
+                onSend = {
+                    planSend = null
+                    vm.send(action)
+                },
+                onClearAndSend = if (ahead.canClear) {
+                    {
+                        planSend = null
+                        vm.send(action, clearQueueFirst = true)
+                    }
+                } else {
+                    null
+                },
+                onDismiss = { planSend = null },
+            )
+        }
+    }
     pausedSend?.let { action ->
         PausedQueueDialog(
             count = ui.queued.size,
@@ -569,10 +672,27 @@ private fun TimelineRowView(
 ) {
     when (row) {
         TimelineRow.LoadOlder -> LoadOlderRow(ui.loadingOlder, ui.olderError?.asString(), vm::loadOlder)
-        is TimelineRow.TurnStart -> TurnStartRow(row.turn)
-        is TimelineRow.ItemRow -> ItemView(row.item, actions, backgroundTask = row.item.backgroundTaskId?.let { ui.backgroundTasks[it] })
+        is TimelineRow.TurnStart -> TurnStartRow(
+            row.turn,
+            fork = ui.forkChoices(row.turn),
+            onForkHere = { vm.forkAt(row.turn, before = false) },
+            onEditPrompt = { vm.forkAt(row.turn, before = true) },
+        )
+        is TimelineRow.ItemRow -> ItemView(
+            row.item,
+            actions,
+            backgroundTask = row.item.backgroundTaskId?.let { ui.backgroundTasks[it] },
+            moveToBackground = ui.moveToBackground(row.item),
+            planChoices = (row.item as? Item.ProposedPlan)?.let { ui.planChoices(it) } ?: PlanChoices.None,
+        )
         is TimelineRow.ActivityGroup -> ActivityGroupRow(row.items, row.expanded) { vm.toggleGroup(row.groupKey, row.expanded) }
-        is TimelineRow.GroupedItem -> ItemView(row.item, actions, Modifier.padding(start = 16.dp), backgroundTask = row.item.backgroundTaskId?.let { ui.backgroundTasks[it] })
+        is TimelineRow.GroupedItem -> ItemView(
+            row.item,
+            actions,
+            Modifier.padding(start = 16.dp),
+            backgroundTask = row.item.backgroundTaskId?.let { ui.backgroundTasks[it] },
+            moveToBackground = ui.moveToBackground(row.item),
+        )
         is TimelineRow.InteractionRow -> {
             val interaction = row.interaction
             if (interaction.status == InteractionStatus.Pending) {
@@ -589,7 +709,13 @@ private fun TimelineRowView(
             }
         }
         is TimelineRow.Working -> WorkingRow(row.turn, row.current, waitingForAnswer = ui.pendingInteractions.any { it.turnId == row.turn.id })
-        is TimelineRow.TurnEnd -> TurnEndRow(row.turn) { navigator.openDiff(vm.threadId, row.turn.id) }
+        is TimelineRow.TurnEnd -> TurnEndRow(
+            row.turn,
+            onOpenDiff = { navigator.openDiff(vm.threadId, row.turn.id) },
+            resumeFailed = ui.resumeFailedChoices(row.turn),
+            onRetry = { vm.retryTurn(row.turn) },
+            onForkNew = { vm.forkAfterFailedResume(row.turn) },
+        )
         is TimelineRow.Pending -> PendingInputRow(
             input = row.input,
             online = ui.online,
@@ -640,6 +766,30 @@ private fun OfflineNote() {
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
         )
     }
+}
+
+/**
+ * `/plan <request>` while messages would start before the request (docs/android.md 31.3): plan
+ * mode applies from the next turn, so they would run in plan mode too. The user chooses: send
+ * anyway, clear the queue first (when all of them wait in the daemon's queue), or cancel (the
+ * draft stays).
+ */
+@Composable
+internal fun PlanAheadDialog(ahead: SendConfirmation.PlanAhead, onSend: () -> Unit, onClearAndSend: (() -> Unit)?, onDismiss: () -> Unit) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.plan_ahead_title)) },
+        text = { Text(stringResource(R.string.plan_ahead_body, ahead.ahead)) },
+        confirmButton = {
+            Column(horizontalAlignment = Alignment.End) {
+                androidx.compose.material3.TextButton(onClick = onSend) { Text(stringResource(R.string.plan_ahead_send)) }
+                if (onClearAndSend != null) {
+                    androidx.compose.material3.TextButton(onClick = onClearAndSend) { Text(stringResource(R.string.plan_ahead_clear)) }
+                }
+                androidx.compose.material3.TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+            }
+        },
+    )
 }
 
 /**

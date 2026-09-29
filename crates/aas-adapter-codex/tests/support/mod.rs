@@ -4,7 +4,8 @@
 //! * `{"s": msg, "respondsTo": recId?}` — the fake server writes `msg` (its `id` rewritten to
 //!   the id the adapter used for the request recorded as `recId`);
 //! * `{"c": {"method", "recId"?, "params"?}}` — the adapter must send this request or
-//!   notification next (`params` is a subset check);
+//!   notification next (`params` is a subset check; the value `"$absent"` means the key must not
+//!   be sent);
 //! * `{"c": {"id", "result"}}` — the adapter must answer a server request exactly so;
 //! * `{"exit": {"code"}}` — the fake process exits (stdout closes).
 //!
@@ -21,7 +22,8 @@ use std::time::Duration;
 
 use aas_adapter_codex::ProcessLink;
 use aas_harness::{
-    AdapterEvent, AdapterPolicy, SessionHandle, StartMode, StartRequest, ThreadId, ThreadSettings,
+    AdapterError, AdapterEvent, AdapterPolicy, SessionHandle, StartMode, StartOptions,
+    StartRequest, ThreadId, ThreadSettings,
 };
 use aas_supervisor::{ExitInfo, StopReason};
 use async_trait::async_trait;
@@ -117,6 +119,12 @@ fn check(pattern: &Value, actual: &Value, ids: &mut HashMap<String, Value>) -> R
         }
         if let Some(Value::Object(subset)) = pattern.get("params") {
             for (k, v) in subset {
+                if v == "$absent" {
+                    if let Some(sent) = actual["params"].get(k) {
+                        return Err(format!("{method}: params.{k} must not be sent, got {sent}"));
+                    }
+                    continue;
+                }
                 if actual["params"].get(k) != Some(v) {
                     return Err(format!(
                         "{method}: params.{k} expected {v}, got {}",
@@ -265,6 +273,81 @@ pub async fn start_entries(
     settings: ThreadSettings,
     policy: AdapterPolicy,
 ) -> Replay {
+    match try_start_entries(
+        entries,
+        mode,
+        settings,
+        StartOptions::default(),
+        &[],
+        policy,
+    )
+    .await
+    {
+        Ok(replay) => replay,
+        Err((e, _)) => panic!("establish failed: {e}"),
+    }
+}
+
+/// Replays `script` with start options and the fast tiers a probe would have learned
+/// (`(model, tier id, tier name)`).
+pub async fn start_with(
+    script: &str,
+    mode: StartMode,
+    settings: ThreadSettings,
+    options: StartOptions,
+    fast_tiers: &[(&str, &str, &str)],
+) -> Replay {
+    match try_start_entries(
+        self::script(script),
+        mode,
+        settings,
+        options,
+        fast_tiers,
+        policy(),
+    )
+    .await
+    {
+        Ok(replay) => replay,
+        Err((e, _)) => panic!("establish failed: {e}"),
+    }
+}
+
+/// Replays `script` whose start fails; returns the error and the runner's verdict.
+pub async fn start_failing(
+    script: &str,
+    mode: StartMode,
+    options: StartOptions,
+) -> (AdapterError, Result<(), String>) {
+    match try_start_entries(
+        self::script(script),
+        mode,
+        ThreadSettings::default(),
+        options,
+        &[],
+        policy(),
+    )
+    .await
+    {
+        Ok(_) => panic!("{script}: the start succeeded"),
+        Err((e, runner)) => {
+            let verdict = tokio::time::timeout(STEP_TIMEOUT, runner)
+                .await
+                .expect("runner did not finish")
+                .expect("runner panicked");
+            (e, verdict)
+        }
+    }
+}
+
+/// Starts a replay; a failed start returns the error with the runner.
+pub async fn try_start_entries(
+    entries: Vec<Value>,
+    mode: StartMode,
+    settings: ThreadSettings,
+    options: StartOptions,
+    fast_tiers: &[(&str, &str, &str)],
+    policy: AdapterPolicy,
+) -> Result<Replay, (AdapterError, JoinHandle<Result<(), String>>)> {
     let (adapter_writer, runner_reader) = tokio::io::duplex(1 << 20);
     let (runner_writer, adapter_reader) = tokio::io::duplex(1 << 20);
     let link = FakeLink::new();
@@ -280,20 +363,27 @@ pub async fn start_entries(
         settings,
         mode,
     };
-    let handle = aas_adapter_codex::testing::establish(
+    let established = aas_adapter_codex::testing::establish_with(
         adapter_reader,
         adapter_writer,
         link.clone(),
         req,
+        options,
+        fast_tiers,
         policy,
     )
-    .await
-    .unwrap_or_else(|e| panic!("establish failed: {e}"));
-    Replay {
-        handle,
-        runner,
-        link,
-        events: Vec::new(),
+    .await;
+    match established {
+        Ok(handle) => Ok(Replay {
+            handle,
+            runner,
+            link,
+            events: Vec::new(),
+        }),
+        Err(e) => {
+            // The adapter dropped its streams: the fake process ends like app-server on EOF.
+            Err((e, runner))
+        }
     }
 }
 

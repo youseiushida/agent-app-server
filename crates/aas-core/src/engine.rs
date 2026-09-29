@@ -23,6 +23,7 @@ use crate::actor::{self, ActorHandle, Msg, Reply};
 use crate::auth::{self, RateLimiter};
 use crate::blobs::BlobStore;
 use crate::capacity::Capacity;
+use crate::commands;
 use crate::config::{EngineConfig, Policy, canonical_roots, path_key};
 use crate::emit::{Emitter, thread_changed};
 use crate::error::{CoreError, CoreResult, invalid_params, invalid_state, not_found, rpc};
@@ -740,6 +741,7 @@ impl Engine {
                         title: p.title,
                         settings: p.settings,
                         pinned: p.pinned,
+                        modes: p.modes,
                         idem,
                         reply,
                     })
@@ -878,6 +880,19 @@ impl Engine {
                 to_value(
                     self.ask(&id, |reply| Msg::StopBackground {
                         task_id: p.task_id,
+                        idem,
+                        reply,
+                    })
+                    .await?,
+                )?
+            }
+            R::ThreadHarnessStatus(p) => to_value(self.harness_status(p).await?)?,
+            R::ThreadSideQuestion(p) => to_value(self.side_question(p).await?)?,
+            R::ItemMoveToBackground(p) => {
+                let id = p.thread_id.clone();
+                to_value(
+                    self.ask(&id, |reply| Msg::MoveToBackground {
+                        item_id: p.item_id,
                         idem,
                         reply,
                     })
@@ -1202,6 +1217,16 @@ impl Engine {
         {
             return Err(invalid_params(format!("unknown harness {h}")));
         }
+        if let Some(h) = p
+            .harness_trust
+            .iter()
+            .flat_map(|trust| trust.keys())
+            .find(|h| self.sh.registry.get(h).is_none())
+        {
+            return Err(invalid_params(format!("unknown harness {h}")));
+        }
+        let project_id = p.project_id.clone();
+        let trust = p.harness_trust.clone();
         let project = self
             .sh
             .tx_idem(idem, move |tx, em| {
@@ -1218,6 +1243,9 @@ impl Engine {
                 if let Some(d) = p.defaults {
                     row.project.defaults = d;
                 }
+                if let Some(trust) = p.harness_trust {
+                    row.project.harness_trust.extend(trust);
+                }
                 row.project.updated_at = now_ms();
                 store::update_project(tx, &row.project, false)?;
                 let project = with_git(row.project);
@@ -1227,7 +1255,35 @@ impl Engine {
                 Ok(ProjectResult { project })
             })
             .await?;
+        if let Some(trust) = trust {
+            self.trust_changed(&project_id, trust.keys()).await?;
+        }
         Ok(project)
+    }
+
+    /// A trust decision for `harnesses` changed in project `project`: the running agents of its
+    /// threads with those harnesses are replaced before their next turn, so that they start with
+    /// it (`Msg::TrustChanged`). Threads without an actor start with it anyway.
+    async fn trust_changed<'a>(
+        &self,
+        project: &ProjectId,
+        harnesses: impl Iterator<Item = &'a String>,
+    ) -> CoreResult<()> {
+        let harnesses: Vec<String> = harnesses.cloned().collect();
+        let pid = project.clone();
+        let threads = self
+            .sh
+            .db
+            .read(move |tx| store::threads_of_project(tx, &pid))
+            .await?;
+        let actors = self.actors.lock();
+        for thread in threads.iter().filter(|t| harnesses.contains(&t.harness_id)) {
+            if let Some(handle) = actors.get(&thread.id) {
+                // An actor that is gone has no process to replace.
+                let _ = handle.send(Msg::TrustChanged);
+            }
+        }
+        Ok(())
     }
 
     async fn project_archive(
@@ -1539,7 +1595,20 @@ impl Engine {
                 }),
             }
         };
+        // Settings of a form the adapter no longer offers (e.g. a project default chosen with
+        // an earlier version) in the form it offers now.
+        let (info_settings, plan) = match self.sh.registry.get(&p.harness_id) {
+            Some(adapter) => {
+                let upgraded = adapter.upgrade_settings(info_settings);
+                (upgraded.settings, upgraded.plan)
+            }
+            None => (info_settings, false),
+        };
         let info = self.validate_new_settings(&p.harness_id, &info_settings)?;
+        let modes = ThreadModes {
+            plan: plan && self.sh.registry.features(&p.harness_id).plan_mode.is_some(),
+            fast: false,
+        };
         let settings = ThreadSettings {
             model: info_settings.model.or(info.default_model.clone()),
             effort: info_settings.effort,
@@ -1555,6 +1624,10 @@ impl Engine {
             // are relative paths, so the project's folder serves for checking them.)
             if !self.sh.accepts_work() {
                 return Err(rpc(ErrorKind::Draining, "the server is shutting down"));
+            }
+            if let Some(adapter) = self.sh.registry.get(&p.harness_id) {
+                let names = commands::session_switching_names(adapter.as_ref());
+                commands::refuse_session_switch(input, &names, &p.harness_id)?;
             }
             actor::check_input(
                 self.sh.clone(),
@@ -1642,6 +1715,7 @@ impl Engine {
                 cwd,
                 workspace,
                 settings,
+                modes,
                 input,
                 idem,
             )
@@ -1670,6 +1744,7 @@ impl Engine {
         cwd: String,
         workspace: Workspace,
         settings: ThreadSettings,
+        modes: ThreadModes,
         input: Option<Vec<InputPart>>,
         idem: Option<Idem>,
     ) -> CoreResult<ThreadCreateResult> {
@@ -1679,6 +1754,9 @@ impl Engine {
             Some(t) if !t.is_empty() => (t.to_owned(), "user"),
             _ => ("New thread".to_owned(), "default"),
         };
+        // A title the user gave reaches the native session when its first agent starts.
+        let native_rename_pending =
+            title_source == "user" && self.sh.registry.features(&harness_id).rename;
         let row = ThreadRow {
             id: thread_id.clone(),
             project_id: project.id.clone(),
@@ -1704,6 +1782,10 @@ impl Engine {
             archived: false,
             removed: false,
             pinned: false,
+            modes,
+            fast_mode_state: None,
+            fork_at: None,
+            native_rename_pending,
         };
         match input {
             Some(input) => {
@@ -1829,6 +1911,16 @@ impl Engine {
             .await
     }
 
+    /// `thread/fork` (design.md §5.2, §9.6): a new thread with the history up to where the fork
+    /// branches, whose first process branches the native session there.
+    ///
+    /// * No `atTurnId`, or the last turn of a harness without `forkAtTurn`: the whole session
+    ///   (the fork is refused later when the parent moved on before the fork's first start).
+    /// * With `forkAtTurn`: at the turn's recorded anchor, the turn included or (`before`) not,
+    ///   in the native session the anchor belongs to (the thread's, or the one it ran before the
+    ///   harness moved it to another). Nothing that reached the agent before the turn: a new
+    ///   session, not a fork. A point the adapter's start would refuse is refused here
+    ///   ([`aas_harness::HarnessAdapter::check_fork_point`]), before a thread is created.
     async fn thread_fork(
         &self,
         p: ThreadForkParams,
@@ -1869,15 +1961,32 @@ impl Engine {
                 "wait for the running turn to finish before forking",
             ));
         }
-        if let Some(at) = &p.at_turn_id
-            && turns.last().map(|t| &t.turn.id) != Some(at)
-        {
-            return Err(rpc(
-                ErrorKind::CapabilityUnsupported,
-                "forking at an earlier turn is not supported",
-            )
-            .with_cap("forkAtTurn"));
-        }
+        let features = self.sh.registry.features(&parent.harness_id);
+        let plan = fork_plan(&turns, p.at_turn_id.as_ref(), p.before, &features)?;
+        // The native session the fork branches when it is not the parent's current one: the
+        // copied anchors of that session are valid in the branch, which keeps its entries.
+        let mut branched_session = None;
+        let (copied, fork_source, fork_at) = match plan {
+            ForkPlan::Whole => (turns.len(), Some(native), None),
+            ForkPlan::Empty => (0, None, None),
+            ForkPlan::At {
+                copied,
+                point,
+                session,
+            } => {
+                if let Some(adapter) = self.sh.registry.get(&parent.harness_id) {
+                    adapter.check_fork_point(&point).map_err(|e| {
+                        invalid_state(format!(
+                            "the thread cannot be forked at this turn: {}",
+                            e.detail()
+                        ))
+                    })?;
+                }
+                branched_session = session.clone();
+                (copied, Some(session.unwrap_or(native)), Some(point))
+            }
+        };
+        let turns: Vec<TurnRow> = turns.into_iter().take(copied).collect();
         let now = now_ms();
         let new_id = ThreadId::generate();
         let row = ThreadRow {
@@ -1886,7 +1995,7 @@ impl Engine {
             title_source: "fork".into(),
             status: ThreadStatus::Idle,
             native_session_id: None,
-            fork_source: Some(native),
+            fork_source,
             forked_from: Some(ForkOrigin {
                 thread_id: parent.id.clone(),
                 turn_id: turns.last().map(|t| t.turn.id.clone()),
@@ -1900,6 +2009,9 @@ impl Engine {
             archived: false,
             removed: false,
             pinned: false,
+            fast_mode_state: None,
+            fork_at,
+            native_rename_pending: false,
             ..parent.clone()
         };
         // The copied turns refer to the snapshots of the parent: keep them for the fork too, so
@@ -1919,7 +2031,8 @@ impl Engine {
             .tx(move |tx, em| {
                 let mut row = row;
                 store::insert_thread(tx, &row)?;
-                // Copy the visible history so the fork shows its context.
+                // Copy the visible history so the fork shows its context. The anchors come
+                // along: the branched session keeps the source's turns under their ids.
                 let ids: Vec<TurnId> = turns.iter().map(|t| t.turn.id.clone()).collect();
                 let items = store::items_of_turns(tx, &ids)?;
                 let mut turn_map = HashMap::new();
@@ -1927,6 +2040,10 @@ impl Engine {
                     let mut copy = t.clone();
                     copy.turn.id = TurnId::generate();
                     copy.turn.thread_id = row.id.clone();
+                    // Anchors of the branched session belong to the fork's own session.
+                    if copy.anchor_session.is_some() && copy.anchor_session == branched_session {
+                        copy.anchor_session = None;
+                    }
                     turn_map.insert(t.turn.id.clone(), copy.turn.id.clone());
                     store::insert_turn(tx, &copy)?;
                 }
@@ -1936,6 +2053,7 @@ impl Engine {
                     item.turn_id = turn_map.get(&item.turn_id).cloned().unwrap_or(item.turn_id);
                     // Background tasks are not copied: they belong to the parent's process.
                     item.background_task_id = None;
+                    item.backgroundable = false;
                     store::insert_item(tx, &item)?;
                 }
                 let view = thread_changed(tx, em, &mut row)?;
@@ -1946,6 +2064,122 @@ impl Engine {
                 Ok(result)
             })
             .await
+    }
+
+    /// `thread/harnessStatus`: the harness's own status, from the thread's running agent
+    /// ([`SessionControl::status`]) or, when none runs, from the harness
+    /// ([`HarnessAdapter::status`]). Bounded by `policy.handshake_timeout`.
+    async fn harness_status(
+        &self,
+        p: ThreadHarnessStatusParams,
+    ) -> CoreResult<ThreadHarnessStatusResult> {
+        let (row, adapter) = self.thread_and_adapter(&p.thread_id).await?;
+        if !self.sh.registry.features(&row.harness_id).status {
+            return Err(rpc(
+                ErrorKind::CapabilityUnsupported,
+                "this harness reports no status of its own",
+            )
+            .with_cap("status"));
+        }
+        let timeout = self.sh.config.policy.handshake_timeout;
+        let harness = row.harness_id.as_str();
+        let late = || {
+            rpc(
+                ErrorKind::AdapterError,
+                format!("the harness did not report its status within {timeout:?}"),
+            )
+            .with_data("harnessId", harness)
+        };
+        let (reported, live) = match self.live_control(&p.thread_id).await? {
+            Some(control) => (tokio::time::timeout(timeout, control.status()).await, true),
+            None => (
+                tokio::time::timeout(timeout, adapter.status(Path::new(&row.cwd))).await,
+                false,
+            ),
+        };
+        let sections = reported
+            .map_err(|_| late())?
+            .map_err(|e| adapter_error(harness, e))?;
+        Ok(ThreadHarnessStatusResult { sections, live })
+    }
+
+    /// `thread/sideQuestion`: a question answered beside the conversation by the thread's
+    /// running agent ([`SessionControl::side_question`]); it does not wait for a running turn
+    /// and is not part of the history. Bounded by `policy.handshake_timeout`.
+    async fn side_question(
+        &self,
+        p: ThreadSideQuestionParams,
+    ) -> CoreResult<ThreadSideQuestionResult> {
+        let question = p.question.trim().to_owned();
+        if question.is_empty() {
+            return Err(invalid_params("question must not be empty"));
+        }
+        let (row, _adapter) = self.thread_and_adapter(&p.thread_id).await?;
+        if !self.sh.registry.features(&row.harness_id).side_question {
+            return Err(rpc(
+                ErrorKind::CapabilityUnsupported,
+                "this harness cannot answer side questions",
+            )
+            .with_cap("sideQuestion"));
+        }
+        let Some(control) = self.live_control(&p.thread_id).await? else {
+            return Err(invalid_state(
+                "the agent is not running; a side question needs its session (send a message first)",
+            ));
+        };
+        let timeout = self.sh.config.policy.handshake_timeout;
+        let answer = tokio::time::timeout(timeout, control.side_question(&question))
+            .await
+            .map_err(|_| {
+                rpc(
+                    ErrorKind::AdapterError,
+                    format!("the harness did not answer the side question within {timeout:?}"),
+                )
+                .with_data("harnessId", row.harness_id.as_str())
+            })?
+            .map_err(|e| adapter_error(&row.harness_id, e))?;
+        Ok(ThreadSideQuestionResult {
+            answer: answer.answer,
+            synthetic: answer.synthetic,
+        })
+    }
+
+    /// The thread (not removed) and its harness's adapter.
+    async fn thread_and_adapter(
+        &self,
+        thread_id: &ThreadId,
+    ) -> CoreResult<(ThreadRow, Arc<dyn aas_harness::HarnessAdapter>)> {
+        self.sh.registry.wait_ready().await;
+        let id = thread_id.clone();
+        let row = self
+            .sh
+            .db
+            .read(move |tx| store::get_thread(tx, &id))
+            .await?
+            .filter(|r| !r.removed)
+            .ok_or_else(|| not_found("thread", thread_id))?;
+        let adapter = self
+            .sh
+            .registry
+            .get(&row.harness_id)
+            .ok_or_else(|| invalid_state("harness not configured"))?;
+        Ok((row, adapter))
+    }
+
+    /// The control of the thread's running agent (`None` when none runs), from its actor.
+    async fn live_control(
+        &self,
+        thread_id: &ThreadId,
+    ) -> CoreResult<Option<Arc<dyn aas_harness::SessionControl>>> {
+        let handle = self.actors.lock().get(thread_id).cloned();
+        let Some(handle) = handle.filter(|h| !h.is_closed()) else {
+            return Ok(None);
+        };
+        let (tx, rx) = oneshot::channel();
+        if handle.send(Msg::LiveControl { reply: tx }).is_err() {
+            return Ok(None);
+        }
+        Ok(rx.await.ok().flatten())
     }
 
     async fn thread_diff(&self, p: ThreadDiffParams) -> CoreResult<ThreadDiffResult> {
@@ -1986,6 +2220,7 @@ impl Engine {
                 base_tree: Some(base),
                 end_tree,
                 turn,
+                ..
             }) => {
                 let head = match end_tree {
                     Some(h) => h,
@@ -2062,35 +2297,48 @@ impl Engine {
 
     async fn command_list(&self, p: CommandListParams) -> CoreResult<CommandListResult> {
         self.sh.registry.wait_ready().await;
-        let (harness_id, cwd, native, thread) = match (&p.thread_id, &p.project_id, &p.harness_id) {
-            (Some(t), _, _) => {
-                let id = t.clone();
-                let row = self
-                    .sh
-                    .db
-                    .read(move |tx| store::get_thread(tx, &id))
-                    .await?
-                    .filter(|r| !r.removed)
-                    .ok_or_else(|| not_found("thread", t))?;
-                (
-                    row.harness_id.clone(),
-                    PathBuf::from(&row.cwd),
-                    row.native_session_id.clone(),
-                    Some(row.id),
-                )
-            }
-            (None, Some(project), Some(h)) => (
-                h.clone(),
-                PathBuf::from(self.project(project).await?.path),
-                None,
-                None,
-            ),
-            _ => {
-                return Err(invalid_params(
-                    "threadId, or projectId and harnessId, are required",
-                ));
-            }
-        };
+        // The project's trust decision goes along, so that a listing without a running agent
+        // lists what an agent started for this project would (design.md §9.6).
+        let (harness_id, cwd, native, thread, project_trusted) =
+            match (&p.thread_id, &p.project_id, &p.harness_id) {
+                (Some(t), _, _) => {
+                    let id = t.clone();
+                    let (row, project) = self
+                        .sh
+                        .db
+                        .read(move |tx| {
+                            let row = store::get_thread(tx, &id)?;
+                            let project = match &row {
+                                Some(r) => store::get_project(tx, &r.project_id)?,
+                                None => None,
+                            };
+                            Ok((row, project))
+                        })
+                        .await?;
+                    let row = row
+                        .filter(|r| !r.removed)
+                        .ok_or_else(|| not_found("thread", t))?;
+                    let trusted =
+                        project.and_then(|p| p.project.harness_trust.get(&row.harness_id).copied());
+                    (
+                        row.harness_id.clone(),
+                        PathBuf::from(&row.cwd),
+                        row.native_session_id.clone(),
+                        Some(row.id),
+                        trusted,
+                    )
+                }
+                (None, Some(project), Some(h)) => {
+                    let project = self.project(project).await?;
+                    let trusted = project.harness_trust.get(h).copied();
+                    (h.clone(), PathBuf::from(project.path), None, None, trusted)
+                }
+                _ => {
+                    return Err(invalid_params(
+                        "threadId, or projectId and harnessId, are required",
+                    ));
+                }
+            };
         let adapter = self
             .sh
             .registry
@@ -2122,7 +2370,11 @@ impl Engine {
         let harness_commands = match cached {
             Some(c) => c,
             None if info.available => adapter
-                .commands(CommandContext { cwd, native_session_id: native })
+                .commands(CommandContext {
+                    cwd,
+                    native_session_id: native,
+                    project_trusted,
+                })
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!(harness = %harness_id, error = %e, "listing harness commands failed");
@@ -2131,11 +2383,12 @@ impl Engine {
             None => Vec::new(),
         };
         let reserved = app_commands(&info, true);
-        let switching = adapter.session_switching_commands();
-        commands.extend(harness_commands.into_iter().filter(|c| {
-            !commands_contains(&reserved, &c.name)
-                && !is_session_switching_command(&c.name, switching)
-        }));
+        let switching = commands::session_switching_names(adapter.as_ref());
+        commands.extend(
+            harness_commands
+                .into_iter()
+                .filter(|c| !commands_contains(&reserved, &c.name) && !switching.contains(&c.name)),
+        );
         Ok(CommandListResult { commands })
     }
 
@@ -2159,7 +2412,11 @@ impl Engine {
         let listed = adapter
             .list_native_sessions(Path::new(&project.path))
             .await
-            .map_err(|e| rpc(ErrorKind::AdapterError, e.to_string()))?;
+            .map_err(|e| {
+                rpc(ErrorKind::AdapterError, e.to_string())
+                    .with_data("harnessId", p.harness_id.as_str())
+                    .with_data("detail", e.detail())
+            })?;
         let sessions = unique_native_sessions(&p.harness_id, listed);
         let harness = p.harness_id.clone();
         let sessions = self
@@ -2219,10 +2476,14 @@ impl Engine {
                 thread: self.thread_view(&existing).await?,
             });
         }
-        let history = adapter
-            .read_native_history(Path::new(&project.path), &p.native_session_id)
+        let (history, anchors) = adapter
+            .read_native_history_anchored(Path::new(&project.path), &p.native_session_id)
             .await
-            .map_err(|e| rpc(ErrorKind::AdapterError, e.to_string()))?;
+            .map_err(|e| {
+                rpc(ErrorKind::AdapterError, e.to_string())
+                    .with_data("harnessId", p.harness_id.as_str())
+                    .with_data("detail", e.detail())
+            })?;
         let now = now_ms();
         let title = history
             .title
@@ -2261,6 +2522,10 @@ impl Engine {
             archived: false,
             removed: false,
             pinned: false,
+            modes: ThreadModes::default(),
+            fast_mode_state: None,
+            fork_at: None,
+            native_rename_pending: false,
         };
         let (harness, native) = (p.harness_id.clone(), p.native_session_id.clone());
         self.sh
@@ -2280,6 +2545,7 @@ impl Engine {
                 }
                 let mut row = row;
                 store::insert_thread(tx, &row)?;
+                let mut anchors = anchors.into_iter();
                 for (index, t) in history.turns.into_iter().enumerate() {
                     let started = t.started_at.unwrap_or(now);
                     let turn = Turn {
@@ -2294,13 +2560,17 @@ impl Engine {
                         usage: None,
                         diff: None,
                         trigger: None,
+                        forkable: false,
                     };
+                    // The anchor the history carries for this turn, if any (same order). The
+                    // turn is part of the imported session.
+                    let native_anchor = anchors.next().flatten();
                     store::insert_turn(
                         tx,
                         &TurnRow {
-                            turn: turn.clone(),
-                            base_tree: None,
-                            end_tree: None,
+                            native_anchor,
+                            delivered: true,
+                            ..TurnRow::new(turn.clone())
                         },
                     )?;
                     for hi in t.items {
@@ -2312,6 +2582,7 @@ impl Engine {
                             started_at: started,
                             completed_at: Some(turn.completed_at.unwrap_or(started)),
                             background_task_id: None,
+                            backgroundable: false,
                             body: hi.body,
                         };
                         store::insert_item(tx, &item)?;
@@ -2542,6 +2813,7 @@ pub(crate) fn upsert_project(
                 updated_at: now,
                 archived: false,
                 defaults: ProjectDefaults::default(),
+                harness_trust: Default::default(),
                 git: GitInfo::default(),
             };
             store::insert_project(tx, &p, &key)?;
@@ -2557,22 +2829,6 @@ pub(crate) fn upsert_project(
 
 fn commands_contains(list: &[Command], name: &str) -> bool {
     list.iter().any(|c| c.name == name)
-}
-
-/// Harness command names that are never offered, whatever the harness.
-///
-/// `resume`: every CLI that has a command of that name uses it to open another of its sessions
-/// in the running process (Claude Code's and pi's session pickers, Codex's `/resume`). A thread
-/// is one native session (design.md §9.5), and the app offers its own `/resume` that opens the
-/// session import (`native/list`, `native/import`), which a harness command of the same name
-/// would hide (docs/ux/codex-desktop.md §8.5).
-const SESSION_SWITCHING_COMMAND_NAMES: &[&str] = &["resume"];
-
-/// Whether a harness command switches the native session inside the running process: one of
-/// [`SESSION_SWITCHING_COMMAND_NAMES`], or one the adapter names
-/// ([`aas_harness::HarnessAdapter::session_switching_commands`]).
-fn is_session_switching_command(name: &str, adapter_names: &[&str]) -> bool {
-    SESSION_SWITCHING_COMMAND_NAMES.contains(&name) || adapter_names.contains(&name)
 }
 
 /// `native/list` names each native session once (protocol.md, `NativeSession`): a thread
@@ -2593,6 +2849,102 @@ fn unique_native_sessions(
         );
     }
     set.into_sessions()
+}
+
+/// Where a fork branches its source (see [`Engine::thread_fork`]).
+#[derive(Debug, Clone, PartialEq)]
+enum ForkPlan {
+    /// The whole source session, as it is when the fork's first process starts.
+    Whole,
+    /// Nothing of it: a fork before the first turn is a new session.
+    Empty,
+    /// At a recorded anchor: the first `copied` turns are the fork's history. `session`: the
+    /// native session the anchor belongs to when it is not the thread's current one.
+    At {
+        copied: usize,
+        point: aas_harness::ForkPoint,
+        session: Option<String>,
+    },
+}
+
+/// The plan of `thread/fork { atTurnId, before }` over the source's `turns` (oldest first).
+fn fork_plan(
+    turns: &[TurnRow],
+    at: Option<&TurnId>,
+    before: bool,
+    features: &HarnessFeatures,
+) -> CoreResult<ForkPlan> {
+    let Some(at) = at else {
+        if before {
+            return Err(invalid_params("`before` needs `atTurnId`"));
+        }
+        return Ok(ForkPlan::Whole);
+    };
+    let Some(pos) = turns.iter().position(|t| &t.turn.id == at) else {
+        return Err(not_found("turn", at));
+    };
+    let last = pos + 1 == turns.len();
+    if !features.fork_at_turn {
+        if last && !before {
+            return Ok(ForkPlan::Whole);
+        }
+        return Err(rpc(
+            ErrorKind::CapabilityUnsupported,
+            "this harness cannot fork at an earlier turn",
+        )
+        .with_cap("forkAtTurn"));
+    }
+    // Turns whose start failed never reached the agent: they are not in the native session.
+    let earlier = || turns[..pos].iter().rev().filter(|t| t.delivered);
+    if before && earlier().next().is_none() {
+        return Ok(ForkPlan::Empty);
+    }
+    let turn = &turns[pos];
+    let Some(anchor) = turn.native_anchor.clone() else {
+        // The last turn holds the whole session anyway.
+        if last && !before {
+            return Ok(ForkPlan::Whole);
+        }
+        return Err(invalid_state(
+            "the harness's anchor of this turn was not recorded, so the thread cannot be forked at it",
+        ));
+    };
+    // Where the session holds everything before the turn: the anchor of the nearest turn that
+    // reached the agent, when it belongs to the same native session (a turn without one, or
+    // one of another session, leaves it unknown).
+    let previous = earlier().next().and_then(|t| {
+        t.native_anchor
+            .clone()
+            .filter(|_| t.anchor_session == turn.anchor_session)
+    });
+    Ok(ForkPlan::At {
+        copied: if before { pos } else { pos + 1 },
+        point: aas_harness::ForkPoint {
+            anchor,
+            before,
+            previous,
+        },
+        session: turn.anchor_session.clone(),
+    })
+}
+
+/// An adapter's failure of a request answered right away (`adapterError`, or
+/// `harnessUnavailable`), with the adapter's own text in `data`.
+fn adapter_error(harness: &str, e: aas_harness::AdapterError) -> CoreError {
+    use aas_harness::AdapterError;
+    match e {
+        AdapterError::Unsupported(capability) => rpc(
+            ErrorKind::CapabilityUnsupported,
+            format!("not supported by {harness}: {capability}"),
+        )
+        .with_cap(capability),
+        AdapterError::Unavailable(_) => rpc(ErrorKind::HarnessUnavailable, e.to_string())
+            .with_data("harnessId", harness)
+            .with_data("reason", e.detail()),
+        other => rpc(ErrorKind::AdapterError, other.to_string())
+            .with_data("harnessId", harness)
+            .with_data("detail", other.detail()),
+    }
 }
 
 /// Commands the app implements itself (mapped to protocol methods or pickers).
@@ -2681,12 +3033,18 @@ fn app_commands(info: &HarnessInfo, in_thread: bool) -> Vec<Command> {
 
 trait WithCap {
     fn with_cap(self, capability: &str) -> CoreError;
+    /// Adds `data.<key>` to an RPC error (other errors are left as they are).
+    fn with_data(self, key: &str, value: impl Into<Value>) -> CoreError;
 }
 
 impl WithCap for CoreError {
     fn with_cap(self, capability: &str) -> CoreError {
+        self.with_data("capability", capability)
+    }
+
+    fn with_data(self, key: &str, value: impl Into<Value>) -> CoreError {
         match self {
-            CoreError::Rpc(e) => CoreError::Rpc(e.with("capability", capability)),
+            CoreError::Rpc(e) => CoreError::Rpc(e.with(key, value)),
             other => other,
         }
     }
@@ -2811,4 +3169,133 @@ async fn recover(sh: &Arc<Shared>) -> CoreResult<()> {
         Ok(())
     })
     .await
+}
+
+#[cfg(test)]
+mod fork_plan_tests {
+    use super::*;
+
+    fn turn(index: u32, anchor: Option<&str>, session: Option<&str>, delivered: bool) -> TurnRow {
+        TurnRow {
+            native_anchor: anchor.map(|a| json!({ "a": a })),
+            anchor_session: session.map(str::to_owned),
+            delivered,
+            ..TurnRow::new(Turn {
+                id: TurnId::from(format!("trn_{index}")),
+                thread_id: ThreadId::from("thr_1"),
+                index,
+                status: TurnStatus::Completed,
+                started_at: 0,
+                completed_at: Some(0),
+                model: None,
+                error: None,
+                usage: None,
+                diff: None,
+                trigger: None,
+                forkable: false,
+            })
+        }
+    }
+
+    fn plan(turns: &[TurnRow], at: usize, before: bool) -> CoreResult<ForkPlan> {
+        let features = HarnessFeatures {
+            fork_at_turn: true,
+            ..HarnessFeatures::default()
+        };
+        fork_plan(turns, Some(&turns[at].turn.id), before, &features)
+    }
+
+    fn at(copied: usize, anchor: &str, before: bool, previous: Option<&str>) -> ForkPlan {
+        ForkPlan::At {
+            copied,
+            point: aas_harness::ForkPoint {
+                anchor: json!({ "a": anchor }),
+                before,
+                previous: previous.map(|p| json!({ "a": p })),
+            },
+            session: None,
+        }
+    }
+
+    /// A turn whose start failed is not in the native session: the cut before the next turn is
+    /// the anchor of the turn before the failed one.
+    #[test]
+    fn a_fork_before_a_turn_skips_turns_that_never_reached_the_agent() {
+        let turns = [
+            turn(0, Some("t0"), None, true),
+            turn(1, None, None, false),
+            turn(2, Some("t2"), None, true),
+        ];
+        assert_eq!(
+            plan(&turns, 2, true).unwrap(),
+            at(2, "t2", true, Some("t0"))
+        );
+        assert_eq!(
+            plan(&turns, 2, false).unwrap(),
+            at(3, "t2", false, Some("t0"))
+        );
+    }
+
+    /// Before a turn that nothing delivered precedes, the session holds nothing: a new session.
+    #[test]
+    fn a_fork_before_the_first_delivered_turn_is_a_new_session() {
+        let turns = [
+            turn(0, None, None, false),
+            turn(1, None, None, false),
+            turn(2, Some("t2"), None, true),
+        ];
+        assert_eq!(plan(&turns, 2, true).unwrap(), ForkPlan::Empty);
+        assert_eq!(plan(&turns, 0, true).unwrap(), ForkPlan::Empty);
+    }
+
+    /// A delivered turn without an anchor leaves the cut before the next turn unknown.
+    #[test]
+    fn a_delivered_turn_without_an_anchor_leaves_the_cut_unknown() {
+        let turns = [
+            turn(0, Some("t0"), None, true),
+            turn(1, None, None, true),
+            turn(2, Some("t2"), None, true),
+        ];
+        assert_eq!(plan(&turns, 2, true).unwrap(), at(2, "t2", true, None));
+        // A turn without an anchor: the last one is the whole session, an earlier one fails.
+        assert_eq!(
+            RpcError::from(plan(&turns, 1, true).unwrap_err()).kind(),
+            Some(ErrorKind::InvalidState)
+        );
+        let turns = [turn(0, Some("t0"), None, true), turn(1, None, None, true)];
+        assert_eq!(plan(&turns, 1, false).unwrap(), ForkPlan::Whole);
+    }
+
+    /// Anchors recorded before the harness moved the thread to another native session branch
+    /// that session; the cut before a turn is never taken from another session.
+    #[test]
+    fn anchors_of_an_earlier_native_session_fork_that_session() {
+        let turns = [
+            turn(0, Some("t0"), Some("ses-1"), true),
+            turn(1, Some("t1"), Some("ses-1"), true),
+            turn(2, Some("t2"), None, true),
+            turn(3, Some("t3"), None, true),
+        ];
+        let in_first = |plan: ForkPlan| match plan {
+            ForkPlan::At {
+                copied,
+                point,
+                session,
+            } => (copied, point.previous, session),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            in_first(plan(&turns, 1, true).unwrap()),
+            (1, Some(json!({ "a": "t0" })), Some("ses-1".to_owned()))
+        );
+        assert_eq!(
+            in_first(plan(&turns, 1, false).unwrap()),
+            (2, Some(json!({ "a": "t0" })), Some("ses-1".to_owned()))
+        );
+        assert_eq!(plan(&turns, 2, true).unwrap(), at(2, "t2", true, None));
+        assert_eq!(
+            plan(&turns, 3, true).unwrap(),
+            at(3, "t3", true, Some("t2"))
+        );
+    }
 }

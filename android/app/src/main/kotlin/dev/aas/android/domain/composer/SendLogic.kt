@@ -51,6 +51,23 @@ enum class SendBlock {
     Interrupting,
 }
 
+/** What the thread screen asks before sending (docs/android.md 25章). */
+sealed interface SendConfirmation {
+    /**
+     * Sending starts a turn while the queue is paused, which resumes it: send (the [queued]
+     * messages follow the new one), clear the queue first, or cancel.
+     */
+    data class PausedQueue(val queued: Int) : SendConfirmation
+
+    /**
+     * `/plan <request>` while [ahead] messages would start before the request: plan mode applies
+     * from the next turn (`thread/update`, protocol.md §4), so they would run in plan mode too.
+     * [canClear]: all of them wait in the daemon's queue, so clearing it first (`queue/remove`,
+     * as for [PausedQueue]) makes the request the next turn.
+     */
+    data class PlanAhead(val ahead: Int, val canClear: Boolean) : SendConfirmation
+}
+
 /** The send button: its action, the long-press alternative and whether it is enabled. */
 data class SendState(val primary: SendAction, val alternate: SendAction?, val blocked: SendBlock?) {
     val enabled: Boolean get() = blocked == null
@@ -127,6 +144,24 @@ object SendLogic {
      */
     fun needsPausedQueueConfirmation(thread: Thread?, queued: List<QueuedInput>, action: SendAction): Boolean =
         action == SendAction.Start && thread != null && thread.queuePaused && queued.isNotEmpty()
+
+    /**
+     * How many of the thread's messages would start a turn before a message sent now — and so
+     * after a mode change sent with it, which applies from the next turn (`thread/update`,
+     * protocol.md §4). [pending] are the deliveries of this thread's messages still in the
+     * outbox (they reach the daemon first, in order).
+     *
+     * * A turn runs: the daemon's queue, and the pending messages except steers (a steer goes
+     *   into the running turn).
+     * * No turn runs: the first pending message starts the next turn itself, and the rest of
+     *   them and the queue (a paused queue resumes with a new turn) wait before the new message.
+     *   Without pending messages the new message is the next turn.
+     */
+    fun messagesStartingBefore(thread: Thread, queued: List<QueuedInput>, pending: List<Delivery>): Int = when {
+        turnActive(thread) -> queued.size + pending.count { it != Delivery.Steer }
+        pending.isEmpty() -> 0
+        else -> queued.size + pending.size - 1
+    }
 
     /**
      * "今すぐ反映" of a queued input (`queue/steer`): while a turn runs it is steered into it

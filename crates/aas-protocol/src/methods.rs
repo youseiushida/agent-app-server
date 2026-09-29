@@ -158,6 +158,9 @@ client_requests! {
     OperationList => "operation/list", Empty, OperationListResult, false;
     OperationCancel => "operation/cancel", OperationCancelParams, OperationResult, true;
     BackgroundTaskStop => "backgroundTask/stop", BackgroundTaskStopParams, BackgroundTaskResult, true;
+    ThreadHarnessStatus => "thread/harnessStatus", ThreadHarnessStatusParams, ThreadHarnessStatusResult, false;
+    ThreadSideQuestion => "thread/sideQuestion", ThreadSideQuestionParams, ThreadSideQuestionResult, false;
+    ItemMoveToBackground => "item/moveToBackground", ItemMoveToBackgroundParams, Empty, true;
 }
 
 with_request_id!(
@@ -183,6 +186,7 @@ with_request_id!(
     NativeImportParams,
     OperationCancelParams,
     BackgroundTaskStopParams,
+    ItemMoveToBackgroundParams,
 );
 
 without_request_id!(
@@ -202,6 +206,8 @@ without_request_id!(
     InteractionListParams,
     CommandListParams,
     NativeListParams,
+    ThreadHarnessStatusParams,
+    ThreadSideQuestionParams,
 );
 
 /// `{}` params or result.
@@ -413,6 +419,11 @@ pub struct ProjectUpdateParams {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub defaults: Option<ProjectDefaults>,
+    /// Records the user's trust decisions for harnesses with the feature `projectTrust`
+    /// (merged into `Project.harnessTrust`: the harnesses named here change, the others keep
+    /// theirs).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub harness_trust: Option<std::collections::BTreeMap<String, bool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -589,14 +600,44 @@ pub struct ThreadUpdateParams {
     /// Pins (`true`) or unpins (`false`) the thread.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pinned: Option<bool>,
+    /// Switches plan mode or fast mode (only the fields present change).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub modes: Option<ThreadModesUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadUpdateResult {
     pub thread: Thread,
+    /// How the `settings` and `modes` of the request reach the agent (present when either was
+    /// given).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub settings_outcome: Option<SettingsOutcome>,
+    /// What happened to the native session's name (present when `title` was given and the
+    /// harness has the feature `rename`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub native_rename: Option<NativeRename>,
+}
+
+/// The native session's side of a rename (`thread/update { title }`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeRename {
+    pub status: NativeRenameStatus,
+    /// Why it failed, as the harness said (`failed` only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeRenameStatus {
+    /// The running agent took the name.
+    Applied,
+    /// No agent runs now (or none has started yet): the name is given when the next one starts.
+    Pending,
+    /// The harness refused the name (`message`); the thread keeps its title.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -625,6 +666,14 @@ pub struct ThreadForkParams {
     pub thread_id: ThreadId,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub at_turn_id: Option<TurnId>,
+    /// With `atTurnId`: the fork ends right before that turn instead of including it (to edit
+    /// the turn's prompt in the new thread).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub before: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -852,6 +901,50 @@ pub struct BackgroundTaskStopParams {
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundTaskResult {
     pub task: BackgroundTask,
+}
+
+// ----- harness status, side questions, items -----
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadHarnessStatusParams {
+    pub thread_id: ThreadId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadHarnessStatusResult {
+    /// The harness's own status, in its order and words (display only).
+    pub sections: Vec<StatusSection>,
+    /// Whether the sections come from the thread's running agent (`false`: from the harness
+    /// without a session, e.g. account limits).
+    pub live: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSideQuestionParams {
+    pub thread_id: ThreadId,
+    pub question: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSideQuestionResult {
+    /// The answer, verbatim. Absent when the harness gave none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub answer: Option<String>,
+    /// The harness says the answer did not come from the model (a canned reply).
+    #[serde(default)]
+    pub synthetic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemMoveToBackgroundParams {
+    pub client_request_id: String,
+    pub thread_id: ThreadId,
+    pub item_id: ItemId,
 }
 
 #[cfg(test)]

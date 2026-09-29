@@ -91,6 +91,20 @@ sealed interface Event {
     @Serializable
     data class BackgroundTaskUpdated(val task: BackgroundTask) : Event
 
+    /**
+     * The harness moved the thread's agent to another native session by itself (a typed command,
+     * an extension): the thread's `nativeSessionId` follows it (protocol.md §3.1).
+     */
+    @Serializable
+    data class NativeSessionChanged(val previousNativeSessionId: String, val nativeSessionId: String) : Event
+
+    /**
+     * The harness asks to put [text] into the open thread's composer (a pi extension's
+     * `setEditorText`). The client never sends it by itself. Transient, like [Native].
+     */
+    @Serializable
+    data class ComposerInsert(val text: String) : Event
+
     @Serializable
     data class Native(val harnessId: String, val payload: JsonElement) : Event
 
@@ -123,6 +137,8 @@ sealed interface Event {
             is QueueUpdated -> "queue/updated"
             CommandsChanged -> "commands/changed"
             is BackgroundTaskUpdated -> "backgroundTask/updated"
+            is NativeSessionChanged -> "thread/nativeSessionChanged"
+            is ComposerInsert -> "composer/insert"
             is Native -> "native"
             is Unknown -> null
         }
@@ -133,7 +149,7 @@ sealed interface Event {
             "interaction/closed", "harness/updated", "operation/updated", "thread/updated", "turn/started",
             "turn/completed", "turn/diffUpdated", "turn/usageUpdated", "item/started", "item/delta", "item/updated",
             "item/completed", "interaction/requested", "interaction/resolved", "interaction/expired", "queue/updated",
-            "commands/changed", "backgroundTask/updated", "native",
+            "commands/changed", "backgroundTask/updated", "thread/nativeSessionChanged", "composer/insert", "native",
         )
 
         fun serializerFor(type: String): KSerializer<out Event>? = when (type) {
@@ -160,6 +176,8 @@ sealed interface Event {
             "queue/updated" -> QueueUpdated.serializer()
             "commands/changed" -> CommandsChanged.serializer()
             "backgroundTask/updated" -> BackgroundTaskUpdated.serializer()
+            "thread/nativeSessionChanged" -> NativeSessionChanged.serializer()
+            "composer/insert" -> ComposerInsert.serializer()
             "native" -> Native.serializer()
             else -> null
         }

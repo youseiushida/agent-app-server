@@ -22,6 +22,9 @@ pub struct ThreadOpenResponse {
     pub sandbox: Option<Value>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// The thread's service tier (`null`: none requested; a persisted tier on resume).
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +99,185 @@ pub struct WireTurnError {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TurnStartResponse {
     pub turn: WireTurn,
+}
+
+/// `review/start` (the review runs as turn `turn.id`; for an inline review Codex sends no
+/// `turn/started` for it).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewStartResponse {
+    pub turn: WireTurn,
+}
+
+/// `thread/settings/updated` (sent with the experimental API whenever the thread's settings
+/// change: the model, effort, service tier and collaboration mode Codex uses from now on).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSettingsUpdated {
+    pub thread_settings: WireThreadSettings,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireThreadSettings {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub approval_policy: Option<Value>,
+    #[serde(default)]
+    pub approvals_reviewer: Option<String>,
+    #[serde(default)]
+    pub sandbox_policy: Option<Value>,
+    #[serde(default)]
+    pub collaboration_mode: Option<WireCollaborationMode>,
+}
+
+/// `CollaborationMode` (`mode` is `plan` or `default`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireCollaborationMode {
+    pub mode: String,
+}
+
+/// `ThreadGoal`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGoal {
+    pub objective: String,
+    /// `active`, `paused`, `blocked`, `usageLimited`, `budgetLimited` or `complete`.
+    pub status: String,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub time_used_seconds: u64,
+}
+
+/// `thread/goal/updated`: `turnId` is the turn the change happened in (`null` for a change a
+/// client made, and for the snapshot sent on resume).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalUpdated {
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    pub goal: WireGoal,
+}
+
+/// `thread/goal/set`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoalSetResponse {
+    pub goal: WireGoal,
+}
+
+/// `thread/goal/get`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoalGetResponse {
+    #[serde(default)]
+    pub goal: Option<WireGoal>,
+}
+
+/// `thread/goal/clear`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoalClearResponse {
+    pub cleared: bool,
+}
+
+/// `account/read`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountReadResponse {
+    /// `{type: "apiKey"}`, `{type: "chatgpt", email, planType}`, `{type: "amazonBedrock", …}`.
+    #[serde(default)]
+    pub account: Option<Value>,
+    #[serde(default)]
+    pub requires_openai_auth: bool,
+}
+
+/// `account/rateLimits/read`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitsReadResponse {
+    pub rate_limits: RateLimitSnapshot,
+}
+
+/// `account/rateLimits/updated` (a sparse rolling update: absent values do not clear earlier
+/// ones).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitsUpdated {
+    pub rate_limits: RateLimitSnapshot,
+}
+
+/// `RateLimitSnapshot` (the fields shown in the status).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitSnapshot {
+    #[serde(default)]
+    pub limit_name: Option<String>,
+    #[serde(default)]
+    pub primary: Option<RateLimitWindow>,
+    #[serde(default)]
+    pub secondary: Option<RateLimitWindow>,
+    #[serde(default)]
+    pub credits: Option<CreditsSnapshot>,
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    #[serde(default)]
+    pub rate_limit_reached_type: Option<String>,
+}
+
+impl RateLimitSnapshot {
+    /// Merges a rolling update into this snapshot: values the update carries replace the known
+    /// ones, absent values keep them (Codex's rule for `account/rateLimits/updated`).
+    pub fn merge(&mut self, update: RateLimitSnapshot) {
+        fn keep<T>(slot: &mut Option<T>, new: Option<T>) {
+            if new.is_some() {
+                *slot = new;
+            }
+        }
+        keep(&mut self.limit_name, update.limit_name);
+        keep(&mut self.primary, update.primary);
+        keep(&mut self.secondary, update.secondary);
+        keep(&mut self.credits, update.credits);
+        keep(&mut self.plan_type, update.plan_type);
+        keep(
+            &mut self.rate_limit_reached_type,
+            update.rate_limit_reached_type,
+        );
+    }
+
+    /// Whether the snapshot reports anything (a provider without Codex's rate-limit headers
+    /// reports every field `null`).
+    pub fn is_empty(&self) -> bool {
+        self.primary.is_none()
+            && self.secondary.is_none()
+            && self.credits.is_none()
+            && self.rate_limit_reached_type.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    #[serde(default)]
+    pub window_duration_mins: Option<u64>,
+    /// Unix seconds.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditsSnapshot {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    #[serde(default)]
+    pub balance: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -640,6 +822,18 @@ pub struct WireModel {
     pub supported_reasoning_efforts: Vec<ReasoningEffortOption>,
     #[serde(default)]
     pub is_default: bool,
+    /// The service tiers the model offers besides the default one (codex-cli 0.148.0: the
+    /// GPT models list `{id: "priority", name: "Fast"}`).
+    #[serde(default)]
+    pub service_tiers: Vec<WireServiceTier>,
+}
+
+/// `ModelServiceTier`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WireServiceTier {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

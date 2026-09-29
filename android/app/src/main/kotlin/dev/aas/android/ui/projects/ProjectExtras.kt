@@ -45,11 +45,13 @@ import dev.aas.android.data.HarnessRepository
 import dev.aas.android.data.ProjectRepository
 import dev.aas.android.data.ThreadRepository
 import dev.aas.android.data.WorkspaceRepository
+import dev.aas.android.domain.ErrorTexts
 import dev.aas.android.domain.HarnessWait
 import dev.aas.android.domain.NativeSessionHarnesses
 import dev.aas.android.domain.ResultMessages
 import dev.aas.android.protocol.ErrorKind
 import dev.aas.android.protocol.Harness
+import dev.aas.android.protocol.HarnessKind
 import dev.aas.android.protocol.NativeSession
 import dev.aas.android.protocol.RpcException
 import dev.aas.android.protocol.Thread
@@ -102,7 +104,7 @@ internal suspend fun <T> fetched(block: suspend () -> T): Fetched<T> = try {
 } catch (e: NotConnectedException) {
     Fetched.Offline
 } catch (e: RpcException) {
-    Fetched.Failed(UiText.of(R.string.error_server, e.error.message))
+    Fetched.Failed(ErrorTexts.server(e.error))
 } catch (e: Exception) {
     Fetched.Failed(requestFailed(e))
 }
@@ -255,6 +257,12 @@ data class ImportSessionUiState(
 ) {
     /** Some offered harness is not the one listed: the chips are shown (also when only one is offered and nothing is selected). */
     val canSwitch: Boolean get() = harnesses.any { it.id != selected }
+
+    /**
+     * The listed harness is Codex: a conversation open in Codex desktop cannot be continued from
+     * the phone (Codex allows one writer per conversation; resuming it fails as `resumeFailed`).
+     */
+    val codexDesktopNote: Boolean get() = harnesses.firstOrNull { it.id == selected }?.kind == HarnessKind.Codex
 }
 
 /**
@@ -395,7 +403,7 @@ class ImportSessionViewModel(
             ErrorKind.HarnessUnavailable -> Listing(Fetched.Failed(UiText.of(R.string.import_harness_unavailable, name, e.error.reason ?: e.error.message)), harnessUnavailable = true)
             // Definitive: listing it again gets the same answer (pickHarness moves on).
             ErrorKind.CapabilityUnsupported -> Listing(Fetched.Failed(UiText.of(R.string.import_harness_unsupported, name)), unsupported = true)
-            else -> Listing(Fetched.Failed(UiText.of(R.string.error_server, e.error.message)))
+            else -> Listing(Fetched.Failed(ErrorTexts.server(e.error)))
         }
     } catch (e: NotConnectedException) {
         Listing(Fetched.Offline)
@@ -467,6 +475,14 @@ fun ImportSessionScreen(vm: ImportSessionViewModel, navigator: AppNavigator) {
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
             Text(stringResource(R.string.import_session_body), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(16.dp))
+            if (ui.codexDesktopNote) {
+                Text(
+                    stringResource(R.string.import_codex_desktop_note),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                )
+            }
             ui.waiting?.let { wait ->
                 HarnessWaitNotice(
                     wait = wait,

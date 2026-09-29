@@ -30,6 +30,39 @@
 - `bg_subagent_v1_interrupt.jsonl`（`features.multi_agent`、v1）: 親が `spawnAgent` で子を起動して `wait` で待つ。親のターンを中断しても子は動き続け、子の `turn/interrupt` で止まる。子のコマンドはターミナルとして残り、terminate で止まる。
 - `bg_subagent_unannounced.jsonl`: `bg_subagents_v2.jsonl` の記録から作った変形。子を起動する `subAgentActivity` の Item を取り除き（子のスレッドの通知が先に届いた場合の代わり）、アダプタが子の最初の `active` のあとに送る `thread/read` の往復を足した（応答は同じ記録の `thread/read` の応答）。3つ目の子は `parentThreadId` を null にしてこのセッションの外のスレッドにし、その承認要求にアダプタがエラーで答えることを期待する行を足した。
 
+### 拡張機能（2回目の記録、2026-09-28）
+`tests/features.rs` が再生する。記録はバックグラウンドの作業と同じ手法（台本の Responses API、一時的な `CODEX_HOME`、`experimentalApi: true`。モデルの一覧は利用者の `models.json` を読み取り専用で使い、`service_tier.jsonl` だけ Codex の bundled catalog）。スクリプトは記録の timeline（両方向の JSON を時刻付きで書いたもの）から変換スクリプトで作った。サーバの行はすべて記録のもの（下の「派生」を除く）で、クライアントの行はアダプタが送るべき要求（照合するパラメータだけ）。
+
+| ファイル | 元の記録 | 内容 |
+|---|---|---|
+| `plan_mode.jsonl` | plan | `collaborationMode` plan のターン（plan Item と `item/plan/delta`）、モードを送らないターン、"Implement the plan." を default で送るターン |
+| `resume_plan.jsonl` | planresume（2つ目の app-server） | resume と、その最初のターン |
+| `fork_at_turn.jsonl` | fork | `thread/fork { lastTurnId: T2 }` と、fork の上のターン |
+| `fork_before_turn.jsonl` | fork | `thread/fork { beforeTurnId: T2 }` |
+| `fork_unknown_turn.jsonl` | fork | 知らない `lastTurnId` の fork（Codex のエラー） |
+| `resume_active_writer.jsonl` | writer（B） | ほかの app-server が書き込み中のスレッドの resume（`already has an active writer`） |
+| `resume_named.jsonl` | writer（B） | 持ち主が終わったあとの resume（名前 "Renamed by B" 付き）と、その最初のターン |
+| `rename.jsonl` | name | ターンのあとの `thread/name/set`（空白付き、空、2つ目の名前） |
+| `init_command.jsonl` | name（派生） | 1つ目のターンの入力を `/init` のプロンプトにしたもの |
+| `review_inline.jsonl` | review | inline の `review/start { target: custom }`（最初の普通のターンは除いた） |
+| `review_interrupt.jsonl` | review（派生） | 同じレビューを、レビュー役のターンが始まったところで中断するもの |
+| `service_tier.jsonl` | tiers | `serviceTier: "priority"` で始めたスレッド、tier を送らないターン、状態（`account/read`、`account/rateLimits/read`）、`serviceTier: null` のターン |
+| `goal_steer.jsonl` | goal3 | ゴールの継続のターンの途中の pause（steer）、resume、途中の clear（steer）、ゴールがないときの clear。記録ドライバが2つ目の継続の途中に送った `turn/start` と `turn/steer` の往復は除いた（エンジンはエージェントのターンの途中にどちらも送らない） |
+| `goal.jsonl` | goal | `/goal` の各形、ゴールの継続のターン3つ（3つ目を中断）、pause、resume と、モデルの `update_goal` で完了する継続のターン、状態 |
+
+加工と派生:
+- パス（作業フォルダ → `C:\WORKSPACE`、一時的な `CODEX_HOME` → `C:\Users\USER\.codex`、`C:\Users\<name>` → `C:\Users\USER`）と `installationId` を置き換えた。
+- 記録ドライバだけが送った要求（`collaborationMode/list`、`model/list`、確認用の `thread/read`、`thread/loaded/list`、後片付けの `thread/delete`）は含めない。アダプタがスレッドを開いた直後に送る `skills/list` の往復（空の一覧）を足した。
+- アダプタの要求が記録ドライバと違うところは、クライアントの行をアダプタの要求にした（サーバの行はそのまま）:
+  - fork と resume の最初のターン: アダプタは `collaborationMode`（default、または plan）を明示する（Codex がモードを戻さないため。docs/adapters/codex.md 14.3）。
+  - `goal.jsonl` の `/goal <objective>`: アダプタは `status: "active"` も送る（記録ドライバは目的だけ。新しいゴールへの Codex の答えは同じ）。
+  - `goal.jsonl` の最後の状態の要求（`account/read`、`account/rateLimits/read`）は、同じ条件（サインインなし）の tiers の記録の応答を使った。
+- 派生:
+  - `init_command.jsonl`: name の記録の1つ目のターンで、期待する入力をインストールされた codex-cli 0.148.0 のバイナリから取り出した `/init` のプロンプト（Windows 版の CRLF を LF にしたもの）にした。Codex の応答は元のターンのもの（アダプタはユーザーメッセージのエコーを使わない）。
+  - `goal.jsonl` の3つ目の継続の中断: アダプタはゴールが active のあいだの中断でゴールを一時停止する（Codex の TUI と同じ。docs/adapters/codex.md 14.6）ので、`turn/interrupt` の前に `thread/goal/set { status: "paused" }` の行を足した。その答えと前後の `thread/goal/updated` は、記録で利用者が送った `/goal pause` の行（答えと、その前後の通知）を移したもの。前の通知の `turnId` は、ターンが動いているあいだの一時停止の記録（goal3）と同じく、動いているターンの id にした。一時停止したゴールのターンの終わりには集計の通知が来ない（goal3）ので、中断したターンの終わりの `thread/goal/updated`（active）と、利用者の `/goal pause` の往復は除いた。
+  - `review_interrupt.jsonl`: review の記録をレビュー役のターンの開始とそのユーザーメッセージまで使い、同期点の `warning`（「replay sync point」）、`turn/interrupt { turnId: <レビューのターン> }` の往復、interrupted の `turn/completed` を足した（形は goal の記録の中断と同じ）。
+- 照合の `"$absent"`: そのパラメータを送らないことを確かめる（plan モードを保つターンの `collaborationMode`、tier を保つターンの `serviceTier`、モードと同時の最上位の `effort`、fork のもう一方の境界）。
+
 ## 加工したところ
 - パスとアカウントに関わる値を置き換えた。
   - 作業フォルダ → `C:\WORKSPACE`
@@ -49,6 +82,6 @@
 
 ## スクリプトの形式（1行1エントリ）
 - `{"s": msg, "respondsTo": recId?}`: サーバからクライアントへ送るメッセージ。`respondsTo` があるときは、記録上の要求 id を、アダプタが実際に使った id に置き換えてから送る。
-- `{"c": {"method", "recId"?, "params"?}}`: アダプタが次に送るべき要求または通知。`params` は、そこに書いたキーだけを照合する。
+- `{"c": {"method", "recId"?, "params"?}}`: アダプタが次に送るべき要求または通知。`params` は、そこに書いたキーだけを照合する。値が `"$absent"` のキーは、送られていないことを照合する。
 - `{"c": {"id", "result"}}`: サーバからの要求に対するアダプタの応答。完全一致で照合する。
 - `{"exit": {"code"}}`: プロセスが終了する（stdout を閉じる）。

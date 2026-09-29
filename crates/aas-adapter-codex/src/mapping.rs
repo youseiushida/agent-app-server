@@ -69,9 +69,16 @@ pub fn map_item(item: &WireItem, cwd: &Path, reasoning: Option<ReasoningStream>)
                 ItemStatus::Completed,
             )
         }
-        WireItem::AgentMessage { id, text } | WireItem::Plan { id, text } => (
+        WireItem::AgentMessage { id, text } => (
             id,
             ItemBody::AgentMessage { text: text.clone() },
+            ItemStatus::Completed,
+        ),
+        // Plan mode's proposed plan (the Markdown inside `<proposed_plan>`; Codex removes the
+        // block from the agent message that carried it).
+        WireItem::Plan { id, text } => (
+            id,
+            ItemBody::ProposedPlan { text: text.clone() },
             ItemStatus::Completed,
         ),
         WireItem::Reasoning {
@@ -366,6 +373,17 @@ pub fn map_item(item: &WireItem, cwd: &Path, reasoning: Option<ReasoningStream>)
         body,
         status,
     }
+}
+
+/// The live counterpart of `exitedReviewMode`: the end of the review that `enteredReviewMode`
+/// started (its text arrives as an agent message of its own; see `session.rs`). History keeps
+/// the item's text instead ([`map_item`]), because `thread/read` has no such agent message.
+pub fn review_finished_notice() -> ItemBody {
+    notice(
+        NoticeLevel::Info,
+        "Review finished".into(),
+        "reviewFinished",
+    )
 }
 
 fn notice(level: NoticeLevel, message: String, code: &str) -> ItemBody {
@@ -1479,6 +1497,26 @@ mod tests {
             body,
             ItemBody::AgentMessage {
                 text: "LGTM".into()
+            }
+        );
+        let item: WireItem =
+            serde_json::from_value(json!({"type":"plan","id":"t-plan","text":"# Plan
+
+1. Do it.
+"}))
+            .unwrap();
+        let MappedItem::Item { key, body, .. } = map_item(&item, &cwd(), None) else {
+            panic!()
+        };
+        assert_eq!(key, "t-plan");
+        assert_eq!(
+            body,
+            ItemBody::ProposedPlan {
+                text: "# Plan
+
+1. Do it.
+"
+                .into()
             }
         );
         let item: WireItem =

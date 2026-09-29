@@ -25,6 +25,7 @@ interface Dialog {
 /** A pi stand-in: records the dialogs and notifications the gate produces. */
 class FakePi {
 	handlers = new Map<string, (event: any, ctx: any) => Promise<unknown>>();
+	commands = new Map<string, { description: string; handler: (args: string, ctx: any) => Promise<void> }>();
 	dialogs: Dialog[] = [];
 	notes: { message: string; type: string }[] = [];
 	/** Answers given to the next dialogs, in order. */
@@ -32,6 +33,25 @@ class FakePi {
 
 	on(event: string, handler: (event: any, ctx: any) => Promise<unknown>) {
 		this.handlers.set(event, handler);
+	}
+
+	registerCommand(name: string, options: { description: string; handler: (args: string, ctx: any) => Promise<void> }) {
+		assert.ok(!this.commands.has(name), `registered twice: ${name}`);
+		this.commands.set(name, options);
+	}
+
+	/** Runs a command the way pi's `_tryExecuteExtensionCommand` does, with a command context. */
+	async command(name: string, args: string, ctx: Partial<CommandCtx>) {
+		const command = this.commands.get(name);
+		assert.ok(command, `the gate registers /${name}`);
+		const full: CommandCtx = {
+			isIdle: () => true,
+			reload: async () => assert.fail("unexpected reload"),
+			fork: async () => assert.fail("unexpected fork"),
+			...ctx,
+			ui: { notify: (message: string, type: string) => this.notes.push({ message, type }) },
+		};
+		await command.handler(args, full);
 	}
 
 	/** Calls the gate's `tool_call` handler the way pi does. */
@@ -70,6 +90,14 @@ class FakePi {
 			return JSON.parse(n.message.slice("aas-gate:".length));
 		});
 	}
+}
+
+/** The parts of pi's command context the gate uses. */
+interface CommandCtx {
+	isIdle: () => boolean;
+	reload: () => Promise<void>;
+	fork: (entryId: string, options: { position: string }) => Promise<{ cancelled: boolean }>;
+	ui: { notify: (message: string, type: string) => void };
 }
 
 let dir: string;
@@ -251,5 +279,64 @@ describe("dialog closure reports", () => {
 		setMode("auto");
 		await pi.toolCall("bash", { command: "ls" });
 		assert.equal(pi.notes.length, 0);
+	});
+});
+
+describe("commands", () => {
+	test("/reload runs pi's reload while the agent is idle, and nothing after it", async () => {
+		const pi = load();
+		assert.equal(pi.commands.get("reload")?.description, "Reload extensions, skills, prompts, themes, and context files");
+		let reloads = 0;
+		await pi.command("reload", "", {
+			reload: async () => {
+				reloads += 1;
+			},
+		});
+		assert.equal(reloads, 1);
+		assert.equal(pi.notes.length, 0, "the stale context is not used after the reload");
+	});
+
+	test("/reload refuses while the agent is busy, with pi's own words", async () => {
+		const pi = load();
+		await pi.command("reload", "", { isIdle: () => false });
+		assert.deepEqual(pi.notes, [{ message: "Wait for the current response to finish before reloading.", type: "warning" }]);
+	});
+
+	test("/aas-gate-fork forks at the entry with the position, and reports nothing once it happened", async () => {
+		const pi = load();
+		const forks: [string, string][] = [];
+		const fork = async (entryId: string, options: { position: string }) => {
+			forks.push([entryId, options.position]);
+			return { cancelled: false };
+		};
+		await pi.command("aas-gate-fork", "41c51822 at", { fork });
+		await pi.command("aas-gate-fork", " 343ba349   before ", { fork });
+		assert.deepEqual(forks, [
+			["41c51822", "at"],
+			["343ba349", "before"],
+		]);
+		assert.equal(pi.notes.length, 0);
+	});
+
+	test("/aas-gate-fork reports why it did not fork", async () => {
+		const pi = load();
+		await pi.command("aas-gate-fork", "nope at", {
+			fork: async () => {
+				throw new Error("Invalid entry ID for forking");
+			},
+		});
+		await pi.command("aas-gate-fork", "41c51822 at", { fork: async () => ({ cancelled: true }) });
+		await pi.command("aas-gate-fork", "41c51822 sideways", {});
+		await pi.command("aas-gate-fork", "", {});
+		assert.deepEqual(
+			pi.reports().map((r) => [r.event, r.error]),
+			[
+				["forkFailed", "Invalid entry ID for forking"],
+				["forkFailed", "an extension cancelled the fork"],
+				["forkFailed", 'usage: /aas-gate-fork <entryId> <at|before>, got "41c51822 sideways"'],
+				["forkFailed", 'usage: /aas-gate-fork <entryId> <at|before>, got ""'],
+			],
+		);
+		assert.ok(pi.reports().every((r) => r.v === 1));
 	});
 });

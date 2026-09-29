@@ -542,9 +542,12 @@ async fn supervise(
         stderr_tail: s.tail.lock().to_string_lossy(),
         exited_at_ms: now_ms(),
     };
-    tracing::info!(pid = s.pid, label = %s.label, outcome = %info.describe(), "supervised process ended");
+    // The bookkeeping is settled before the end is announced (the log line and `ExitInfo`):
+    // whoever learns that the process ended — a waiter, or a reader of the log — finds it
+    // gone from the ledger and from `running_count`.
     s.ledger.remove(s.pid);
     s.running.fetch_sub(1, Ordering::SeqCst);
+    tracing::info!(pid = s.pid, label = %s.label, outcome = %info.describe(), "supervised process ended");
     exit_tx.send_replace(Some(info));
     #[cfg(windows)]
     drop(tree);

@@ -1,0 +1,5 @@
+{"c":{"method":"initialize","recId":"1","params":{"capabilities":{"experimentalApi":true,"requestAttestation":false}}}}
+{"s":{"id":1,"result":{"userAgent":"agent-app-server/0.148.0 (Windows 10.0.26200; x86_64) WindowsTerminal (agent-app-server; 0.1.0)","codexHome":"C:\\Users\\USER\\.codex","platformFamily":"windows","platformOs":"windows"}},"respondsTo":"1"}
+{"c":{"method":"initialized"}}
+{"c":{"method":"thread/fork","recId":"18","params":{"threadId":"01a0e93f-b44a-7780-9cf4-c8ca66db79c3","lastTurnId":"019999ff-0000-7000-8000-000000000000"}}}
+{"s":{"error":{"code":-32600,"message":"lastTurnId '019999ff-0000-7000-8000-000000000000' was not found in the source thread"},"id":18},"respondsTo":"18"}

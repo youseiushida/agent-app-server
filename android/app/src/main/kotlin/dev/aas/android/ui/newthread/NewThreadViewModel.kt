@@ -8,20 +8,27 @@ import dev.aas.android.data.ComposerDrafts
 import dev.aas.android.data.HarnessRepository
 import dev.aas.android.data.ImageUploader
 import dev.aas.android.data.ProjectRepository
+import dev.aas.android.data.SentDrafts
 import dev.aas.android.data.ThreadRepository
+import dev.aas.android.domain.ErrorTexts
 import dev.aas.android.domain.HarnessWait
 import dev.aas.android.domain.NativeSessionHarnesses
 import dev.aas.android.domain.ResultMessages
+import dev.aas.android.domain.composer.ComposerText
 import dev.aas.android.domain.composer.HarnessSettings
 import dev.aas.android.domain.composer.LocalCommand
 import dev.aas.android.domain.composer.Palette
+import dev.aas.android.domain.composer.PaletteAction
 import dev.aas.android.domain.composer.PaletteContext
 import dev.aas.android.domain.composer.PaletteEntry
 import dev.aas.android.domain.composer.SendAction
 import dev.aas.android.domain.composer.SendBlock
 import dev.aas.android.domain.composer.SendLogic
 import dev.aas.android.domain.composer.SendState
+import dev.aas.android.domain.composer.TypedCommand
+import dev.aas.android.domain.composer.TypedCommands
 import dev.aas.android.protocol.Harness
+import dev.aas.android.protocol.InputPart
 import dev.aas.android.protocol.PickerKind
 import dev.aas.android.protocol.Project
 import dev.aas.android.protocol.ProjectDefaults
@@ -42,6 +49,7 @@ import dev.aas.android.ui.composer.ComposerController
 import dev.aas.android.ui.composer.ComposerUiState
 import dev.aas.android.ui.composer.PaletteChoice
 import dev.aas.android.ui.composer.PromptTemplates
+import dev.aas.android.ui.composer.SentDraft
 import dev.aas.android.ui.navigation.NewThreadRoute
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
@@ -84,6 +92,13 @@ data class NewThreadUiState(
 ) {
     /** A worktree needs a git repository (protocol.md `thread/create`). */
     val worktreeAvailable: Boolean get() = project?.git?.isRepo == true
+
+    /**
+     * The chosen harness asks per project whether it may load the project's own resources
+     * (`features.projectTrust`) and the user has not decided for this project yet.
+     */
+    val trustUndecided: Boolean
+        get() = harness?.features?.projectTrust == true && project != null && harness.id !in project.harnessTrust
 }
 
 sealed interface NewThreadEvent {
@@ -101,7 +116,8 @@ sealed interface NewThreadEvent {
  * `thread/create` with `input` starts the first turn at once, and the project's `defaults`
  * become these choices (`project/update`, "前回値を引き継ぐ"): both are committed to the outbox
  * together, in this order, before the answer is awaited, so leaving the screen (offline, the
- * creation is only queued) loses neither.
+ * creation is only queued) loses neither. `/plan <request>` commits plan mode and the request
+ * with the creation the same way (a chain that takes the created thread's id).
  */
 class NewThreadViewModel(
     private val route: NewThreadRoute,
@@ -113,10 +129,12 @@ class NewThreadViewModel(
     drafts: ComposerDrafts,
     uploader: ImageUploader,
     policy: AppPolicy,
-    templates: PromptTemplates,
+    private val templates: PromptTemplates,
     outbox: StateFlow<List<OutboxEntry>>,
     harnesses: HarnessRepository,
+    private val sentDrafts: SentDrafts,
 ) : ViewModel() {
+    private val harnessRepository = harnesses
     private val choices = MutableStateFlow(NewThreadChoices(null, ThreadSettings(), worktree = false, branch = "", baseRef = ""))
     private val creating = MutableStateFlow(false)
 
@@ -176,13 +194,37 @@ class NewThreadViewModel(
     }
 
     init {
-        // `/resume` is offered while some harness can list its sessions.
+        // `/resume` is offered while some harness can list its sessions; `/plan` where the chosen
+        // harness offers the app's plan mode.
         viewModelScope.launch {
-            workspace.map { paletteContext(it) }.distinctUntilChanged().collect { composer.setPaletteContext(it) }
+            combine(workspace, choices) { ws, c -> paletteContext(ws, c.harnessId) }.distinctUntilChanged().collect { composer.setPaletteContext(it) }
         }
     }
 
-    private fun paletteContext(ws: WorkspaceState) = PaletteContext(inThread = false, canImport = NativeSessionHarnesses.canImport(ws.harnesses))
+    private fun paletteContext(ws: WorkspaceState, harnessId: String? = null) = PaletteContext(
+        inThread = false,
+        canImport = NativeSessionHarnesses.canImport(ws.harnesses),
+        planMode = harnessId?.let { id -> ws.harnesses.firstOrNull { it.id == id } }?.features?.planMode != null,
+    )
+
+    /**
+     * The user's decision whether the chosen harness may load this project's own resources
+     * (`features.projectTrust`): asked here, never decided by the app.
+     */
+    fun setTrust(trusted: Boolean) {
+        val ui = state.value
+        val harness = ui.harness ?: return
+        viewModelScope.launch {
+            try {
+                harnessRepository.setTrust(route.projectId, harness.id, trusted)
+                messages.show(UiText.of(if (trusted) R.string.trust_saved_yes else R.string.trust_saved_no, harness.displayName))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                messages.show(UiText.of(R.string.error_local_store, e.message ?: e.javaClass.simpleName))
+            }
+        }
+    }
 
     /** 再確認: `harness/refresh` of one harness, or of all when [harnessId] is `null`. */
     fun refreshHarness(harnessId: String?) = refresher.refresh(viewModelScope, harnessId)
@@ -255,7 +297,7 @@ class NewThreadViewModel(
             } catch (e: NotConnectedException) {
                 CommandsState.Offline
             } catch (e: RpcException) {
-                CommandsState.Failed(UiText.of(R.string.error_server, e.error.message))
+                CommandsState.Failed(ErrorTexts.server(e.error))
             } catch (e: Exception) {
                 CommandsState.Failed(requestFailed(e))
             }
@@ -270,10 +312,11 @@ class NewThreadViewModel(
             // Thread commands do not exist before the thread (the daemon does not list them here).
             is PaletteChoice.Method -> messages.show(UiText.of(R.string.palette_needs_thread))
             is PaletteChoice.Local -> when (choice.command) {
-                // Inserted by the composer.
-                LocalCommand.Review, LocalCommand.Init -> Unit
+                // Inserted by the composer (sending runs `/plan` with its request).
+                LocalCommand.Review, LocalCommand.Init, LocalCommand.Plan -> Unit
                 LocalCommand.Resume -> resume()
-                LocalCommand.New, LocalCommand.Status, LocalCommand.Rename, LocalCommand.Pin -> messages.show(UiText.of(R.string.palette_needs_thread))
+                LocalCommand.New, LocalCommand.Status, LocalCommand.Rename, LocalCommand.Pin, LocalCommand.Btw ->
+                    messages.show(UiText.of(R.string.palette_needs_thread))
             }
             is PaletteChoice.Unsupported -> messages.show(UiText.of(R.string.palette_unsupported_type, choice.type))
         }
@@ -283,20 +326,126 @@ class NewThreadViewModel(
      * `thread/create` with the first message, and the choices as the project's defaults. The
      * draft leaves the composer at once (the requests are in the outbox); offline, the thread is
      * created when the connection is back. It comes back (text, mentions and images) when the
-     * request cannot be queued or the daemon refuses it; never once the thread exists.
+     * request cannot be queued or the daemon refuses it — to this composer; a `/plan` request
+     * refused after the thread exists comes back in that thread's composer.
      */
     fun create() {
-        if (Palette.isResume(composer.textValue.text)) {
+        val text = composer.textValue.text
+        if (Palette.isResume(text)) {
             // Typed out instead of chosen: the app's `/resume`, never sent to the harness.
             composer.setText("")
             resume()
             return
         }
+        TypedCommands.split(text)?.let { (name, args) ->
+            if (name in LocalCommand.New.names) {
+                // `/new`, `/clear`, `/reset`: this is a new conversation already; what follows stays.
+                composer.setText(args)
+                messages.show(UiText.of(R.string.newthread_already_new, name))
+                return
+            }
+        }
         val ui = state.value
         val harness = ui.harness ?: return
         if (!ui.send.enabled || creating.value) return
+        val typed = composer.typedCommand(Palette.protocolAppCommands(harness, inThread = false))
+        if (typed != null) {
+            runTyped(typed)
+            return
+        }
         val input = composer.input()
         if (input.isEmpty()) return
+        start(input, composer.sentDraft(), plan = false)
+    }
+
+    /**
+     * The app's command the first message starts with (docs/android.md 25章 「打ったコマンド」):
+     * `/plan <request>` creates the thread in plan mode with the request as its first message, the
+     * prompt templates start it with their text, `/model` and `/effort` choose from the harness's
+     * lists (the picker without an argument or with one the lists do not have), the permission
+     * picker opens; the thread's own commands wait for the thread.
+     */
+    private fun runTyped(typed: TypedCommand) {
+        val args = typed.args
+        when (val action = typed.entry.action) {
+            is PaletteAction.Local -> when (action.command) {
+                LocalCommand.Plan -> {
+                    val draft = composer.draftWith(args)
+                    val input = ComposerText.input(args, draft.mentions, draft.images.map { it.image.blobId })
+                    if (input.isEmpty()) {
+                        messages.show(UiText.of(R.string.newthread_plan_needs_request))
+                        return
+                    }
+                    start(input, composer.sentDraft(), plan = true)
+                }
+                LocalCommand.Review, LocalCommand.Init -> {
+                    val template = if (action.command == LocalCommand.Review) templates.review else templates.init
+                    val text = if (args.isEmpty()) template else ComposerText.appendParagraph(template, args)
+                    val draft = composer.draftWith(text)
+                    start(ComposerText.input(text, draft.mentions, draft.images.map { it.image.blobId }), composer.sentDraft(), plan = false)
+                }
+                LocalCommand.Resume -> resume()
+                LocalCommand.New, LocalCommand.Status, LocalCommand.Rename, LocalCommand.Pin, LocalCommand.Btw ->
+                    messages.show(UiText.of(R.string.palette_needs_thread))
+            }
+            is PaletteAction.Picker -> {
+                composer.setText("")
+                pick(action.kind, args)
+            }
+            // Thread commands do not exist before the thread (the daemon does not list them here).
+            is PaletteAction.Method -> messages.show(UiText.of(R.string.palette_needs_thread))
+            is PaletteAction.Insert -> composer.setText(action.text)
+            is PaletteAction.Unsupported -> messages.show(UiText.of(R.string.palette_unsupported_type, action.type))
+        }
+    }
+
+    /** `/model <id>` and `/effort <level>` of the new thread (see [runTyped]). */
+    private fun pick(kind: PickerKind, args: String) {
+        val harness = state.value.harness
+        if (args.isEmpty() || harness == null) {
+            viewModelScope.launch { events.send(NewThreadEvent.OpenPicker(kind)) }
+            return
+        }
+        val settings = choices.value.settings
+        when (kind) {
+            PickerKind.Model -> {
+                val model = harness.models.firstOrNull { it.id == args || it.displayName.equals(args, ignoreCase = true) }
+                if (model == null) {
+                    messages.show(UiText.of(R.string.typed_model_unknown, args))
+                    viewModelScope.launch { events.send(NewThreadEvent.OpenPicker(kind)) }
+                } else {
+                    // An effort the new model does not offer is dropped (the harness default applies).
+                    val effort = settings.effort?.takeIf { e -> HarnessSettings.effortLevels(harness, model.id).any { it.id == e } }
+                    setModel(model.id, effort)
+                }
+            }
+            PickerKind.Effort -> {
+                val level = HarnessSettings.effortLevels(harness, HarnessSettings.model(harness, settings)?.id)
+                    .firstOrNull { it.id == args || it.label.equals(args, ignoreCase = true) }
+                if (level == null) {
+                    messages.show(UiText.of(R.string.typed_effort_unknown, args))
+                    viewModelScope.launch { events.send(NewThreadEvent.OpenPicker(kind)) }
+                } else {
+                    setModel(settings.model, level.id)
+                }
+            }
+            PickerKind.PermissionMode, PickerKind.Unknown -> viewModelScope.launch { events.send(NewThreadEvent.OpenPicker(kind)) }
+        }
+    }
+
+    /**
+     * `thread/create` with [input] as the first message and the choices as the project's
+     * defaults. With [plan] (`/plan`), the thread is created without input and plan mode
+     * (`thread/update { modes }`) and the request (its first `turn/start`) follow it as one chain
+     * ([ThreadRepository.createInPlanMode]; `thread/create` takes no modes). Everything is
+     * committed before anything is awaited, so leaving the screen while the creation waits (or
+     * the process ending) loses none of it. [draft] comes back to the composer when the creation
+     * cannot be queued, is refused ([SentDrafts.followCreation], also after this screen is gone)
+     * or is taken back ([discardCreation]).
+     */
+    private fun start(input: List<InputPart>, draft: SentDraft, plan: Boolean) {
+        val ui = state.value
+        val harness = ui.harness ?: return
         val c = ui.choices
         val settings = c.settings.takeIf { it != ThreadSettings() }
         val workspace = if (c.worktree && ui.worktreeAvailable) {
@@ -304,7 +453,6 @@ class NewThreadViewModel(
         } else {
             WorkspaceSpec.Local
         }
-        val draft = composer.sentDraft()
         val defaults = ProjectDefaults(harness.id, c.settings.model, c.settings.effort, c.settings.permissionMode)
         creating.value = true
         if (!status.value.isOnline) messages.show(UiText.of(R.string.newthread_queued))
@@ -317,8 +465,13 @@ class NewThreadViewModel(
                 // right after sending must not keep the defaults from being queued behind it.
                 val creation = try {
                     withContext(NonCancellable) {
-                        val pending = threads.create(route.projectId, harness.id, settings, workspace, input)
+                        val (pending, request) = if (plan) {
+                            threads.createInPlanMode(route.projectId, harness.id, settings, workspace, input).let { it.creation to it.request }
+                        } else {
+                            threads.create(route.projectId, harness.id, settings, workspace, input) to null
+                        }
                         creatingId.value = pending.clientRequestId
+                        sentDrafts.followCreation(ComposerDrafts.newThreadKey(route.projectId), pending, request, draft.toDraft())
                         queueDefaults(defaults)
                         pending
                     }
@@ -333,10 +486,15 @@ class NewThreadViewModel(
                 try {
                     events.send(NewThreadEvent.Created(creation.await().thread.id))
                 } catch (e: RpcException) {
-                    // The shell reports the definitive failure; the message comes back to edit.
-                    composer.restore(draft)
+                    // The shell reports the definitive failure; the message comes back to edit
+                    // through SentDrafts.followCreation.
                 } catch (e: OutboxClearedException) {
+                    // Taken back (discardCreation), or unpaired meanwhile.
                     composer.restore(draft)
+                } catch (e: IllegalArgumentException) {
+                    // An answer of another shape than protocol.md's (SerializationException is
+                    // one): the thread exists, but this screen cannot tell which one to open.
+                    messages.show(requestFailed(e))
                 }
             } finally {
                 creating.value = false

@@ -1,8 +1,10 @@
 //! Claude Code's own session transcripts (`<config>/projects/<dir>/<sessionId>.jsonl`).
 //!
 //! Sessions are matched to a working directory by the `cwd` recorded *inside* each
-//! transcript; the directory names are never decoded. Turns are grouped by the explicit
-//! `promptId` of user entries. Unknown entry types are skipped and counted.
+//! transcript; the directory names are never decoded. A turn begins with the prompt of a new
+//! `turnPosition.turnIndex` (Claude Code 2.1.284 writes it on every prompt; a fork keeps it
+//! while it gives every copied prompt the same `promptId`), and in transcripts without it with a
+//! new `promptId`. Unknown entry types are skipped and counted.
 //!
 //! Failures are reported, never turned into an empty result: a projects folder that cannot
 //! be read fails the listing; a project folder or transcript that cannot be read is skipped
@@ -22,6 +24,20 @@ use aas_harness::{
 use serde_json::Value;
 
 use crate::mapping::{self, TaskList, ToolClass, ToolResult};
+
+/// The steer Claude Code took into a running turn: an `attachment` of type `queued_command`
+/// with `commandMode: "prompt"` and `origin.kind: "human"` (recording a1: the steer is no user
+/// entry of its own). Its `prompt` is the message.
+fn steer_text(entry: &Value) -> Option<String> {
+    let attachment = entry.get("attachment")?;
+    let steer = str_of(attachment, "type") == Some("queued_command")
+        && str_of(attachment, "commandMode") == Some("prompt")
+        && attachment.pointer("/origin/kind").and_then(Value::as_str) == Some("human");
+    if !steer {
+        return None;
+    }
+    str_of(attachment, "prompt").map(str::to_owned)
+}
 use crate::time::parse_rfc3339_millis;
 
 /// `CLAUDE_CONFIG_DIR`, or `~/.claude`.
@@ -295,26 +311,38 @@ pub fn find_transcript(
     Ok(None)
 }
 
-/// Parses a transcript into turns and items.
-pub fn read_history(path: &Path, policy: &AdapterPolicy) -> Result<NativeHistory, AdapterError> {
+/// Parses a transcript into turns and items, with each turn's anchor: the `uuid` of its last
+/// main-thread entry among its prompt, its `assistant` entries and its tool results (the anchor
+/// the live session reports, `mapping::turn_anchor`).
+pub fn read_history(
+    path: &Path,
+    policy: &AdapterPolicy,
+) -> Result<(NativeHistory, Vec<Option<Value>>), AdapterError> {
     let entries = lines(path)
         .map_err(|e| AdapterError::Other(format!("cannot read {}: {e}", path.display())))?;
     let mut history = NativeHistory::default();
+    let mut anchors: Vec<Option<Value>> = Vec::new();
     let mut custom_title = None;
     let mut ai_title = None;
     let mut summary = None;
     let mut first_prompt: Option<String> = None;
     let mut current_prompt: Option<String> = None;
+    let mut current_turn_index: Option<u64> = None;
     let mut turn: Option<HistoryTurn> = None;
+    let mut anchor: Option<String> = None;
     // tool_use id → (index of the item in the current turn or None for plan tools, name, input)
     let mut tools: HashMap<String, (Option<usize>, String, Value)> = HashMap::new();
     let mut tasks = TaskList::default();
     let mut plan_index: Option<usize> = None;
     let mut skipped: HashMap<String, usize> = HashMap::new();
 
-    let flush = |turn: &mut Option<HistoryTurn>, history: &mut NativeHistory| {
+    let flush = |turn: &mut Option<HistoryTurn>,
+                 anchor: &mut Option<String>,
+                 history: &mut NativeHistory,
+                 anchors: &mut Vec<Option<Value>>| {
         if let Some(t) = turn.take() {
             history.turns.push(t);
+            anchors.push(anchor.take().map(|uuid| mapping::turn_anchor(&uuid)));
         }
     };
 
@@ -338,14 +366,21 @@ pub fn read_history(path: &Path, policy: &AdapterPolicy) -> Result<NativeHistory
                     continue;
                 };
                 let prompt_id = str_of(&v, "promptId").map(str::to_owned);
+                let turn_index = v.pointer("/turnPosition/turnIndex").and_then(Value::as_u64);
                 if let Some(text) = prompt_text(message) {
-                    let new_turn =
-                        turn.is_none() || prompt_id.is_none() || prompt_id != current_prompt;
+                    let new_turn = match turn_index {
+                        Some(index) => turn.is_none() || current_turn_index != Some(index),
+                        None => {
+                            turn.is_none() || prompt_id.is_none() || prompt_id != current_prompt
+                        }
+                    };
                     if new_turn {
-                        flush(&mut turn, &mut history);
+                        flush(&mut turn, &mut anchor, &mut history, &mut anchors);
                         tools.clear();
                         plan_index = None;
                         current_prompt = prompt_id;
+                        current_turn_index = turn_index;
+                        anchor = str_of(&v, "uuid").map(str::to_owned);
                         if first_prompt.is_none() {
                             first_prompt = Some(text.clone());
                         }
@@ -382,6 +417,11 @@ pub fn read_history(path: &Path, policy: &AdapterPolicy) -> Result<NativeHistory
                     .iter()
                     .filter(|b| str_of(b, "type") == Some("tool_result"))
                     .collect();
+                if !results.is_empty()
+                    && let Some(uuid) = str_of(&v, "uuid")
+                {
+                    anchor = Some(uuid.to_owned());
+                }
                 let structured = if results.len() == 1 {
                     v.get("toolUseResult").cloned()
                 } else {
@@ -432,6 +472,9 @@ pub fn read_history(path: &Path, policy: &AdapterPolicy) -> Result<NativeHistory
                 let Some(t) = turn.as_mut() else { continue };
                 if let Some(ts) = ts {
                     t.completed_at = Some(ts);
+                }
+                if let Some(uuid) = str_of(&v, "uuid") {
+                    anchor = Some(uuid.to_owned());
                 }
                 let blocks = v
                     .pointer("/message/content")
@@ -492,8 +535,20 @@ pub fn read_history(path: &Path, policy: &AdapterPolicy) -> Result<NativeHistory
                     });
                 }
             }
-            "attachment"
-            | "queue-operation"
+            "attachment" => {
+                if let (Some(text), Some(t)) = (steer_text(&v), turn.as_mut()) {
+                    t.items.push(HistoryItem {
+                        body: ItemBody::UserMessage {
+                            text,
+                            attachments: Vec::new(),
+                            mentions: Vec::new(),
+                            delivery: UserMessageDelivery::Steer,
+                        },
+                        status: ItemStatus::Completed,
+                    });
+                }
+            }
+            "queue-operation"
             | "atis-latch"
             | "last-prompt"
             | "cost-state"
@@ -504,7 +559,7 @@ pub fn read_history(path: &Path, policy: &AdapterPolicy) -> Result<NativeHistory
             other => *skipped.entry(other.to_owned()).or_default() += 1,
         }
     }
-    flush(&mut turn, &mut history);
+    flush(&mut turn, &mut anchor, &mut history, &mut anchors);
     if !skipped.is_empty() {
         tracing::debug!(path = %path.display(), ?skipped, "skipped unknown transcript entry types");
     }
@@ -515,7 +570,7 @@ pub fn read_history(path: &Path, policy: &AdapterPolicy) -> Result<NativeHistory
         first_prompt.as_deref(),
         policy,
     );
-    Ok(history)
+    Ok((history, anchors))
 }
 
 #[cfg(test)]
@@ -663,7 +718,7 @@ mod tests {
     fn reads_history_grouped_by_prompt_id() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_transcript(dir.path(), "a", "s1", &sample("C:\\Work\\Proj", "s1"));
-        let h = read_history(&path, &AdapterPolicy::default()).unwrap();
+        let (h, _) = read_history(&path, &AdapterPolicy::default()).unwrap();
         assert_eq!(h.title.as_deref(), Some("Note creation"));
         assert_eq!(h.turns.len(), 2);
         let t0 = &h.turns[0];
@@ -689,6 +744,80 @@ mod tests {
         );
         // The interrupt marker belongs to prompt p2 and does not open a turn.
         assert_eq!(h.turns[1].items.len(), 1);
+    }
+
+    /// A forked transcript of Claude Code 2.1.284 (recording g2, shortened): every copied prompt
+    /// has the fork's new `promptId`, and `turnPosition` still tells the turns apart. Each turn's
+    /// anchor is the uuid of its last main-thread entry.
+    #[test]
+    fn forked_transcripts_keep_their_turns_and_anchors() {
+        use serde_json::json;
+        let prompt = |uuid: &str, parent: Option<&str>, n: u64, text: &str| {
+            json!({"parentUuid": parent, "isSidechain": false, "promptId": "a0179e95", "type": "user",
+                "message": {"role": "user", "content": text}, "uuid": uuid, "origin": {"kind": "human"},
+                "turnPosition": {"promptIndex": n, "turnIndex": n}, "cwd": "C:\\w", "sessionId": "5ede89bd",
+                "timestamp": format!("2026-09-28T18:33:4{n}.000Z")})
+        };
+        let assistant = |uuid: &str, parent: &str, text: &str| {
+            json!({"parentUuid": parent, "isSidechain": false, "type": "assistant", "uuid": uuid,
+                "message": {"id": format!("m-{uuid}"), "content": [{"type": "text", "text": text}]}})
+        };
+        let lines = vec![
+            json!({"type": "queue-operation", "operation": "enqueue", "sessionId": "5ede89bd"}),
+            prompt("2d328301", None, 1, "Word one is APPLE."),
+            json!({"parentUuid": "2d328301", "type": "attachment", "uuid": "c24660e1", "attachment": {"type": "date"}}),
+            json!({"parentUuid": "c24660e1", "isSidechain": false, "type": "assistant", "uuid": "1b87658f",
+                "message": {"id": "m1", "content": [{"type": "thinking", "thinking": "", "signature": "sig"}]}}),
+            assistant("cffd151b", "1b87658f", "OK1"),
+            prompt("834ee69c", Some("cffd151b"), 2, "Word two is BANANA."),
+            json!({"parentUuid": "834ee69c", "isSidechain": false, "type": "assistant", "uuid": "t2use",
+                "message": {"id": "m2", "content": [{"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": "sleep 12"}}]}}),
+            json!({"parentUuid": "t2use", "isSidechain": false, "promptId": "a0179e95", "type": "user", "uuid": "t2res",
+                "message": {"role": "user", "content": [{"tool_use_id": "tu1", "type": "tool_result", "content": "ok"}]},
+                "toolUseResult": {"stdout": "ok", "stderr": "", "interrupted": false}}),
+            // A message the turn took at its tool boundary (recording a1's shape).
+            json!({"parentUuid": "t2res", "isSidechain": false, "type": "attachment", "uuid": "93bdf902",
+                "attachment": {"type": "queued_command", "prompt": "Add PINEAPPLE at the end.", "source_uuid": "74d8e49b",
+                    "commandMode": "prompt", "origin": {"kind": "human"}, "humanTurn": true}}),
+            // Another kind of queued command is not the user's message.
+            json!({"parentUuid": "93bdf902", "isSidechain": false, "type": "attachment", "uuid": "q2",
+                "attachment": {"type": "queued_command", "prompt": "<task-notification>", "commandMode": "task-notification"}}),
+            assistant("018cc139", "q2", "OK2 PINEAPPLE"),
+            // A subagent's entry is never an anchor.
+            json!({"parentUuid": "018cc139", "isSidechain": true, "type": "assistant", "uuid": "side",
+                "message": {"id": "m3", "content": [{"type": "text", "text": "inner"}]}}),
+            prompt("8b2ad96a", Some("018cc139"), 3, "List every word."),
+            json!({"type": "last-prompt", "leafUuid": "8b2ad96a"}),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_transcript(dir.path(), "a", "5ede89bd", &lines);
+        let (h, anchors) = read_history(&path, &AdapterPolicy::default()).unwrap();
+        assert_eq!(h.turns.len(), 3);
+        let anchors: Vec<Option<&str>> = anchors
+            .iter()
+            .map(|a| a.as_ref().and_then(mapping::anchor_uuid))
+            .collect();
+        // The last turn has no answer yet: its prompt is its anchor.
+        assert_eq!(
+            anchors,
+            [Some("cffd151b"), Some("018cc139"), Some("8b2ad96a")]
+        );
+        let steers: Vec<&str> = h.turns[1]
+            .items
+            .iter()
+            .filter_map(|i| match &i.body {
+                ItemBody::UserMessage {
+                    text,
+                    delivery: UserMessageDelivery::Steer,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steers, ["Add PINEAPPLE at the end."]);
+        assert!(
+            matches!(&h.turns[1].items[1].body, ItemBody::CommandExecution { output, .. } if output == "ok")
+        );
     }
 
     #[test]

@@ -29,6 +29,8 @@
   - 送信待ちの入力（キュー）の編集、削除、今すぐ反映
   - エージェントが自発的に始めたターンの記録、ハーネスが付けたタイトルの反映
   - バックグラウンド作業（ハーネスがターンの外で動かすサブエージェント、シェル、ワークフロー、監視、予約した起床など）の表示、プロセスの保持、個別の停止（5.6）
+  - ハーネスの拡張機能の中継（9.6）: 途中のターンからの fork、スレッド名とネイティブセッションの名前の双方向の反映、プランモードと高速モード、ハーネスが自分で変えた権限モードなどの反映、ハーネス自身の状態、会話に入らない質問、実行中の作業のバックグラウンドへの移動、プロジェクトの信頼の判断、入力欄へのテキスト
+  - 手で打ったセッション切り替えのコマンドの拒否と、ハーネスが自分でセッションを替えたことの通知（9.5）
   - worktree モード
   - git ベースのターン差分とスレッド差分
   - `@` メンション用のファイル検索、画像の添付（blob）
@@ -38,8 +40,8 @@
 - Android アプリ
   - ペアリング（QR / 手入力）
   - プロジェクト一覧とスレッド一覧（状態、未読、要対応）
-  - スレッド画面（ストリーミング表示）
-  - Composer（`/` コマンド（アプリの `/resume` を含む）、`@` メンション、画像、モデル・推論量（ハーネスが挙げるもの。Claude Code の `ultracode` を含む）・権限のピッカー、実行中の送信を steer か queue で選ぶ、中断）
+  - スレッド画面（ストリーミング表示、ターンごとの「ここから分岐」「このプロンプトを編集」、提案されたプランの実装、実行中の作業の「裏に回す」）
+  - Composer（`/` コマンド（アプリの `/resume`・`/plan`・`/btw` を含む。最初の語がアプリのコマンドなら送らずに実行する）、`@` メンション、画像、モデル・推論量（ハーネスが挙げるもの。Claude Code の `ultracode` を含む）・権限のピッカー、実行中の送信を steer か queue で選ぶ、中断）
   - 承認と質問（アプリ内と通知アクション）
   - バックグラウンドの作業（スレッドの「バックグラウンド」の区域で一覧・進捗・結果、個別の停止、終わりの通知。5.6）
   - 差分ビューア（ターン単位とスレッド単位）
@@ -52,13 +54,13 @@
 |---|---|
 | チャットごとの対話的ターミナル（PTY）、ユーザーが直接実行するシェル（Codex の `!`（`thread/shellCommand`）、pi の `bash`） | Android 側にターミナルエミュレータの実装が必要で、規模が本体と同程度になる。スマホのキーボードでのシェル操作は実用的でなく、エージェントに頼めば実行できる。プロトコルは `method` を足すだけで拡張できる |
 | git の書き込み操作の UI（ハンク・ファイル単位の stage / unstage / 戻す、ターン差分の「元に戻す / 再適用」、commit、push、PR の作成・マージ、ブランチの切り替え） | エージェントに頼めば実行できる。スマホでの誤操作は取り返しがつきにくい。閲覧（差分ビューア）は含む。daemon が git に書き込むのは、スナップショット用の一時 index と ref（10.1）、worktree の作成と削除、init と clone だけ |
-| 会話の巻き戻し（Codex の `thread/rollback`） | ファイルは戻らず会話だけが巻き戻るので、作業ツリーと履歴が食い違う。ファイルを戻すのは git の書き込み操作（上の行）と同じ理由で持たない |
-| スレッドのゴール（Codex の `/goal`）、MCP サーバの状態表示（`/mcp`） | ハーネス固有の機能で、ハーネスをまたいで正規化できるシグナルがない。アダプタがハーネスのコマンドとして公開すれば、`command/list` の `insertText` として使える |
+| 同じスレッドの中での会話の巻き戻し（Codex の `thread/rollback`、Claude Code の `/rewind` の会話の部分、Codex の前のプロンプトの編集） | ファイルは戻らず会話だけが巻き戻るので、作業ツリーと履歴が食い違い、スレッドのターン・差分・Interaction もエージェントの持っていない会話を指すことになる。代わりに途中のターンからの fork（「ここから分岐」「このプロンプトを編集」。9.6）で、そのターンまでの会話を新しいスレッドとして続ける。ファイルを戻すのは下の「ファイルの巻き戻し」の行のとおり持たない |
+| MCP サーバの状態表示（Codex の `/mcp`） | ハーネス固有の機能で、ハーネスをまたいで正規化できるシグナルがない。結果を出す場所の設計も要る。アダプタがハーネスのコマンドとして公開すれば、`command/list` の `insertText` として使える（Codex の `/goal` はこの形で、アダプタのコマンドとして中継する） |
 | ブロックしない質問の自動クローズ（カウントダウン） | 締め切りを正規化して報告するハーネスがない。アプリが独自に時間を計ると、ハーネスの実際の状態と食い違う推測になる。ハーネスが質問を取り下げれば `interaction/expired`（`harnessCancelled`）で閉じる |
-| クラウド実行、スケジュールタスク（desktop の automations。daemon が自分で予定を持って入力を送るもの。ハーネスが自分で予約した起床は 5.6 のとおり中継する）、音声入力（アプリ独自のもの。OS の IME の音声入力は使える）、ブラウザパネル、Computer Use、画像生成、ChatGPT のチャットやメモリ、プラグインのマーケット、高速モード・パーソナリティなど特定のサービスに依存する desktop の機能 | 「自宅 PC のエージェントを外から確実に操作する」という目的から外れる |
+| クラウド実行、スケジュールタスク（desktop の automations。daemon が自分で予定を持って入力を送るもの。ハーネスが自分で予約した起床は 5.6 のとおり中継する）、音声入力（アプリ独自のもの。OS の IME の音声入力は使える）、ブラウザパネル、Computer Use、画像生成、ChatGPT のチャットやメモリ、プラグインのマーケット、パーソナリティなど特定のサービスに依存する desktop の機能（高速モードは、ハーネスがモデルごとに明示するものだけをスレッドのモードとして中継する。9.6） | 「自宅 PC のエージェントを外から確実に操作する」という目的から外れる |
 | 複数のソースフォルダを持つプロジェクト、リモートホストの選択 | daemon は 1 台の PC だけを扱う。多くのハーネスは作業フォルダ（cwd）を 1 つしか扱えない |
-| サイドチャット、タブ、ペイン、新しいウィンドウ（desktop の画面構成） | スマホの単一カラムの画面では意味がない。新しいスレッドで続ける |
-| 自動レビュー（Codex の guardian と `/approve`） | Codex 固有で、ハーネスをまたいだ形では実現できない。Codex のスレッドでは「代わりに承認」に当たる権限モード（`auto`）として選べる（docs/adapters/codex.md 5章） |
+| サイドチャット、タブ、ペイン、新しいウィンドウ（desktop の画面構成） | スマホの単一カラムの画面では意味がない。新しいスレッドで続ける。ハーネスの「会話に入らない質問」（Claude Code の `/btw`）は画面構成ではなくハーネスの機能なので、`thread/sideQuestion` で中継する（9.6） |
+| 自動レビュー（Codex の guardian と `/approve`）の拒否の表示と、拒否を覆すこと | 利用者は Full access で使っていて自動レビューを通らない。拒否を知らせる通知（`item/autoApprovalReview/*`）は Codex 自身が UNSTABLE と明記していて、形が版ごとに変わりうる。Codex のスレッドでは「代わりに承認」に当たる権限モード（`auto`）として選べ、拒否された操作の Item は `declined` として見える（docs/adapters/codex.md 5章） |
 | Sources パネル（参照した情報源の一覧） | 情報源を正規化して報告するハーネスの共通のシグナルがなく、Item の本文や URL から拾い集めるのはヒューリスティックになる。検索・取得は toolCall（category `search` / `fetch`）の Item として会話に出る |
 | 差分ビューアの git blame、定義へ移動、リッチプレビュー（PDF など） | スマホでの差分の確認の範囲を超える。PC で見る |
 | 会話のエクスポート（pi の `export_html` など） | 会話はイベントログとアプリの端末 DB に残り、ハーネスのセッションファイルも PC にある。スマホから別形式で書き出す用途がない |
@@ -66,26 +68,32 @@
 | ハーネスの CLI のログイン（認証）をアプリから行うこと | 認証は CLI ごとにブラウザや端末での対話が必要で、資格情報をスマホと daemon に通すことになる。PC で一度ログインしておく前提で、ログインが必要なら `harness/list` の `unavailableReason`・`adapterError` と `doctor` で知らせる |
 | iOS | 利用者は Android。iOS はバックグラウンド接続を保持できず、設計の前提（常時接続）が変わる |
 | 複数ユーザー | 自分専用。デバイスは複数登録できるが、利用者は1人という前提 |
-| 途中のターンからの fork（`thread/fork` の `atTurnId` に最後以外のターンを指定） | 各ハーネスのネイティブ fork はセッション全体を複製するもので、途中の時点を指定する共通の手段がない。履歴の表示と実体がずれるのを避けるため、`capabilityUnsupported`（`data.capability = "forkAtTurn"`）を返す |
+| ファイルの巻き戻し（Claude Code の `rewind_files`、Devin の `revert/execute`、Codex の `thread/revert`） | どれもハーネスの内部の、または実験的な仕組み（Claude Code は起動時の環境変数が要り、Codex は experimental）で、版ごとに追いかける保守が重い。会話の巻き戻しは途中のターンからの fork で代わりになり（9.6）、ファイルはエージェントに頼むか git で戻せる。どうしても要るなら、ハーネスの仕組みではなく daemon 自身のターンのスナップショット（10.1）から戻す形で足す |
+| `/review` の対象を選ぶ画面（ブランチやコミットの一覧から選ぶ Codex の `review/start` の `baseBranch` / `commit`） | 未コミットの変更と、文で書いた指示（Codex の `review/start` の `custom`）で足りる。ブランチやコミットを一覧する API と選択の画面が要り、git の閲覧の範囲を広げることになる |
 | エージェントが自発的に始めたターンのターン差分 | 開始はアダプタからの `TurnStarted` で初めて分かり、その時点で作業が始まっている可能性がある。開始前の作業ツリーを記録できないので、誤った差分を出さないために持たない（スレッド差分には含まれる） |
 | Job Object の外で起動されたプロセスの管理（WMI の `Win32_Process.Create`、タスクスケジューラ、COM / DDE のサーバ、既に動いているアプリへの ShellExecute、サービス） | これらのプロセスは OS の部品（`WmiPrvSE.exe`、タスクスケジューラのサービス、DCOM の起動サービス、既存のアプリ、サービスコントロールマネージャ）が作るので、エージェントのプロセスツリーにも job にも入らず、親子関係からも辿れない。エージェントが起動したと言える明示的なシグナルがなく、コマンドラインや時刻で結び付けるのはヒューリスティックになる。daemon の対応は 4.9 |
-| スレッドの中でネイティブセッションを切り替えるハーネスのコマンド（Claude Code の `/clear`、各 CLI の `/resume`、pi の `/new`・`/fork`・`/clone`・`/tree`） | 1つのスレッドは1つのネイティブセッションに対応する（3章）。動いているプロセスの中でセッションが替わると、スレッドの履歴・ターン・差分・Interaction が、エージェントがもう持っていない会話を指すことになる。`command/list` に出さない（9.5）。別のセッションを続けたいときは、アプリの `/resume`（PC のセッションの取り込み）で、そのセッションを別のスレッドとして開く |
+| スレッドの中でネイティブセッションを切り替えるハーネスのコマンド（Claude Code の `/clear` とその別名 `reset`・`new`、`/resume`・`/continue`、各 CLI の `/resume`、pi の `/new`・`/import`・`/fork`・`/clone`・`/tree`） | 1つのスレッドは1つのネイティブセッションに対応する（3章）。動いているプロセスの中でセッションが替わると、スレッドの履歴・ターン・差分・Interaction が、エージェントがもう持っていない会話を指すことになる。`command/list` に出さず、手で打った入力も断る（`sessionSwitchingCommand`。9.5）。アプリは `/clear`・`/reset` を自分の `/new`（新しいスレッド）として扱う。別のセッションを続けたいときは、アプリの `/resume`（PC のセッションの取り込み）で、そのセッションを別のスレッドとして開く |
 | バックグラウンドタスクをエージェントのプロセスの再起動をまたいで続けること | ハーネスはバックグラウンドタスクをプロセスの外に保存しない（Claude Code のタスクはプロセスの中で動き、Codex のバックグラウンドのターミナルはプロセスと一緒に終わる）。再起動のあとも動いているとみなすのは推定になるので、プロセスとともに終わったものとして理由付きで記録する（`stopped` / `lost`、5.6） |
 | バックグラウンドの作業が終わったときに、ハーネスが自分でしないのに親のエージェントを続けさせること | daemon は利用者が書いていない入力をエージェントに送らない（ハーネスの機能をそのまま中継する）。ハーネスが自分でターンを始めるもの（Claude Code のタスクの通知など）は、エージェント起点のターンとして理由（`trigger`）付きで記録する。続けさせたいときは利用者が送る |
 | ACP のエージェントへの承認のフィードバック文（`denyWithFeedback`） | ACP v1（schema 1.23.0）の `RequestPermissionResponse` は選んだ選択肢（`optionId`）か `cancelled` だけを持ち、自由記述を返す場所がない。独自の `_meta` で送っても、エージェントがそれを読む規約はない。ACP の承認には `denyWithFeedback` の選択肢を出さない |
 | 標準の ACP のエージェントのバックグラウンドの作業 | ACP v1（schema 1.23.0）にも v2 草案（2.0.0-alpha.5。`state_update` は前面の作業だけを表す）にも、ターンの外の作業の開始・終了・一覧を表すシグナルがない。ターンの外に届いた更新は `Native`（`outsideTurn`）で転送し、終わらなかったツール呼び出しはターンの終わりに interrupted にする。独自の拡張で明示的に知らせるエージェントは、その拡張をエージェントが確認したときだけ扱う（Devin。docs/adapters/acp.md 16章） |
 | Devin の休止中のサブエージェントを、動いているものと区別すること | Devin 3000.11.3 は `session/cancel` でバックグラウンドのサブエージェントを終わらせずに休止させ、次のプロンプトで再開させるが、休止を示す信号がない（`_cognition.ai/agent_stopped` に agentId がない）。終わりの信号（`subagent_completed`）が来るまで動いているものとして扱い、プロセスを保持し、`backgroundTask/stop` で止められるようにする（acp.md 16.6） |
+| Devin の前面のサブエージェントをバックグラウンドへ移すこと、戻すこと（`_cognition.ai/subagent/background`・`foreground`。Claude Code の Ctrl+B に当たる。Devin には `moveToBackground` を付けない） | 記録（Devin CLI 3000.11.3）で確かめた。応答は存在しない ID や終わったサブエージェントにも `{}` で、受け付けたことを示さず、移ったことを示す信号もない（`subagent_started` は再び来ず、`isBackground` も変わらない）。`run_subagent` の Item とサブエージェントを結ぶ ID がなく、Item に操作を付けるには文字列で結び付ける推定が要る。移しても `session/prompt` はサブエージェントが終わるまで返らないので会話は空かず、移したサブエージェントの承認の要るツールは自動で拒否される。前面のサブエージェントはターンの一部として扱う（acp.md 17.6） |
 | Devin のバックグラウンドのサブエージェントの会話（発話・思考・ツール呼び出し）の表示 | Item はターンに属し、ターンの外で動くタスクの会話を置く場所がプロトコルにない。root のターンの Item に混ぜると、root の発話と別のエージェントの文を区別できなくなる。スマホには進捗（最後のツール、ツールの回数、トークン数）と終わりの要約（`subagent_completed.summary`）を出す。結果は root がプロンプトの中で答える（acp.md 16.3） |
 | Devin のバックグラウンドのシェルの途中の出力 | Devin は約1秒ごとに出力全体（差分ではない）を `terminalPreview` で送るが、プロトコルにタスクの出力を流す場所がない（起動した Item はバックグラウンドに移った時点で閉じる）。毎秒の全文をイベントログに書くことにもなる。終わったときの出力全体を `result.output` に入れる（acp.md 16.4） |
 | Devin の `run_subagent` の Item と、それが始めたサブエージェントのタスクの結び付け | 2つを結ぶ ID がない（一致するのは title と task の文字列だけで、それで結び付けるのはヒューリスティックになる）。`run_subagent` の Item は Devin の報告どおり completed、タスクは `originItemId` なしで出す |
-| Devin の前面のサブエージェントのバックグラウンドへの移動（`_cognition.ai/subagent/background` / `foreground`） | 実機で記録していない（引数の形も、移ったことを示す信号も分からない）。前面のサブエージェントはターンの一部として扱う |
 | Devin のバックグラウンドの作業のツールの承認 | Devin 3000.11.3 はバックグラウンドのサブエージェントから承認を求めず、事前に許可されていないツールを自動で拒否する（`cognition.ai/rejected`）。中継する要求が来ない。前面で与えたセッション内の許可（`allow_session`）は引き継がれる |
 | Devin の予約した起床（D5） | 実機の記録（3000.11.3。プロンプトの外を最長 290 秒観察）で、Devin は自分からターンを始めず、起床の予約に当たるツールや通知も現れなかった。明示的な信号がないので、`scheduled` のタスクも `trigger` も出さない |
 | pi の拡張が常駐させるリソース（ファイル監視、タイマー（拡張が予約した起床を含む）、ソケット、子プロセスなど）の表示と、それを理由にしたプロセスの保持 | pi 0.85.1 の RPC には、拡張のリソースの存在や寿命を知らせるイベントがない（拡張が `session_start` で作り `session_shutdown` で片付ける、拡張の中だけの約束。pi の rpc.md のイベント一覧にない）。`setStatus` / `setWidget` / `notify` は人間向けの自由文で、状態の判定に使うとヒューリスティックになる。pi 本体にはバックグラウンドの作業も予約した起床もない（pi の README の「No sub-agents」「No background bash」）。拡張がリソースから始める実行には `agent_start` / `agent_settled` という明示的なシグナルがあるので、エージェント起点のターンとして記録し、その間はプロセスを保持する（adapters/pi.md 3章）。アイドル回収でプロセスが止まると常駐リソースも止まり、次の入力でプロセスを起動し直すと拡張が `session_start` から作り直す |
+| pi の拡張のコマンドが、アダプタの知らない名前でセッションを替えるのを、送る前に断ること（pi の docs の例の `handoff` のように、別の名前で `ctx.newSession` / `ctx.fork` / `ctx.switchSession` を呼ぶもの） | pi 0.85.1 の `get_commands` は、コマンドがセッションを替えるかを示さない（名前、説明文、出どころだけ）。説明文や名前から推測するのはヒューリスティックになる。pi の組み込みと同じ名前のもの（`new`、`resume`、`import`、`fork`、`clone`、`tree`）は名前で断る。それ以外は、ターンの終わりに `get_state.sessionId` を比べ、替わったことを `thread/nativeSessionChanged` で知らせ、スレッドの設定（モデル、thinking level）を新しいセッションに付け直す（9.5、adapters/pi.md 3.5） |
+| pi の実行の途中で届いて、実行が終わっても pi に残った steer（`queue_update` の `steering`）を、アプリのキューに戻すこと | pi の `queue_update` と `clear_queue` は残ったメッセージを文だけで返し、アプリのメッセージの ID を持たない。どのメッセージかを文の比較で決めるのはヒューリスティックになり、同じ文のメッセージでは取り違え、添付も戻せない。アダプタは `clear_queue` で捨てて notice（`steerNotDelivered`）で知らせる。実行が終わったあと（`agent_settled` のあと）に届いた steer は pi に送らずにキューに戻す（`SteerReturned`、adapters/pi.md 3.6） |
+| エージェントが動いていない pi のスレッドの、ハーネスの状態（`thread/harnessStatus`） | pi の状態（`get_state`、`get_session_stats`）はセッションを動かしているプロセスが答えるもので、アカウントや CLI 全体の状態はない。プロセスなしで出すには、セッションファイルから pi の集計（トークン、費用、コンテキスト）を daemon が作り直すことになり、pi の計算の写しと推定になる。エージェントが動いていれば pi の答えを pi の `/session` と同じ節で出す（adapters/pi.md 13.3） |
 | Claude Code のバックグラウンドのサブエージェントの内部の経過（サブエージェントの発話やツール呼び出しを 1 つずつ Item として表示すること） | Item はターンに属し、ターンの外で動くタスクの会話を入れる場所がない。サブエージェントのメッセージ（`parent_tool_use_id` 付き）をすべて記録するとログが大きくなる一方で、スマホに要る進み具合（最後のツール、ツールの回数、トークン、ワークフローのエージェントごとの状態）と結果の要約は `task_progress` / `task_notification` の明示的な欄でタスクに出る（docs/adapters/claude.md 15章）。会話全体は CLI が PC のトランスクリプトに残す |
 | Claude Code のバックグラウンドのシェルの出力（動いている間の出力、終わったときの全文）と終了コード | Claude Code は出力のストリームを出さず、出力を CLI の内部の一時ファイル（`output_file`）に書くだけ。その形式はプロトコルとして定められていない（エージェントでは JSONL のトランスクリプト、シェルでは CLI が書き足した行を含む）。終了コードは人向けの要約文（「…completed (exit code 0)」）にしか出ず、文を解析するのはヒューリスティックになる。タスクの状態と CLI の要約（`result.summary`）は表示する |
-| フォアグラウンドで動いているツールをスマホからバックグラウンドに移すこと（Claude Code の制御要求 `background_tasks`） | ハーネスが報告するバックグラウンドの作業を中継するのではなく、実行中のターンの作業に対する新しい操作で、Claude Code にしかない（他のハーネスに同等のものがない）。バックグラウンドで動かしたい作業はエージェントに頼めば `run_in_background` で始まり、中断（`turn/interrupt`）もターンだけを止めてバックグラウンドの作業を残す |
 | Claude Code の予約した起床（`CronCreate` / `ScheduleWakeup` / `/loop`）を 1 つずつ止めること、起床で始まったターンに `trigger: scheduled` を付けること、中断されたターンで予約された `ScheduleWakeup` を次に普通に終わるターンより前に知ること、起床で始まったターンが中断や失敗で終わったときに、どの一度だけの起床が実行されたかを知ること | Claude Code 2.1.283 には、起床を一覧・取り消す制御要求がない（取り消せるのはモデル自身の `CronDelete` / `ScheduleWakeup {stop: true}` か、プロセスの終了だけ）。起床で始まったターンの `result` に `origin` はなく、stdout にも起床を示すメッセージがない（CLI の自動の続行も同じ形になる。`command_lifecycle` が示すのは「CLI が自分で入れたコマンド」まで）。待っている起床の一覧は Stop フックの `session_crons` にしかなく、中断や失敗で終わったターンのあとにはこのフックが来ず（失敗のときの StopFailure フックに一覧はない）、`ScheduleWakeup` の結果には ID がない（実機の記録 w1〜w8）。待っている起床は表示してプロセスを残し、止めたいときはエージェントに頼むか `thread/stop` で止める。CLI が自分のコマンドを始めたあとに一覧なしで終わったターンのあとは、一度だけの起床をライブから外し（終わらせない）、次の一覧で決める（docs/adapters/claude.md 16章） |
+| Claude Code で、ほかのプロセス（PC のターミナルなど）が付けたセッション名を、動いているスレッドに反映すること | Claude Code 2.1.284 は名前の変更を stdout で知らせない（`rename_session` の応答にも本文がない。実機の記録 b1）。名前はトランスクリプトの `custom-title` にだけ残り、動いているプロセスの外で変わったことを知る明示的な信号がない。トランスクリプトを見張って読むのはハーネスのプロトコルの外になる。取り込み（`native/import`）では `custom-title` をタイトルにする（docs/adapters/claude.md 10章） |
+| エージェントが動いていない Claude Code のスレッドの、`get_status` の節（`thread/harnessStatus`） | `get_status` は答えるプロセス自身のセッション（セッション ID、名前、種類、接続先）を返すので、使い捨てのプロセスに聞くと、スレッドと関係のないセッションを説明することになる。行を名前で選んで残すのは、表示用の文を解析することになる。プロセスなしでは、アカウントのプランの使用量（`get_usage`）だけを出す。エージェントが動いていれば `get_status` の節をそのまま出す（docs/adapters/claude.md 19章） |
+| Claude Code の実行中のターンに、ツールの区切りを待たずにメッセージを入れること（`priority: "now"`、`rapidFollowupPreempt`） | Claude Code 2.1.284 が送ったメッセージをターンに取り込むのはツールの区切りだけ（記録 a1、a2）。`priority: "now"` は取り込みではなく、動いているツールを中断してから新しいターンとして実行する（記録 a4。中断と送信は別の操作としてアプリにある）。`rapidFollowupPreempt` は `@internal` で、ロールアウトのフラグが要る。ターンに取り込まれなかったメッセージは、取り下げて（`cancel_async_message`）アプリのキューに戻す（`SteerReturned`、docs/adapters/claude.md 3章） |
 | `stop --drain` で、バックグラウンドの作業の終わりを受けてエージェントがこれから自分で始めるターンを待つこと | Claude Code は作業の終わり（`background_tasks_changed` の空の集合、`task_updated`、`task_notification`）を出してから、約 100 ミリ秒あとにそのターンの `init` を出す（記録 E2: 43.20 と 43.30）。その間に、ターンが続くことを示す明示的なシグナルがない: `task_notification` のスキーマはターンを約束せず、サブエージェントが始めたタスクや、中断で止まったタスクの終わりにはターンが続かない（check.md B3）。知らせのターンは `command_lifecycle` のコマンドとしても出ない。`session_state_changed` は環境変数が要り、`running` になるのも作業の終わりのあと。ターンが来ると決めて待つには時間での推定（ヒューリスティック）が要る。drain はライブセットが空になった時点で終わり、そのあとの段階停止で stdin を閉じてから `policy.stop_grace` の間に CLI が実行を終えたターンは記録される（18.5） |
 | Codex のバックグラウンドのターミナルから切り離されたプロセス（`Start-Process` などでシェルから切り離した孫）を 1 つずつ止めること、表示すること | Codex はシェル本体が終わるとターミナルの job から子孫を外す（`preserve_descendants`）ので、`thread/backgroundTerminals/terminate` はシェル本体にしか届かない（codex-cli 0.148.0）。Codex はそのプロセスを一覧にも通知にも出さないので、タスクにする明示的な信号もない。daemon の job（`KILL_ON_JOB_CLOSE`、breakaway 不可）には残るので、スレッドの停止（アイドル回収を含む）で必ず終わる（4.1、docs/adapters/codex.md 13.6） |
 | Codex のバックグラウンドのターミナルの途中の出力 | Codex はターンのあとも元のターン id で `item/commandExecution/outputDelta` を送るが、起動した Item はバックグラウンドに移った時点で閉じ、プロトコルにタスクの出力を流す場所がない。終わったときに Codex が `item/completed` で報告する出力全体（`aggregatedOutput`）と終了コードを `result` に入れる（docs/adapters/codex.md 13.2） |
@@ -143,7 +151,7 @@ aas-testkit ─→ aas-core, aas-server, aas-adapter-fake, aas-supervisor（E2E�
 - ポート trait（`HarnessAdapter` / `SessionControl`）と正規化イベント（`AdapterEvent`）は、独立したクレート `aas-harness` に置く。
   - `aas-core` もアダプタも `aas-harness` だけに依存するので、アダプタは SQLite などエンジンの依存を持たない（依存性逆転）。
 - `aas-core` は具体的なアダプタを知らない。アダプタは `aas-daemon` が設定を読んで組み立て（`build_adapters`）、`HarnessRegistry` として `Engine` に渡す（コンストラクタ注入）。DI コンテナは使わない。
-  - 各アダプタには `AdapterContext { supervisor, state_dir, policy }` を渡す。`state_dir` は `%LOCALAPPDATA%\agent-app-server\adapters\<harnessId>`、`policy` は `Policy` のうちアダプタに関係する値（`stop_grace`、`max_line_bytes`、`handshake_timeout`、ネイティブセッションのタイトルの長さ `first_message_title_chars` と `harness_title_chars`）。
+  - 各アダプタには `AdapterContext { supervisor, state_dir, policy }` を渡す。`state_dir` は `%LOCALAPPDATA%\agent-app-server\adapters\<harnessId>`、`policy` は `Policy` のうちアダプタに関係する値（`stop_grace`、`max_line_bytes`、`handshake_timeout`、ネイティブセッションのタイトルの長さ `first_message_title_chars` と `harness_title_chars`、エラーに引用する stderr の行数 `exit_message_stderr_lines`）。
 - テストでは `aas-adapter-fake` を注入する（`aas-core` と `aas-server` の dev-dependency）。トークンを消費せずに全経路を検証するため。
 
 ## 3. ドメインモデル
@@ -317,7 +325,7 @@ running ──turn が completed で完了 かつ queue あり（一時停止で
 - 実行中の場合:
   - `queue` と `auto`: daemon 側のキュー（`queued_inputs`）に積む。`queue/updated` イベントで見えるようになり、`queue/remove` で取り消せる。
     - ハーネス自身のキュー機能は使わない。挙動をハーネス間で揃えるため。
-  - `steer`: ハーネスの能力 `steer` がある場合だけ、アダプタに渡して実行中のターンに差し込む（Codex の `turn/steer`、pi の `steer`）。能力がなければエラー `capabilityUnsupported` を返す。
+  - `steer`: ハーネスの能力 `steer` がある場合だけ、アダプタに渡して実行中のターンに差し込む（Codex の `turn/steer`、pi の `steer`、Claude Code の実行中の stdin のメッセージ。取り込まれなかった steer はハーネスの明示的な報告でキューに戻る。5.5 の「戻された steer」）。能力がなければエラー `capabilityUnsupported` を返す。
     - ターンの入力がまだエージェントに送られていない（起動中）場合は、最初のメッセージの末尾に結合して送る。
 - ユーザーの入力は userMessage Item（`delivery: normal | steer`）として記録する。この Item は最初から確定しているので、`item/started`（`status: completed`）だけを出し、`item/completed` は出さない。
 - キューの進み方:
@@ -342,6 +350,8 @@ running ──turn が completed で完了 かつ queue あり（一時停止で
 - 実行中のターンには影響させない。ターンの実行中（送信済みのターン、エージェント起点のターン）や停止処理中の変更は記録だけして `appliesNextTurn` を返し、次のターンの入力を送る前に適用する。アクターはプロセスが今どの設定で動いているか（起動時の設定と、その後ライブで反映したもの）を持ち、スレッドの設定と違えば送る前に `apply_settings` する。
 - 変更を断る要求（未知の値、アダプタの失敗）は、タイトルやピン留めも含めて何も変えない。検査とアダプタへの反映を先に済ませ、成功してからスレッドの行を書き換える。アダプタが失敗した場合は、プロセスが設定の一部だけを反映した可能性があるので、次のターンの前にプロセスを作り直す。
 - プロセスの作り直しは、バックグラウンドの作業がエージェントを動かしている間は行わない（その作業が止まるため。5.6）。次のターンは入力を送らずに待ち、notice の Item（`code: "waitingForBackgroundWork"`）で理由を示す。作業が終わる（または利用者が止める）と作り直して送る。待っている間もターンは `interrupt` で取り消せる。
+- **モード**（`Thread.modes`: プランモードと高速モード）も設定と同じ規則で反映する（`thread/update { modes }`、アダプタの `SessionControl::apply_modes`、起動時は `StartOptions::modes`）。値はハーネスが提供するものだけ（`features.planMode`、`features.fastModeModels` のモデル）で、エージェントは両方とも切った状態で起動し、スレッドのモードで起動し直すか反映する。高速モードを持たないモデルに変えると高速モードは切れる（ハーネスが挙げるモデルの一覧による明示的な規則）。
+- プロジェクトの信頼の判断（`Project.harnessTrust`）は起動時に渡す（`StartOptions::project_trusted`）。判断が変わると、そのハーネスで動いているエージェントは次のターンの前に作り直す（上の規則どおり、バックグラウンドの作業がある間は待つ）。
 
 ### 5.5 アダプタ起点の変化
 - **エージェントが自発的に始めたターン**: ターンが動いていないときにアダプタが `TurnStarted` を出したら（フック、拡張、バックグラウンドの通知などで CLI が自分で実行を始めた）、入力なしのターンとして記録する（`turn/started` のみ。userMessage Item はない）。以降は通常のターンと同じに扱う。開始前のスナップショットがないのでターン差分は持たない（1章の範囲外）。
@@ -350,9 +360,19 @@ running ──turn が completed で完了 かつ queue あり（一時停止で
   - `default`（"New thread"）→ 最初のメッセージの1行目（`policy.first_message_title_chars`、既定 80 文字まで）で置き換える（`firstMessage`）。
   - アダプタの `SessionTitle`（ハーネスが自動で付けた名前）は、`default` / `firstMessage` / `harness` のタイトルを置き換える（200 文字まで）。利用者が付けたタイトル（`user`）、fork（`fork`）、取り込み（`import`）のタイトルは置き換えない。
 - **ハーネス情報の変化**: アダプタの `HarnessInfoChanged`（モデル一覧や権限モードが変わったかもしれない）を受けたら、そのハーネスをバックグラウンドで probe し直し、変わっていれば workspace に `harness/updated` を出す。プロセスの起動がアダプタの `AdapterError::Unavailable`（CLI が使えない）で失敗した場合も同じ（直前の probe では使えたハーネスが使えなくなったことを、クライアントと以後の要求に知らせ、9.4 の再試行に乗せる）。
-- **CLI が報告した現在値**: `SessionInfo`（CLI が解決した完全なモデル ID など）はターンの `model` に記録するが、スレッドの設定は書き換えない。利用者が選んだ値を CLI の解釈で上書きしないため。
+- **CLI が報告した現在値**: `SessionInfo` の権限モードと推論量（CLI が明示的に報告したものだけ）、`ModesReported` のプランモードは、スレッドの設定（`settings.permissionMode`、`settings.effort`、`modes.plan`）に反映する。CLI は自分でモードを変える（Claude Code の「このセッションは許可」が返す `setMode acceptEdits`、ExitPlanMode の承認で元のモードに戻る、Devin の `/plan`・`/ask`・`/code` とプランの終わりの選択肢）ので、反映しないとアプリの表示と CLI の実際がずれる。
+  - 利用者が同じ値を変えて次のターンを待っている（スレッドの値がプロセスの値と違う）ときは、プロセスの値だけを報告に合わせ、スレッドの値は変えない。利用者の変更は次のターンの前に反映される。
+  - ハーネスの一覧（`permissionModes`、`effortLevels`、`features.planMode`）にない値は反映しない（ログに残す）。
+  - プロセスはすでにその値で動いているので、反映した値をもう一度 `apply_settings` しない。
+  - モデルは反映しない。CLI が解決した完全なモデル ID（`opus` → `claude-opus-5-5`）で利用者の選択を置き換えないため。ターンの `model` には報告値を記録する。
+  - 高速モードについての報告（`ModesReported.fast_state`）は `Thread.fastModeState` に語のまま入れる（表示用。`modes.fast` は利用者の選択のまま）。
 - **使用量とコンテキスト**: `TurnUsage`（ターン内の累計）を受けたら、実行中のターンの行に記録し、`turn/usageUpdated` を出す（値が変わったときだけ）。`Usage.context`（コンテキストウィンドウの使用量と大きさ）はアダプタが CLI の明示的な値から設定したときだけ付き、推定はしない。ターンの終了時の使用量に `context` がなければ、そのターンで最後に報告された値を残す。スレッドの `usage` はターンの使用量の和だが、`context` だけは最後に報告された値にする。
-- **ネイティブセッション ID**: `SessionIdentified` で分かった ID（fork で新しい ID が付いた場合など）をスレッドに記録する。
+- **ネイティブセッション ID**: `SessionIdentified` で分かった ID（fork で新しい ID が付いた場合など）をスレッドに記録する。スレッドがすでに持っていた ID と違う ID が届いたら（resume した起動が別の ID を返した場合も）、CLI が自分でセッションを替えたということなので、黙って張り替えずに `thread/nativeSessionChanged`（前と後の ID）を出し、動いているターンに notice の Item（`code: "nativeSessionChanged"`）を付ける。以後のスレッドは新しいセッションを続ける（9.5）。それまでに記録したターンの印は前のセッションの印として残す（`turns.anchor_session`。実行中のターンの、切り替えより前に届いた印も同じ）。そのターンでの fork は前のセッションを分ける（9.6）。
+- **ターンの印（アンカー）**: `TurnAnchor` で届いたハーネス自身のターンの印を、そのターンの行（`turns.native_anchor`）に記録する（`Turn.forkable`）。途中のターンからの fork に使う（9.6）。あとで確定する印は `TurnAnchorReplaced { previous, anchor }` で届き、記録した印が `previous` と同じターン（実行中のターンか、このスレッドの保存済みのターン）の印を `anchor` に置き換える。どのターンかは位置でなく前の印で決める。置き換えるのは今のネイティブセッションの印だけ（ハーネスは自分が動かしているセッションの印を指す。前のセッションの印が同じ値でも変えない）。当てはまるターンがなければ何も変えずに警告のログを出す。
+- **エージェントに届いたか**: ターンの行は、入力がエージェントに届いたか（またはエージェントが自分で始めたか）を持つ（`turns.delivered`）。起動や resume の失敗、送る前の中断、`forkOutdated` で終わったターンはネイティブセッションにないので、fork の位置を決めるときに飛ばす（9.6）。
+- **戻された steer**: `SteerReturned` を受けたら、その steer の userMessage の Item を `declined` にし（`item/updated`）、送ったときの入力をキューに戻す（送った時刻の位置）。
+- **入力欄へのテキスト**: `ComposerText` は `composer/insert` として流す（状態は作らない）。
+- **動いている Item のバックグラウンドへの移動**: `ItemBackgroundable` で Item の `backgroundable` を更新する（`item/updated`）。Item が閉じると `false` に戻す。
 - **コマンド一覧**: `CommandsChanged` を受けたら一覧をアクターが保持し、`commands/changed` を出す（クライアントは `command/list` を取り直す）。
 - ターンの外で届いた `Notice` は、Item にせず `native` イベントとして流す。
 - **バックグラウンドタスク**: `BackgroundTask` を受けたら 5.6 のとおり記録する。
@@ -475,8 +495,8 @@ running ──turn が completed で完了 かつ queue あり（一時停止で
 - テストは、DB の書き込みを失敗させる failpoint（`#[cfg(test)]` のときだけ存在する `WriteFailpoint`。リリースには含まれない）で行う（`aas-core::fail_stop_tests`）。
 
 ### 主なテーブル
-- `aas-core`: `meta`（epoch など）、`devices`、`pairing_codes`、`projects`、`threads`（`pinned` を含む）、`turns`（`base_tree` / `end_tree` / `start_trigger` を含む）、`items`（`background_task_id` を含む）、`interactions`（`background_task_id` と、内部用の `anchor_turn_id` を含む）、`queued_inputs`、`background_tasks(id, thread_id, status, ambient, turn_id, started_at, ended_at, task)`（`task` はプロトコルの `BackgroundTask` の JSON。ほかの列は検索用）、`blobs`（`orphaned_at` を含む）、`blob_refs`、`cleanup_jobs`、`operations`（`progress` と、内部用の作業フォルダ `work_dir` を含む）、`idempotency(device_id, client_request_id, method, params_hash, response, created_at)`。
-- スキーマは `PRAGMA user_version` で管理し、起動時に順に移行する（v1: 初版、v2: `threads.pinned`、`operations.progress` / `work_dir`、v3: 保持と削除のための `blobs.orphaned_at`・`blob_refs`・`cleanup_jobs`、イベントのキーの列。v3 への移行では、既存の Item とキューの入力から blob の参照を記録し、既存のイベントのキーを埋める。v4: `background_tasks`、`items.background_task_id`、`interactions.background_task_id` / `anchor_turn_id`、`turns.start_trigger`。既存の行はどれも値を持たない）。
+- `aas-core`: `meta`（epoch など）、`devices`、`pairing_codes`、`projects`、`threads`（`pinned` を含む）、`turns`（`base_tree` / `end_tree` / `start_trigger` を含む）、`items`（`background_task_id` を含む）、`interactions`（`background_task_id` と、内部用の `anchor_turn_id` を含む）、`queued_inputs`、`background_tasks(id, thread_id, status, ambient, turn_id, started_at, ended_at, task)`（`task` はプロトコルの `BackgroundTask` の JSON。ほかの列は検索用）、`blobs`（`orphaned_at` を含む）、`blob_refs`、`cleanup_jobs`、`operations`（`progress` と、内部用の作業フォルダ `work_dir` を含む）、`idempotency(device_id, client_request_id, method, params_hash, response, created_at)`。v6 で `threads` に `modes`・`fast_mode_state`・`fork_at`・`native_rename_pending`、`turns` に `native_anchor`、`items` に `backgroundable`、`projects` に `harness_trust` が加わった。v7 で `turns` に `anchor_session`（印が前のネイティブセッションのものならその ID）と `delivered`（入力がエージェントに届いたか）が加わった。
+- スキーマは `PRAGMA user_version` で管理し、起動時に順に移行する（v1: 初版、v2: `threads.pinned`、`operations.progress` / `work_dir`、v3: 保持と削除のための `blobs.orphaned_at`・`blob_refs`・`cleanup_jobs`、イベントのキーの列。v3 への移行では、既存の Item とキューの入力から blob の参照を記録し、既存のイベントのキーを埋める。v4: `background_tasks`、`items.background_task_id`、`interactions.background_task_id` / `anchor_turn_id`、`turns.start_trigger`。既存の行はどれも値を持たない。v5: `background_last_ended`（スレッドのバックグラウンドの作業の最後の終わり。移行時に既存のタスクから埋める）。v6: ハーネスの拡張機能のための列（上）。既存の行はどれも値を持たない（モードは切、fork の位置なし、印なし）。v7: `turns.anchor_session` と `turns.delivered`。既存の印は今のセッションのもの。既存のターンは届いたものとし、エンジンが送らなかったターンにだけ付けるエラーの種類（`spawnFailed`、`resumeFailed`、`harnessUnavailable`、`forkOutdated`、送る前の中断の `interrupted`）で終わったターンだけを届いていないものにする。
   - `anchor_turn_id`: ターンに属さない Interaction（バックグラウンドタスクやスレッドに属するもの）を、求められたときに動いていたターン（なければその時点の最後のターン）と一緒に `thread/read` で返すための内部の列。
 - `aas-eventlog`: `streams(name, head)`、`events(stream, seq, ts, type, data, item_id, thread_id, snapshot_key, supersedable)`。
 - PID 台帳は SQLite ではなく supervisor の `children.json`（4.5）。
@@ -585,10 +605,18 @@ pub trait HarnessAdapter: Send + Sync + 'static {
     fn display_name(&self) -> &str;
     async fn probe(&self) -> HarnessInfo;       // 可用性・バージョン・能力・モデル・推論量・権限モード。失敗しない
     async fn start(&self, req: StartRequest) -> Result<SessionHandle, AdapterError>; // New / Resume / Fork
+    async fn start_with(&self, req: StartRequest, options: StartOptions) -> Result<SessionHandle, AdapterError> { .. } // エンジンが呼ぶ。既定は start
+    fn features(&self) -> HarnessFeatures { .. }                                   // 9.6。probe の直後に読む。既定はなし
+    fn check_fork_point(&self, point: &ForkPoint) -> Result<(), AdapterError> { .. } // 9.6。起動が必ず断る fork の位置。既定は Ok
+    fn upgrade_settings(&self, settings: ThreadSettings) -> UpgradedSettings { .. } // 9.6。以前の版の形の設定。既定はそのまま
     async fn commands(&self, ctx: CommandContext) -> Result<Vec<Command>, AdapterError>;
     fn session_switching_commands(&self) -> &'static [&'static str] { &[] } // command/list に出さないもの（9.5）
+    fn session_switching_names(&self) -> Vec<String> { .. }                        // 上の名前と、ハーネスの一覧にある別名（9.5）
+    async fn status(&self, cwd: &Path) -> Result<Vec<StatusSection>, AdapterError> { .. } // セッションなしの状態（9.6）
     async fn list_native_sessions(&self, cwd: &Path) -> Result<Vec<NativeSessionSummary>, AdapterError>; // id は一意（9.5）
     async fn read_native_history(&self, cwd: &Path, native_session_id: &str) -> Result<NativeHistory, AdapterError>;
+    async fn read_native_history_anchored(&self, cwd: &Path, native_session_id: &str)
+        -> Result<(NativeHistory, Vec<Option<Value>>), AdapterError> { .. }        // ターンの印つき（9.6）
 }
 
 #[async_trait]
@@ -601,15 +629,21 @@ pub trait SessionControl: Send + Sync {
     async fn shutdown(&self, reason: StopReason) -> ExitInfo;                      // 4.3 の段階停止。冪等
     async fn stop_background(&self, key: &str) -> Result<(), AdapterError> { .. }  // 5.6。既定は Unsupported("backgroundStop")
     async fn expire_request(&self, request_id: &str, reason: ExpireReason) -> Result<(), AdapterError> { .. } // 8章。既定は Dismissed で respond
+    async fn steer_message(&self, message_id: &str, input: TurnInput) -> Result<(), AdapterError> { .. } // 既定は steer
+    async fn apply_modes(&self, modes: &ThreadModes) -> Result<SettingsApplied, AdapterError> { .. }    // 以下 9.6。既定は Unsupported
+    async fn rename(&self, title: &str) -> Result<(), AdapterError> { .. }
+    async fn status(&self) -> Result<Vec<StatusSection>, AdapterError> { .. }      // 既定は空
+    async fn side_question(&self, question: &str) -> Result<SideAnswer, AdapterError> { .. }
+    async fn move_to_background(&self, item_key: &str) -> Result<(), AdapterError> { .. }
 }
 // SessionHandle = { native_session_id: Option<String>, control: Arc<dyn SessionControl>,
 //                   events: mpsc::UnboundedReceiver<AdapterEvent> }
 ```
 
 `AdapterEvent`（正規化されたイベント。アダプタは Item をアダプタ内のキーで識別し、core が `itm_` の ID に割り当てる）:
-- セッション: `SessionIdentified { native_session_id }`、`SessionInfo { model, permission_mode, effort }`、`CommandsChanged { commands }`、`SessionTitle { title }`、`HarnessInfoChanged`
-- ターン: `TurnStarted`、`TurnUsage { usage }`（`usage.context` は CLI がコンテキストウィンドウの大きさと使用量を明示したときだけ）、`TurnCompleted { status, usage, error, trigger }`（`trigger` はエージェントが自分で始めた理由をハーネスが明示したときだけ）
-- Item: `ItemStarted { key, body }`、`ItemDelta { key, field, text }`、`ItemUpdated { key, body }`、`ItemCompleted { key, body: Option, status }`（`status` が `Backgrounded` なら作業はバックグラウンドタスクとして続く）
+- セッション: `SessionIdentified { native_session_id }`（既知の ID から変われば CLI が替えた。5.5）、`SessionInfo { model, permission_mode, effort }`（権限モードと推論量はスレッドに反映。5.5）、`ModesReported { plan, fast_state }`、`CommandsChanged { commands }`、`SessionTitle { title }`（ハーネスが付けた名前、ほかのプロセスでの名前の変更）、`HarnessInfoChanged`、`ComposerText { text }`
+- ターン: `TurnStarted`、`TurnAnchor { anchor }`（ハーネス自身のそのターンの印。9.6）、`TurnAnchorReplaced { previous, anchor }`（前のターンの印があとで確定した。9.6）、`TurnUsage { usage }`（`usage.context` は CLI がコンテキストウィンドウの大きさと使用量を明示したときだけ）、`TurnCompleted { status, usage, error, trigger }`（`trigger` はエージェントが自分で始めた理由をハーネスが明示したときだけ）、`SteerReturned { message_id }`（取り込まれなかった steer）
+- Item: `ItemStarted { key, body }`、`ItemDelta { key, field, text }`、`ItemUpdated { key, body }`、`ItemCompleted { key, body: Option, status }`（`status` が `Backgrounded` なら作業はバックグラウンドタスクとして続く）、`ItemBackgroundable { key, backgroundable }`
 - 承認と質問: `InteractionRequested { request_id, request, item_key, background_key }`、`InteractionWithdrawn { request_id }`
 - バックグラウンド: `BackgroundTask { task: BackgroundTaskInfo }`（タスクの状態全体。`key`、`kind`、`title`、`live`、`ambient`、`state`、`runs`、`origin_item_key`、`parent_key`、`progress`、`result`、`usage`、`stoppable`、`next_run_at`）
 - その他: `Notice { level, message, code }`、`Native { payload }`
@@ -624,12 +658,16 @@ pub trait SessionControl: Send + Sync {
 - 子プロセスはすべて `AdapterContext::supervisor` で起動する。
 - 対応付けられないメッセージは捨てたり推測したりせず、`Native` で流す。
 - `send` は、CLI が自分で始めた実行が動いていて入力を受け取らなかったときだけ `AdapterError::TurnInProgress` を返し、その実行の `TurnStarted` を先に出す（5.2）。
+- 拡張の機能（9.6）は `features` で提供を示したものだけエンジンが使う。どのメソッドにも既定の実装（断る、または何も報告しない）があるので、アダプタは CLI が提供するものだけを実装する。`status` と `side_question` は何も変えないので、ほかの呼び出しと並んで呼ばれることがある。
+- エラーの文（`AdapterError` の `Display`）は種類の前置きを1回だけ持ち、端末の制御文字を含まない。stderr は `AdapterPolicy::with_stderr` で付ける（stderr がメッセージになる唯一の場所。9.6）。
 - バックグラウンドタスク（5.6）: 状態全体を送る（同じ状態を送り直しても何も変わらない）。`live && !ambient` のタスクがハーネスのライブセットと一致するようにする（毎回集合を置き換えるハーネスは、集合にないタスクの `live` を外す。`aas_harness::BackgroundTasks` がこの規則を実装する）。終わりはハーネスの明示的なシグナルだけで、時間では終わらせない。`Exited` は終わっていないすべてのタスクを終わらせる（アダプタが最後の状態を送る必要はない）。タスクを起動した Item は、タスクを先に送ってから `Backgrounded` で閉じ、どちらもターンの `TurnCompleted` より前に送る。`stop_background` の `Ok` は「求めを受け付けた」だけを表す。
 
 ### 9.2 能力（capabilities）
 `interrupt`、`steer`、`approvals`、`questions`、`resume`、`fork`、`images`、`modelSwitchLive`、`nativeSessions`、`backgroundTasks`（ターンの外の作業をバックグラウンドタスクとして報告する）、`backgroundStop`（1 つのタスクを止められる）。
 
 推論量と権限モードは能力フラグではなく、ハーネスの一覧（`effortLevels`、`permissionModes`）で表す。空なら指定できない。
+
+能力のほかにハーネスが提供するものは `Harness.features`（`forkAtTurn`、`forkWhileHeld`、`rename`、`sideQuestion`、`moveToBackground`、`status`、`projectTrust`、`planMode`、`fastModeModels`）で表す（9.6）。アダプタの `HarnessAdapter::features` を probe のたびに読む。使えないハーネスは何も提供しない。
 
 UI はこれを見て機能を出し分ける。例えば pi で承認ゲートを無効にした場合は「承認なし（全自動）」と表示する。
 
@@ -640,13 +678,13 @@ UI はこれを見て機能を出し分ける。例えば pi で承認ゲート�
 | 起動 | `codex app-server`（stdio） | `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio` と SDK の制御プロトコル | `pi --mode rpc --session-id <id> -e <同梱の承認ゲート拡張>` | 設定のコマンド（例 `devin acp`） |
 | ターン | `turn/start` | stdin にユーザーメッセージ | `prompt` | `session/prompt` |
 | 中断 | `turn/interrupt` | control `interrupt` | `abort` | `session/cancel` |
-| steer | `turn/steer` | なし | `steer` | なし |
+| steer | `turn/steer` | stdin にユーザーメッセージ（CLI はツールの区切りで取り込む。取り込まれなければ `cancel_async_message` で取り下げてキューに戻す。9.6） | `steer`（拡張のコマンドは `prompt { streamingBehavior: "steer" }`） | なし |
 | 承認 | サーバからの要求（コマンド実行、ファイル変更、権限、入力、elicitation） | control `can_use_tool` | 拡張の `extension_ui_request` | `session/request_permission` |
 | 質問 | `item/tool/requestUserInput`、`mcpServer/elicitation/request` | control `can_use_tool`（AskUserQuestion） | 拡張の `extension_ui_request` | `elicitation/create`（form / url） |
 | 再開 | `thread/resume` | `--resume=<id>` | `--session <セッションファイル>` | `session/load` / `session/resume` |
-| fork | `thread/fork` | `--resume=<id> --fork-session --session-id=<新しい id>` | `--fork <セッションファイル> --session-id <新しい id>` | `session/fork`（対応するエージェントだけ） |
+| fork | `thread/fork`（途中のターンは `lastTurnId` / `beforeTurnId`） | `--resume=<id> --fork-session --session-id=<新しい id>`（途中のターンは `--resume-session-at`） | `--fork <セッションファイル> --session-id <新しい id>`（途中のターンは承認ゲートの `ctx.fork`） | `session/fork`（対応するエージェントだけ）。Devin は `_cognition.ai/revert/forkFromStep` |
 | モデル | `model/list` | 固定のエイリアスと init の情報 | `get_available_models` | config options（category `model`） |
-| コマンド | アプリ側 + `skills/list` | init の `slash_commands` | `get_commands` + `/compact`（RPC の `compact`） | `available_commands_update` |
+| コマンド | `compact`・`review`・`init`・`goal`（アダプタが Codex の API で実行する）+ `skills/list` | `initialize.commands`・`commands_changed`・init の `slash_commands`（別名を展開し、端末専用のものを除く） | `get_commands` + `/compact`（RPC の `compact`） | `available_commands_update`（Devin の `login`・`logout` は除く） |
 | コンテキストの使用量（`Usage.context`） | `thread/tokenUsage/updated` の `last.totalTokens` / `modelContextWindow`（モデル呼び出しごと） | `result` のあとに control `get_context_usage` の `totalTokens` / `rawMaxTokens`（ターンの終わり） | assistant のメッセージごとに `get_session_stats` の `contextUsage` | ターン中の最後の `usage_update` の `used` / `size`（ターンの終わり） |
 | バックグラウンドの作業（5.6。能力 `backgroundTasks`） | ターミナル: `turn/completed` の時点の `thread/backgroundTerminals/list`（`experimentalApi`）と、あとから届く `item/completed`。サブエージェント: 子のスレッドの `turn/started` / `turn/completed` / `thread/status/changed`（codex.md 13章） | ライブセットは `background_tasks_changed`、開始・進捗・終わりは `task_started` / `task_progress` / `task_updated` / `task_notification`、予約した起床は Stop フックの `session_crons` と `CronCreate` / `CronList` / `CronDelete` の結果（claude.md 15・16章） | なし（拡張が始める実行はエージェント起点のターン） | 標準の ACP ではなし。Devin は Cognition の拡張（`cognition.ai/subagentControl` を確認したとき）の `subagent_started` / `subagent_completed` と `background` / `terminal_exit`（acp.md 16章） |
 | バックグラウンドの作業の停止（能力 `backgroundStop`） | `thread/backgroundTerminals/terminate`、子のターンへの `turn/interrupt` | control `stop_task`（予約した起床は止められない） | —（能力なし） | Devin: `_cognition.ai/subagent/cancel`、`_cognition.ai/terminal/killBackgroundShell` |
@@ -677,20 +715,96 @@ UI はこれを見て機能を出し分ける。例えば pi で承認ゲート�
   - CLI が同じセッションを何度も並べる場合は、アダプタがまとめる（`aas_harness::NativeSessionSet`: 位置は最初の項目、内容は `updatedAt` が最も新しい項目）。Codex の `thread/list` は、Codex desktop などで resume したスレッドを rollout ファイルごとに同じ id で並べる（docs/adapters/codex.md 7章）。ページを読む途中で並びが変わって同じセッションが2つのページに出る場合（ACP の `session/list`）も同じ。
   - エンジン（`Engine::native_list`）も、どのアダプタの結果にも同じ規則を当てる。そこで重複が見つかるのはアダプタの不具合なので、ハーネスの id と除いた件数を付けて warn ログを出す（`the adapter listed native sessions more than once`）。
 - **セッションを切り替えるコマンド**: 動いているプロセスの中で別のネイティブセッションに移るハーネスのコマンド（新しいセッションを始める、別のセッションを開く、セッションの木の別の位置に移る）は、`command/list` に出さない。スレッドの下でセッションが替わると、履歴・ターン・差分・Interaction が、エージェントの持っていない会話を指すことになるため（範囲外、1章）。
-  - `resume` はどのハーネスでも出さない（`engine.rs` の `SESSION_SWITCHING_COMMAND_NAMES`）。その名前のコマンドを持つ CLI はどれも、別のセッションを開くのに使う。また、アプリは独自の `/resume` を出す（下）ので、同じ名前のハーネスのコマンドがあるとそれが隠れてしまう（docs/ux/codex-desktop.md §8.5）。
+  - `resume` はどのハーネスでも出さない（`aas-core` の `commands.rs` の `SESSION_SWITCHING_COMMAND_NAMES`）。その名前のコマンドを持つ CLI はどれも、別のセッションを開くのに使う。また、アプリは独自の `/resume` を出す（下）ので、同じ名前のハーネスのコマンドがあるとそれが隠れてしまう（docs/ux/codex-desktop.md §8.5）。
   - そのほかは、アダプタが自分の CLI のコマンドを名前で挙げる（`HarnessAdapter::session_switching_commands`。理由は各アダプタの doc コメント）。
 
     | ハーネス | 除くコマンド | 根拠 |
     |---|---|---|
-    | claude | `clear`、`resume` | Claude Code 2.1.283 の `initialize.commands` に `clear`（「Start a new session with empty context; previous session stays on disk」）があり、stream-json モードでも動いて新しい `session_id` になる。`resume` はセッションの選択（今は端末専用） |
-    | pi | `new`、`resume`、`fork`、`clone`、`tree` | pi の組み込みのセッション操作の名前。組み込みは TUI 専用で `get_commands` に出ないが、同じ名前で登録された拡張のコマンドは RPC で同じことをする（`ctx.newSession`、`ctx.switchSession`、`ctx.fork`、`ctx.navigateTree`） |
-    | codex | （なし） | アダプタが出すのは `compact`・`review`（どちらも同じ Codex thread で動く）とスキル（`$name`）だけ。Codex のセッション操作（`/new`、`/resume`、`/fork`）はクライアントの機能で、app-server はコマンドとして出さない |
+    | claude | `clear`（とその一覧にある別名 `reset`、`new`）、`resume`、`continue` | Claude Code 2.1.284 の `initialize.commands` に `clear`（「Start a new session with empty context; previous session stays on disk」）があり、stream-json モードでも動いて新しい `session_id` になる。別名は同じ一覧の `aliases` から読む。`resume` と `continue` はセッションの選択（今は端末専用） |
+    | pi | `new`、`resume`、`import`、`fork`、`clone`、`tree`、`aas-gate-fork` | pi 0.85.1 の組み込みのセッション操作の名前（`import` は JSONL ファイルのセッションに置き換える）。組み込みは TUI 専用で `get_commands` に出ないが、同じ名前で登録された拡張のコマンドは RPC で同じことをする（`ctx.newSession`、`ctx.switchSession`、`ctx.fork`、`ctx.navigateTree`）。`aas-gate-fork` は承認ゲートの内部の fork（アダプタだけが送る。9.6） |
+    | codex | （なし） | アダプタが出すのは `compact`・`review`・`init`・`goal`（どれも同じ Codex thread で動く）とスキル（`$name`）だけ。Codex のセッション操作（`/new`、`/resume`、`/fork`）はクライアントの機能で、app-server はコマンドとして出さない |
     | acp | （なし） | ACP には接続中のセッションを替えるコマンドがない（要求ごとにクライアントがセッションを指定し、新しいセッションを知らせる通知もない） |
-    | fake | （なし） | `fake-help` だけ |
+    | fake | `fake-clear`（とその別名 `fake-reset`） | fake エージェントの台本のセッション切り替え（テスト用。docs/adapters/fake.md） |
 
-  - 除くのは一覧に出すことだけ。利用者が入力欄に打って送ったテキストは、ほかの入力と同じくハーネスに届く（アプリは `/resume` と打たれた入力を送らずに自分の `/resume` を実行する）。
-  - 名前を挙げていない拡張のコマンド（pi の拡張が別の名前で `ctx.newSession` を呼ぶなど）は区別できない。コマンドの説明文から推測するのはヒューリスティックになるので行わない。
+  - 名前と別名はアダプタが挙げる（`HarnessAdapter::session_switching_names`。別名はハーネス自身の一覧から読む。名前だけの静的な一覧は `session_switching_commands`）。
+  - **手で打った入力も断る**: 入力の最初の部分がテキストで、その最初の語が `/` とこれらの名前のどれかなら、`turn/start`（steer と queue を含む）、`queue/update`、`queue/steer`、`thread/create` の `input` を `sessionSwitchingCommand`（`data.command`）で断る。キューに残っていた古い入力も、ターンを始める前に確かめて除く。以前は「除くのは一覧だけで、打った文はハーネスに届く」としていたが、Claude Code では打った `/clear`（と別名の `/new`、`/reset`）で CLI が新しいセッションに移り、スレッドの履歴と CLI の会話が黙ってずれていた。照合するのはハーネス自身の一覧の名前だけで、推測はしない。
+  - アプリは、送る前に最初の語がアプリのコマンドなら横取りして自分で実行する（引数も扱う。`/stop` と `/archive` は確認を出す）。`/clear` と `/reset` はアプリの `/new`（新しいスレッド）として扱う。アプリのコマンドとハーネスのコマンドの名前が重なったときは、アプリのコマンド（`new`、`status`、`rename`、`pin` など）を優先する。アプリの `/plan` は、ハーネスが `features.planMode` を持つときだけアプリのもの（それ以外では同じ名前のハーネスのコマンドのまま）。
+  - **CLI が自分でセッションを替えたとき**: 名前を挙げていない拡張のコマンド（pi の拡張が別の名前で `ctx.newSession` を呼ぶなど）は、コマンドとしては区別できない（説明文から推測するのはヒューリスティックになるので行わない）。代わりに、CLI の状態が別のセッションを示したら（アダプタが明示的な値を比べる。pi はターンの終わりのたびに `get_state.sessionId` を比べる）、アダプタが新しい ID を `SessionIdentified` で報告し、エンジンは黙って張り替えずに `thread/nativeSessionChanged` と notice で知らせる（5.5）。
+- **Codex desktop で開いている会話**: Codex は1つのスレッドに書き込めるプロセスを1つに限る（別の app-server からの `thread/resume` は「already has an active writer」で断られる。記録: codex-cli 0.148.0）。Codex desktop で開いたままの会話を取り込んだスレッドは、desktop がそのスレッドを離す（desktop を閉じる、またはアイドルのスレッドを 30 分後にアンロードする）まで続けられない。ターンは `resumeFailed` で終わり、アプリは「再試行」と、Codex は fork できるので「新しいスレッドに分岐」を出す。取り込みの画面と README でこのことを案内する。
 - **アプリの `/resume`**: `command/list` には入らないアプリ側のコマンド。「PC のセッションを取り込む」画面を、そのプロジェクトとハーネスを選んだ状態で開く（`native/list` → `native/import`）。取り込んだセッションは新しいスレッドになる（取り込み済みなら既存のスレッドを開く）。今のスレッドのセッションが替わることはない。詳細は docs/ux/codex-desktop.md §8.5 と docs/android.md。
+
+### 9.6 ハーネスの拡張機能
+
+ハーネスが明示的な手段を持つ機能は、共通の最低限に削らずに中継する（0章の3本目の柱）。どれも `Harness.features`（アダプタの `HarnessAdapter::features`）で提供を示したハーネスだけで使い、ポートのメソッドには既定の実装（断る、または何も報告しない）がある。状態はどれもハーネスの明示的なシグナルから作る（14章）。
+
+| 機能（`features`） | プロトコル | ポート |
+|---|---|---|
+| 途中のターンからの fork（`forkAtTurn`） | `thread/fork { atTurnId, before }`、`Turn.forkable` | `TurnAnchor`、`TurnAnchorReplaced`、`StartOptions::fork_at` と `StartMode::Fork`、`read_native_history_anchored` |
+| 持たれているセッションの fork（`forkWhileHeld`） | `Turn.error.kind` の `resumeFailed` のあとの `thread/fork` | （ふつうの fork） |
+| 名前（`rename`） | `thread/update { title }` の `nativeRename` | `SessionControl::rename`、`SessionTitle` |
+| プランモード（`planMode`） | `ThreadModes.plan`、`proposedPlan` の Item、`PlanModeFeature` | `StartOptions::modes`、`apply_modes`、`ModesReported` |
+| 高速モード（`fastModeModels`） | `ThreadModes.fast`、`Thread.fastModeState` | 同上 |
+| ハーネスの状態（`status`） | `thread/harnessStatus` | `SessionControl::status`、`HarnessAdapter::status` |
+| 会話に入らない質問（`sideQuestion`） | `thread/sideQuestion` | `SessionControl::side_question` |
+| 実行中の作業のバックグラウンドへの移動（`moveToBackground`） | `item/moveToBackground`、`Item.backgroundable` | `ItemBackgroundable`、`SessionControl::move_to_background` |
+| プロジェクトの信頼（`projectTrust`） | `Project.harnessTrust`、`project/update { harnessTrust }` | `StartOptions::project_trusted` |
+| （能力 `steer` の一部）取り込まれなかった steer | userMessage の `declined` とキュー | `steer_message`、`SteerReturned` |
+| 入力欄へのテキスト | `composer/insert` | `ComposerText` |
+
+**途中のターンからの fork**
+
+- 各ターンについて、ハーネス自身のそのターンの印（アンカー）を、そのターンが動いている間に記録する（`TurnAnchor`、`turns.native_anchor`）。印はハーネスがそのターンについて送った明示的な値だけから作り、ターンやメッセージを数えて作らない（steer が別のエントリになる pi のように、数えるとずれるため）。値はアダプタのもの（JSON）で、エンジンは解釈せずに保存し、fork するときにそのまま返す。
+- `thread/fork { atTurnId }` はそのターンを含めて、`before: true` はそのターンの前まで分ける（「ここから分岐」と「このプロンプトを編集」。後者ではアプリがそのターンの入力を新しいスレッドの入力欄に入れる）。そのターンより前にエージェントに届いたターンがなければ（最初のターン、または前のターンがどれも起動に失敗した）、履歴のない新しいセッションになる。新しいスレッドは分けた位置までのターンと Item を複製し（印も引き継ぐので、fork の fork もできる）、最初の起動で `StartMode::Fork` と `StartOptions::fork_at`（`ForkPoint { anchor, before, previous }`）でネイティブのセッションを分ける。
+- `previous` は、セッションがそのターンの前までを持つ位置: そのターンより前でエージェントに届いたいちばん近いターン（`turns.delivered`。起動に失敗したターンはセッションにないので飛ばす。スレッドの並びの1つ前を使うと、再試行の前に `resumeFailed` で終わったターンがあるだけで位置が分からなくなる）の印。そのターンに印がないとき、別のネイティブセッションの印のときは `None`（数えて補わない）。最後のメッセージのあとでしか切れない CLI（Claude Code、始まりのエントリの分からないターンの pi）はそれを使う。
+- 分ける位置を印だけで判断できるものは、スレッドを作る前に確かめる: アダプタの `HarnessAdapter::check_fork_point` が、起動が必ず断る位置（ハーネスの印でない、必要な `previous` がない、確定する前の印でしか分けられないなど）を断り、`thread/fork` は `invalidState`（アダプタの文）で答える。以前はスレッドを作ってから最初の起動で失敗させていたので、`fork_at` を持ったまま毎回失敗するスレッドが残っていた。CLI にしか分からないこと（印がもうセッションにない）は起動で分かる。
+- ハーネスがスレッドを別のネイティブセッションに移したあと（5.5、9.5）も、それより前のターンの印は元のセッションの印として残る（`turns.anchor_session`）。そのターンでの fork は元のセッションを分け（`fork_source` がそのセッション）、`previous` も同じセッションの印だけを使う。fork に複製した印のうち、分けたセッションのものは fork 自身のセッションの印になる（分けたセッションはエントリの ID を保つ）。今のセッションの印で前のセッションを切ると、印が位置でもある CLI（fake の番号、Devin のノードの ID）では黙って違う位置で切れるため。
+- ターンの印があとで確定する CLI（Devin のステップのノードの ID は、プロンプトの間に動き、`session/prompt` の応答のあとの一覧（アダプタが応答の直後に送る `listSteps`、次のプロンプトの `stepsUpdated`）で確定する）では、アダプタはまずそのターンのうちに分かる印を送り、確定したら `TurnAnchorReplaced { previous, anchor }` で置き換える。どのターンかは前の印で指す（位置で指すと取り込みや fork のあとでずれる）。確定する前の印で fork できないハーネスでは、その間の fork は `thread/fork` が断る（`check_fork_point`。`Turn.forkable` は印があることだけを表す）。
+- 印で分けるので、元のスレッドがそのあとに進んでもかまわない（`forkOutdated` はセッション全体の fork だけ。5.2）。印のないターン（この仕組みより前のターン、印を持たない履歴を取り込んだターン）では断る（`invalidState`）。
+- 記録で確かめたハーネスごとの手段（詳細は docs/adapters/*.md。どれも印はそのターンのもの）:
+
+  | ハーネス | 印 | そのターンを含める | その前まで |
+  |---|---|---|---|
+  | codex | turn id（`turn/start` の応答、Codex が自分で始めたターンは `turn/started`。fork でも変わらない） | `thread/fork { lastTurnId }` | `thread/fork { beforeTurnId }`（experimental API） |
+  | claude | ターンの `result` より前の、最後の最上位（`parent_tool_use_id` なし）の `assistant` か `tool_result` のメッセージの uuid（トランスクリプトの鎖の要素。fork でも変わらない）と、送ったプロンプトの uuid | `--resume=<元> --resume-session-at=<印> --fork-session` | 前のターンの印で同じ（`--resume-drops-turn` は最後のターンでしか通らないので使わない） |
+  | pi | ターンの終わり（`agent_settled` のあと）の `get_entries { since: ターンの始まりの葉 }` の `leafId` と、ターンが足した最初のユーザーエントリ（`userEntryId`） | 承認ゲートの `/aas-gate-fork <leafId> at`（`ctx.fork(leafId, { position: "at" })`） | `/aas-gate-fork <userEntryId> before`（なければ前のターンの `leafId` で `at`）。RPC の `fork` はユーザーメッセージの前でしか、`clone` は今の葉でしか分けられないので、どちらもゲートの `ctx.fork` を使う |
+  | acp（Devin） | そのプロンプトの間に初めて一覧に現れたステップの ID（なければ `session/prompt` の応答の `userMessageId`）。応答の直後の `listSteps` でノードの ID を含む印に置き換え、以後の一覧（次のプロンプトの `stepsUpdated`）が別の値を示せばまた置き換える（`TurnAnchorReplaced`。持たれているセッションは読み込めないので、ノードの ID がないと fork できない） | 最後のステップの `forkTargetNodeId` で `_cognition.ai/revert/forkFromStep` | 最初のステップの `revertTargetNodeId` で同じ |
+
+**持たれているセッション**
+
+- ほかのプロセスが持っているセッションの resume が失敗したターンは `resumeFailed` で終わる（`Turn.error.kind`）。アプリは「再試行」と、`forkWhileHeld` のハーネスでは「新しいスレッドに分岐」（`thread/fork`）を出す。`forkAtTurn` のハーネスでは、エージェントが最後に実行したターン（そこから失敗したターンまでがすべて `resumeFailed`）の印で分け、エージェントに届かなかったプロンプトを新しいスレッドの入力欄に入れる（印のないときはセッション全体。docs/android.md 31.9）。記録では、Codex（別の app-server が書き込み中でも `thread/fork` は通る）と Devin（読み込まずに `forkFromStep` できる。ただしノードの ID を記録してあるとき。セッション全体の fork では印がないので、ソースを読む必要があり断られうる）が fork でき（`forkWhileHeld`）、Claude Code は `-p` のプロセスが持っているセッションの resume 自体を受け付ける（バックグラウンドのセッションが持っているときだけ断り、`--fork-session` を勧める。`forkWhileHeld` を出す）。pi にはセッションを書き込むプロセスを1つに限る仕組みがなく、resume が持たれていることで失敗しないので、`forkWhileHeld` を出さない（adapters/pi.md 13.1）。
+
+**名前**
+
+- 利用者がタイトルを付けたら（`thread/update { title }`、`thread/create { title }`）、ネイティブセッションにも付ける。エージェントが動いていればすぐ（`SessionControl::rename`）、動いていなければ次に起動したとき（`threads.native_rename_pending`。daemon の再起動をまたいでも残る）。ハーネスが断ったら、スレッドのタイトルは変えたまま `nativeRename.status = failed` と理由を返す（起動時ならそのターンの notice）。
+- 逆向き: ハーネスで付いた名前（ほかのプロセスでの名前の変更、拡張の `setSessionName`、自動のタイトル）は `SessionTitle` で届き、5.5 の規則でタイトルにする（利用者のタイトルは置き換えない。自分の名前のエコーは何も変えない）。
+
+**プランモードと高速モード**
+
+- 以前の版では Claude Code の権限モード `plan` を権限モードとして選べた。その値を持つスレッドとプロジェクトの既定値はそのまま残っているので、プランモードとして扱う（`HarnessAdapter::upgrade_settings`）: スレッドを作るとき（要求や既定値の値）は、権限モードを既定にして `modes.plan` をオンにする。保存済みのスレッドはアダプタが起動時に同じように扱い（`--permission-mode plan` を渡さず、起動後にプランモードに入る）、CLI の報告（今の権限モードとプランモード）がスレッドの設定に反映される（5.5）。プランモードを出るときに戻る権限モードは `plan` にしない（Claude Code に `plan` を送り直しても何も変わらず、報告も来ないため）。
+- アプリの `/plan [本文]` は `modes.plan` をオンにして本文を送る。ハーネスごとの仕組み（Claude Code の権限モード `plan`、Codex の collaborationMode など）はアダプタが受け持ち、プランモードを出入りしたという報告（`ModesReported`）で `modes.plan` が追従する（5.5）。Codex のようにプランを Item で出すハーネスでは `proposedPlan` の Item になり、`PlanModeFeature` の文面（ハーネス自身のもの）で「実装する」「新しいスレッドで実装」を出す。自分の `/plan` を持つハーネス（Devin）には `planMode` を付けず、ハーネスのコマンドのまま中継する。
+- 高速モードは、ハーネスがモデルごとに持つと示したとき（`fastModeModels`）だけのスレッドのモード。ハーネスの語（`fastModeState`）を表示する。高速モードを持たないモデルに変えると切れる。
+
+**ハーネスの状態と、会話に入らない質問**
+
+- `thread/harnessStatus` は、エージェントが動いていればそのセッションから、動いていなければハーネスから（アカウントの上限など）、ハーネスの節と言葉のまま返す。値は表示用で、daemon もアプリも解釈しない。Claude Code の `get_status` / `get_usage` は `@internal`（`get_usage` は experimental）と注記された要求なので、版の更新で形が変わりうる。変わったらアダプタが報告の形を直す。
+- `thread/sideQuestion` は動いているエージェントに会話とは別に聞く（Claude Code の `side_question`、`/btw`）。答えは履歴に入らず、実行中のターンを待たない。`status` と `side_question` は何も変えないので、エンジンはアクターの外で呼ぶ（その間もアクターはエージェントのイベントを処理する）。上限は `policy.handshake_timeout`。
+
+**実行中の作業のバックグラウンドへの移動**
+
+- ハーネスが「この Item は今バックグラウンドに移せる」と明示したとき（Claude Code の前面の Bash / Agent の `task_started { is_backgrounded: false }`。それより前の要求は断られる）だけ、Item の `backgroundable` を立て、`item/moveToBackground` を受け付ける。移ったことは、ほかのバックグラウンドの作業と同じく、タスクと `backgrounded` での Item の完了で届く（5.6）。時間で「そろそろ移せる」と推定することはしない。
+
+**取り込まれなかった steer**
+
+- 実行中のターンに steer を送れても、ハーネスがそれを取り込むのは自分の区切り（Claude Code ではツールの区切り）だけのことがある。ハーネスが取り込まなかったと明示したとき（Claude Code では、そのメッセージの `command_lifecycle started` が実行中のターンの `result` より前に来なかった）、アダプタはそれを取り下げて `SteerReturned` を出し、エンジンはその userMessage を `declined` にして入力をキューに戻す（送った時刻の位置）。
+
+**エラーの文**
+
+- stderr がメッセージになるのは1か所: アダプタの `AdapterPolicy::with_stderr`（最後の `exit_message_stderr_lines` 行）と、エンジンの想定外の終了のメッセージ（`exit_message`）は、どちらも `aas_harness::stderr_excerpt` を使う。端末の制御文字（ANSI / VT のエスケープシーケンス。ECMA-48 の構文で見分け、中の文は変えない）を除く。
+- `AdapterError` の文は種類の前置き（「the harness reported an error: 」など）を1回だけ持つ（アダプタが別の `AdapterError` を文に入れても重ならない）。クライアントに渡すのは前置きのない文（`AdapterError::detail`: `adapterError` の `data.detail`、起動と送信の失敗の `Turn.error.message`）で、アプリは自分の言語の導入文を前に置いてそのまま見せる。
+
+**プロジェクトの信頼**
+
+- プロジェクト自身の資源（拡張、テンプレート、スキル、設定）を読むかを利用者に聞くハーネス（pi）では、アプリがプロジェクトごとに明示的に聞き（自動では決めない）、`Project.harnessTrust` に記録する。エージェントの起動時に渡し（`StartOptions::project_trusted`）、判断が変われば次のターンの前にエージェントを起動し直す。エージェントが動いていないときのコマンドの一覧（`command/list`）にも同じ判断を渡す（`CommandContext::project_trusted`。プロジェクトのコマンドが出るかを、起動したエージェントと同じにする）。判断がなければ何も渡さない（ハーネス自身の保存済みの判断が使われる）。
 
 ## 10. Git 連携
 
@@ -797,7 +911,7 @@ UI はこれを見て機能を出し分ける。例えば pi で承認ゲート�
 | `background_progress_interval` | 1s | 0 | 動いているバックグラウンドタスクの進捗（`progress` と `usage`）だけの変化を書く最短の間隔（5.6）。ワークフローは段階ごとにエージェントの一覧全体を報告し、更新はすべてスレッドのログに残るので、ログを膨らませない。スマホの表示には1秒に1回で足りる。最新の状態は残り、ほかの変化はすぐに書く。0 なら毎回書く |
 | `background_stop_confirm_timeout` | 30s | 100ms | `backgroundTask/stop` のあと、ハーネスが終わりを報告しないままタスクを「停止中」と表示する時間（5.6）。ハーネスは応じる停止を数十ミリ秒で報告する（Claude Code の `stop_task` で約 50ms を測った）。遅いツールの後片付けを見込む。過ぎたら `stopUnconfirmedAt` を付けるだけで、ほかの手段には切り替えない |
 | `stderr_tail_bytes` | 16KiB | 0 | 終了理由と一緒に保持する stderr の末尾 |
-| `exit_message_stderr_lines` | 5 | 0 | 想定外に終了したエージェントのターンのエラーに引用する stderr の末尾の行数。最後の例外とその原因が収まり、スマホで読める長さ。全体は daemon のログに残る |
+| `exit_message_stderr_lines` | 5 | 0 | 想定外に終了したエージェントのターンのエラーに引用する stderr の末尾の行数。最後の例外とその原因が収まり、スマホで読める長さ。全体は daemon のログに残る。アダプタも、起動の失敗などのエラーに stderr を引用するときに同じ値を使う（`AdapterPolicy::stderr_excerpt_lines`。9.6） |
 | `first_message_title_chars` | 80 | 1 | 最初のメッセージの1行目から作るスレッドのタイトルの文字数。スレッド一覧の1行に収まる。アダプタも、名前のないネイティブセッションのタイトル（最初のプロンプトの1行目）に同じ値を使う（`AdapterPolicy`） |
 | `harness_title_chars` | 200 | 1 | ハーネスがセッションに付けたタイトルを保存する文字数。ハーネスは文を書くことがあり、一覧の2行を超える分は雑音。アダプタも、ネイティブセッションの名前（Codex の thread の name、Claude の custom-title / ai-title / summary、pi の session_info、ACP の title）に同じ値を使う |
 | `queued_preview_chars` | 120 | 1 | キューに入ったメッセージのプレビュー（1行目）の文字数 |
@@ -891,7 +1005,8 @@ UI はこれを見て機能を出し分ける。例えば pi で承認ゲート�
 - **保持と削除**（6.1）: 参照のない blob が猶予の後に消えて参照のあるものは残ること、プロジェクトの削除でスレッドのデータ・スナップショットの ref・worktree が消えること（未コミットの変更がある worktree では何も消さずに断ること）、圧縮したログを追いかけたクライアントが同じ状態になること、容量が OS に返ること、前回の実行が残したファイルが起動時に消えることを確かめる（`aas-core` の `tests/engine.rs`、`aas-eventlog` と `db` の単体テスト）。
 - **ハーネスの回復**（9.4）: 使えるかを切り替えられるハーネス（fake を包んだもの）で、起動時に使えなかったハーネスが要求なしに再試行の予定で回復して `harness/updated` が出ること、要求が断る前に probe し直すこと（`harnessUnavailable` は保存されず、同じ `clientRequestId` の再送がログインの後に成功する）、最近の probe の再利用、遅い probe を `handshake_timeout` だけ待つこと、能力の分からないハーネスで `capabilityUnsupported` を返さないこと、`thread/update` の設定を使えるハーネスの一覧に対して要求が指定した値だけ検査すること（使えない間は受け付け、CLI の更新で一覧から消えたスレッドの値はほかの値の変更を妨げない。5.4）を確かめる（`aas-core` の `tests/harness_recovery.rs`）。予定の計算（倍々、上限、回復で元に戻る）と probe の共有は止めた時計で確かめる（`registry.rs` の単体テスト）。
 - **セッションの終了**（18.8）: 入力の終わりにも中断にも反応しないエージェントで、`shutdown_for_end_session` が `end_session_stop_grace` で戻り、記録できなかったターンが次の起動で `systemShutdown` になり、その記録が1回で消えることを確かめる（`aas-core` の `tests/end_session.rs`）。
-- **スレッドとネイティブセッション**（9.5）: 同じセッションを何度も並べるアダプタ（台本で動くハーネス）で、`native/list` が各セッションを1回だけ、最初の位置と最新の内容で返し、取り込み済みの印も付くこと、`resume` とアダプタが挙げたコマンドが `command/list` に出ないこと（アダプタの `commands` と、動いているセッションの `CommandsChanged` の両方）を確かめる（`aas-core` の `tests/actor.rs`）。Codex の rollout ごとの重複とページングは、観察した形から作った台本で確かめる（`crates/aas-adapter-codex/tests/replay.rs`）。
+- **スレッドとネイティブセッション**（9.5）: 同じセッションを何度も並べるアダプタ（台本で動くハーネス）で、`native/list` が各セッションを1回だけ、最初の位置と最新の内容で返し、取り込み済みの印も付くこと、`resume` とアダプタが挙げたコマンドが `command/list` に出ないこと（アダプタの `commands` と、動いているセッションの `CommandsChanged` の両方）を確かめる（`aas-core` の `tests/actor.rs`）。手で打ったセッション切り替えのコマンド（名前と別名）がどの経路でも `sessionSwitchingCommand` で断られること、CLI が自分でセッションを替えたことが `thread/nativeSessionChanged` と notice で知らされることは `tests/harness_features.rs`。 Codex の rollout ごとの重複とページングは、観察した形から作った台本で確かめる（`crates/aas-adapter-codex/tests/replay.rs`）。
+- **ハーネスの拡張機能**（9.6、5.5）: セッションを保存する fake エージェントで、ハーネスが変えた権限モード・推論量・プランモードの反映（一覧にない値は反映しない、待っている利用者の変更が勝つ）、プランモードと提案されたプラン、高速モード（モデルによる制限と、モデルを変えると切れること）、名前の反映（エージェントがないときは次の起動で、あるときはすぐ。ハーネスの名前は利用者のタイトルを置き換えない）、途中のターンからの fork（含める・その前・最初のターンの前・fork の fork、印の引き継ぎ）、ハーネスの状態（動いているときとそうでないとき）、会話に入らない質問（実行中のターンの間、履歴に入らない）、動いている Item のバックグラウンドへの移動と各エラー、戻された steer が次のターンになること、入力欄へのテキスト、プロジェクトの信頼の判断が届くこと、持たれているセッションの resume が `resumeFailed`（制御文字と前置きのない文）になり fork で続けられることを確かめる（`aas-core` の `tests/harness_features.rs`）。実プロセスのエージェントで、持たれているセッション（`aas-test-server` の `hold-session`）、途中のターンからの fork、会話に入らない質問、ハーネスの状態を端から端まで（`aas-testkit/tests/test_server.rs`）。制御文字の除去、前置きが重ならないこと、stderr の引用は `aas-harness` の単体テスト、v6 への移行は `db` の単体テスト、fake エージェントの台本は `aas-adapter-fake` の単体テスト。
 - **バックグラウンド作業**（5.6）: 台本で動くハーネスで、ライブセットにあるタスクがアイドル回収を止め、空になった時点から待ち時間を数えること、`ambient` のタスクは保持しないこと、期限と同時に届いたイベントが先に処理されること（`biased`）、スリープ抑止のリース（ターンはどう終わっても（完了、ハーネスの失敗、中断、応じない中断の強制停止、プロセスの終了）リースを返し、エージェント起点のターンも持つこと、ターンとバックグラウンドの作業のリースは別に数えられ、`ambient` のタスクは持たないこと、`prevent_sleep_while_running = false` ではどちらも持たないこと）と daemon の数、drain が待つこと、起動した Item とタスクの相互の参照、run・親・同じ状態の送り直し、進捗のまとめ（ポリシー値）、長い出力の blob、プロセスの終わり方ごとの `status` / `endReason` と `lastError`、再起動で `lost` になること、タスクやスレッドに属する Interaction と期限切れの答え（`expire_request`）、取り下げには答えないこと、`backgroundTask/stop` と確認の期限・各エラー、`TurnInProgress` の入力が失敗にならずに続くこと、設定の作り直しが待つこと、中断に応じない CLI でもビジーならプロセスを止めないことを確かめる（`aas-core` の `tests/background.rs`）。fake エージェントの `@bg` の台本で同じ経路を端から端まで（同じファイル、`aas-adapter-fake` の単体テスト、実プロセスの `aas-testkit/tests/test_server.rs`）。v4 への移行は `db` の単体テスト、ログの圧縮は `aas-eventlog` の単体テスト。`[power] keep_awake = "always"` の daemon のリース（daemon が動いている間ずっと1つ持ち、ターンや作業のリースはその上に数える）は `aas-daemon` の単体テスト（`keep_awake_always_holds_one_lease_for_the_daemons_life`）。
 - **ポリシー値の下限**（13章）: 各構造体のすべてのキーに下限があり、下限を下回る値がキー名付きで断られ、下限そのものは受け付けられることを、層ごとのテストが `aas_core::config::verify_policy_bounds` で確かめる。`tests/cli.rs` は 0 秒の値で `run` が終了コード 2 で止まることを確かめる。
 - **システムテスト**（任意。`AAS_SYSTEM_TESTS=1` と `--ignored` で実行する。現在のユーザーのタスクを登録するので CI では回さない）:
@@ -911,9 +1026,9 @@ UI はこれを見て機能を出し分ける。例えば pi で承認ゲート�
   - pi の承認ゲート拡張（TypeScript）は、pi の拡張 API を模したオブジェクトで Node.js のテストランナーを使ってテストする: `node --test crates/aas-adapter-pi/extension/aas-gate.test.ts`（Node.js 22.18 以上。`crates/aas-adapter-pi/extension` で `npm test` でもよい）。
 - **Android**: fixtures の往復、MockWebServer を使った SyncEngine の再接続、outbox、epoch 変更のテスト（`:protocol:test`、`:sync:test`）。`:app` は Robolectric を含む JVM の単体テスト（`:app:testDebugUnitTest`）と lint（`:app:lintDebug`）。詳細は `docs/android.md` の 9章と 23章。
 - **Android の結合テスト用サーバ（`aas-test-server`）**: 本物の daemon（Engine + Server。fake ハーネスを process モードで使い、エージェントは隣に置いた `aas-dummy-agent`）を、ポートを固定した `ChaosProxy` の後ろで動かし、stdin のコマンドで操作する。
-  - 起動: `aas-test-server --state-dir <dir> [--heartbeat-ms 300] [--client-timeout-ms 1500] [--idle-process-ttl-ms <ms>] [--background-progress-ms <ms>] [--background-stop-confirm-ms <ms>]`。最後の3つは daemon の `policy.idle_process_ttl`、`background_progress_interval`、`background_stop_confirm_timeout`（省略時は daemon の既定値）で、アイドル回収、進捗のまとめ、確認されない停止をテストの待てる時間で起こすため。バックグラウンドの作業は fake エージェントの `@bg` の台本（docs/adapters/fake.md）で起こす。`<dir>` はなければ作る。サーバは `127.0.0.1:0`、プロキシも `127.0.0.1:0` で待ち受け、プロキシのポートはプロセスが終わるまで変わらない（再起動のあとは新しいサーバに転送する）。
+  - 起動: `aas-test-server --state-dir <dir> [--heartbeat-ms 300] [--client-timeout-ms 1500] [--idle-process-ttl-ms <ms>] [--background-progress-ms <ms>] [--background-stop-confirm-ms <ms>]`。最後の3つは daemon の `policy.idle_process_ttl`、`background_progress_interval`、`background_stop_confirm_timeout`（省略時は daemon の既定値）で、アイドル回収、進捗のまとめ、確認されない停止をテストの待てる時間で起こすため。バックグラウンドの作業は fake エージェントの `@bg` の台本（docs/adapters/fake.md）で起こす。fake ハーネスは 9.6 のすべての機能と、別名つきのセッション切り替えのコマンド（`/fake-clear`、`/fake-reset`）を持ち、それぞれ台本の指示（`@switch-session`、`@permission`、`@plan-mode`、`@proposed-plan`、`@tool`、`@refuse-steers`、`@editor`、`@trust` など）で起こせる。`<dir>` はなければ作る。サーバは `127.0.0.1:0`、プロキシも `127.0.0.1:0` で待ち受け、プロキシのポートはプロセスが終わるまで変わらない（再起動のあとは新しいサーバに転送する）。
   - 準備ができたら stdout に1行の JSON を出す: `{"event":"ready","wsUrl":"ws://127.0.0.1:<proxyPort>/v1/ws","httpUrl":"http://127.0.0.1:<proxyPort>","token":…,"deviceId":…,"pairingCode":…,"root":…,"epoch":…}`。`token` / `deviceId` はペアリング済みのデバイス（`<dir>/test-device.json` に記録し、同じ状態フォルダで起動し直したときも使い続ける）、`pairingCode` は新しいペアリングコード、`root` は `projects.roots` にある `<dir>\projects` の絶対パス。取り込みのテストのため、ready 行には fake ハーネスのネイティブセッションの場所（`nativeSessionsDir` = `<dir>/fake-sessions`）、それを PC で使ったとみなすプロジェクトのフォルダ（`nativeProject` = `<root>/pc-sessions`）、そのフォルダのセッションの一覧（`nativeSessions`、新しい順）も入る。最初の起動で決まったセッションを記録し、`restart` と `reset` でも残す（CLI のデータで daemon のものではないため）。
-  - コマンド（stdin に1行ずつ）: `chaos pass`、`chaos drop`（今のプロキシ経由の接続をすべて切り、以後の接続は通す）、`chaos blackhole`（受け付けるが何も転送しない）、`chaos delay <ms>`、`restart`（同じ状態フォルダで daemon を正常に停止して起動し直す。epoch・URL・token は変わらない。新しい ready 行を出す）、`reset`（停止し、DB を消して起動し直し、新しいデバイスをペアリングする。epoch と token が変わる。新しい ready 行を出す）、`pairing-code`（`{"event":"pairingCode","code":…}`）、`native-session <folder> <prompt…>`（`root` からの相対のフォルダでセッションを1つ記録する。プロンプトの `\n` は改行で、fake エージェントの台本の指示を複数書ける。`{"event":"nativeSession","nativeSessionId":…,"cwd":…,"title":…}`）、`quit`（正常に停止して終了コード 0。stdin の EOF も同じ）。
+  - コマンド（stdin に1行ずつ）: `chaos pass`、`chaos drop`（今のプロキシ経由の接続をすべて切り、以後の接続は通す）、`chaos blackhole`（受け付けるが何も転送しない）、`chaos delay <ms>`、`hold-session <nativeSessionId>`（ネイティブセッションをほかのプロセスが持っている状態にする。resume は失敗し（ターンは `resumeFailed`）、fork はできる。Codex desktop で開いている会話の代わり）、`release-session <nativeSessionId>`（それを解く）、`restart`（同じ状態フォルダで daemon を正常に停止して起動し直す。epoch・URL・token は変わらない。新しい ready 行を出す）、`reset`（停止し、DB を消して起動し直し、新しいデバイスをペアリングする。epoch と token が変わる。新しい ready 行を出す）、`pairing-code`（`{"event":"pairingCode","code":…}`）、`native-session <folder> <prompt…>`（`root` からの相対のフォルダでセッションを1つ記録する。プロンプトの `\n` は改行で、fake エージェントの台本の指示を複数書ける。`{"event":"nativeSession","nativeSessionId":…,"cwd":…,"title":…}`）、`quit`（正常に停止して終了コード 0。stdin の EOF も同じ）。
   - 各コマンドの出力の最後に `{"event":"ok","cmd":<コマンド行>}` か `{"event":"error","cmd":<コマンド行>,"message":…}` を出す（ready 行や pairingCode はその前に出る）。
   - エージェントのプロセスは `<dir>/agent-pids` に自分を記録する（環境変数 `AAS_DUMMY_AGENT_PID_DIR`）。`quit` のあとに生き残っているものがないことをテストで確かめる（`crates/aas-testkit/tests/test_server.rs`）。
   - 停止のたびに DB を閉じる（`Engine::close`）ので、同じプロセスの中で DB を開き直したり消したりできる。

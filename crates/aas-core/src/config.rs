@@ -722,6 +722,7 @@ impl Policy {
             handshake_timeout: self.handshake_timeout,
             first_message_title_chars: self.first_message_title_chars,
             harness_title_chars: self.harness_title_chars,
+            stderr_excerpt_lines: self.exit_message_stderr_lines,
         }
     }
 

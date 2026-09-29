@@ -1,0 +1,952 @@
+{
+ "_comment": "Recorded from pi 0.85.1 (2026-09-28, rec2): pi's output only, local paths replaced by C:\\rec. Built by the recording's mkfixture.py; see docs/adapters/pi.md 11.",
+ "threeTurns": {
+  "commands": [
+   {
+    "name": "rec-ping",
+    "description": "Recording: notify and return",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-editor",
+    "description": "Recording: ctx.ui.setEditorText",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-paste",
+    "description": "Recording: ctx.ui.pasteToEditor",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-name",
+    "description": "Recording: pi.setSessionName",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-reload",
+    "description": "Recording: ctx.reload()",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-new",
+    "description": "Recording: ctx.newSession()",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-fork-at",
+    "description": "Recording: ctx.fork(entryId, {position: 'at'})",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-tree",
+    "description": "Recording: ctx.navigateTree(targetId)",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "llama",
+    "description": "Manage llama.cpp router models",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "<inline:llama.cpp>",
+     "source": "inline",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   }
+  ],
+  "stateStart": {
+   "model": {
+    "id": "obsidian/Qwen3.8-27B",
+    "name": "Qwen3.8 27B (OrcaRouter)",
+    "api": "openai-completions",
+    "provider": "orcarouter",
+    "baseUrl": "https://api.orcarouter.ai/v1",
+    "reasoning": true,
+    "input": [
+     "text",
+     "image"
+    ],
+    "cost": {
+     "input": 0.4,
+     "output": 4.21,
+     "cacheRead": 0,
+     "cacheWrite": 0
+    },
+    "contextWindow": 262144,
+    "maxTokens": 32768,
+    "compat": {
+     "supportsDeveloperRole": false,
+     "maxTokensField": "max_tokens",
+     "thinkingFormat": "openrouter"
+    }
+   },
+   "thinkingLevel": "medium",
+   "isStreaming": false,
+   "isCompacting": false,
+   "steeringMode": "one-at-a-time",
+   "followUpMode": "one-at-a-time",
+   "sessionFile": "C:\\rec\\sessions\\2026-09-28T18-20-40-967Z_dfa5c5b7-269c-44a2-ba1b-9992ea29c424.jsonl",
+   "sessionId": "dfa5c5b7-269c-44a2-ba1b-9992ea29c424",
+   "autoCompactionEnabled": true,
+   "messageCount": 0,
+   "pendingMessageCount": 0
+  },
+  "nameEvent": {
+   "type": "session_info_changed",
+   "name": "rec2 initial name"
+  },
+  "nameResponse": {
+   "id": "A-5",
+   "type": "response",
+   "command": "set_session_name",
+   "success": true
+  },
+  "blankNameResponse": {
+   "id": "A-7",
+   "type": "response",
+   "command": "set_session_name",
+   "success": false,
+   "error": "Session name cannot be empty"
+  },
+  "extensionNameEvent": {
+   "type": "session_info_changed",
+   "name": "ext renamed"
+  },
+  "entriesAfterOne": {
+   "entries": [
+    {
+     "type": "model_change",
+     "id": "48862298",
+     "parentId": null,
+     "timestamp": "2026-09-28T18:20:41.178Z",
+     "provider": "orcarouter",
+     "modelId": "obsidian/Qwen3.8-27B"
+    },
+    {
+     "type": "thinking_level_change",
+     "id": "6ed83920",
+     "parentId": "48862298",
+     "timestamp": "2026-09-28T18:20:41.179Z",
+     "thinkingLevel": "medium"
+    },
+    {
+     "type": "model_change",
+     "id": "c73518c4",
+     "parentId": "6ed83920",
+     "timestamp": "2026-09-28T18:20:41.237Z",
+     "provider": "orcarouter",
+     "modelId": "deepseek/deepseek-v4.1-flash"
+    },
+    {
+     "type": "thinking_level_change",
+     "id": "1304c5da",
+     "parentId": "c73518c4",
+     "timestamp": "2026-09-28T18:20:41.237Z",
+     "thinkingLevel": "high"
+    },
+    {
+     "type": "thinking_level_change",
+     "id": "faa023a3",
+     "parentId": "1304c5da",
+     "timestamp": "2026-09-28T18:20:41.240Z",
+     "thinkingLevel": "low"
+    },
+    {
+     "type": "session_info",
+     "id": "98573ff6",
+     "parentId": "faa023a3",
+     "timestamp": "2026-09-28T18:20:41.242Z",
+     "name": "rec2 initial name"
+    },
+    {
+     "type": "session_info",
+     "id": "da36193f",
+     "parentId": "98573ff6",
+     "timestamp": "2026-09-28T18:20:41.248Z",
+     "name": "ext renamed"
+    },
+    {
+     "type": "message",
+     "id": "41c51822",
+     "parentId": "da36193f",
+     "timestamp": "2026-09-28T18:20:41.257Z",
+     "message": {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "Reply with exactly: ONE"
+       }
+      ],
+      "timestamp": 1790619641252
+     }
+    },
+    {
+     "type": "message",
+     "id": "6229f6ef",
+     "parentId": "41c51822",
+     "timestamp": "2026-09-28T18:20:44.070Z",
+     "message": {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "text",
+        "text": "ONE"
+       }
+      ],
+      "api": "openai-completions",
+      "provider": "orcarouter",
+      "model": "deepseek/deepseek-v4.1-flash",
+      "usage": {
+       "input": 1618,
+       "output": 2,
+       "cacheRead": 0,
+       "cacheWrite": 0,
+       "reasoning": 0,
+       "totalTokens": 1620,
+       "cost": {
+        "input": 0.0002427,
+        "output": 1.2e-06,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 0.0002439
+       }
+      },
+      "stopReason": "stop",
+      "timestamp": 1790619641828,
+      "responseId": "82570a5e-9a40-4a45-89a7-8232461e4484",
+      "responseModel": "deepseek-v4.1-flash",
+      "rawStopReason": "stop"
+     }
+    }
+   ],
+   "leafId": "6229f6ef"
+  },
+  "entriesAfterTwo": {
+   "entries": [
+    {
+     "type": "message",
+     "id": "343ba349",
+     "parentId": "6229f6ef",
+     "timestamp": "2026-09-28T18:20:44.080Z",
+     "message": {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "Reply with exactly: TWO"
+       }
+      ],
+      "timestamp": 1790619644079
+     }
+    },
+    {
+     "type": "message",
+     "id": "46f74d5b",
+     "parentId": "343ba349",
+     "timestamp": "2026-09-28T18:20:46.039Z",
+     "message": {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "text",
+        "text": "TWO"
+       }
+      ],
+      "api": "openai-completions",
+      "provider": "orcarouter",
+      "model": "deepseek/deepseek-v4.1-flash",
+      "usage": {
+       "input": 93,
+       "output": 3,
+       "cacheRead": 1536,
+       "cacheWrite": 0,
+       "reasoning": 0,
+       "totalTokens": 1632,
+       "cost": {
+        "input": 1.3949999999999999e-05,
+        "output": 1.8e-06,
+        "cacheRead": 4.608e-06,
+        "cacheWrite": 0,
+        "total": 2.0358e-05
+       }
+      },
+      "stopReason": "stop",
+      "timestamp": 1790619644083,
+      "responseId": "4a04d761-d795-4d4a-bd02-82d09d4e8ae2",
+      "responseModel": "deepseek-v4.1-flash",
+      "rawStopReason": "stop"
+     }
+    }
+   ],
+   "leafId": "46f74d5b"
+  },
+  "entriesAfterThree": {
+   "entries": [
+    {
+     "type": "message",
+     "id": "eb03ba61",
+     "parentId": "46f74d5b",
+     "timestamp": "2026-09-28T18:20:46.043Z",
+     "message": {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "Reply with exactly: THREE"
+       }
+      ],
+      "timestamp": 1790619646042
+     }
+    },
+    {
+     "type": "message",
+     "id": "20e3f58d",
+     "parentId": "eb03ba61",
+     "timestamp": "2026-09-28T18:20:48.191Z",
+     "message": {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "thinking",
+        "thinking": "The user says \"Reply with exactly: THREE\". I should reply exactly THREE.",
+        "thinkingSignature": "reasoning_content"
+       },
+       {
+        "type": "text",
+        "text": "THREE"
+       }
+      ],
+      "api": "openai-completions",
+      "provider": "orcarouter",
+      "model": "deepseek/deepseek-v4.1-flash",
+      "usage": {
+       "input": 105,
+       "output": 19,
+       "cacheRead": 1536,
+       "cacheWrite": 0,
+       "reasoning": 16,
+       "totalTokens": 1660,
+       "cost": {
+        "input": 1.575e-05,
+        "output": 1.14e-05,
+        "cacheRead": 4.608e-06,
+        "cacheWrite": 0,
+        "total": 3.1757999999999996e-05
+       }
+      },
+      "stopReason": "stop",
+      "timestamp": 1790619646044,
+      "responseId": "05464cb5-fa4c-4ea9-9748-3981ba4a4a91",
+      "responseModel": "deepseek-v4.1-flash",
+      "rawStopReason": "stop"
+     }
+    }
+   ],
+   "leafId": "20e3f58d"
+  },
+  "forkMessages": {
+   "messages": [
+    {
+     "entryId": "41c51822",
+     "text": "Reply with exactly: ONE"
+    },
+    {
+     "entryId": "343ba349",
+     "text": "Reply with exactly: TWO"
+    },
+    {
+     "entryId": "eb03ba61",
+     "text": "Reply with exactly: THREE"
+    }
+   ]
+  },
+  "stateAfterTurns": {
+   "model": {
+    "id": "deepseek/deepseek-v4.1-flash",
+    "name": "DeepSeek V4.1 Flash (OrcaRouter)",
+    "api": "openai-completions",
+    "provider": "orcarouter",
+    "baseUrl": "https://api.orcarouter.ai/v1",
+    "reasoning": true,
+    "thinkingLevelMap": {
+     "minimal": null,
+     "low": "low",
+     "medium": null,
+     "high": "high",
+     "xhigh": null,
+     "max": "max"
+    },
+    "input": [
+     "text",
+     "image"
+    ],
+    "cost": {
+     "input": 0.15,
+     "output": 0.6,
+     "cacheRead": 0.003,
+     "cacheWrite": 0
+    },
+    "contextWindow": 1048576,
+    "maxTokens": 65536,
+    "compat": {
+     "supportsDeveloperRole": false,
+     "maxTokensField": "max_tokens",
+     "thinkingFormat": "deepseek"
+    }
+   },
+   "thinkingLevel": "low",
+   "isStreaming": false,
+   "isCompacting": false,
+   "steeringMode": "one-at-a-time",
+   "followUpMode": "one-at-a-time",
+   "sessionFile": "C:\\rec\\sessions\\2026-09-28T18-20-40-967Z_dfa5c5b7-269c-44a2-ba1b-9992ea29c424.jsonl",
+   "sessionId": "dfa5c5b7-269c-44a2-ba1b-9992ea29c424",
+   "sessionName": "rec2 named after turns",
+   "autoCompactionEnabled": true,
+   "messageCount": 6,
+   "pendingMessageCount": 0
+  }
+ },
+ "forkAt": {
+  "events": [
+   {
+    "type": "extension_ui_request",
+    "id": "ccb8aee1-1bbc-4d8f-a9cb-fe47ba526dad",
+    "method": "notify",
+    "message": "rec[gen=1]:session_start:reason=startup:sid=dfa5c5b7-269c-44a2-ba1b-9992ea29c424:prev=-",
+    "notifyType": "info"
+   },
+   {
+    "type": "extension_ui_request",
+    "id": "15a39fd4-8f21-4c8d-8b26-ed749fde2030",
+    "method": "notify",
+    "message": "rec[gen=1]:session_shutdown:reason=fork:target=C:\\rec\\sessions\\2026-09-28T18-20-53-316Z_01a0e93f-94c2-72cb-ba2c-cd9a788c132f.jsonl",
+    "notifyType": "info"
+   },
+   {
+    "type": "extension_ui_request",
+    "id": "69b09c27-1733-4602-8fac-cb29a9218247",
+    "method": "notify",
+    "message": "rec[gen=1]:session_start:reason=fork:sid=01a0e93f-94c2-72cb-ba2c-cd9a788c132f:prev=C:\\rec\\sessions\\2026-09-28T18-20-40-967Z_dfa5c5b7-269c-44a2-ba1b-9992ea29c424.jsonl",
+    "notifyType": "info"
+   },
+   {
+    "type": "extension_ui_request",
+    "id": "6aac91b5-ebed-4312-9c3c-0d72027eb96e",
+    "method": "notify",
+    "message": "rec[gen=1]:fork-at:withSession:sid=01a0e93f-94c2-72cb-ba2c-cd9a788c132f:before=dfa5c5b7-269c-44a2-ba1b-9992ea29c424",
+    "notifyType": "info"
+   }
+  ],
+  "response": {
+   "id": "B4-1",
+   "type": "response",
+   "command": "prompt",
+   "success": true
+  },
+  "stateAfter": {
+   "model": {
+    "id": "deepseek/deepseek-v4.1-flash",
+    "name": "DeepSeek V4.1 Flash (OrcaRouter)",
+    "api": "openai-completions",
+    "provider": "orcarouter",
+    "baseUrl": "https://api.orcarouter.ai/v1",
+    "reasoning": true,
+    "thinkingLevelMap": {
+     "minimal": null,
+     "low": "low",
+     "medium": null,
+     "high": "high",
+     "xhigh": null,
+     "max": "max"
+    },
+    "input": [
+     "text",
+     "image"
+    ],
+    "cost": {
+     "input": 0.15,
+     "output": 0.6,
+     "cacheRead": 0.003,
+     "cacheWrite": 0
+    },
+    "contextWindow": 1048576,
+    "maxTokens": 65536,
+    "compat": {
+     "supportsDeveloperRole": false,
+     "maxTokensField": "max_tokens",
+     "thinkingFormat": "deepseek"
+    }
+   },
+   "thinkingLevel": "low",
+   "isStreaming": false,
+   "isCompacting": false,
+   "steeringMode": "one-at-a-time",
+   "followUpMode": "one-at-a-time",
+   "sessionFile": "C:\\rec\\sessions\\2026-09-28T18-20-53-316Z_01a0e93f-94c2-72cb-ba2c-cd9a788c132f.jsonl",
+   "sessionId": "01a0e93f-94c2-72cb-ba2c-cd9a788c132f",
+   "sessionName": "ext renamed",
+   "autoCompactionEnabled": true,
+   "messageCount": 2,
+   "pendingMessageCount": 0
+  }
+ },
+ "forkRefused": {
+  "id": "B1-3",
+  "type": "response",
+  "command": "fork",
+  "success": false,
+  "error": "Invalid entry ID for forking"
+ },
+ "editorText": [
+  {
+   "type": "extension_ui_request",
+   "id": "cc2baea6-f61d-4d11-8deb-bddfe1afcd43",
+   "method": "set_editor_text",
+   "text": "Hello from the extension"
+  },
+  {
+   "type": "extension_ui_request",
+   "id": "442936a6-e4b3-4e9a-8972-6300a5123488",
+   "method": "set_editor_text",
+   "text": "pasted text"
+  }
+ ],
+ "streamingCommand": {
+  "notify": {
+   "type": "extension_ui_request",
+   "id": "bad22e59-e7fc-49f1-bdf3-e2255d30500e",
+   "method": "notify",
+   "message": "rec[gen=1]:ping:c1-streamingBehavior-steer:idle=false:sid=01a0e941-3ffa-714d-93b4-b647fa566116",
+   "notifyType": "info"
+  },
+  "response": {
+   "id": "P-10",
+   "type": "response",
+   "command": "prompt",
+   "success": true
+  }
+ },
+ "steerRefused": {
+  "id": "P-12",
+  "type": "response",
+  "command": "steer",
+  "success": false,
+  "error": "Extension command \"/rec-ping\" cannot be queued. Use prompt() or execute the command when not streaming."
+ },
+ "reload": {
+  "commandsBefore": [
+   {
+    "name": "rec-ping",
+    "description": "Recording: notify and return",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-editor",
+    "description": "Recording: ctx.ui.setEditorText",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-paste",
+    "description": "Recording: ctx.ui.pasteToEditor",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-name",
+    "description": "Recording: pi.setSessionName",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-reload",
+    "description": "Recording: ctx.reload()",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-new",
+    "description": "Recording: ctx.newSession()",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-fork-at",
+    "description": "Recording: ctx.fork(entryId, {position: 'at'})",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-tree",
+    "description": "Recording: ctx.navigateTree(targetId)",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-v1",
+    "description": "Recording: version 1 of the reloadable command",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext2.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "llama",
+    "description": "Manage llama.cpp router models",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "<inline:llama.cpp>",
+     "source": "inline",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   }
+  ],
+  "events": [
+   {
+    "type": "extension_ui_request",
+    "id": "cef6eb2e-e2cf-4591-b5e5-dfbbdc924eb6",
+    "method": "notify",
+    "message": "rec[gen=1]:reload:before:sid=01a0e941-3ffa-714d-93b4-b647fa566116",
+    "notifyType": "info"
+   },
+   {
+    "type": "extension_ui_request",
+    "id": "01b27faa-777c-4ebd-8f47-01ccbc469ff2",
+    "method": "notify",
+    "message": "rec[gen=1]:session_shutdown:reason=reload:target=-",
+    "notifyType": "info"
+   },
+   {
+    "type": "extension_ui_request",
+    "id": "203ce22d-01b1-43fd-ad7b-6e5a1985c83b",
+    "method": "notify",
+    "message": "rec[gen=2]:session_start:reason=reload:sid=01a0e941-3ffa-714d-93b4-b647fa566116:prev=-",
+    "notifyType": "info"
+   }
+  ],
+  "response": {
+   "id": "P-21",
+   "type": "response",
+   "command": "prompt",
+   "success": true
+  },
+  "commandsAfter": [
+   {
+    "name": "rec-ping",
+    "description": "Recording: notify and return",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-editor",
+    "description": "Recording: ctx.ui.setEditorText",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-paste",
+    "description": "Recording: ctx.ui.pasteToEditor",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-name",
+    "description": "Recording: pi.setSessionName",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-reload",
+    "description": "Recording: ctx.reload()",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-new",
+    "description": "Recording: ctx.newSession()",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-fork-at",
+    "description": "Recording: ctx.fork(entryId, {position: 'at'})",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-tree",
+    "description": "Recording: ctx.navigateTree(targetId)",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "rec-v2",
+    "description": "Recording: version 2 of the reloadable command",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "C:\\rec\\ext\\rec-ext2.ts",
+     "source": "cli",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   },
+   {
+    "name": "llama",
+    "description": "Manage llama.cpp router models",
+    "source": "extension",
+    "sourceInfo": {
+     "path": "<inline:llama.cpp>",
+     "source": "inline",
+     "scope": "temporary",
+     "origin": "top-level"
+    }
+   }
+  ]
+ },
+ "newSession": {
+  "stateBefore": {
+   "model": {
+    "id": "deepseek/deepseek-v4.1-flash",
+    "name": "DeepSeek V4.1 Flash (OrcaRouter)",
+    "api": "openai-completions",
+    "provider": "orcarouter",
+    "baseUrl": "https://api.orcarouter.ai/v1",
+    "reasoning": true,
+    "thinkingLevelMap": {
+     "minimal": null,
+     "low": "low",
+     "medium": null,
+     "high": "high",
+     "xhigh": null,
+     "max": "max"
+    },
+    "input": [
+     "text",
+     "image"
+    ],
+    "cost": {
+     "input": 0.15,
+     "output": 0.6,
+     "cacheRead": 0.003,
+     "cacheWrite": 0
+    },
+    "contextWindow": 1048576,
+    "maxTokens": 65536,
+    "compat": {
+     "supportsDeveloperRole": false,
+     "maxTokensField": "max_tokens",
+     "thinkingFormat": "deepseek"
+    }
+   },
+   "thinkingLevel": "low",
+   "isStreaming": false,
+   "isCompacting": false,
+   "steeringMode": "one-at-a-time",
+   "followUpMode": "one-at-a-time",
+   "sessionId": "01a0e941-3ffa-714d-93b4-b647fa566116",
+   "autoCompactionEnabled": true,
+   "messageCount": 4,
+   "pendingMessageCount": 0
+  },
+  "events": [
+   {
+    "type": "extension_ui_request",
+    "id": "e89db6f2-0cdd-4b81-9970-e87fb9f05b0d",
+    "method": "notify",
+    "message": "rec[gen=2]:session_shutdown:reason=new:target=-",
+    "notifyType": "info"
+   },
+   {
+    "type": "extension_ui_request",
+    "id": "f72ac3a9-2e82-41be-91c2-cf00764ee2cd",
+    "method": "notify",
+    "message": "rec[gen=2]:session_start:reason=new:sid=01a0e941-5cbd-714d-93b4-b649075cd762:prev=-",
+    "notifyType": "info"
+   },
+   {
+    "type": "extension_ui_request",
+    "id": "64622bdf-977f-46b7-b4af-163780a599ab",
+    "method": "notify",
+    "message": "rec[gen=2]:new:withSession:sid=01a0e941-5cbd-714d-93b4-b649075cd762:before=01a0e941-3ffa-714d-93b4-b647fa566116",
+    "notifyType": "info"
+   }
+  ],
+  "response": {
+   "id": "P-30",
+   "type": "response",
+   "command": "prompt",
+   "success": true
+  },
+  "stateAfter": {
+   "model": {
+    "id": "obsidian/Qwen3.8-27B",
+    "name": "Qwen3.8 27B (OrcaRouter)",
+    "api": "openai-completions",
+    "provider": "orcarouter",
+    "baseUrl": "https://api.orcarouter.ai/v1",
+    "reasoning": true,
+    "input": [
+     "text",
+     "image"
+    ],
+    "cost": {
+     "input": 0.4,
+     "output": 4.21,
+     "cacheRead": 0,
+     "cacheWrite": 0
+    },
+    "contextWindow": 262144,
+    "maxTokens": 32768,
+    "compat": {
+     "supportsDeveloperRole": false,
+     "maxTokensField": "max_tokens",
+     "thinkingFormat": "openrouter"
+    }
+   },
+   "thinkingLevel": "medium",
+   "isStreaming": false,
+   "isCompacting": false,
+   "steeringMode": "one-at-a-time",
+   "followUpMode": "one-at-a-time",
+   "sessionId": "01a0e941-5cbd-714d-93b4-b649075cd762",
+   "autoCompactionEnabled": true,
+   "messageCount": 0,
+   "pendingMessageCount": 0
+  }
+ }
+}

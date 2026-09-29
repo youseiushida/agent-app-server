@@ -12,6 +12,7 @@
 //! | `message_end` (assistant)                  | closes its blocks with the authoritative content, usage |
 //! | `tool_execution_start/update/end`          | tool item (see [`crate::tools`])                |
 //! | `thinking_level_changed`                   | `SessionInfo { effort }`                        |
+//! | `session_info_changed` (with a name)       | `SessionTitle`                                  |
 //! | `compaction_*`, `auto_retry_*`, `summarization_retry_scheduled`, `extension_error` | notices |
 //! | `turn_start`, `turn_end`, `agent_end`, `queue_update`, non-assistant messages, `toolcall_*` deltas, `summarization_retry_attempt_start/finished`, `bash_execution_update` | ignored (covered elsewhere) |
 //! | anything else                              | `Native`                                        |
@@ -194,6 +195,14 @@ impl Mapper {
                 permission_mode: None,
                 effort: ev.get("level").and_then(Value::as_str).map(str::to_owned),
             }],
+            // pi's name of the session changed (`set_session_name`, an extension's
+            // `setSessionName`): pi 0.85.1 writes it before its answer to the request.
+            "session_info_changed" => match ev.get("name").and_then(Value::as_str) {
+                Some(name) if !name.trim().is_empty() => vec![AdapterEvent::SessionTitle {
+                    title: name.to_owned(),
+                }],
+                _ => vec![native(ev)],
+            },
             "compaction_start" => {
                 let reason = ev.get("reason").and_then(Value::as_str).unwrap_or("manual");
                 vec![notice(
@@ -634,6 +643,27 @@ mod tests {
 
     fn upd(ev: Value) -> Value {
         json!({"type": "message_update", "usage": {}, "assistantMessageEvent": ev})
+    }
+
+    #[test]
+    fn session_names_become_titles() {
+        let mut m = Mapper::new();
+        // Recorded from pi 0.85.1 (`set_session_name`, and an extension's `setSessionName`).
+        assert_eq!(
+            m.map(
+                &json!({"type":"session_info_changed","name":"rec2 initial name"}),
+                &no
+            ),
+            vec![AdapterEvent::SessionTitle {
+                title: "rec2 initial name".into()
+            }]
+        );
+        // No name: nothing to reflect, relayed as it is.
+        assert!(matches!(
+            m.map(&json!({"type":"session_info_changed"}), &no)
+                .as_slice(),
+            [AdapterEvent::Native { .. }]
+        ));
     }
 
     #[test]

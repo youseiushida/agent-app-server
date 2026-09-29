@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.aas.android.R
 import dev.aas.android.data.ProjectRepository
+import dev.aas.android.domain.ErrorTexts
 import dev.aas.android.domain.NameProblem
 import dev.aas.android.domain.ProjectNames
 import dev.aas.android.domain.ResultMessages
@@ -393,7 +394,7 @@ class NewProjectViewModel(
             ErrorKind.NotFound -> UiText.of(R.string.newproject_not_found)
             ErrorKind.AlreadyExists -> UiText.of(R.string.newproject_already_exists)
             ErrorKind.InvalidState -> UiText.of(R.string.newproject_invalid_state, e.error.message)
-            else -> UiText.of(R.string.error_server, e.error.message)
+            else -> ErrorTexts.server(e.error)
         }
 
         fun nameProblemText(problem: NameProblem): Int = when (problem) {

@@ -150,7 +150,8 @@ pub fn event_keys(event: &Event) -> EventKeys {
         // Every update carries the whole task, a restart (a new run) included: a later one
         // replaces it. The last update of a task stays, whatever its state.
         Event::BackgroundTaskUpdated { task } => keyed(format!("background:{}", task.id), true),
-        // Each of these adds something no later event repeats.
+        // Each of these adds something no later event repeats. The transient ones
+        // ([`TRANSIENT_EVENT_TYPES`]) expire by age instead.
         Event::TurnStarted { .. }
         | Event::TurnDiffUpdated { .. }
         | Event::ItemStarted { .. }
@@ -158,6 +159,8 @@ pub fn event_keys(event: &Event) -> EventKeys {
         | Event::InteractionRequested { .. }
         | Event::InteractionResolved { .. }
         | Event::InteractionExpired { .. }
+        | Event::NativeSessionChanged { .. }
+        | Event::ComposerInsert { .. }
         | Event::Native { .. } => (None, false),
     };
     let thread_id = match event {
@@ -425,8 +428,13 @@ pub fn compact_superseded(
     delete_rows(tx, &rows)
 }
 
-/// Deletes up to `limit` events of type `type_name` older than `before` (used for `native`
-/// events, which no state is built from). Returns the number deleted.
+/// Event types no state is built from: `native` (what an adapter did not map) and
+/// `composer/insert` (text a harness offered for the composer at that moment). They are
+/// deleted once they are older than `policy.native_event_retention` ([`compact_type`]).
+pub const TRANSIENT_EVENT_TYPES: &[&str] = &["native", "composer/insert"];
+
+/// Deletes up to `limit` events of type `type_name` older than `before` (used for the
+/// [`TRANSIENT_EVENT_TYPES`], which no state is built from). Returns the number deleted.
 pub fn compact_type(
     tx: &Transaction<'_>,
     type_name: &str,

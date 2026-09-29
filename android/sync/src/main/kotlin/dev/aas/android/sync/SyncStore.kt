@@ -244,6 +244,14 @@ data class OutboxEntry(
      * `harness/updated`); once it does, the request is sent at once. `null` for any other state.
      */
     val waitingForHarness: String? = null,
+    /**
+     * The `clientRequestId` of the entry before this one in its chain ([SyncEngine.submitChain]),
+     * while that entry waits for its answer: this one is not sent before it succeeded, and is
+     * dropped (never sent) when it fails definitively or is discarded. `null` for an entry that
+     * may be sent (not chained, or its predecessor succeeded). An entry chained after a
+     * `thread/create` has no `threadId` until the creation succeeded.
+     */
+    val after: String? = null,
 ) {
     /** The thread the request targets, when it names one. */
     val threadId: ThreadId? get() = (params[JsonKeys.THREAD_ID] as? JsonPrimitive)?.contentOrNull

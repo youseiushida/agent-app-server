@@ -1,5 +1,6 @@
 package dev.aas.android.sync
 
+import dev.aas.android.protocol.AasJson
 import dev.aas.android.protocol.BackgroundTask
 import dev.aas.android.protocol.BackgroundTaskEnded
 import dev.aas.android.protocol.ClientPolicy
@@ -8,10 +9,13 @@ import dev.aas.android.protocol.Interaction
 import dev.aas.android.protocol.InteractionId
 import dev.aas.android.protocol.InteractionStatus
 import dev.aas.android.protocol.Item
+import dev.aas.android.protocol.JsonKeys
+import dev.aas.android.protocol.Methods
 import dev.aas.android.protocol.Operation
 import dev.aas.android.protocol.Project
 import dev.aas.android.protocol.QueuedInput
 import dev.aas.android.protocol.RpcError
+import dev.aas.android.protocol.RpcMethod
 import dev.aas.android.protocol.ServerInfo
 import dev.aas.android.protocol.ShutdownReason
 import dev.aas.android.protocol.Thread
@@ -20,6 +24,8 @@ import dev.aas.android.protocol.Turn
 import dev.aas.android.protocol.TurnSummary
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 /** Where and how to connect: the paired server's WebSocket URL and this device's token. */
 data class Credentials(val wsUrl: String, val token: String) {
@@ -281,6 +287,22 @@ sealed interface SyncSignal {
     /** An operation (git clone) ended. */
     data class OperationFinished(val operation: Operation) : SyncSignal
 
+    /**
+     * The harness asks to put [text] into the composer of [threadId] (`composer/insert`, e.g. a
+     * pi extension's `setEditorText`). Not notified: the thread's screen shows it while open.
+     * [live]: it arrived after this connection subscribed to the thread; `false` for the catch-up
+     * from an older cursor (and right after subscribing, before the subscription's head is
+     * known), which the screen offers instead of putting it in (protocol.md §5).
+     */
+    data class ComposerInsert(val threadId: ThreadId, val text: String, val live: Boolean) : SyncSignal
+
+    /**
+     * The harness moved the agent of [threadId] to another native session by itself
+     * (`thread/nativeSessionChanged`). Not notified: the thread's screen says so while open, and
+     * the running turn carries a notice.
+     */
+    data class NativeSessionChanged(val threadId: ThreadId, val previousNativeSessionId: String, val nativeSessionId: String) : SyncSignal
+
     /** A thread was deleted on the server (its local data is gone). */
     data class ThreadRemoved(val threadId: ThreadId) : SyncSignal
 }
@@ -296,6 +318,15 @@ sealed interface OutboxResult {
 
     /** Dropped without an answer: by [SyncEngine.resetLocalData] or [SyncEngine.discardOutbox]. */
     data class Discarded(override val entry: OutboxEntry) : OutboxResult
+
+    /**
+     * Never sent: the entry before it in its chain ([SyncEngine.submitChain], [OutboxEntry.after])
+     * did not succeed — it failed definitively, was discarded, or was dropped itself. [after] is
+     * that entry's `clientRequestId`; [error] the definitive error that broke the chain (`null`
+     * when it was discarded, or its answer could not be used). That entry's own result reports
+     * the failure; this one is only the consequence.
+     */
+    data class Dropped(override val entry: OutboxEntry, val after: String, val error: RpcError?) : OutboxResult
 }
 
 /** Outcome of [SyncEngine.discardOutbox]. */
@@ -327,6 +358,7 @@ class PendingMutation<R> internal constructor(
      *
      * @throws dev.aas.android.protocol.RpcException the server answered with a definitive error.
      * @throws OutboxClearedException the entry was dropped before an answer.
+     * @throws OutboxChainBrokenException an entry before it in its chain did not succeed, so it was never sent.
      */
     suspend fun await(): R = decode(answer.await())
 
@@ -337,9 +369,50 @@ class PendingMutation<R> internal constructor(
      *
      * @throws dev.aas.android.protocol.RpcException the server answered with a definitive error.
      * @throws OutboxClearedException the entry was dropped before an answer.
+     * @throws OutboxChainBrokenException an entry before it in its chain did not succeed, so it was never sent.
      */
     suspend fun awaitAccepted() {
         answer.await()
+    }
+}
+
+/**
+ * The requests of one chain, collected by [SyncEngine.submitChain] and committed together: each
+ * request added after the first waits for the one before it ([OutboxEntry.after]).
+ *
+ * A chain that starts with `thread/create` is for the thread it creates: the requests after it
+ * are built with [CREATED_THREAD] as their `threadId`, are stored without it, and get the new
+ * thread's id when the creation succeeds.
+ */
+class OutboxChain internal constructor(private val newRequestId: () -> String, private val nowMs: Long) {
+    internal val entries = ArrayList<OutboxEntry>()
+    internal val waiters = LinkedHashMap<String, CompletableDeferred<JsonElement>>()
+
+    /** Adds a request after the ones added before; its answer is awaited on the returned handle. */
+    fun <P, R> add(method: RpcMethod<P, R>, build: (clientRequestId: String) -> P): PendingMutation<R> {
+        require(method.mutating) { "${method.name} does not change state: it cannot be in the outbox" }
+        val crid = newRequestId()
+        val encoded = AasJson.encodeToJsonElement(method.params, build(crid)) as? JsonObject
+            ?: throw IllegalArgumentException("${method.name} params must be a JSON object")
+        require(encoded[JsonKeys.CLIENT_REQUEST_ID] == JsonPrimitive(crid)) { "${method.name} params must carry the clientRequestId" }
+        val forCreatedThread = entries.firstOrNull()?.method == Methods.ThreadCreate.name
+        val params = if (forCreatedThread) {
+            require(encoded[JsonKeys.THREAD_ID] == JsonPrimitive(CREATED_THREAD)) {
+                "${method.name} after thread/create is for the created thread: build it with OutboxChain.CREATED_THREAD"
+            }
+            JsonObject(encoded - JsonKeys.THREAD_ID)
+        } else {
+            encoded
+        }
+        entries += OutboxEntry(crid, method.name, params, nowMs, after = entries.lastOrNull()?.clientRequestId)
+        val waiter = CompletableDeferred<JsonElement>()
+        waiters[crid] = waiter
+        return PendingMutation(crid, waiter) { AasJson.decodeFromJsonElement(method.result, it) }
+    }
+
+    companion object {
+        /** The `threadId` a request after the chain's `thread/create` is built with (the created thread's id replaces it). */
+        const val CREATED_THREAD: ThreadId = ""
     }
 }
 
@@ -357,3 +430,13 @@ class CallTimeoutException(val method: String, val timeoutMs: Long) : Exception(
  * left the outbox without an answer: [SyncEngine.resetLocalData] or [SyncEngine.discardOutbox].
  */
 class OutboxClearedException : Exception("the pending request was discarded")
+
+/**
+ * Thrown to callers waiting for an entry of a chain ([SyncEngine.submitChain]) that was dropped
+ * without being sent ([OutboxResult.Dropped]): the entry before it ([after]) did not succeed.
+ * [error] is the definitive error that broke the chain, `null` when an entry of it was discarded
+ * or its answer could not be used. Unlike [OutboxClearedException], the request itself was not
+ * taken back: what it carried (a message) was never delivered.
+ */
+class OutboxChainBrokenException(val after: String, val error: RpcError?) :
+    Exception("the request before it in its chain did not succeed ($after${error?.let { ": ${it.kind.wire}" } ?: ""})")

@@ -33,6 +33,17 @@ object HarnessSettings {
         return harness.effortLevels.filter { it.id in allowed }
     }
 
+    /**
+     * Whether [modelId] can keep the thread's [effort]: it has none (the harness decides), the
+     * model offers it, or the model offers no levels to choose from (as in the model sheet,
+     * where only a model with levels asks for one).
+     */
+    fun offersEffort(harness: Harness?, modelId: String, effort: String?): Boolean {
+        if (effort == null) return true
+        val levels = effortLevels(harness, modelId)
+        return levels.isEmpty() || levels.any { it.id == effort }
+    }
+
     /** The effort level in effect (`null`: the harness decides, shown as 既定). */
     fun effort(harness: Harness?, settings: ThreadSettings): EffortLevel? =
         settings.effort?.let { id -> harness?.effortLevels?.firstOrNull { it.id == id } }

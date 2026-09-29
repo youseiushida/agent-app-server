@@ -1,9 +1,12 @@
 //! Replays transcripts recorded from pi 0.85.1 (`tests/fixtures/`) against the session core
 //! over in-memory pipes. A small fake plays pi's side: it answers `get_state` (the adapter's
-//! "did a run start?" probe), `get_session_stats` (asked after every assistant message; the
-//! answer has the shape recorded from pi 0.85.1, with `contextUsage.tokens` = 1000 × the
-//! number of stats requests so far) and `clear_queue` itself and hands every other command to
-//! the scenario.
+//! "did a run start?" probe and its question at the end of a turn; `isStreaming` and what the
+//! scenario set in [`FakePi::state`]), `get_session_stats` (asked after every assistant message;
+//! the answer has the shape recorded from pi 0.85.1, with `contextUsage.tokens` = 1000 × the
+//! number of stats requests so far), `clear_queue`, `get_entries` and `get_fork_messages` (from
+//! the session tree in [`FakePi::entries`], like pi 0.85.1's `rpc-mode.js`) and, once the
+//! scenario set a listing, `get_commands` itself, and hands every other command to the
+//! scenario.
 //!
 //! Fixture lines are pi output, except:
 //! * `{"$await": "<command>", "respond"?: true}` — wait for the adapter to send `<command>`
@@ -14,13 +17,20 @@
 //! test's extension (`tests/extension/aas-live.ts`): runs pi starts by itself, the race of a
 //! prompt with such a run, a run started from a run's end, an abort, the approval gate inside
 //! such a run, and a dialog outside any turn. Response ids are replaced by `resp-<n>`.
+//!
+//! `rec2.json` holds pi 0.85.1's own output recorded on 2026-09-28 (the recording "rec2"), with
+//! local paths replaced by `C:\rec`: the entries of a session after each of three turns and its
+//! user messages (`get_entries`, `get_fork_messages`), names (`set_session_name`,
+//! `session_info_changed`), a fork at an entry by an extension (`ctx.fork`), the editor text of
+//! an extension (`set_editor_text`), an extension command while pi streams, a reload, and an
+//! extension that starts a new session (`ctx.newSession`).
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use aas_adapter_pi::{PiSession, ProcessLink, SessionConfig, handshake};
+use aas_adapter_pi::{ForkTarget, PiSession, ProcessLink, SessionConfig, handshake};
 use aas_harness::{
     AdapterError, AdapterEvent, ContextUsage, DeltaField, ExitInfo, ExpireReason,
     InteractionRequest, InteractionResolution, ItemBody, ItemStatus, NoticeLevel, SessionControl,
@@ -93,6 +103,61 @@ impl ProcessLink for FakeLink {
     }
 }
 
+/// What the fake reports of its session.
+#[derive(Default)]
+struct FakePi {
+    /// Fields of every `get_state` answer besides `isStreaming` (e.g. `sessionId`).
+    state: serde_json::Map<String, Value>,
+    /// The session's entries in file order (the leaf is the last one).
+    entries: Vec<Value>,
+    /// `get_commands`, once the fake answers it itself.
+    commands: Option<Value>,
+    /// The commands the fake answered itself, in order.
+    answered: Vec<Value>,
+}
+
+impl FakePi {
+    /// pi 0.85.1's `get_entries`: the entries after `since` (all without it), and the leaf.
+    fn entries(&self, since: Option<&str>) -> Result<Value, String> {
+        let after = match since {
+            None => 0,
+            Some(id) => {
+                self.entries
+                    .iter()
+                    .position(|e| e["id"] == id)
+                    .ok_or_else(|| format!("Entry not found: {id}"))?
+                    + 1
+            }
+        };
+        Ok(json!({
+            "entries": self.entries[after..],
+            "leafId": self.entries.last().map_or(Value::Null, |e| e["id"].clone()),
+        }))
+    }
+
+    /// pi 0.85.1's `get_fork_messages`: the user messages with text, in file order.
+    fn fork_messages(&self) -> Value {
+        let messages: Vec<Value> = self
+            .entries
+            .iter()
+            .filter(|e| e["type"] == "message" && e["message"]["role"] == "user")
+            .filter_map(|e| {
+                let content = &e["message"]["content"];
+                let text = match content {
+                    Value::String(s) => s.clone(),
+                    Value::Array(blocks) => blocks
+                        .iter()
+                        .filter_map(|b| b["text"].as_str())
+                        .collect::<String>(),
+                    _ => String::new(),
+                };
+                (!text.is_empty()).then(|| json!({"entryId": e["id"], "text": text}))
+            })
+            .collect();
+        json!({ "messages": messages })
+    }
+}
+
 struct Fake {
     out: Arc<Mutex<Option<DuplexStream>>>,
     commands: mpsc::UnboundedReceiver<Value>,
@@ -100,6 +165,7 @@ struct Fake {
     link: Arc<FakeLink>,
     /// `get_session_stats` requests answered by the fake so far.
     stats: Arc<AtomicU64>,
+    pi: Arc<std::sync::Mutex<FakePi>>,
 }
 
 impl Fake {
@@ -125,6 +191,31 @@ impl Fake {
             resp["data"] = d;
         }
         self.write(&resp).await;
+    }
+
+    /// pi's session from now on: the `get_state` fields and the entries.
+    fn set_session(&self, state: &Value, entries: Vec<Value>) {
+        let mut pi = self.pi.lock().unwrap();
+        pi.state = state.as_object().cloned().unwrap_or_default();
+        pi.state.remove("isStreaming");
+        pi.entries = entries;
+    }
+
+    /// Appends entries pi wrote.
+    fn append(&self, entries: &[Value]) {
+        self.pi.lock().unwrap().entries.extend_from_slice(entries);
+    }
+
+    /// The commands of `kind` the fake answered itself (in order).
+    fn answered(&self, kind: &str) -> Vec<Value> {
+        self.pi
+            .lock()
+            .unwrap()
+            .answered
+            .iter()
+            .filter(|c| c["type"] == kind)
+            .cloned()
+            .collect()
     }
 
     /// Plays a fixture. `prompt_id` replaces `$prompt`; returns the answers the adapter
@@ -214,28 +305,54 @@ impl Harness {
         let out = Arc::new(Mutex::new(Some(fake_write)));
         let streaming = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(AtomicU64::new(0));
+        let pi = Arc::new(std::sync::Mutex::new(FakePi::default()));
         let (cmd_tx, commands) = mpsc::unbounded_channel();
         {
             let out = out.clone();
             let streaming = streaming.clone();
             let stats = stats.clone();
             let link = link.clone();
+            let pi = pi.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(fake_read).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let cmd: Value = serde_json::from_str(&line).unwrap();
-                    let auto = match cmd["type"].as_str() {
-                        Some("get_state") if auto_state => {
-                            Some(json!({"isStreaming": streaming.load(Ordering::SeqCst)}))
+                    let auto: Option<Result<Value, String>> = {
+                        let pi = pi.lock().unwrap();
+                        match cmd["type"].as_str() {
+                            Some("get_state") if auto_state => {
+                                let mut state = pi.state.clone();
+                                state.insert(
+                                    "isStreaming".into(),
+                                    json!(streaming.load(Ordering::SeqCst)),
+                                );
+                                Some(Ok(Value::Object(state)))
+                            }
+                            Some("get_session_stats") if auto_stats => Some(Ok(session_stats(
+                                1000 * (stats.fetch_add(1, Ordering::SeqCst) + 1),
+                            ))),
+                            Some("clear_queue") => {
+                                Some(Ok(json!({"steering": [], "followUp": []})))
+                            }
+                            Some("get_entries") => Some(pi.entries(cmd["since"].as_str())),
+                            Some("get_fork_messages") => Some(Ok(pi.fork_messages())),
+                            Some("get_commands") => pi
+                                .commands
+                                .clone()
+                                .map(|commands| Ok(json!({ "commands": commands }))),
+                            _ => None,
                         }
-                        Some("get_session_stats") if auto_stats => Some(session_stats(
-                            1000 * (stats.fetch_add(1, Ordering::SeqCst) + 1),
-                        )),
-                        Some("clear_queue") => Some(json!({"steering": [], "followUp": []})),
-                        _ => None,
                     };
-                    if let Some(data) = auto {
-                        let resp = json!({"type":"response","command":cmd["type"],"success":true,"id":cmd["id"],"data":data});
+                    if let Some(answer) = auto {
+                        pi.lock().unwrap().answered.push(cmd.clone());
+                        let resp = match answer {
+                            Ok(data) => {
+                                json!({"type":"response","command":cmd["type"],"success":true,"id":cmd["id"],"data":data})
+                            }
+                            Err(error) => {
+                                json!({"type":"response","command":cmd["type"],"success":false,"id":cmd["id"],"error":error})
+                            }
+                        };
                         if let Some(w) = out.lock().await.as_mut() {
                             w.write_all(format!("{resp}\n").as_bytes()).await.unwrap();
                         }
@@ -259,6 +376,7 @@ impl Harness {
                 streaming,
                 link,
                 stats,
+                pi,
             },
             sending: None,
         }
@@ -304,15 +422,11 @@ impl Harness {
             .unwrap()
     }
 
-    /// Lets the session learn pi's commands (`get_commands`), as the handshake does.
+    /// Lets the session learn pi's commands (`get_commands`), as the handshake does; the fake
+    /// answers `get_commands` with them from now on.
     async fn load_commands(&mut self, commands: Value) {
-        let session = self.session.clone();
-        let listing = tokio::spawn(async move { session.get_commands().await });
-        let cmd = self.fake.expect("get_commands").await;
-        self.fake
-            .respond(&cmd, Some(json!({ "commands": commands })))
-            .await;
-        listing.await.unwrap().unwrap();
+        self.fake.pi.lock().unwrap().commands = Some(commands);
+        self.session.get_commands().await.unwrap();
     }
 }
 
@@ -1210,7 +1324,9 @@ async fn handshake_checks_session_and_applies_settings() {
     );
     match h.next().await {
         AdapterEvent::CommandsChanged { commands } => {
-            assert!(commands.iter().any(|c| c.name == "llama"));
+            // pi 0.85.1's bundled llama.cpp extension (`<inline:llama.cpp>`) only works in pi's
+            // interactive mode: not offered.
+            assert!(!commands.iter().any(|c| c.name == "llama"));
             // The RPC `compact` command is offered as `/compact`.
             assert_eq!(commands.last().map(|c| c.name.as_str()), Some("compact"));
         }
@@ -1321,6 +1437,613 @@ async fn run_ends(h: &mut Harness) {
         .write(&json!({"type":"agent_end","messages":[]}))
         .await;
     h.fake.write(&json!({"type":"agent_settled"})).await;
+}
+
+// ----- anchors, forks, names, status, commands (recorded in rec2, pi 0.85.1) ------------------
+
+/// `tests/fixtures/rec2.json`.
+fn rec2() -> Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rec2.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn array(v: &Value) -> Vec<Value> {
+    v.as_array().expect("an array").clone()
+}
+
+/// A recorded response to the adapter's own request `cmd` (the recorded id replaced).
+async fn reply(h: &Harness, cmd: &Value, recorded: &Value) {
+    let mut resp = recorded.clone();
+    resp["id"] = cmd["id"].clone();
+    h.fake.write(&resp).await;
+}
+
+/// The anchor reported right before the turn's `TurnCompleted` (the events of one turn).
+fn anchor_of(events: &[AdapterEvent]) -> Option<Value> {
+    let completed_at = events.iter().position(completed).expect("a completed turn");
+    match completed_at.checked_sub(1).map(|i| &events[i]) {
+        Some(AdapterEvent::TurnAnchor { anchor }) => Some(anchor.clone()),
+        _ => {
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AdapterEvent::TurnAnchor { .. })),
+                "an anchor comes right before TurnCompleted: {events:?}"
+            );
+            None
+        }
+    }
+}
+
+/// The recorded entries of the three turns (session dfa5c5b7): the entries before the first
+/// user message, then the entries each turn added.
+fn recorded_turn_entries(rec: &Value) -> (Vec<Value>, [Vec<Value>; 3]) {
+    let t = &rec["threeTurns"];
+    let all = array(&t["entriesAfterOne"]["entries"]);
+    let first_user = all
+        .iter()
+        .position(|e| e["message"]["role"] == "user")
+        .unwrap();
+    (
+        all[..first_user].to_vec(),
+        [
+            all[first_user..].to_vec(),
+            array(&t["entriesAfterTwo"]["entries"]),
+            array(&t["entriesAfterThree"]["entries"]),
+        ],
+    )
+}
+
+/// Runs a turn whose run adds `entries` to the session tree; returns its events.
+async fn turn_adding(h: &mut Harness, text: &str, entries: &[Value]) -> Vec<AdapterEvent> {
+    running_turn(h, text).await;
+    h.fake.append(entries);
+    run_ends(h).await;
+    h.until(completed).await
+}
+
+#[tokio::test]
+async fn recorded_turns_are_anchored_by_the_entries_they_added() {
+    let rec = rec2();
+    let t = &rec["threeTurns"];
+    let (before, turns) = recorded_turn_entries(&rec);
+    let mut h = Harness::new();
+    h.fake.set_session(&t["stateStart"], before);
+    h.fake.pi.lock().unwrap().commands = Some(t["commands"].clone());
+    handshake(
+        &h.session,
+        "dfa5c5b7-269c-44a2-ba1b-9992ea29c424",
+        &ThreadSettings::default(),
+        "ask",
+    )
+    .await
+    .unwrap();
+    h.until(|e| matches!(e, AdapterEvent::CommandsChanged { .. }))
+        .await;
+    // The handshake learnt the leaf: the session had no user message yet, so every entry was
+    // asked for.
+    assert_eq!(
+        h.fake.answered("get_entries"),
+        [json!({"id": h.fake.answered("get_entries")[0]["id"], "type": "get_entries"})]
+    );
+
+    let expected = [
+        ("Reply with exactly: ONE", "6229f6ef", "41c51822"),
+        ("Reply with exactly: TWO", "46f74d5b", "343ba349"),
+        ("Reply with exactly: THREE", "20e3f58d", "eb03ba61"),
+    ];
+    for ((text, leaf, user), entries) in expected.iter().zip(turns.iter()) {
+        let events = turn_adding(&mut h, text, entries).await;
+        assert_eq!(
+            anchor_of(&events),
+            Some(json!({"leafId": leaf, "userEntryId": user})),
+            "{events:?}"
+        );
+    }
+    // Each turn asked for the entries after the previous turn's leaf (the requests recorded from
+    // pi after TWO and THREE were the same).
+    let since: Vec<Value> = h
+        .fake
+        .answered("get_entries")
+        .iter()
+        .map(|c| c["since"].clone())
+        .collect();
+    assert_eq!(
+        since,
+        [
+            Value::Null,
+            json!("da36193f"),
+            json!("6229f6ef"),
+            json!("46f74d5b")
+        ]
+    );
+    // The recorded user messages are what the fake lists (the shape of `get_fork_messages`).
+    assert_eq!(h.fake.pi.lock().unwrap().fork_messages(), t["forkMessages"]);
+}
+
+#[tokio::test]
+async fn a_turn_after_one_completed_for_a_new_run_is_anchored_without_its_user_entry() {
+    let rec = rec2();
+    let (before, turns) = recorded_turn_entries(&rec);
+    let mut h = Harness::new();
+    h.fake.set_session(&rec["threeTurns"]["stateStart"], before);
+    // No handshake: where the first turn begins is not known; its anchor has the leaf only.
+    let events = turn_adding(&mut h, "Reply with exactly: ONE", &turns[0]).await;
+    assert_eq!(anchor_of(&events), Some(json!({"leafId": "6229f6ef"})));
+    // A run started from the end of the next turn (pi writes its `agent_start` before the
+    // turn's `agent_settled`): that turn completes at once, without an anchor.
+    running_turn(&mut h, "Reply with exactly: TWO").await;
+    h.fake.append(&turns[1]);
+    h.fake
+        .write(&json!({"type":"agent_end","messages":[]}))
+        .await;
+    h.fake.write(&json!({"type":"agent_start"})).await;
+    h.fake.write(&json!({"type":"agent_settled"})).await;
+    let events = h.until(completed).await;
+    assert_eq!(anchor_of(&events), None);
+    assert_eq!(h.next().await, AdapterEvent::TurnStarted);
+    // The run's turn: its entries follow the earlier turn's, so only its leaf is known.
+    h.fake.append(&turns[2]);
+    run_ends(&mut h).await;
+    let events = h.until(completed).await;
+    assert_eq!(anchor_of(&events), Some(json!({"leafId": "20e3f58d"})));
+    // From then on turns are anchored whole again.
+    let next = [
+        json!({"type":"message","id":"u4","parentId":"20e3f58d","message":{"role":"user","content":[{"type":"text","text":"four"}]}}),
+        json!({"type":"message","id":"a4","parentId":"u4","message":{"role":"assistant","content":[]}}),
+    ];
+    let events = turn_adding(&mut h, "four", &next).await;
+    assert_eq!(
+        anchor_of(&events),
+        Some(json!({"leafId": "a4", "userEntryId": "u4"}))
+    );
+}
+
+/// The commands of the three turns' session with the gate's fork command.
+fn with_gate_commands(rec: &Value) -> Value {
+    let mut commands = array(&rec["threeTurns"]["commands"]);
+    commands.push(json!({"name": "aas-gate-fork", "description": "agent-app-server: branch this session at an entry (internal)", "source": "extension", "sourceInfo": {"path": "C:\\rec\\pi-state\\aas-gate-v3.ts", "source": "local"}}));
+    Value::Array(commands)
+}
+
+#[tokio::test]
+async fn a_fork_at_a_turn_runs_the_gate_command_and_takes_the_branch_pi_made() {
+    let rec = rec2();
+    let (before, turns) = recorded_turn_entries(&rec);
+    let mut h = Harness::new();
+    let mut entries = before;
+    entries.extend(turns.iter().flatten().cloned());
+    h.fake
+        .set_session(&rec["threeTurns"]["stateAfterTurns"], entries.clone());
+    h.fake.pi.lock().unwrap().commands = Some(with_gate_commands(&rec));
+    let session = h.session.clone();
+    let fork = tokio::spawn(async move {
+        session
+            .fork_to(&ForkTarget {
+                entry_id: "6229f6ef".into(),
+                position: "at",
+            })
+            .await
+    });
+    let prompt = h.fake.expect("prompt").await;
+    assert_eq!(prompt["message"], "/aas-gate-fork 6229f6ef at");
+    assert!(prompt.get("streamingBehavior").is_none());
+    // Recorded: an extension's `ctx.fork("6229f6ef", {position: "at"})` in a second process.
+    let fork_at = &rec["forkAt"];
+    for event in array(&fork_at["events"]) {
+        h.fake.write(&event).await;
+    }
+    let through = entries.iter().position(|e| e["id"] == "6229f6ef").unwrap();
+    h.fake
+        .set_session(&fork_at["stateAfter"], entries[..=through].to_vec());
+    reply(&h, &prompt, &fork_at["response"]).await;
+    assert_eq!(
+        fork.await.unwrap(),
+        Ok("01a0e93f-94c2-72cb-ba2c-cd9a788c132f".to_owned())
+    );
+    // The other extensions' notifications are relayed as they are.
+    let notified = h
+        .until(|e| matches!(e, AdapterEvent::Notice { message, .. } if message.contains("fork-at:withSession")))
+        .await;
+    assert_eq!(notices(&notified, "extensionNotify").len(), 4);
+}
+
+#[tokio::test]
+async fn a_fork_pi_does_not_make_fails_with_pi_reason() {
+    let rec = rec2();
+    let mut h = Harness::new();
+    h.fake
+        .set_session(&rec["threeTurns"]["stateAfterTurns"], Vec::new());
+    h.fake.pi.lock().unwrap().commands = Some(with_gate_commands(&rec));
+    let session = h.session.clone();
+    let fork = tokio::spawn(async move {
+        session
+            .fork_to(&ForkTarget {
+                entry_id: "nonexistent".into(),
+                position: "before",
+            })
+            .await
+    });
+    let prompt = h.fake.expect("prompt").await;
+    assert_eq!(prompt["message"], "/aas-gate-fork nonexistent before");
+    // The gate reports pi's error (recorded as the RPC `fork`'s answer to an unknown entry).
+    let error = rec["forkRefused"]["error"].as_str().unwrap();
+    let report = json!({"v":1,"event":"forkFailed","error":error});
+    h.fake
+        .write(&json!({"type":"extension_ui_request","id":"n1","method":"notify","notifyType":"info","message":format!("aas-gate:{report}")}))
+        .await;
+    h.fake.respond(&prompt, None).await;
+    assert_eq!(
+        fork.await.unwrap(),
+        Err(AdapterError::Harness("Invalid entry ID for forking".into()))
+    );
+    // The report is the adapter's, not the user's.
+    assert!(h.events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn without_the_gate_command_no_fork_is_attempted() {
+    let rec = rec2();
+    let mut h = Harness::new();
+    h.fake
+        .set_session(&rec["threeTurns"]["stateAfterTurns"], Vec::new());
+    h.fake.pi.lock().unwrap().commands = Some(rec["threeTurns"]["commands"].clone());
+    let result = h
+        .session
+        .fork_to(&ForkTarget {
+            entry_id: "6229f6ef".into(),
+            position: "at",
+        })
+        .await;
+    assert!(
+        matches!(&result, Err(AdapterError::Other(m)) if m.contains("aas-gate-fork")),
+        "{result:?}"
+    );
+    // pi would take the text for a prompt to the model: nothing was sent.
+    nothing_written(&mut h).await;
+    let result = h
+        .session
+        .fork_to(&ForkTarget {
+            entry_id: "two words".into(),
+            position: "at",
+        })
+        .await;
+    assert!(matches!(result, Err(AdapterError::Other(_))));
+}
+
+#[tokio::test]
+async fn names_go_to_pi_and_pi_names_come_back_as_titles() {
+    let rec = rec2();
+    let t = &rec["threeTurns"];
+    let mut h = Harness::new();
+    let session = h.session.clone();
+    let rename = tokio::spawn(async move { session.rename("rec2 initial name").await });
+    let cmd = h.fake.expect("set_session_name").await;
+    assert_eq!(cmd["name"], "rec2 initial name");
+    // Recorded: pi reports the name before it answers.
+    h.fake.write(&t["nameEvent"]).await;
+    reply(&h, &cmd, &t["nameResponse"]).await;
+    assert_eq!(rename.await.unwrap(), Ok(()));
+    assert_eq!(
+        h.next().await,
+        AdapterEvent::SessionTitle {
+            title: "rec2 initial name".into()
+        }
+    );
+    // pi refuses a blank name with its own words.
+    let session = h.session.clone();
+    let rename = tokio::spawn(async move { session.rename("   ").await });
+    let cmd = h.fake.expect("set_session_name").await;
+    reply(&h, &cmd, &t["blankNameResponse"]).await;
+    assert_eq!(
+        rename.await.unwrap(),
+        Err(AdapterError::Harness("Session name cannot be empty".into()))
+    );
+    // An extension names the session (`pi.setSessionName`): the same event.
+    h.fake.write(&t["extensionNameEvent"]).await;
+    assert_eq!(
+        h.next().await,
+        AdapterEvent::SessionTitle {
+            title: "ext renamed".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn the_status_is_pi_session_screen() {
+    let rec = rec2();
+    let h = Harness::new();
+    h.fake
+        .set_session(&rec["threeTurns"]["stateAfterTurns"], Vec::new());
+    let sections = h.session.status().await.unwrap();
+    let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        ["Session Info", "State", "Messages", "Tokens", "Cost"]
+    );
+    assert_eq!(sections[0].rows[0].label, "Name");
+    assert_eq!(sections[0].rows[0].value, "rec2 named after turns");
+    assert!(
+        sections[1]
+            .rows
+            .iter()
+            .any(|r| r.label == "Model" && r.value == "orcarouter/deepseek/deepseek-v4.1-flash")
+    );
+}
+
+#[tokio::test]
+async fn an_extension_editor_text_goes_to_the_composer() {
+    let rec = rec2();
+    let mut h = Harness::new();
+    for request in array(&rec["editorText"]) {
+        h.fake.write(&request).await;
+    }
+    assert_eq!(
+        h.next().await,
+        AdapterEvent::ComposerText {
+            text: "Hello from the extension".into()
+        }
+    );
+    assert_eq!(
+        h.next().await,
+        AdapterEvent::ComposerText {
+            text: "pasted text".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn an_extension_command_steered_while_pi_streams_goes_through_prompt() {
+    let rec = rec2();
+    let mut h = Harness::new();
+    h.load_commands(rec["reload"]["commandsBefore"].clone())
+        .await;
+    running_turn(
+        &mut h,
+        "Count from 1 to 300, one number per line, nothing else.",
+    )
+    .await;
+    let session = h.session.clone();
+    let steer = tokio::spawn(async move {
+        session
+            .steer_message(
+                "itm_1",
+                TurnInput::text("/rec-ping c1-streamingBehavior-steer"),
+            )
+            .await
+    });
+    let cmd = h.fake.expect("prompt").await;
+    assert_eq!(cmd["message"], "/rec-ping c1-streamingBehavior-steer");
+    assert_eq!(cmd["streamingBehavior"], "steer");
+    // Recorded: pi ran the command at once and answered when its handler returned.
+    h.fake.write(&rec["streamingCommand"]["notify"]).await;
+    reply(&h, &cmd, &rec["streamingCommand"]["response"]).await;
+    assert_eq!(steer.await.unwrap(), Ok(()));
+    // Other text is a steer (pi refuses extension commands there: `steerRefused`).
+    let session = h.session.clone();
+    let steer = tokio::spawn(async move {
+        session
+            .steer_message("itm_2", TurnInput::text("also say DONE"))
+            .await
+    });
+    let cmd = h.fake.expect("steer").await;
+    assert_eq!(cmd["message"], "also say DONE");
+    h.fake.respond(&cmd, None).await;
+    assert_eq!(steer.await.unwrap(), Ok(()));
+    // The turn ran an extension command: its end asks for pi's commands again (unchanged here,
+    // so nothing is reported).
+    run_ends(&mut h).await;
+    let events = h.until(completed).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::CommandsChanged { .. })),
+        "{events:?}"
+    );
+    assert_eq!(h.fake.answered("get_commands").len(), 2);
+}
+
+#[tokio::test]
+async fn a_reload_reports_pi_new_commands_before_the_turn_completes() {
+    let rec = rec2();
+    let reload = &rec["reload"];
+    let mut h = Harness::new();
+    h.load_commands(reload["commandsBefore"].clone()).await;
+    let prompt = h.start_turn("/rec-reload").await;
+    assert_eq!(h.sent().await, Ok(()));
+    for event in array(&reload["events"]) {
+        h.fake.write(&event).await;
+    }
+    // Recorded: the extension files were re-read (`rec-v1` became `rec-v2`).
+    h.fake.pi.lock().unwrap().commands = Some(reload["commandsAfter"].clone());
+    reply(&h, &json!({"id": prompt}), &reload["response"]).await;
+    let events = h.until(completed).await;
+    let commands = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::CommandsChanged { commands } => Some(commands.clone()),
+            _ => None,
+        })
+        .expect("the new commands");
+    let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+    assert!(
+        names.contains(&"rec-v2") && !names.contains(&"rec-v1"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"llama"), "{names:?}");
+    // The reload's notifications stay visible.
+    assert_eq!(notices(&events, "extensionNotify").len(), 3);
+}
+
+#[tokio::test]
+async fn a_new_session_an_extension_starts_is_reported_and_the_thread_settings_applied_again() {
+    let rec = rec2();
+    let new = &rec["newSession"];
+    let mut h = Harness::new();
+    h.fake.set_session(&new["stateBefore"], Vec::new());
+    h.fake.pi.lock().unwrap().commands = Some(rec["reload"]["commandsAfter"].clone());
+    let settings = ThreadSettings {
+        model: Some("orcarouter/deepseek/deepseek-v4.1-flash".into()),
+        effort: Some("low".into()),
+        permission_mode: None,
+    };
+    // The thread's settings are in effect already: the handshake changes nothing.
+    handshake(
+        &h.session,
+        "01a0e941-3ffa-714d-93b4-b647fa566116",
+        &settings,
+        "ask",
+    )
+    .await
+    .unwrap();
+    h.until(|e| matches!(e, AdapterEvent::CommandsChanged { .. }))
+        .await;
+    let prompt = h.start_turn("/rec-new").await;
+    for event in array(&new["events"]) {
+        h.fake.write(&event).await;
+    }
+    // Recorded: a new session with pi's defaults (another model, thinking `medium`).
+    h.fake.set_session(&new["stateAfter"], Vec::new());
+    reply(&h, &json!({"id": prompt}), &new["response"]).await;
+    // The thread's model and thinking level are applied again.
+    let cmd = h.fake.expect("set_model").await;
+    assert_eq!(
+        (&cmd["provider"], &cmd["modelId"]),
+        (&json!("orcarouter"), &json!("deepseek/deepseek-v4.1-flash"))
+    );
+    h.fake.respond(&cmd, None).await;
+    let cmd = h.fake.expect("set_thinking_level").await;
+    assert_eq!(cmd["level"], "low");
+    h.fake.respond(&cmd, None).await;
+    let events = h.until(completed).await;
+    let switched = events
+        .iter()
+        .position(|e| {
+            *e == AdapterEvent::SessionIdentified {
+                native_session_id: "01a0e941-5cbd-714d-93b4-b649075cd762".into(),
+            }
+        })
+        .expect("the switch is reported");
+    let settings_again = events
+        .iter()
+        .position(|e| {
+            matches!(e, AdapterEvent::SessionInfo { model: Some(m), effort: Some(l), .. }
+                if m == "orcarouter/deepseek/deepseek-v4.1-flash" && l == "low")
+        })
+        .expect("the settings are reported");
+    assert!(switched < settings_again);
+    // The turn belongs to neither session as a whole: no anchor.
+    assert_eq!(anchor_of(&events), None);
+    assert_eq!(
+        h.session.native_session_id().as_deref(),
+        Some("01a0e941-5cbd-714d-93b4-b649075cd762")
+    );
+    // The next turn is anchored in the new session (its leaf learnt at the switch).
+    let entries = [
+        json!({"type":"message","id":"93345645","parentId":null,"message":{"role":"user","content":[{"type":"text","text":"Reply with exactly: NEW-SESSION"}]}}),
+        json!({"type":"message","id":"d15e731c","parentId":"93345645","message":{"role":"assistant","content":[]}}),
+    ];
+    let events = turn_adding(&mut h, "Reply with exactly: NEW-SESSION", &entries).await;
+    assert_eq!(
+        anchor_of(&events),
+        Some(json!({"leafId": "d15e731c", "userEntryId": "93345645"}))
+    );
+}
+
+#[tokio::test]
+async fn settings_pi_refuses_after_a_switch_are_reported() {
+    let mut h = Harness::new();
+    let model = |id: &str| json!({"id": id, "provider": "p", "reasoning": true});
+    h.fake.set_session(
+        &json!({"sessionId": "s1", "model": model("m"), "thinkingLevel": "low"}),
+        Vec::new(),
+    );
+    h.fake.pi.lock().unwrap().commands =
+        Some(json!([{"name": "switch", "description": "d", "source": "extension"}]));
+    let settings = ThreadSettings {
+        model: Some("p/m".into()),
+        effort: Some("low".into()),
+        permission_mode: None,
+    };
+    handshake(&h.session, "s1", &settings, "ask").await.unwrap();
+    h.until(|e| matches!(e, AdapterEvent::CommandsChanged { .. }))
+        .await;
+    // An extension command whose name says nothing moves pi to another session.
+    let prompt = h.start_turn("/switch").await;
+    h.fake.set_session(
+        &json!({"sessionId": "s2", "model": model("d"), "thinkingLevel": "medium"}),
+        Vec::new(),
+    );
+    h.fake
+        .write(&json!({"type":"response","command":"prompt","success":true,"id":prompt}))
+        .await;
+    let cmd = h.fake.expect("set_model").await;
+    h.fake
+        .write(&json!({"type":"response","command":"set_model","success":false,"id":cmd["id"],"error":"Model not found: p/m"}))
+        .await;
+    let events = h.until(completed).await;
+    assert!(events.contains(&AdapterEvent::SessionIdentified {
+        native_session_id: "s2".into()
+    }));
+    assert_eq!(
+        notices(&events, "settingsNotApplied"),
+        [
+            "pi now runs another session, and the thread's model and thinking level could not be applied to it: Model not found: p/m"
+        ]
+    );
+    assert!(matches!(
+        events.last().unwrap(),
+        AdapterEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn steers_that_come_after_the_run_are_returned_before_the_turn_completes() {
+    let mut h = Harness::build(true, false);
+    running_turn(&mut h, "hello").await;
+    h.fake
+        .write(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hi"}],
+            "stopReason":"stop","usage":{"input":10,"output":1,"cacheRead":0,"cacheWrite":0}}}))
+        .await;
+    let stats = h.fake.expect("get_session_stats").await;
+    run_ends(&mut h).await;
+    // A notification after the run's end: once it arrives, the end has been read.
+    h.fake
+        .write(&json!({"type":"extension_ui_request","id":"n1","method":"notify","message":"settled","notifyType":"info"}))
+        .await;
+    h.until(|e| matches!(e, AdapterEvent::Notice { message, .. } if message == "settled"))
+        .await;
+    // The run is over; the turn waits for its context. A steer now would reach an idle pi.
+    h.session
+        .steer_message("itm_late", TurnInput::text("one more thing"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        h.session.steer(TurnInput::text("and another")).await,
+        Err(AdapterError::Other(_))
+    ));
+    nothing_written(&mut h).await;
+    h.fake.respond(&stats, Some(session_stats(2000))).await;
+    let events = h.until(completed).await;
+    let returned = events
+        .iter()
+        .position(|e| {
+            *e == AdapterEvent::SteerReturned {
+                message_id: "itm_late".into(),
+            }
+        })
+        .expect("the steer is returned");
+    assert!(returned < events.len() - 1, "{events:?}");
+    // The session is idle: the returned input can start the next turn.
+    h.start_turn("one more thing").await;
 }
 
 const BUSY: &str = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";

@@ -9,8 +9,9 @@ use aas_harness::protocol::{
     TurnStatus,
 };
 use aas_harness::{
-    AdapterContext, AdapterEvent, AdapterPolicy, CommandContext, HarnessAdapter, HarnessConfig,
-    StartMode, StartRequest, StopReason, ThreadId, TurnInput,
+    AdapterContext, AdapterEvent, AdapterPolicy, CommandContext, ForkPoint, HarnessAdapter,
+    HarnessConfig, StartMode, StartOptions, StartRequest, StopReason, ThreadId, ThreadModes,
+    TurnInput,
 };
 use aas_supervisor::{Supervisor, SupervisorPolicy};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -230,6 +231,7 @@ async fn live_turn_approval_history_and_clean_exit() {
         .commands(CommandContext {
             cwd: work.path().to_path_buf(),
             native_session_id: Some(native.clone()),
+            project_trusted: None,
         })
         .await
         .unwrap();
@@ -653,4 +655,576 @@ async fn live_interrupt_and_shutdown_mid_turn() {
     }
     assert_eq!(supervisor.running_count(), 0);
     remove_transcripts(&[native]);
+}
+
+// -------------------------------------------------------------------------------------------
+// The paths of docs/adapters/claude.md §19 (steer, rename, status, side questions, moving work
+// to the background, plan mode, fork at a turn, fast mode) against the real CLI.
+// -------------------------------------------------------------------------------------------
+
+/// Removes what a test created — its sessions ([`remove_transcripts`]) and the plan files its
+/// plan mode wrote — when it ends, also when it fails half-way.
+#[derive(Default)]
+struct Cleanup {
+    sessions: std::sync::Mutex<Vec<String>>,
+    files: std::sync::Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl Cleanup {
+    fn session(&self, id: &str) {
+        self.sessions.lock().unwrap().push(id.to_owned());
+    }
+
+    /// The plan files among the files the events show written (`~/.claude/plans/*.md`).
+    fn plan_files(&self, events: &[AdapterEvent]) {
+        for e in events {
+            if let AdapterEvent::ItemStarted {
+                body: ItemBody::FileChange { changes },
+                ..
+            } = e
+            {
+                for c in changes {
+                    let path = std::path::PathBuf::from(&c.path);
+                    let in_plans = path.parent().is_some_and(|d| {
+                        d.ends_with(std::path::Path::new(".claude").join("plans"))
+                    });
+                    if in_plans {
+                        self.files.lock().unwrap().push(path);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        remove_transcripts(&self.sessions.lock().unwrap());
+        for file in self.files.lock().unwrap().iter() {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
+fn haiku() -> ThreadSettings {
+    ThreadSettings {
+        model: Some("haiku".into()),
+        effort: None,
+        permission_mode: Some("default".into()),
+    }
+}
+
+async fn start_new(
+    adapter: &ClaudeAdapter,
+    cwd: &std::path::Path,
+    settings: ThreadSettings,
+    options: StartOptions,
+) -> aas_harness::SessionHandle {
+    adapter
+        .start_with(
+            StartRequest {
+                thread_id: ThreadId::generate(),
+                cwd: cwd.to_path_buf(),
+                settings,
+                mode: StartMode::New,
+            },
+            options,
+        )
+        .await
+        .unwrap()
+}
+
+/// Stops the session and waits for its `Exited`.
+async fn stop(handle: &mut aas_harness::SessionHandle) {
+    handle.control.shutdown(StopReason::User).await;
+    while let Ok(Some(ev)) =
+        tokio::time::timeout(Duration::from_secs(30), handle.events.recv()).await
+    {
+        if matches!(ev, AdapterEvent::Exited { .. }) {
+            break;
+        }
+    }
+}
+
+fn row(sections: &[aas_harness::StatusSection], title: &str, label: &str) -> Option<String> {
+    sections
+        .iter()
+        .find(|s| s.title == title)?
+        .rows
+        .iter()
+        .find(|r| r.label == label)
+        .map(|r| r.value.clone())
+}
+
+fn last_agent_message(events: &[AdapterEvent]) -> String {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AdapterEvent::ItemCompleted {
+                body: Some(ItemBody::AgentMessage { text }),
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Status (with and without a session), a steer taken at a tool boundary, a side question during
+/// the turn, a rename the CLI's status shows, and a foreground command moved to the background.
+#[tokio::test]
+#[ignore = "spends tokens; set AAS_LIVE_TESTS=1 and pass --ignored"]
+async fn live_steer_side_question_rename_status_and_background() {
+    if !live() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (adapter, supervisor) = adapter(state.path());
+    let info = adapter.probe().await;
+    assert!(info.capabilities.steer);
+    let features = adapter.features();
+    assert!(features.side_question && features.rename && features.move_to_background);
+
+    // The status without a session: the plan's usage.
+    let sections = adapter.status(work.path()).await.unwrap();
+    assert!(
+        sections.iter().any(|s| s.title == "Plan usage"),
+        "{sections:?}"
+    );
+
+    let cleanup = Cleanup::default();
+    let mut handle = start_new(&adapter, work.path(), haiku(), StartOptions::default()).await;
+    cleanup.session(handle.native_session_id.as_deref().unwrap());
+    let sections = handle.control.status().await.unwrap();
+    assert!(
+        row(&sections, "Session", "Version").is_some(),
+        "{sections:?}"
+    );
+
+    // 1. A steer while the first command runs, and a side question beside the turn.
+    handle
+        .control
+        .send(TurnInput::text(
+            "Use the Bash tool to run exactly this command: sleep 12 && echo first-done\n\
+             After it finishes, use the Bash tool again to run: echo second-step\n\
+             Then reply with a one-line summary.",
+        ))
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    until(&mut handle, &mut seen, "the first command", |e| {
+        matches!(
+            e,
+            AdapterEvent::ItemStarted {
+                body: ItemBody::CommandExecution { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    handle
+        .control
+        .steer_message(
+            "steer-1",
+            TurnInput::text(
+                "Additional instruction from the user: at the very end of your final reply, add the word PINEAPPLE.",
+            ),
+        )
+        .await
+        .unwrap();
+    let answer = handle
+        .control
+        .side_question("In one short sentence: what are you doing right now?")
+        .await
+        .unwrap();
+    assert!(
+        answer.answer.as_deref().is_some_and(|a| !a.is_empty()),
+        "{answer:?}"
+    );
+    until(&mut handle, &mut seen, "the steered turn", |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::SteerReturned { .. })),
+        "the steer was taken at the tool boundary"
+    );
+    assert!(
+        last_agent_message(&seen).contains("PINEAPPLE"),
+        "{}",
+        last_agent_message(&seen)
+    );
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, AdapterEvent::TurnAnchor { .. }))
+    );
+
+    // 2. A rename, which the CLI's own status shows.
+    handle.control.rename("aas live rename").await.unwrap();
+    let sections = handle.control.status().await.unwrap();
+    assert_eq!(
+        row(&sections, "Session", "Session name").as_deref(),
+        Some("aas live rename"),
+        "{sections:?}"
+    );
+
+    // 3. A foreground command moved to the background once the CLI registered its task.
+    seen.clear();
+    handle
+        .control
+        .send(TurnInput::text(
+            "Use the Bash tool (in the foreground; do not set run_in_background) to run exactly: \
+             ping -n 60 127.0.0.1 > /dev/null && echo bg-done\n\
+             If the tool result says the command was moved to the background, reply immediately with just: moved. \
+             Do not wait for it or check on it.",
+        ))
+        .await
+        .unwrap();
+    let movable = until(&mut handle, &mut seen, "backgroundable work", |e| {
+        matches!(
+            e,
+            AdapterEvent::ItemBackgroundable {
+                backgroundable: true,
+                ..
+            }
+        )
+    })
+    .await;
+    let AdapterEvent::ItemBackgroundable { key, .. } = movable else {
+        unreachable!()
+    };
+    handle.control.move_to_background(&key).await.unwrap();
+    until(&mut handle, &mut seen, "the moving turn", |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert!(seen.iter().any(|e| matches!(e, AdapterEvent::ItemCompleted { key: k, status: ItemStatus::Backgrounded, .. } if *k == key)));
+    let shell = seen
+        .iter()
+        .filter_map(task_of)
+        .rfind(|t| t.origin_item_key.as_deref() == Some(key.as_str()))
+        .cloned()
+        .expect("the moved command is a task");
+    if shell.state == aas_harness::BackgroundState::Running {
+        handle.control.stop_background(&shell.key).await.unwrap();
+        until(&mut handle, &mut seen, "the stopped command", |e| {
+            task_of(e).is_some_and(|t| t.key == shell.key && t.state.is_ended())
+        })
+        .await;
+    }
+    stop(&mut handle).await;
+    assert_eq!(
+        supervisor.running_count(),
+        0,
+        "no supervised process may remain"
+    );
+}
+
+/// Plan mode (the plan presented for approval as a proposed plan, plan mode left after it),
+/// turn anchors equal to the history's, forks at a turn and right before it, and a fork at an
+/// anchor the session does not have (refused with the CLI's words).
+#[tokio::test]
+#[ignore = "spends tokens; set AAS_LIVE_TESTS=1 and pass --ignored"]
+async fn live_plan_mode_anchors_and_forks_at_a_turn() {
+    if !live() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (adapter, supervisor) = adapter(state.path());
+    let info = adapter.probe().await;
+    assert!(
+        !info.permission_modes.iter().any(|m| m.id == "plan"),
+        "plan mode is the thread's mode"
+    );
+    assert!(adapter.features().plan_mode.is_some() && adapter.features().fork_at_turn);
+    let cleanup = Cleanup::default();
+
+    let mut handle = start_new(
+        &adapter,
+        work.path(),
+        haiku(),
+        StartOptions {
+            modes: ThreadModes {
+                plan: true,
+                fast: false,
+            },
+            ..StartOptions::default()
+        },
+    )
+    .await;
+    let native = handle.native_session_id.clone().unwrap();
+    cleanup.session(&native);
+    let mut seen = Vec::new();
+    handle
+        .control
+        .send(TurnInput::text(
+            "I want a file named hello.txt in the current directory containing exactly: hi\n\
+             Make a one-line plan, present it with the ExitPlanMode tool, and after it is approved \
+             create the file with the Write tool. Then reply DONE.",
+        ))
+        .await
+        .unwrap();
+    until(&mut handle, &mut seen, "the plan turn", |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    cleanup.plan_files(&seen);
+    let plans: Vec<bool> = seen
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ModesReported { plan: Some(p), .. } => Some(*p),
+            _ => None,
+        })
+        .collect();
+    // Off after the handshake, on by the start's modes, off after the plan's approval.
+    assert_eq!(plans, [false, true, false]);
+    assert!(seen.iter().any(|e| matches!(e, AdapterEvent::ItemCompleted { body: Some(ItemBody::ProposedPlan { text }), status: ItemStatus::Completed, .. } if text.contains("hello.txt"))
+        || matches!(e, AdapterEvent::ItemStarted { body: ItemBody::ProposedPlan { text }, .. } if text.contains("hello.txt"))));
+    assert!(work.path().join("hello.txt").exists());
+
+    // Three turns to fork at; their anchors.
+    let mut anchors = Vec::new();
+    for word in ["APPLE", "BANANA", "CHERRY"] {
+        seen.clear();
+        handle
+            .control
+            .send(TurnInput::text(format!(
+                "Memory game: the next word is {word}. Reply with just OK. Do not use tools."
+            )))
+            .await
+            .unwrap();
+        until(&mut handle, &mut seen, "a memory turn", |e| {
+            matches!(e, AdapterEvent::TurnCompleted { .. })
+        })
+        .await;
+        let anchor = seen
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                AdapterEvent::TurnAnchor { anchor } => Some(anchor.clone()),
+                _ => None,
+            })
+            .expect("the turn was anchored");
+        anchors.push(anchor);
+    }
+    stop(&mut handle).await;
+
+    // The history has the same anchors.
+    let (history, history_anchors) = adapter
+        .read_native_history_anchored(work.path(), &native)
+        .await
+        .unwrap();
+    assert_eq!(history.turns.len(), 4);
+    assert_eq!(
+        history_anchors[1..].to_vec(),
+        anchors.iter().cloned().map(Some).collect::<Vec<_>>()
+    );
+
+    let fork = |point: ForkPoint| {
+        let adapter = &adapter;
+        let native = native.clone();
+        let cwd = work.path().to_path_buf();
+        async move {
+            adapter
+                .start_with(
+                    StartRequest {
+                        thread_id: ThreadId::generate(),
+                        cwd,
+                        settings: haiku(),
+                        mode: StartMode::Fork {
+                            native_session_id: native,
+                        },
+                    },
+                    StartOptions {
+                        fork_at: Some(point),
+                        ..StartOptions::default()
+                    },
+                )
+                .await
+        }
+    };
+    let ask = "List, numbered, every word of the memory game so far. Do not use tools.";
+    // At BANANA: APPLE and BANANA.
+    let mut at = fork(ForkPoint {
+        anchor: anchors[1].clone(),
+        before: false,
+        previous: Some(anchors[0].clone()),
+    })
+    .await
+    .unwrap();
+    cleanup.session(at.native_session_id.as_deref().unwrap());
+    at.control.send(TurnInput::text(ask)).await.unwrap();
+    let events = until_turn_end(&mut at.events, |_| {}).await;
+    let listed = last_agent_message(&events);
+    assert!(
+        listed.contains("BANANA") && !listed.contains("CHERRY"),
+        "{listed}"
+    );
+    stop(&mut at).await;
+    // Right before BANANA: APPLE only.
+    let mut before = fork(ForkPoint {
+        anchor: anchors[1].clone(),
+        before: true,
+        previous: Some(anchors[0].clone()),
+    })
+    .await
+    .unwrap();
+    cleanup.session(before.native_session_id.as_deref().unwrap());
+    before.control.send(TurnInput::text(ask)).await.unwrap();
+    let events = until_turn_end(&mut before.events, |_| {}).await;
+    let listed = last_agent_message(&events);
+    assert!(
+        listed.contains("APPLE") && !listed.contains("BANANA"),
+        "{listed}"
+    );
+    stop(&mut before).await;
+    // An anchor the session does not have.
+    let refused = fork(ForkPoint {
+        anchor: serde_json::json!({"leafUuid": "11111111-2222-4333-8444-555555555555"}),
+        before: false,
+        previous: None,
+    })
+    .await;
+    match refused {
+        Err(e) => assert!(
+            e.detail().contains("11111111-2222-4333-8444-555555555555"),
+            "{e}"
+        ),
+        Ok(_) => panic!("the fork at an unknown anchor started"),
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        supervisor.running_count(),
+        0,
+        "no supervised process may remain"
+    );
+}
+
+/// Fast mode for a model the CLI marks: on at the start, the CLI's state for it reported, off
+/// again (one turn on opus).
+#[tokio::test]
+#[ignore = "spends tokens; set AAS_LIVE_TESTS=1 and pass --ignored"]
+async fn live_fast_mode() {
+    if !live() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (adapter, supervisor) = adapter(state.path());
+    adapter.probe().await;
+    let fast = adapter.features().fast_mode_models;
+    assert!(fast.iter().any(|m| m == "opus"), "{fast:?}");
+    let mut handle = start_new(
+        &adapter,
+        work.path(),
+        ThreadSettings {
+            model: Some("opus".into()),
+            ..haiku()
+        },
+        StartOptions {
+            modes: ThreadModes {
+                plan: false,
+                fast: true,
+            },
+            ..StartOptions::default()
+        },
+    )
+    .await;
+    let cleanup = Cleanup::default();
+    cleanup.session(handle.native_session_id.as_deref().unwrap());
+    handle
+        .control
+        .send(TurnInput::text(
+            "Reply with just the word OK. Do not use tools.",
+        ))
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    until(&mut handle, &mut seen, "the fast turn", |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert!(
+        seen.iter().any(
+            |e| matches!(e, AdapterEvent::ModesReported { fast_state: Some(s), .. } if s == "on")
+        ),
+        "{seen:?}"
+    );
+    handle
+        .control
+        .apply_modes(&ThreadModes::default())
+        .await
+        .unwrap();
+    stop(&mut handle).await;
+    assert_eq!(supervisor.running_count(), 0);
+}
+
+/// A thread stored with the permission mode `plan` of earlier versions: the CLI starts in its own
+/// default permission mode and enters plan mode, and leaving plan mode sets a permission mode the
+/// CLI reports (never `plan` again). No model is called.
+#[tokio::test]
+#[ignore = "runs the installed claude CLI; set AAS_LIVE_TESTS=1 and pass --ignored"]
+async fn live_a_legacy_plan_permission_mode_is_plan_mode() {
+    if !live() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (adapter, supervisor) = adapter(state.path());
+    adapter.probe().await;
+    let mut handle = start_new(
+        &adapter,
+        work.path(),
+        ThreadSettings {
+            permission_mode: Some("plan".into()),
+            ..haiku()
+        },
+        StartOptions::default(),
+    )
+    .await;
+    let cleanup = Cleanup::default();
+    cleanup.session(handle.native_session_id.as_deref().unwrap());
+    let mut seen = Vec::new();
+    until(&mut handle, &mut seen, "plan mode", |e| {
+        matches!(
+            e,
+            AdapterEvent::ModesReported {
+                plan: Some(true),
+                ..
+            }
+        )
+    })
+    .await;
+    handle
+        .control
+        .apply_modes(&ThreadModes::default())
+        .await
+        .unwrap();
+    until(&mut handle, &mut seen, "plan mode left", |e| {
+        matches!(
+            e,
+            AdapterEvent::ModesReported {
+                plan: Some(false),
+                ..
+            }
+        )
+    })
+    .await;
+    let modes: Vec<&str> = seen
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::SessionInfo {
+                permission_mode: Some(m),
+                ..
+            } => Some(m.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(!modes.is_empty() && !modes.contains(&"plan"), "{seen:?}");
+    stop(&mut handle).await;
+    assert_eq!(supervisor.running_count(), 0);
 }

@@ -11,8 +11,9 @@
 //! * Every session emits exactly one [`AdapterEvent::Exited`], as its last event, when its
 //!   process tree is gone. The events channel closes right after it.
 //! * [`SessionControl::send`] is only called while no turn runs; [`SessionControl::steer`]
-//!   only while one runs and only when [`HarnessCapabilities::steer`] is set. The engine
-//!   serializes all calls of one session.
+//!   (and [`SessionControl::steer_message`]) only while one runs and only when
+//!   [`HarnessCapabilities::steer`] is set. The engine serializes the calls of one session,
+//!   except the read-only [`SessionControl::status`] and [`SessionControl::side_question`].
 //! * A turn ends with exactly one [`AdapterEvent::TurnCompleted`]. Items still open at that
 //!   point are closed by the engine.
 //! * [`AdapterEvent::TurnStarted`] may also arrive without a preceding `send` when the CLI
@@ -20,8 +21,14 @@
 //!   records an agent-initiated turn.
 //! * When the process dies mid-turn an adapter may emit `TurnCompleted { status: Failed }`
 //!   before `Exited`, or only `Exited`; the engine fails a turn that is still open.
-//! * [`AdapterEvent::SessionInfo`] reports what the CLI resolved (e.g. a full model id); the
-//!   engine records it on turns but never rewrites the thread's settings with it.
+//! * [`AdapterEvent::SessionInfo`] reports what the CLI says is current. The model is recorded
+//!   on turns only (a CLI resolves `opus` to a full id; the user's choice stays). The permission
+//!   mode, and the effort, are reflected into the thread's settings (see "Settings the harness
+//!   changes by itself"); an adapter reports the effort only when the CLI states it explicitly.
+//! * [`AdapterEvent::SessionIdentified`] with an id other than the session's known one means
+//!   the CLI moved to another native session by itself (a command, an extension): the engine
+//!   follows it and tells the user. Adapters report it whenever the CLI's own state shows such a
+//!   switch (e.g. pi's `get_state.sessionId` compared at every turn end).
 //! * Every child process is spawned through [`AdapterContext::supervisor`].
 //! * Anything the adapter cannot map is forwarded as [`AdapterEvent::Native`] instead of
 //!   being dropped or guessed.
@@ -69,6 +76,77 @@
 //! task ended), the engine calls [`SessionControl::expire_request`] so that the adapter answers
 //! the CLI, which would otherwise wait for an answer forever. A request the CLI withdrew
 //! ([`AdapterEvent::InteractionWithdrawn`]) needs no answer.
+//!
+//! # Features beyond the capabilities
+//!
+//! [`HarnessAdapter::features`] ([`HarnessFeatures`], published as `Harness.features`) says what
+//! the harness offers besides [`HarnessCapabilities`]. The engine calls the matching methods
+//! only when the feature is on; each has a default that refuses (or reports nothing), so an
+//! adapter implements exactly what its CLI supports:
+//!
+//! | feature | methods and events |
+//! |---|---|
+//! | `forkAtTurn` | [`AdapterEvent::TurnAnchor`], [`AdapterEvent::TurnAnchorReplaced`]; [`StartOptions::fork_at`] with [`StartMode::Fork`] |
+//! | `forkWhileHeld` | (a fork of a session another process holds starts like any fork) |
+//! | `rename` | [`SessionControl::rename`]; native renames arrive as [`AdapterEvent::SessionTitle`] |
+//! | `sideQuestion` | [`SessionControl::side_question`] |
+//! | `moveToBackground` | [`AdapterEvent::ItemBackgroundable`]; [`SessionControl::move_to_background`] |
+//! | `status` | [`SessionControl::status`], [`HarnessAdapter::status`] |
+//! | `projectTrust` | [`StartOptions::project_trusted`] |
+//! | `planMode` | [`StartOptions::modes`], [`SessionControl::apply_modes`], [`AdapterEvent::ModesReported`], [`ItemBody::ProposedPlan`] items |
+//! | `fastModeModels` | the same, for `fast` |
+//!
+//! [`HarnessAdapter::start_with`] is what the engine calls to start a session; its default
+//! calls [`HarnessAdapter::start`] and ignores the options (none are set for an adapter whose
+//! features do not name them).
+//!
+//! # Turn anchors (fork at a turn)
+//!
+//! While a turn runs (or right when it ends, before its `TurnCompleted`), an adapter with the
+//! feature `forkAtTurn` reports the CLI's own anchor of that turn with
+//! [`AdapterEvent::TurnAnchor`]: whatever the CLI needs later to branch the session at that
+//! turn, taken from explicit fields the CLI sent for this very turn (a turn id, the uuid of its
+//! last message, an entry id, a step id), never by counting turns or messages. The value is the
+//! adapter's own (JSON); the engine stores it with the turn, copies it into forks, and hands it
+//! back unchanged in a [`ForkPoint`]. The latest report of a turn wins; a CLI that settles the
+//! anchor of a turn only later (in the next turn) replaces it with
+//! [`AdapterEvent::TurnAnchorReplaced`], naming the turn by its earlier anchor. A turn without an
+//! anchor cannot be forked at (`Turn.forkable`). [`HarnessAdapter::read_native_history_anchored`] gives
+//! the anchors of imported turns when the CLI's history carries them.
+//!
+//! An anchor belongs to the native session it was reported in. When the harness moves the
+//! thread to another native session ([`AdapterEvent::SessionIdentified`] with another id), the
+//! engine keeps the earlier anchors with the session they came from: a fork at such a turn
+//! branches that session ([`StartMode::Fork`] names it), and a [`AdapterEvent::TurnAnchorReplaced`]
+//! only replaces anchors of the session the thread runs now. [`ForkPoint::previous`] is always
+//! an anchor of the same session as [`ForkPoint::anchor`].
+//!
+//! # Settings the harness changes by itself
+//!
+//! Harnesses change their permission mode by themselves (Claude Code's "allow for this session"
+//! suggestion that switches to `acceptEdits`, leaving plan mode after its approval, Devin's
+//! `/plan` and `/ask` commands). The adapter reports what the CLI says
+//! ([`AdapterEvent::SessionInfo`], [`AdapterEvent::ModesReported`]) and the engine reflects it
+//! into the thread (`settings.permissionMode`, `settings.effort`, `modes.plan`) — unless the user
+//! changed the same value and it waits for the next turn, which the engine then applies. Values
+//! outside the harness's advertised lists are not taken over (logged). The process already runs
+//! with a reflected value, so the engine does not apply it again.
+//!
+//! # Commands that switch sessions
+//!
+//! [`HarnessAdapter::session_switching_names`] names the harness's commands that switch the
+//! native session inside the running process, with their aliases as the harness lists them.
+//! The engine never offers them in `command/list` and refuses input whose first word is one of
+//! them (`sessionSwitchingCommand`): a thread is one native session. Adapters may list a
+//! command's aliases as commands of their own (`/review` for Claude's `code-review`).
+//!
+//! # Errors
+//!
+//! [`AdapterError`]'s text never repeats its own prefix and never carries terminal escape
+//! sequences ([`sanitize_terminal_text`]). Adapters attach a process's stderr with
+//! [`AdapterPolicy::with_stderr`] (the one place stderr becomes part of a message);
+//! [`AdapterError::detail`] is the text without the daemon's prefix, which clients show after a
+//! lead-in in their own language.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -85,10 +163,10 @@ use tokio::sync::mpsc;
 pub use aas_protocol as protocol;
 pub use aas_protocol::{
     BackgroundProgress, BackgroundTaskKind, BackgroundUsage, Command, ContextUsage, DeltaField,
-    EffortLevel, ExpireReason, HarnessCapabilities, HarnessKind, InteractionRequest,
-    InteractionResolution, ItemBody, ItemStatus, Millis, Model, NoticeLevel, PermissionMode,
-    ThreadId, ThreadSettings, TurnError, TurnStatus, TurnTrigger, Usage, WorkflowAgent,
-    WorkflowAgentState,
+    EffortLevel, ExpireReason, HarnessCapabilities, HarnessFeatures, HarnessKind,
+    InteractionRequest, InteractionResolution, ItemBody, ItemStatus, Millis, Model, NoticeLevel,
+    PermissionMode, PlanModeFeature, StatusRow, StatusSection, ThreadId, ThreadModes,
+    ThreadSettings, TurnError, TurnStatus, TurnTrigger, Usage, WorkflowAgent, WorkflowAgentState,
 };
 pub use aas_supervisor::{ExitInfo, StopReason, Supervisor};
 
@@ -136,6 +214,10 @@ pub struct AdapterPolicy {
     /// the rule the engine applies to `SessionTitle`). Default 200: harnesses write whole
     /// sentences, and more than two lines of the list is noise.
     pub harness_title_chars: usize,
+    /// Last lines of a process's stderr quoted in an error (`policy.exit_message_stderr_lines`,
+    /// the rule the engine applies to an agent that exited). Default 5: the last exception and
+    /// its cause fit, and a phone can show them.
+    pub stderr_excerpt_lines: usize,
 }
 
 impl Default for AdapterPolicy {
@@ -146,11 +228,19 @@ impl Default for AdapterPolicy {
             handshake_timeout: Duration::from_secs(60),
             first_message_title_chars: 80,
             harness_title_chars: 200,
+            stderr_excerpt_lines: 5,
         }
     }
 }
 
 impl AdapterPolicy {
+    /// `error` with the last [`stderr_excerpt_lines`](Self::stderr_excerpt_lines) lines of a
+    /// process's stderr (`stderr_tail`, e.g. [`ExitInfo::stderr_tail`]) added to its text,
+    /// escape sequences removed (see [`AdapterError::with_stderr`]).
+    pub fn with_stderr(&self, error: AdapterError, stderr_tail: &str) -> AdapterError {
+        error.with_stderr(stderr_tail, self.stderr_excerpt_lines)
+    }
+
     /// Title of a native session made from its first prompt (see [`title_from_first_line`]).
     pub fn prompt_title(&self, prompt: &str) -> Option<String> {
         let title = title_from_first_line(prompt, self.first_message_title_chars);
@@ -185,6 +275,102 @@ pub fn title_from_first_line(text: &str, max_chars: usize) -> String {
 /// session names.
 pub fn harness_title(title: &str, max_chars: usize) -> String {
     title.trim().chars().take(max_chars).collect()
+}
+
+/// `text` without terminal control: ANSI / VT escape sequences (ECMA-48 CSI, OSC, DCS, SOS, PM
+/// and APC strings, and the other escape sequences), C1 control characters, and the C0 control
+/// characters other than line feed and tab. Line breaks become `\n` (`\r\n` and a lone `\r`).
+///
+/// A CLI writes colours and cursor movement to its stderr for a terminal; the daemon shows
+/// that text on a phone, where the codes would appear as garbage. The sequences are recognised
+/// by their syntax (ECMA-48), not by what they mean, so nothing is guessed: the text between
+/// them is kept as it is.
+pub fn sanitize_terminal_text(text: &str) -> String {
+    const ESC: char = '\u{1b}';
+    const BEL: char = '\u{07}';
+    const C1_CSI: char = '\u{9b}';
+    const C1_ST: char = '\u{9c}';
+    const C1_OSC: char = '\u{9d}';
+    /// Introducers of strings ended by ST: DCS, SOS, PM, APC (C1 and 7-bit forms).
+    fn is_string_c1(c: char) -> bool {
+        matches!(c, '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}')
+    }
+    fn is_string_7bit(c: char) -> bool {
+        matches!(c, 'P' | 'X' | '^' | '_')
+    }
+    /// Skips a control sequence's parameter and intermediate bytes and its final byte.
+    fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+        for c in chars.by_ref() {
+            if ('\u{40}'..='\u{7e}').contains(&c) {
+                return;
+            }
+            if !('\u{20}'..='\u{3f}').contains(&c) {
+                // Not a well-formed sequence: it ends here.
+                return;
+            }
+        }
+    }
+    /// Skips a command string up to its terminator (ST as `ESC \` or C1, or BEL for OSC).
+    fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, bel_ends: bool) {
+        while let Some(c) = chars.next() {
+            match c {
+                BEL if bel_ends => return,
+                C1_ST => return,
+                ESC => {
+                    if chars.peek() == Some(&'\\') {
+                        chars.next();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ESC => match chars.next() {
+                Some('[') => skip_csi(&mut chars),
+                Some(']') => skip_string(&mut chars, true),
+                Some(c) if is_string_7bit(c) => skip_string(&mut chars, false),
+                // nF sequences: intermediate bytes, then a final byte.
+                Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
+                    for c in chars.by_ref() {
+                        if !('\u{20}'..='\u{2f}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // Fp, Fe, Fs sequences: one final byte (already consumed); a lone ESC at the
+                // end is dropped.
+                _ => {}
+            },
+            C1_CSI => skip_csi(&mut chars),
+            C1_OSC => skip_string(&mut chars, true),
+            c if is_string_c1(c) => skip_string(&mut chars, false),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The last `max_lines` lines of a process's stderr (`tail`), without terminal control
+/// ([`sanitize_terminal_text`]) and surrounding blank space: what an error quotes of it. Empty
+/// when nothing is left.
+pub fn stderr_excerpt(tail: &str, max_lines: usize) -> String {
+    let clean = sanitize_terminal_text(tail);
+    let lines: Vec<&str> = clean.trim().lines().collect();
+    let skip = lines.len().saturating_sub(max_lines);
+    lines[skip..].join("\n").trim().to_owned()
 }
 
 /// Dependencies injected into adapters.
@@ -247,6 +433,61 @@ pub struct StartRequest {
     pub cwd: PathBuf,
     pub settings: ThreadSettings,
     pub mode: StartMode,
+}
+
+/// What [`HarnessAdapter::start_with`] adds to a [`StartRequest`]. The engine sets only what the
+/// adapter's [`HarnessFeatures`] offer; everything else stays at its default. An adapter that
+/// offers a feature honours its option here, or fails the start with an error that says why
+/// (it never starts a session that silently lacks it: a fork at a turn that copies the whole
+/// session would hold turns the new thread does not show).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StartOptions {
+    /// The modes the session starts in (plan mode with the feature `planMode`, fast mode for a
+    /// model of `fastModeModels`). A session starts with both off unless they are set here.
+    pub modes: ThreadModes,
+    /// With [`StartMode::Fork`]: branch the source at this point instead of copying the whole
+    /// session (feature `forkAtTurn`).
+    pub fork_at: Option<ForkPoint>,
+    /// The user's decision whether the harness may load the project's own resources (feature
+    /// `projectTrust`); `None`: not decided, the CLI's own saved decision applies.
+    pub project_trusted: Option<bool>,
+}
+
+/// Where a fork at a turn branches the source session ([`StartOptions::fork_at`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkPoint {
+    /// The anchor the adapter reported for the turn, unchanged: the latest of
+    /// [`AdapterEvent::TurnAnchor`] and [`AdapterEvent::TurnAnchorReplaced`].
+    pub anchor: Value,
+    /// `false`: the branch holds the turn and everything before it. `true`: it holds everything
+    /// before the turn (the user edits the turn's prompt). The engine never asks for "before
+    /// the first turn": that is a new session.
+    pub before: bool,
+    /// Where the source holds everything before the turn, for CLIs that cut after the last
+    /// message they keep: the anchor of the nearest earlier turn that reached the agent (turns
+    /// whose start failed are not in the session and are skipped), when that turn's anchor was
+    /// recorded in the same native session as `anchor`. `None` when there is no such anchor;
+    /// an adapter that needs one refuses the point ([`HarnessAdapter::check_fork_point`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<Value>,
+}
+
+/// What [`HarnessAdapter::upgrade_settings`] makes of settings of an earlier form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradedSettings {
+    pub settings: ThreadSettings,
+    /// The settings asked for plan mode ([`ThreadModes::plan`]).
+    pub plan: bool,
+}
+
+/// The answer to [`SessionControl::side_question`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SideAnswer {
+    /// The answer, verbatim; `None` when the harness gave none.
+    pub answer: Option<String>,
+    /// The harness says the answer did not come from the model.
+    pub synthetic: bool,
 }
 
 /// One piece of user input, in order.
@@ -569,11 +810,14 @@ impl BackgroundTasks {
 /// (unique within the session); the engine maps keys to protocol item ids.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdapterEvent {
-    /// The native session id became known or changed (e.g. a fork got its own id).
+    /// The native session id became known or changed (e.g. a fork got its own id). A change of
+    /// an id the thread already had is a switch the CLI made by itself: the engine follows it
+    /// and tells the user (`thread/nativeSessionChanged`).
     SessionIdentified {
         native_session_id: String,
     },
-    /// Model / permission mode / effort the CLI reports as current.
+    /// Model / permission mode / effort the CLI reports as current. The permission mode and the
+    /// effort are reflected into the thread's settings; the model is recorded on turns only.
     SessionInfo {
         model: Option<String>,
         permission_mode: Option<String>,
@@ -653,6 +897,41 @@ pub enum AdapterEvent {
         message: String,
         code: Option<String>,
     },
+    /// The CLI's own anchor of the running turn (see the crate docs, "Turn anchors"). The
+    /// latest report before the turn's `TurnCompleted` wins.
+    TurnAnchor {
+        anchor: Value,
+    },
+    /// The anchor of a turn of this thread (the running one or an earlier one), the one whose
+    /// recorded anchor is exactly `previous`, becomes `anchor`: for CLIs that settle what a turn
+    /// is branched at only after the turn (Devin's step node ids, notified with the next
+    /// prompt). The turn is named by its own earlier anchor, never by its position. A
+    /// replacement that matches no turn changes nothing (the engine logs a warning).
+    TurnAnchorReplaced {
+        previous: Value,
+        anchor: Value,
+    },
+    /// Plan mode and fast mode as the CLI reports them (see "Settings the harness changes by
+    /// itself"). `fast_state` is the CLI's own word for fast mode (display only).
+    ModesReported {
+        plan: Option<bool>,
+        fast_state: Option<String>,
+    },
+    /// The CLI did not take a steer sent with [`SessionControl::steer_message`] into the running
+    /// turn and the adapter withdrew it: the engine puts it back at the front of the queue.
+    SteerReturned {
+        message_id: String,
+    },
+    /// The CLI asks to put `text` into the composer (e.g. a pi extension's `setEditorText`).
+    ComposerText {
+        text: String,
+    },
+    /// Whether the running item `key` can be moved to the background now
+    /// ([`SessionControl::move_to_background`]), as the CLI says explicitly.
+    ItemBackgroundable {
+        key: String,
+        backgroundable: bool,
+    },
     /// A CLI message the adapter does not map.
     Native {
         payload: Value,
@@ -672,28 +951,114 @@ pub struct SessionHandle {
 }
 
 /// Errors reported by adapters.
+///
+/// The text (`Display`) is a prefix naming the kind of error, then [`detail`](Self::detail):
+/// the error's own text without terminal escape sequences and without prefixes of this type
+/// that an adapter carried over by formatting another `AdapterError` into it (so no prefix is
+/// ever repeated).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AdapterError {
-    #[error("harness unavailable: {0}")]
     Unavailable(String),
-    #[error("not supported by this harness: {0}")]
     Unsupported(&'static str),
-    #[error("failed to start the harness: {0}")]
     Spawn(String),
-    #[error("unexpected message from the harness: {0}")]
     Protocol(String),
-    #[error("the harness reported an error: {0}")]
     Harness(String),
-    #[error("the session is closed")]
     Closed,
-    #[error("unknown request id {0}")]
     UnknownRequest(String),
     /// [`SessionControl::send`] found the CLI running a turn it started by itself (the
     /// adapter has emitted that turn's `TurnStarted`); the input was not taken.
-    #[error("the agent is running a turn it started by itself")]
     TurnInProgress,
-    #[error("{0}")]
     Other(String),
+}
+
+/// The prefixes of [`AdapterError`]'s text, by kind.
+const UNAVAILABLE_PREFIX: &str = "harness unavailable: ";
+const UNSUPPORTED_PREFIX: &str = "not supported by this harness: ";
+const SPAWN_PREFIX: &str = "failed to start the harness: ";
+const PROTOCOL_PREFIX: &str = "unexpected message from the harness: ";
+const HARNESS_PREFIX: &str = "the harness reported an error: ";
+const UNKNOWN_REQUEST_PREFIX: &str = "unknown request id ";
+const CLOSED_TEXT: &str = "the session is closed";
+const TURN_IN_PROGRESS_TEXT: &str = "the agent is running a turn it started by itself";
+
+impl AdapterError {
+    fn prefix(&self) -> &'static str {
+        match self {
+            AdapterError::Unavailable(_) => UNAVAILABLE_PREFIX,
+            AdapterError::Unsupported(_) => UNSUPPORTED_PREFIX,
+            AdapterError::Spawn(_) => SPAWN_PREFIX,
+            AdapterError::Protocol(_) => PROTOCOL_PREFIX,
+            AdapterError::Harness(_) => HARNESS_PREFIX,
+            AdapterError::UnknownRequest(_) => UNKNOWN_REQUEST_PREFIX,
+            AdapterError::Closed | AdapterError::TurnInProgress | AdapterError::Other(_) => "",
+        }
+    }
+
+    /// The error's own text: what the harness (or the adapter) said, without the prefix of
+    /// its kind, without the prefixes of this type an adapter formatted into it, and without
+    /// terminal control ([`sanitize_terminal_text`]). Clients show it after a lead-in of their
+    /// own (`data.detail` of `adapterError`, `Turn.error.message` of a failed start).
+    pub fn detail(&self) -> String {
+        let raw = match self {
+            AdapterError::Unavailable(s)
+            | AdapterError::Spawn(s)
+            | AdapterError::Protocol(s)
+            | AdapterError::Harness(s)
+            | AdapterError::UnknownRequest(s)
+            | AdapterError::Other(s) => s.as_str(),
+            AdapterError::Unsupported(capability) => capability,
+            AdapterError::Closed => CLOSED_TEXT,
+            AdapterError::TurnInProgress => TURN_IN_PROGRESS_TEXT,
+        };
+        let mut text = sanitize_terminal_text(raw);
+        // The prefixes are this type's own words (never the harness's), so removing them is
+        // exact: an adapter that wrote `format!("{e}; …")` of another error gets it once.
+        loop {
+            let trimmed = text.trim_start();
+            let Some(rest) = [
+                UNAVAILABLE_PREFIX,
+                UNSUPPORTED_PREFIX,
+                SPAWN_PREFIX,
+                PROTOCOL_PREFIX,
+                HARNESS_PREFIX,
+            ]
+            .iter()
+            .find_map(|p| trimmed.strip_prefix(p)) else {
+                break;
+            };
+            text = rest.to_owned();
+        }
+        text.trim().to_owned()
+    }
+
+    /// The same error with the last `max_lines` lines of a process's stderr added to its text
+    /// (see [`stderr_excerpt`]); unchanged when the stderr holds nothing. Adapters use
+    /// [`AdapterPolicy::with_stderr`].
+    pub fn with_stderr(self, stderr_tail: &str, max_lines: usize) -> AdapterError {
+        let excerpt = stderr_excerpt(stderr_tail, max_lines);
+        if excerpt.is_empty() {
+            return self;
+        }
+        let text = format!("{}\nstderr: {excerpt}", self.detail());
+        match self {
+            AdapterError::Unavailable(_) => AdapterError::Unavailable(text),
+            AdapterError::Spawn(_) => AdapterError::Spawn(text),
+            AdapterError::Protocol(_) => AdapterError::Protocol(text),
+            AdapterError::Harness(_) => AdapterError::Harness(text),
+            AdapterError::UnknownRequest(_) | AdapterError::Other(_) => AdapterError::Other(text),
+            // Kinds without a text of their own keep their kind in the words.
+            AdapterError::Unsupported(capability) => AdapterError::Other(format!(
+                "{UNSUPPORTED_PREFIX}{capability}\nstderr: {excerpt}"
+            )),
+            AdapterError::Closed | AdapterError::TurnInProgress => AdapterError::Other(text),
+        }
+    }
+}
+
+impl std::fmt::Display for AdapterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.prefix(), self.detail())
+    }
 }
 
 /// Context of [`HarnessAdapter::commands`].
@@ -701,6 +1066,12 @@ pub enum AdapterError {
 pub struct CommandContext {
     pub cwd: PathBuf,
     pub native_session_id: Option<String>,
+    /// The user's trust decision for the project and this harness (`Project.harnessTrust`), as
+    /// [`StartOptions::project_trusted`] passes it to a start: a harness with the feature
+    /// `projectTrust` that lists commands without a running agent lists them as an agent
+    /// started with this decision would (`None`: not decided, the harness's own saved decision
+    /// applies).
+    pub project_trusted: Option<bool>,
 }
 
 /// A native session found on disk / through the CLI.
@@ -849,18 +1220,86 @@ pub trait HarnessAdapter: Send + Sync + 'static {
     /// Spawns the CLI and completes its handshake.
     async fn start(&self, req: StartRequest) -> Result<SessionHandle, AdapterError>;
 
-    /// Harness-native commands for the composer's `/` menu.
+    /// What the engine calls to start a session: [`start`](Self::start) with the
+    /// [`StartOptions`] of the adapter's features. The default ignores the options (the engine
+    /// sets none that [`features`](Self::features) does not offer); adapters with features
+    /// that need them at the start override it.
+    async fn start_with(
+        &self,
+        req: StartRequest,
+        options: StartOptions,
+    ) -> Result<SessionHandle, AdapterError> {
+        let _ = options;
+        self.start(req).await
+    }
+
+    /// Features beyond [`HarnessInfo`] (see the crate docs, "Features beyond the
+    /// capabilities"). The engine reads them right after every probe, so they may follow what
+    /// the probe learned (e.g. which models support fast mode). Default: none.
+    fn features(&self) -> HarnessFeatures {
+        HarnessFeatures::default()
+    }
+
+    /// Whether a start with [`StartOptions::fork_at`] `point` could branch the source (feature
+    /// `forkAtTurn`), judged from the point alone, before anything is started: the checks the
+    /// adapter's start makes of the point itself (the anchor is one of this adapter's, the
+    /// anchors the cut needs are there). The engine asks before it creates a fork thread, so
+    /// that a point the start would always refuse is refused at `thread/fork` instead of
+    /// leaving a thread whose every start fails. What only the CLI can tell (the anchor is no
+    /// longer in the session) is still found out by the start. Default: every point.
+    fn check_fork_point(&self, point: &ForkPoint) -> Result<(), AdapterError> {
+        let _ = point;
+        Ok(())
+    }
+
+    /// Settings in a form an earlier version of this adapter offered and that it now expresses
+    /// otherwise (threads and project defaults outlive adapter versions), for settings that
+    /// have not been stored with a thread yet (`thread/create`, from the request or the
+    /// project's defaults). Returns the settings to use instead and whether they ask for plan
+    /// mode ([`ThreadModes::plan`]); e.g. Claude Code's permission mode `plan`, once offered
+    /// as a permission mode, is plan mode now. Settings already stored with a thread reach the
+    /// adapter unchanged, which handles the old form itself. Default: unchanged.
+    fn upgrade_settings(&self, settings: ThreadSettings) -> UpgradedSettings {
+        UpgradedSettings {
+            settings,
+            plan: false,
+        }
+    }
+
+    /// Harness-native commands for the composer's `/` menu. An adapter may list a command's
+    /// aliases as commands of their own (the harness resolves them).
     async fn commands(&self, ctx: CommandContext) -> Result<Vec<Command>, AdapterError>;
 
     /// Names of harness commands (from [`commands`](Self::commands) and
     /// [`AdapterEvent::CommandsChanged`]) whose effect is to switch the native session inside
     /// the running process: start a new one, open another one, or move to another branch of
-    /// it. The engine never offers them in `command/list`: a thread is one native session, and
-    /// a switch under a running thread would leave its history, turns, diffs and interactions
-    /// describing a conversation the agent no longer has. Each adapter lists its CLI's
-    /// commands by explicit name, with the reason; the default is none.
+    /// it. A thread is one native session, and a switch under a running thread would leave its
+    /// history, turns, diffs and interactions describing a conversation the agent no longer has.
+    /// Each adapter lists its CLI's commands by explicit name, with the reason; the default is
+    /// none. See [`session_switching_names`](Self::session_switching_names).
     fn session_switching_commands(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// Every name under which the harness runs a session-switching command: the names of
+    /// [`session_switching_commands`](Self::session_switching_commands) and their aliases as
+    /// the harness lists them (e.g. Claude Code's `clear` with `reset` and `new`, read from its
+    /// command list). The engine never offers them in `command/list` and refuses input whose
+    /// first word is `/` and one of them (`sessionSwitchingCommand`). The default is the static
+    /// names.
+    fn session_switching_names(&self) -> Vec<String> {
+        self.session_switching_commands()
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect()
+    }
+
+    /// The harness's own status without a session (feature `status`): what it reports for the
+    /// account or the CLI in `cwd` (e.g. rate limits). Used by `thread/harnessStatus` when the
+    /// thread's agent is not running ([`SessionControl::status`] otherwise). Default: nothing.
+    async fn status(&self, cwd: &Path) -> Result<Vec<StatusSection>, AdapterError> {
+        let _ = cwd;
+        Ok(Vec::new())
     }
 
     /// Native sessions whose working directory is `cwd` (capability `nativeSessions`), each
@@ -892,10 +1331,25 @@ pub trait HarnessAdapter: Send + Sync + 'static {
         cwd: &Path,
         native_session_id: &str,
     ) -> Result<NativeHistory, AdapterError>;
+
+    /// [`read_native_history`](Self::read_native_history) with the anchor of each turn (same
+    /// order; `None` or missing entries for turns without one), for adapters whose CLI's history
+    /// carries the explicit anchors of [`AdapterEvent::TurnAnchor`]. Default: no anchors.
+    async fn read_native_history_anchored(
+        &self,
+        cwd: &Path,
+        native_session_id: &str,
+    ) -> Result<(NativeHistory, Vec<Option<Value>>), AdapterError> {
+        Ok((
+            self.read_native_history(cwd, native_session_id).await?,
+            Vec::new(),
+        ))
+    }
 }
 
 /// Control of one running session. All methods may be called from any task; the engine
-/// never overlaps calls for the same session.
+/// never overlaps calls for the same session, except [`status`](Self::status) and
+/// [`side_question`](Self::side_question), which change nothing and may run beside the others.
 #[async_trait]
 pub trait SessionControl: Send + Sync {
     /// Starts a new turn (only while no turn runs).
@@ -944,6 +1398,57 @@ pub trait SessionControl: Send + Sync {
         let _ = reason;
         self.respond(request_id, &InteractionResolution::Dismissed)
             .await
+    }
+
+    /// Like [`steer`](Self::steer), naming the engine's id of the steered message
+    /// (`message_id`). An adapter whose CLI may not take a steer into the running turn (it
+    /// takes it only at a point of its own) withdraws a steer that was not taken and reports
+    /// [`AdapterEvent::SteerReturned`] with that id; the engine then queues the message again.
+    /// The default steers without an id.
+    async fn steer_message(&self, message_id: &str, input: TurnInput) -> Result<(), AdapterError> {
+        let _ = message_id;
+        self.steer(input).await
+    }
+
+    /// Brings the session to `modes` (plan mode, fast mode; features `planMode`,
+    /// `fastModeModels`), like [`apply_settings`](Self::apply_settings). Only called while no
+    /// turn runs, and only with modes the adapter's features offer. Default: unsupported.
+    async fn apply_modes(&self, modes: &ThreadModes) -> Result<SettingsApplied, AdapterError> {
+        let _ = modes;
+        Err(AdapterError::Unsupported("modes"))
+    }
+
+    /// Gives the native session the user's title (feature `rename`). The CLI's echo of it (a
+    /// `SessionTitle`) changes nothing. Default: unsupported.
+    async fn rename(&self, title: &str) -> Result<(), AdapterError> {
+        let _ = title;
+        Err(AdapterError::Unsupported("rename"))
+    }
+
+    /// The session's own status, in the harness's sections and words (feature `status`). It
+    /// changes nothing, so the engine may call it while other calls of the session run.
+    /// Bounded by `handshake_timeout`. Default: nothing.
+    async fn status(&self) -> Result<Vec<StatusSection>, AdapterError> {
+        Ok(Vec::new())
+    }
+
+    /// Asks a question beside the conversation (feature `sideQuestion`, Claude Code's `/btw`):
+    /// the answer is not part of the session's history. It changes nothing, so the engine may
+    /// call it while other calls of the session run (a turn may be running). Default:
+    /// unsupported.
+    async fn side_question(&self, question: &str) -> Result<SideAnswer, AdapterError> {
+        let _ = question;
+        Err(AdapterError::Unsupported("sideQuestion"))
+    }
+
+    /// Moves the running item `item_key` to the background (feature `moveToBackground`); only
+    /// called for an item the adapter reported backgroundable
+    /// ([`AdapterEvent::ItemBackgroundable`]). `Ok` means the CLI accepted the request: the item
+    /// then closes as `Backgrounded` with its task, as for work started in the background.
+    /// Default: unsupported.
+    async fn move_to_background(&self, item_key: &str) -> Result<(), AdapterError> {
+        let _ = item_key;
+        Err(AdapterError::Unsupported("moveToBackground"))
     }
 }
 
@@ -1322,6 +1827,132 @@ mod tests {
             session.stop_background("k").await,
             Err(AdapterError::Unsupported("backgroundStop"))
         );
+    }
+
+    #[test]
+    fn terminal_control_is_removed_and_the_text_kept() {
+        let colored = "\u{1b}[1;31merror\u{1b}[0m: session \u{1b}[4mabc\u{1b}[24m is held";
+        assert_eq!(
+            sanitize_terminal_text(colored),
+            "error: session abc is held"
+        );
+        // OSC (window title, hyperlinks) ended by BEL or ST, C1 CSI, charset selection (nF),
+        // keypad mode (Fp), cursor save (Fe), lone control characters.
+        let mixed = "\u{1b}]0;title\u{07}a\u{1b}]8;;http://x\u{1b}\\link\u{1b}]8;;\u{1b}\\\u{9b}2Kb\u{1b}(Bc\u{1b}=d\u{1b}7e\u{8}\u{0}f";
+        assert_eq!(sanitize_terminal_text(mixed), "alinkbcdef");
+        // DCS and APC strings are dropped whole.
+        assert_eq!(
+            sanitize_terminal_text("x\u{1b}Pq#0;2;0;0;0\u{1b}\\y\u{1b}_apc\u{1b}\\z"),
+            "xyz"
+        );
+        // Line breaks become `\n`; tabs stay; text of other scripts is untouched.
+        assert_eq!(
+            sanitize_terminal_text("一行目\r\n二行目\r三行目\tend"),
+            "一行目\n二行目\n三行目\tend"
+        );
+        // A sequence cut off at the end of the text leaves nothing behind.
+        assert_eq!(sanitize_terminal_text("done\u{1b}[3"), "done");
+        assert_eq!(sanitize_terminal_text("done\u{1b}"), "done");
+    }
+
+    #[test]
+    fn stderr_excerpts_keep_the_last_lines_without_escapes() {
+        let tail = "\n\u{1b}[2mstarting\u{1b}[0m\none\ntwo\n\u{1b}[31mthree\u{1b}[0m\n\n";
+        assert_eq!(stderr_excerpt(tail, 2), "two\nthree");
+        assert_eq!(stderr_excerpt(tail, 0), "");
+        assert_eq!(stderr_excerpt("  \n\u{1b}[0m\n", 5), "");
+    }
+
+    #[test]
+    fn adapter_errors_never_repeat_their_prefix() {
+        let inner = AdapterError::Harness("initialize: \u{1b}[31mnot logged in\u{1b}[0m".into());
+        assert_eq!(
+            inner.to_string(),
+            "the harness reported an error: initialize: not logged in"
+        );
+        assert_eq!(inner.detail(), "initialize: not logged in");
+        // An adapter that formats an error into another one gets each prefix once.
+        let wrapped = AdapterError::Harness(format!("{inner}; claude stderr: boom"));
+        assert_eq!(
+            wrapped.to_string(),
+            "the harness reported an error: initialize: not logged in; claude stderr: boom"
+        );
+        let spawned = AdapterError::Spawn(format!("{wrapped}"));
+        assert_eq!(
+            spawned.to_string(),
+            "failed to start the harness: initialize: not logged in; claude stderr: boom"
+        );
+        assert_eq!(AdapterError::Unsupported("fork").detail(), "fork");
+        assert_eq!(AdapterError::Closed.to_string(), "the session is closed");
+    }
+
+    #[test]
+    fn stderr_is_added_to_the_text_of_the_same_kind() {
+        let policy = AdapterPolicy {
+            stderr_excerpt_lines: 1,
+            ..AdapterPolicy::default()
+        };
+        let e = policy.with_stderr(
+            AdapterError::Harness("the harness reported an error: resume failed".into()),
+            "noise\n\u{1b}[31mError: session is held\u{1b}[0m\n",
+        );
+        assert_eq!(
+            e,
+            AdapterError::Harness("resume failed\nstderr: Error: session is held".into())
+        );
+        assert_eq!(
+            e.to_string(),
+            "the harness reported an error: resume failed\nstderr: Error: session is held"
+        );
+        // Nothing on stderr: unchanged.
+        let same = AdapterError::Spawn("x".into());
+        assert_eq!(policy.with_stderr(same.clone(), " \n"), same);
+        assert!(matches!(
+            AdapterError::Unsupported("fork").with_stderr("why", 5),
+            AdapterError::Other(m) if m == "not supported by this harness: fork\nstderr: why"
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_extended_port_methods_refuse_or_report_nothing_by_default() {
+        let session = Recorder::default();
+        assert_eq!(
+            session.apply_modes(&ThreadModes::default()).await,
+            Err(AdapterError::Unsupported("modes"))
+        );
+        assert_eq!(
+            session.rename("t").await,
+            Err(AdapterError::Unsupported("rename"))
+        );
+        assert_eq!(session.status().await, Ok(Vec::new()));
+        assert_eq!(
+            session.side_question("q").await,
+            Err(AdapterError::Unsupported("sideQuestion"))
+        );
+        assert_eq!(
+            session.move_to_background("k").await,
+            Err(AdapterError::Unsupported("moveToBackground"))
+        );
+        // A steer with the engine's id is a plain steer.
+        assert_eq!(
+            session.steer_message("itm_1", TurnInput::text("x")).await,
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_fork_point_round_trips_as_json() {
+        let point = ForkPoint {
+            anchor: serde_json::json!({"turnId": "t2"}),
+            before: true,
+            previous: None,
+        };
+        let json = serde_json::to_value(&point).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"anchor": {"turnId": "t2"}, "before": true})
+        );
+        assert_eq!(serde_json::from_value::<ForkPoint>(json).unwrap(), point);
     }
 
     #[test]

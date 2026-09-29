@@ -6,6 +6,7 @@ import dev.aas.android.R
 import dev.aas.android.protocol.Methods
 import dev.aas.android.protocol.RpcError
 import dev.aas.android.sync.OutboxEntry
+import dev.aas.android.ui.common.UiText
 
 /** What a request (by method name) does, in the user's words: "メッセージの送信" etc. */
 object RequestLabels {
@@ -20,6 +21,7 @@ object RequestLabels {
         Methods.ThreadFork.name -> R.string.request_thread_fork
         Methods.ThreadStop.name -> R.string.request_thread_stop
         Methods.BackgroundTaskStop.name -> R.string.request_background_stop
+        Methods.ItemMoveToBackground.name -> R.string.request_move_to_background
         Methods.QueueRemove.name -> R.string.request_queue_remove
         Methods.QueueResume.name -> R.string.request_queue_resume
         Methods.QueueUpdate.name -> R.string.request_queue_update
@@ -38,5 +40,5 @@ object RequestLabels {
 
     /** "メッセージの送信に失敗しました: <server message>". */
     fun failure(res: Resources, entry: OutboxEntry, error: RpcError): String =
-        res.getString(R.string.request_failed, res.getString(of(entry.method)), error.message)
+        ErrorTexts.requestFailed(UiText.of(of(entry.method)), error).resolve(res)
 }

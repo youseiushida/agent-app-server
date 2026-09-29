@@ -1,5 +1,9 @@
+@file:OptIn(ExperimentalSerializationApi::class)
+
 package dev.aas.android.protocol
 
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -40,6 +44,47 @@ data class Harness(
     val effortLevels: List<EffortLevel> = emptyList(),
     val permissionModes: List<PermissionMode> = emptyList(),
     val defaultPermissionMode: String? = null,
+    /** What the harness offers beyond [capabilities] (all off when absent; protocol.md §3.1). */
+    val features: HarnessFeatures = HarnessFeatures(),
+)
+
+/**
+ * Features of a harness beyond [HarnessCapabilities]: the app offers the matching commands and
+ * actions only where they are on (protocol.md §3.1 「ハーネスの機能」). Each field is left out of
+ * the JSON while it is off, as the server writes it.
+ */
+@Serializable
+data class HarnessFeatures(
+    /** `thread/fork` at any turn whose anchor was recorded ([Turn.forkable]), with it or right before it. */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val forkAtTurn: Boolean = false,
+    /** A session another process holds can still be forked: after `resumeFailed`, 「新しいスレッドに分岐」. */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val forkWhileHeld: Boolean = false,
+    /** A user's title (`thread/update { title }`) is given to the native session too. */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val rename: Boolean = false,
+    /** `thread/sideQuestion`: a question answered beside the conversation (Claude Code's `/btw`). */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val sideQuestion: Boolean = false,
+    /** `item/moveToBackground` on items that report [Item.backgroundable]. */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val moveToBackground: Boolean = false,
+    /** `thread/harnessStatus` reports sections of the harness's own status. */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val status: Boolean = false,
+    /**
+     * The harness loads a project's own resources only when the user trusts the project: the app
+     * asks per project ([Project.harnessTrust]), never on its own.
+     */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val projectTrust: Boolean = false,
+    /** The app's `/plan` ([ThreadModes.plan]). Absent: the app does not offer `/plan` for this harness. */
+    val planMode: PlanModeFeature? = null,
+    /** Models (ids of [Harness.models]) with fast mode ([ThreadModes.fast]). Empty: no fast mode. */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val fastModeModels: List<String> = emptyList(),
+)
+
+/** How a harness's plan mode continues from a proposed plan ([Item.ProposedPlan]); the texts are the harness's own. */
+@Serializable
+data class PlanModeFeature(
+    /** Sent (with plan mode off) to implement the plan in the same thread. Absent: the harness continues by itself. */
+    val implementPrompt: String? = null,
+    /** A new thread implementing the plan starts with this text, a blank line, then the plan. Absent: not offered. */
+    val newThreadPreamble: String? = null,
 )
 
 @Serializable
@@ -91,6 +136,11 @@ data class Project(
     val archived: Boolean = false,
     val defaults: ProjectDefaults = ProjectDefaults(),
     val git: GitInfo = GitInfo(),
+    /**
+     * The user's decision, per harness id, whether a harness with the feature `projectTrust` may
+     * load this project's own resources. No entry: not decided (the agent starts without one).
+     */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val harnessTrust: Map<String, Boolean> = emptyMap(),
 )
 
 @Serializable
@@ -150,6 +200,18 @@ data class ThreadSettings(
     val effort: String? = null,
     val permissionMode: String? = null,
 )
+
+/**
+ * Modes of a thread switched on and off (`thread/update { modes }`) next to its [ThreadSettings]:
+ * plan mode (also followed when the harness reports entering or leaving it) and fast mode (the
+ * user's request; what the harness does with it is [Thread.fastModeState]).
+ */
+@Serializable
+data class ThreadModes(val plan: Boolean = false, val fast: Boolean = false)
+
+/** A change of [ThreadModes]: only the fields present change. */
+@Serializable
+data class ThreadModesUpdate(val plan: Boolean? = null, val fast: Boolean? = null)
 
 @Serializable(with = Workspace.Serializer::class)
 sealed interface Workspace {
@@ -241,6 +303,10 @@ data class Thread(
     val head: Long = 0,
     /** The thread's background work: how many tasks run, and the one that ended last (protocol.md §3.1). */
     val background: ThreadBackground = ThreadBackground(),
+    /** Plan mode and fast mode (`thread/update { modes }`; plan mode also follows the harness's reports). */
+    val modes: ThreadModes = ThreadModes(),
+    /** What the harness last reported about fast mode, verbatim (Claude Code: `on`, `off`, `cooldown`). Display only. */
+    val fastModeState: String? = null,
 )
 
 /**
@@ -316,6 +382,11 @@ data class Turn(
      * agent started, reported with `turn/completed`).
      */
     val trigger: TurnTrigger? = null,
+    /**
+     * The harness's own anchor of this turn was recorded while it ran: the thread can be forked at
+     * it (`thread/fork { atTurnId }`, feature `forkAtTurn`). Never inferred by counting.
+     */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val forkable: Boolean = false,
 )
 
 @Serializable
@@ -632,6 +703,13 @@ sealed interface DiffScope {
         override fun rawOf(value: DiffScope) = (value as? Unknown)?.raw
     }
 }
+
+/** One section of a harness's own status (`thread/harnessStatus`), in its order and words. Display only. */
+@Serializable
+data class StatusSection(val title: String, val rows: List<StatusRow> = emptyList())
+
+@Serializable
+data class StatusRow(val label: String, val value: String)
 
 /** Policy values the client must honour (from `initialize`). */
 @Serializable

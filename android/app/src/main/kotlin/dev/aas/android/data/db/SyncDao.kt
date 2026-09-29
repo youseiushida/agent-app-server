@@ -211,7 +211,8 @@ interface SyncDao {
         """
         UPDATE outbox
         SET method = :method, params = :params, created_at = :createdAt, failures = :failures,
-            last_error = :lastError, next_attempt_at = :nextAttemptAt, waiting_for_harness = :waitingForHarness
+            last_error = :lastError, next_attempt_at = :nextAttemptAt, waiting_for_harness = :waitingForHarness,
+            after_request_id = :after
         WHERE client_request_id = :clientRequestId
         """,
     )
@@ -224,6 +225,7 @@ interface SyncDao {
         lastError: String?,
         nextAttemptAt: Long,
         waitingForHarness: String?,
+        after: String?,
     ): Int
 
     @Query("DELETE FROM outbox WHERE client_request_id = :clientRequestId")

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aas_harness::{HarnessAdapter, HarnessInfo};
+use aas_harness::{HarnessAdapter, HarnessFeatures, HarnessInfo};
 use aas_protocol::{ErrorKind, Harness, RpcError};
 use parking_lot::Mutex;
 use tokio::sync::watch;
@@ -39,6 +39,8 @@ struct Entry {
 #[derive(Default)]
 struct ProbeState {
     info: Option<HarnessInfo>,
+    /// What the adapter offered beyond `info` right after that probe (none while unavailable).
+    features: HarnessFeatures,
     /// When the probe that produced `info` started, and when it ended.
     started: Option<Instant>,
     finished: Option<Instant>,
@@ -155,6 +157,13 @@ impl HarnessRegistry {
         entry.state.lock().running_since = Some(started);
         let running = RunningProbe(&entry.state);
         let info = entry.adapter.probe().await;
+        // Read right after the probe, which may have changed them; an unavailable harness
+        // offers nothing.
+        let features = if info.available {
+            entry.adapter.features()
+        } else {
+            HarnessFeatures::default()
+        };
         drop(running);
         if !info.available {
             tracing::warn!(harness = %id, reason = ?info.unavailable_reason, "harness unavailable");
@@ -167,6 +176,7 @@ impl HarnessRegistry {
                 state.failures.saturating_add(1)
             };
             state.info = Some(info);
+            state.features = features;
             state.started = Some(started);
             state.finished = Some(Instant::now());
         }
@@ -207,6 +217,14 @@ impl HarnessRegistry {
         self.entry(id)?.state.lock().info.clone()
     }
 
+    /// The features harness `id` offered at its last probe (none for an unknown harness, one
+    /// not probed yet, or one that was unavailable).
+    pub fn features(&self, id: &str) -> HarnessFeatures {
+        self.entry(id)
+            .map(|e| e.state.lock().features.clone())
+            .unwrap_or_default()
+    }
+
     /// Protocol view of one harness (unprobed harnesses are reported unavailable).
     pub fn harness(&self, id: &str) -> Option<Harness> {
         self.entry(id).map(|e| self.view(e))
@@ -214,12 +232,16 @@ impl HarnessRegistry {
 
     fn view(&self, entry: &Entry) -> Harness {
         let adapter = &entry.adapter;
-        let info = entry
-            .state
-            .lock()
-            .info
-            .clone()
-            .unwrap_or_else(|| HarnessInfo::unavailable("not probed yet"));
+        let (info, features) = {
+            let state = entry.state.lock();
+            (
+                state
+                    .info
+                    .clone()
+                    .unwrap_or_else(|| HarnessInfo::unavailable("not probed yet")),
+                state.features.clone(),
+            )
+        };
         Harness {
             id: adapter.id().to_owned(),
             kind: adapter.kind(),
@@ -234,6 +256,7 @@ impl HarnessRegistry {
             effort_levels: info.effort_levels,
             permission_modes: info.permission_modes,
             default_permission_mode: info.default_permission_mode,
+            features,
         }
     }
 

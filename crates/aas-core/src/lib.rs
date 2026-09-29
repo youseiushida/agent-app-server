@@ -10,6 +10,7 @@ pub mod auth;
 mod background;
 mod blobs;
 mod capacity;
+mod commands;
 pub mod config;
 mod db;
 mod emit;

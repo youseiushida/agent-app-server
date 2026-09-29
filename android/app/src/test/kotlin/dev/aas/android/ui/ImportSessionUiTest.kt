@@ -3,6 +3,7 @@ package dev.aas.android.ui
 import android.app.Application
 import android.os.Looper
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.v2.createComposeRule
@@ -20,6 +21,7 @@ import dev.aas.android.protocol.AasJson
 import dev.aas.android.protocol.ErrorKind
 import dev.aas.android.protocol.Event
 import dev.aas.android.protocol.HarnessCapabilities
+import dev.aas.android.protocol.HarnessKind
 import dev.aas.android.protocol.Methods
 import dev.aas.android.protocol.NativeListResult
 import dev.aas.android.protocol.NativeSession
@@ -178,6 +180,30 @@ class ImportSessionUiTest {
         assertEquals(listOf("devin", "codex"), env.requests(Methods.NativeList.name).map { (it.params as JsonObject)["harnessId"]!!.jsonPrimitive.content })
     }
 
+    /**
+     * Listing Codex's sessions says that a conversation open in Codex desktop cannot be continued
+     * from the phone (Codex allows one writer per conversation); other harnesses do not.
+     */
+    @Test
+    fun codexsListSaysThatAConversationOpenInCodexDesktopCannotBeContinued() {
+        env.serve(
+            null,
+            harnesses = listOf(
+                Samples.harness("codex", capabilities = canList).copy(displayName = "Codex", kind = HarnessKind.Codex),
+                Samples.harness("claude", capabilities = canList).copy(displayName = "Claude", kind = HarnessKind.Claude),
+            ),
+            projects = listOf(Samples.project("prj_1")),
+        )
+        env.answers[Methods.NativeList.name] = { AasJson.encodeToJsonElement(NativeListResult.serializer(), NativeListResult(listOf(NativeSession("019a", title = "Fix the build", updatedAt = 1)))) }
+        runBlocking { env.connect() }
+        show(requested = "codex")
+        waitFor("Fix the build")
+        compose.onNodeWithText(NOTE, substring = true).assertIsDisplayed()
+        compose.onNodeWithText("Claude").performClick()
+        waitFor("Fix the build")
+        assertEquals(0, compose.onAllNodes(hasText(NOTE, substring = true)).fetchSemanticsNodes().size)
+    }
+
     /** The import screen for `/resume` from a thread of [requested], against the scripted daemon. */
     private fun show(requested: String) {
         val container = ApplicationProvider.getApplicationContext<Application>().appContainer
@@ -196,5 +222,6 @@ class ImportSessionUiTest {
 
     private companion object {
         const val WAIT_MS = 10_000L
+        const val NOTE = "Codex desktop で開いている会話は、スマホから続けられません"
     }
 }

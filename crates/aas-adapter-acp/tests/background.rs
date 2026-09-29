@@ -237,7 +237,8 @@ async fn devin_background_shell_and_sub_agent_are_tasks() {
     assert!(f.notices.is_empty(), "{:?}", f.notices);
     assert_eq!(
         client[0]["params"]["clientCapabilities"]["_meta"],
-        json!({"cognition.ai/subagentSupport": true, "cognition.ai/subagentControl": true})
+        json!({"cognition.ai/subagentSupport": true, "cognition.ai/subagentControl": true,
+               "cognition.ai/revert": true})
     );
 }
 

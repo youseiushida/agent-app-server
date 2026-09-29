@@ -47,7 +47,9 @@ class TimelineTest {
         val rows = Timeline.build(state(), emptyList(), emptyMap())
         assertEquals(
             listOf(
-                "TurnStart", "ItemRow", "ActivityGroup", "ItemRow", "ItemRow", "ItemRow", "ItemRow", "InteractionRow", "InteractionRow", "TurnEnd",
+                // After the group: the plan, the answer, a notice, the backgrounded tool call, a
+                // proposed plan and the command still running (the ones the group does not fold).
+                "TurnStart", "ItemRow", "ActivityGroup", "ItemRow", "ItemRow", "ItemRow", "ItemRow", "ItemRow", "ItemRow", "InteractionRow", "InteractionRow", "TurnEnd",
                 // The background agent's approval (no turn), then the turn the agent started when background work finished.
                 "InteractionRow", "TurnStart",
             ),
@@ -70,8 +72,8 @@ class TimelineTest {
         assertTrue(group.expanded)
         assertEquals(4, rows.count { it is TimelineRow.GroupedItem })
         val working = rows.filterIsInstance<TimelineRow.Working>().single()
-        // What it is doing: the latest item in progress (the answer being written).
-        assertIs<Item.AgentMessage>(working.current)
+        // What it is doing: the latest item in progress (the command that can move to the background).
+        assertIs<Item.CommandExecution>(working.current)
 
         val closed = Timeline.build(state(turns = running), emptyList(), mapOf(group.groupKey to false))
         assertEquals(false, closed.filterIsInstance<TimelineRow.ActivityGroup>().single().expanded)

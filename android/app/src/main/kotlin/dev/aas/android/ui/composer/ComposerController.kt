@@ -13,6 +13,7 @@ import dev.aas.android.data.DraftImage
 import dev.aas.android.data.ImageUploadException
 import dev.aas.android.data.ImageUploader
 import dev.aas.android.data.UploadedImage
+import dev.aas.android.domain.ErrorTexts
 import dev.aas.android.domain.composer.ComposerText
 import dev.aas.android.domain.composer.ComposerTextState
 import dev.aas.android.domain.composer.ComposerTrigger
@@ -21,6 +22,8 @@ import dev.aas.android.domain.composer.Palette
 import dev.aas.android.domain.composer.PaletteAction
 import dev.aas.android.domain.composer.PaletteContext
 import dev.aas.android.domain.composer.PaletteEntry
+import dev.aas.android.domain.composer.TypedCommand
+import dev.aas.android.domain.composer.TypedCommands
 import dev.aas.android.protocol.Command
 import dev.aas.android.protocol.CommandAction
 import dev.aas.android.protocol.InputPart
@@ -71,8 +74,11 @@ sealed interface MentionSearch {
     data class Failed(val message: UiText) : MentionSearch
 }
 
-/** An attached image. */
-data class Attachment(val id: String, val localUri: String, val state: State) {
+/**
+ * An attached image. [localUri] is the picked content (its thumbnail); `null` for an image only
+ * the daemon has (an attachment of a sent message put back, [DraftImage]).
+ */
+data class Attachment(val id: String, val localUri: String?, val state: State) {
     sealed interface State {
         data object Uploading : State
 
@@ -251,6 +257,11 @@ class ComposerController(
                 PaletteChoice.Inserted
             }
             is PaletteAction.Local -> when (action.command) {
+                // The argument is typed after it; sending runs the command (TypedCommands).
+                LocalCommand.Plan, LocalCommand.Btw -> {
+                    insert("/${action.command.commandName} ")
+                    PaletteChoice.Inserted
+                }
                 LocalCommand.Review -> {
                     insert(templates.review)
                     PaletteChoice.Inserted
@@ -328,6 +339,31 @@ class ComposerController(
     /** The draft about to be sent, for [restore] if the request cannot be made. */
     fun sentDraft(): SentDraft = SentDraft(value.value.text, mentions.value, uploadedImages())
 
+    /**
+     * The app's command the draft starts with ([TypedCommands.resolve]), resolved against this
+     * composer's palette: the daemon's command list when it is loaded, else [fallback] (the
+     * protocol's app commands, [Palette.protocolAppCommands]); the prompt templates only with the
+     * loaded list.
+     */
+    fun typedCommand(fallback: List<Command>): TypedCommand? {
+        val loaded = (commands.value as? CommandsState.Loaded)?.commands
+        return TypedCommands.resolve(value.value.text, loaded, fallback, context.value)
+    }
+
+    /** The draft with [text] instead of its text (a typed command's argument, a template): its mentions and images stay. */
+    fun draftWith(text: String): SentDraft = SentDraft(text, mentions.value, uploadedImages())
+
+    /**
+     * Puts text the harness asked for into the composer (`composer/insert`): in place of the text
+     * when [replace] or when there is none, else as the next paragraph after it.
+     */
+    fun insertFromHarness(text: String, replace: Boolean) {
+        val current = value.value.text
+        val next = if (replace || current.isBlank()) text else ComposerText.appendParagraph(current, text)
+        update(TextFieldValue(next, TextRange(next.length)))
+        onTextChanged()
+    }
+
     /** After sending: an empty composer and no draft. */
     fun clear() {
         uploads.values.forEach { it.cancel() }
@@ -368,9 +404,11 @@ class ComposerController(
     }
 
     private fun upload(attachment: Attachment) {
+        // Only picked images upload: an image of a sent message put back is on the daemon already.
+        val uri = attachment.localUri ?: return
         uploads[attachment.id] = scope.launch {
             val next = try {
-                Attachment.State.Uploaded(uploader.upload(attachment.localUri))
+                Attachment.State.Uploaded(uploader.upload(uri))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: ImageUploadException) {
@@ -411,7 +449,7 @@ class ComposerController(
             } catch (e: NotConnectedException) {
                 MentionSearch.Offline
             } catch (e: RpcException) {
-                MentionSearch.Failed(UiText.of(R.string.error_server, e.error.message))
+                MentionSearch.Failed(ErrorTexts.server(e.error))
             } catch (e: Exception) {
                 MentionSearch.Failed(requestFailed(e))
             }

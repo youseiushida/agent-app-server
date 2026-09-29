@@ -48,7 +48,7 @@ abstract class AasDatabase : RoomDatabase() {
 
     companion object {
         /** Current schema version (see the class documentation for the migration rules). */
-        const val VERSION = 3
+        const val VERSION = 4
 
         /** File name in the app's database directory (`%LOCALAPPDATA%`-like private storage). */
         const val FILE_NAME = "aas-sync.db"
@@ -101,5 +101,15 @@ object Migrations {
         }
     }
 
-    val ALL: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
+    /**
+     * 3 → 4: `outbox.after_request_id`, the entry a chained request waits for (docs/android.md
+     * 6.3). Existing requests are not chained.
+     */
+    val MIGRATION_3_4: Migration = object : Migration(3, 4) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `outbox` ADD COLUMN `after_request_id` TEXT")
+        }
+    }
+
+    val ALL: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
 }

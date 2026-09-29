@@ -17,7 +17,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -67,6 +66,7 @@ import dev.aas.android.ui.composer.rememberImageSources
 import dev.aas.android.ui.navigation.AppNavigator
 import dev.aas.android.ui.navigation.NewThreadRoute
 import dev.aas.android.ui.theme.statusColors
+import dev.aas.android.ui.thread.ProjectTrustBanner
 
 fun NavGraphBuilder.newThreadDestinations(navigator: AppNavigator) {
     composable<NewThreadRoute> { entry ->
@@ -86,6 +86,7 @@ fun NavGraphBuilder.newThreadDestinations(navigator: AppNavigator) {
                 templates = PromptTemplates(res.getString(R.string.template_review), res.getString(R.string.template_init)),
                 outbox = c.engine.outbox,
                 harnesses = c.harnessRepository,
+                sentDrafts = c.sentDrafts,
             )
         }
         NewThreadScreen(vm, navigator)
@@ -136,7 +137,10 @@ fun NewThreadScreen(vm: NewThreadViewModel, navigator: AppNavigator) {
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                     )
                 }
-                HorizontalDivider()
+                val chosen = harness
+                if (ui.trustUndecided && chosen != null) {
+                    ProjectTrustBanner(chosen.displayName, onTrust = { vm.setTrust(true) }, onDistrust = { vm.setTrust(false) })
+                }
                 if (ui.creating) LinearProgressIndicator(Modifier.fillMaxWidth())
                 ComposerBar(
                     value = vm.composer.textValue,
@@ -243,7 +247,7 @@ fun NewThreadScreen(vm: NewThreadViewModel, navigator: AppNavigator) {
     }
     if (harness != null) {
         when (picker) {
-            PickerKind.Model, PickerKind.Effort -> ModelSheet(harness, ui.choices.settings, allowDefaultEffort = true, onApply = vm::setModel, onDismiss = { picker = null })
+            PickerKind.Model, PickerKind.Effort -> ModelSheet(harness, ui.choices.settings, allowDefaultEffort = true, onApply = { model, effort, _ -> vm.setModel(model, effort) }, onDismiss = { picker = null })
             PickerKind.PermissionMode -> PermissionSheet(harness, ui.choices.settings, onApply = { vm.setPermission(it.id) }, onDismiss = { picker = null })
             PickerKind.Unknown, null -> Unit
         }

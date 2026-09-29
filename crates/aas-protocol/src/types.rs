@@ -57,6 +57,70 @@ pub struct Harness {
     pub permission_modes: Vec<PermissionMode>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub default_permission_mode: Option<String>,
+    /// What the harness offers beyond `capabilities` (all off when absent).
+    #[serde(default)]
+    pub features: HarnessFeatures,
+}
+
+/// Features of a harness beyond [`HarnessCapabilities`]: the app offers the matching commands
+/// and actions only where they are on. Everything is off by default, and a client that does not
+/// know a field ignores it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessFeatures {
+    /// `thread/fork` at any turn whose native anchor was recorded (`Turn.forkable`): with the
+    /// turn included, or right before it (`before`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fork_at_turn: bool,
+    /// A native session another process holds (so that resuming it fails) can still be forked:
+    /// after a failed resume (`Turn.error.kind` `resumeFailed`) the client may offer a fork into
+    /// a new thread besides a retry.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fork_while_held: bool,
+    /// A user's title (`thread/update { title }`) is given to the native session too.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rename: bool,
+    /// `thread/sideQuestion` (a question answered beside the conversation, not in it).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub side_question: bool,
+    /// `item/moveToBackground` on items that report `backgroundable`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub move_to_background: bool,
+    /// `thread/harnessStatus` reports sections of the harness's own status.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub status: bool,
+    /// The harness loads a project's own resources (extensions, prompts, skills) only when the
+    /// user trusts the project: the client asks per project (`Project.harnessTrust`), never on
+    /// its own.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub project_trust: bool,
+    /// Plan mode driven by the app's `/plan` (`ThreadModes.plan`). Absent: the app does not offer
+    /// `/plan` for this harness (a harness command of that name stays the harness's).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub plan_mode: Option<PlanModeFeature>,
+    /// Ids of the models (`Harness.models`) that support fast mode (`ThreadModes.fast`). Empty:
+    /// no fast mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fast_mode_models: Vec<String>,
+}
+
+/// How the harness's plan mode continues from a proposed plan (`proposedPlan` items). The
+/// texts are the harness's own, verbatim (Codex 0.148.0's for Codex).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanModeFeature {
+    /// Sent (with plan mode off) to implement the proposed plan in the same thread. Absent: the
+    /// harness continues by itself (e.g. through the approval of its plan).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub implement_prompt: Option<String>,
+    /// Starts a new thread that implements the proposed plan: this text, a blank line
+    /// (`"\n\n"`), then the plan's text. Absent: not offered.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub new_thread_preamble: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -125,6 +189,11 @@ pub struct Project {
     pub archived: bool,
     pub defaults: ProjectDefaults,
     pub git: GitInfo,
+    /// The user's decision, per harness id, whether the harness may load this project's own
+    /// resources (harnesses with the feature `projectTrust`). A harness without an entry has
+    /// not been decided for: the agent starts without a decision (its own saved one applies).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub harness_trust: std::collections::BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -176,6 +245,32 @@ pub struct ThreadSettings {
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub permission_mode: Option<String>,
+}
+
+/// Modes of a thread that are switched on and off (`thread/update { modes }`), next to the
+/// picked [`ThreadSettings`]. A mode is only set on a harness that offers it
+/// (`HarnessFeatures.planMode`, `HarnessFeatures.fastModeModels`); the harness's own reports
+/// of plan mode are reflected here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadModes {
+    /// The agent plans instead of acting (plan mode).
+    #[serde(default)]
+    pub plan: bool,
+    /// Fast mode is requested (the harness reports what it does with it in
+    /// `Thread.fastModeState`).
+    #[serde(default)]
+    pub fast: bool,
+}
+
+/// A change of [`ThreadModes`]: only the fields present change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadModesUpdate {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub plan: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fast: Option<bool>,
 }
 
 /// Where a thread's agent works.
@@ -285,6 +380,13 @@ pub struct Thread {
     /// The thread's background work: how many tasks run, and the last one that ended.
     #[serde(default)]
     pub background: ThreadBackground,
+    /// Plan mode and fast mode (`thread/update { modes }`).
+    #[serde(default)]
+    pub modes: ThreadModes,
+    /// What the harness last reported about fast mode, verbatim (Claude Code's
+    /// `fast_mode_state`: `on`, `off`, `cooldown`). Display only.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fast_mode_state: Option<String>,
     /// Head of the thread stream, refreshed at turn boundaries.
     pub head: u64,
 }
@@ -438,6 +540,10 @@ pub struct Turn {
     /// the agent started; see `TurnTrigger`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub trigger: Option<TurnTrigger>,
+    /// The harness's own anchor of this turn was recorded while it ran, so the thread can be
+    /// forked at it (`thread/fork { atTurnId }`, feature `forkAtTurn`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forkable: bool,
 }
 
 /// What made the harness start a run by itself, as the harness reported it.
@@ -551,6 +657,10 @@ pub struct Item {
     /// The background task this item launched (the task names the item as its origin).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub background_task_id: Option<BackgroundTaskId>,
+    /// The running item can be moved to the background now (`item/moveToBackground`): the
+    /// harness said so explicitly. Only while the item is `inProgress`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub backgroundable: bool,
     #[serde(flatten)]
     pub body: ItemBody,
 }
@@ -615,6 +725,11 @@ pub enum ItemBody {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         code: Option<String>,
     },
+    /// A plan the agent proposes in plan mode (Markdown), to implement next (see
+    /// `HarnessFeatures.planMode`). Streams with `text` deltas.
+    ProposedPlan {
+        text: String,
+    },
 }
 
 impl ItemBody {
@@ -628,6 +743,7 @@ impl ItemBody {
             ItemBody::ToolCall { .. } => "toolCall",
             ItemBody::Plan { .. } => "plan",
             ItemBody::Notice { .. } => "notice",
+            ItemBody::ProposedPlan { .. } => "proposedPlan",
         }
     }
 
@@ -636,7 +752,8 @@ impl ItemBody {
     pub fn append(&mut self, field: DeltaField, text: &str) -> bool {
         match (self, field) {
             (ItemBody::AgentMessage { text: t }, DeltaField::Text)
-            | (ItemBody::Reasoning { text: t }, DeltaField::Text) => {
+            | (ItemBody::Reasoning { text: t }, DeltaField::Text)
+            | (ItemBody::ProposedPlan { text: t }, DeltaField::Text) => {
                 t.push_str(text);
                 true
             }
@@ -1424,6 +1541,22 @@ pub struct DiffFile {
 pub enum DiffScope {
     Turn { turn_id: TurnId },
     Thread,
+}
+
+/// One section of a harness's own status (`thread/harnessStatus`): what the harness reports,
+/// in its order and words. Display only: nobody interprets the values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusSection {
+    pub title: String,
+    pub rows: Vec<StatusRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusRow {
+    pub label: String,
+    pub value: String,
 }
 
 /// Policy values the client must honour (sent in the `initialize` result).

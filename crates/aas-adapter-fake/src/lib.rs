@@ -14,6 +14,14 @@
 //!
 //! Background work (`@bg`, [`background`]) is reported as background tasks (capabilities
 //! `backgroundTasks` and `backgroundStop`), with the agent's own turns when a task ends.
+//!
+//! It offers every extended feature of the port ([`FakeAdapter::features`]): turn anchors and
+//! forks at a turn (with a store; a fork before a turn ends right after the turn before it, as
+//! Claude Code cuts), forks of sessions another process holds, renames both ways,
+//! the harness status, side questions, moving a running item to the background, returned
+//! steers, composer text, plan mode with proposed plans, fast mode with the model `fake-fast`,
+//! the project trust decision, and a session-switching command with an alias (`fake-clear`,
+//! `fake-reset`).
 
 pub mod agent;
 pub mod background;
@@ -24,8 +32,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::HashMap;
+
 use aas_harness::*;
-use aas_protocol::types::{EffortLevel, HarnessCapabilities, Model, PermissionMode};
+use aas_protocol::types::{
+    EffortLevel, HarnessCapabilities, HarnessFeatures, Model, PermissionMode, PlanModeFeature,
+    StatusRow, StatusSection,
+};
 use aas_stdio::{JsonLinesReader, JsonLinesWriter, ReadLine, SharedJsonLinesWriter};
 use aas_supervisor::{ChildHandle, SpawnSpec};
 use async_trait::async_trait;
@@ -35,7 +48,18 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use crate::agent::AgentOptions;
 use crate::store::{SessionStore, StoreError};
-use crate::wire::{Ev, Op};
+use crate::wire::{Ev, ForkAt, Modes, Op, Query};
+
+/// Text the fake harness sends (with plan mode off) to implement a proposed plan in the same
+/// thread: its own words, shaped like Codex's.
+pub const IMPLEMENT_PROMPT: &str = "Implement the plan.";
+/// Preamble of a new thread that implements a proposed plan (then a blank line and the plan).
+pub const NEW_THREAD_PREAMBLE: &str =
+    "Implement the plan below, which an earlier session proposed, in this new session.";
+
+/// A permission mode the fake does not offer and takes as plan mode
+/// ([`HarnessAdapter::upgrade_settings`]), like Claude Code's `plan`.
+pub const LEGACY_PLAN_MODE: &str = "plan";
 
 /// Buffer of each in-memory pipe between the adapter and an in-process agent. A pure buffer
 /// size: both ends are read continuously.
@@ -92,7 +116,8 @@ fn store_error(e: StoreError) -> AdapterError {
         StoreError::InvalidId(_)
         | StoreError::NotFound(_)
         | StoreError::Exists(_)
-        | StoreError::OtherFolder { .. } => AdapterError::Harness(e.to_string()),
+        | StoreError::OtherFolder { .. }
+        | StoreError::NoSuchTurn { .. } => AdapterError::Harness(e.to_string()),
         StoreError::Io { .. } | StoreError::Corrupt { .. } => AdapterError::Other(e.to_string()),
     }
 }
@@ -252,6 +277,14 @@ impl HarnessAdapter for FakeAdapter {
     }
 
     async fn start(&self, req: StartRequest) -> Result<SessionHandle, AdapterError> {
+        self.start_with(req, StartOptions::default()).await
+    }
+
+    async fn start_with(
+        &self,
+        req: StartRequest,
+        start: StartOptions,
+    ) -> Result<SessionHandle, AdapterError> {
         let sessions_dir = self
             .options()?
             .sessions_dir
@@ -271,11 +304,18 @@ impl HarnessAdapter for FakeAdapter {
                 )
             }
         };
+        let fork_at = start.fork_at.as_ref().map(fork_cut).transpose()?;
         let hello = Op::Hello {
             session_id,
             resume,
             fork_from,
+            fork_at,
             sessions_dir,
+            modes: Modes {
+                plan: start.modes.plan,
+                fast: start.modes.fast,
+            },
+            project_trusted: start.project_trusted,
         };
         let options = AgentOptions {
             cwd: req.cwd.clone(),
@@ -335,20 +375,100 @@ impl HarnessAdapter for FakeAdapter {
             exit,
             hello,
             req.settings,
+            start.modes,
             self.ctx.policy.clone(),
         )
         .await
     }
 
-    async fn commands(&self, _ctx: CommandContext) -> Result<Vec<Command>, AdapterError> {
-        Ok(vec![Command {
-            name: "fake-help".into(),
-            description: Some("Show the fake agent's scenario directives".into()),
-            source: aas_protocol::CommandSource::Harness,
-            argument_hint: None,
-            action: aas_protocol::CommandAction::InsertText {
-                text: "/fake-help ".into(),
+    /// The checks of [`fork_cut`].
+    fn check_fork_point(&self, point: &ForkPoint) -> Result<(), AdapterError> {
+        fork_cut(point).map(|_| ())
+    }
+
+    /// Like Claude Code's adapter, the fake takes the permission mode `plan` (which it does not
+    /// offer) as plan mode over the default permission mode, so that the engine's handling of
+    /// settings of an earlier form is exercised.
+    fn upgrade_settings(&self, settings: ThreadSettings) -> UpgradedSettings {
+        if settings.permission_mode.as_deref() != Some(LEGACY_PLAN_MODE) {
+            return UpgradedSettings {
+                settings,
+                plan: false,
+            };
+        }
+        UpgradedSettings {
+            settings: ThreadSettings {
+                permission_mode: None,
+                ..settings
             },
+            plan: true,
+        }
+    }
+
+    /// Everything the port offers; the ones that need stored sessions (forks at a turn, forks of
+    /// held sessions) only with `sessionsDir`.
+    fn features(&self) -> HarnessFeatures {
+        let stored = self
+            .options()
+            .is_ok_and(|options| options.sessions_dir.is_some());
+        HarnessFeatures {
+            fork_at_turn: stored,
+            fork_while_held: stored,
+            rename: true,
+            side_question: true,
+            move_to_background: true,
+            status: true,
+            project_trust: true,
+            plan_mode: Some(PlanModeFeature {
+                implement_prompt: Some(IMPLEMENT_PROMPT.into()),
+                new_thread_preamble: Some(NEW_THREAD_PREAMBLE.into()),
+            }),
+            fast_mode_models: vec![agent::FAST_MODEL.into()],
+        }
+    }
+
+    /// The fake agent's commands; `fake-project` only for a trusted project.
+    async fn commands(&self, ctx: CommandContext) -> Result<Vec<Command>, AdapterError> {
+        Ok(agent::fake_commands(ctx.project_trusted))
+    }
+
+    /// `fake-clear` starts a new session in the running agent.
+    fn session_switching_commands(&self) -> &'static [&'static str] {
+        &[agent::SWITCH_COMMAND]
+    }
+
+    /// `fake-clear` and its alias from the command list.
+    fn session_switching_names(&self) -> Vec<String> {
+        std::iter::once(agent::SWITCH_COMMAND)
+            .chain(agent::SWITCH_COMMAND_ALIASES.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// What the harness says without a session: where its sessions are and how it runs.
+    async fn status(&self, _cwd: &Path) -> Result<Vec<StatusSection>, AdapterError> {
+        let options = self.options()?;
+        let row = |label: &str, value: String| StatusRow {
+            label: label.into(),
+            value,
+        };
+        Ok(vec![StatusSection {
+            title: "Fake harness".into(),
+            rows: vec![
+                row(
+                    "Sessions",
+                    options
+                        .sessions_dir
+                        .map_or_else(|| "not stored".into(), |d| d.display().to_string()),
+                ),
+                row(
+                    "Runs as",
+                    match options.mode {
+                        ModeOption::Process => "process".into(),
+                        ModeOption::InProcess => "in process".into(),
+                    },
+                ),
+            ],
         }])
     }
 
@@ -372,6 +492,19 @@ impl HarnessAdapter for FakeAdapter {
             .map_err(store_error)
     }
 
+    /// The anchor of each stored turn is its index in the transcript.
+    async fn read_native_history_anchored(
+        &self,
+        cwd: &Path,
+        id: &str,
+    ) -> Result<(NativeHistory, Vec<Option<serde_json::Value>>), AdapterError> {
+        let history = self.read_native_history(cwd, id).await?;
+        let anchors = (0..history.turns.len())
+            .map(|turn| Some(serde_json::json!({ "turn": turn })))
+            .collect();
+        Ok((history, anchors))
+    }
+
     async fn read_native_history(
         &self,
         cwd: &Path,
@@ -386,6 +519,50 @@ impl HarnessAdapter for FakeAdapter {
             .map_err(|e| AdapterError::Other(format!("reading the session failed: {e}")))?
             .map_err(store_error)
     }
+}
+
+/// The stored turn a fake anchor names (`{"turn": <index>}`). A provisional anchor
+/// (`{"pending": <index>}`, `@late-anchor`) cannot be branched at.
+fn anchor_turn(anchor: &serde_json::Value) -> Result<usize, AdapterError> {
+    if let Some(turn) = anchor["pending"].as_u64() {
+        return Err(AdapterError::Harness(format!(
+            "turn {turn} has not settled yet: it can be branched at once the next turn has started"
+        )));
+    }
+    anchor["turn"]
+        .as_u64()
+        .map(|n| n as usize)
+        .ok_or_else(|| AdapterError::Harness(format!("{anchor} is not an anchor of this harness")))
+}
+
+/// Where the stored agent cuts a fork at `point`, from the anchors this adapter reported
+/// (`{"turn": <index>}`): with the turn, right after it; before it, right after the turn before
+/// (`previous`), like a CLI that cuts after the last message it keeps (Claude Code), so the
+/// engine's choice of that turn is what a fork before a turn exercises. The turn's own anchor
+/// must have settled either way.
+fn fork_cut(point: &ForkPoint) -> Result<ForkAt, AdapterError> {
+    let turn = anchor_turn(&point.anchor)?;
+    if !point.before {
+        return Ok(ForkAt {
+            turn,
+            before: false,
+        });
+    }
+    let previous = point.previous.as_ref().ok_or_else(|| {
+        AdapterError::Harness(
+            "the turn before the fork point has no recorded anchor, so the fork cannot end right before it"
+                .into(),
+        )
+    })?;
+    Ok(ForkAt {
+        turn: anchor_turn(previous)?,
+        before: false,
+    })
+}
+
+/// The provisional anchor of stored turn `turn` (`@late-anchor`).
+fn provisional_anchor(turn: usize) -> serde_json::Value {
+    serde_json::json!({ "pending": turn })
 }
 
 /// Where the session's exit information comes from.
@@ -474,12 +651,18 @@ struct PromptAck {
 /// the session closed) when the reader ends.
 type AckSlot = Arc<parking_lot::Mutex<Option<oneshot::Sender<PromptAck>>>>;
 
+/// Queries (`Op::Query`) waiting for their answer, by id. Emptied (so they see the session
+/// closed) when the reader ends.
+type QuerySlots = Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<Ev>>>>;
+
 struct FakeSession {
     writer: SharedJsonLinesWriter,
     exit: ExitSource,
     policy: AdapterPolicy,
     model: Mutex<Option<String>>,
+    modes: Mutex<ThreadModes>,
     ack: AckSlot,
+    queries: QuerySlots,
 }
 
 impl FakeSession {
@@ -489,6 +672,7 @@ impl FakeSession {
         exit: ExitSource,
         hello: Op,
         settings: ThreadSettings,
+        modes: ThreadModes,
         policy: AdapterPolicy,
     ) -> Result<SessionHandle, AdapterError> {
         let mut writer = JsonLinesWriter::new(writer);
@@ -536,9 +720,9 @@ impl FakeSession {
         let native_session_id = match ready {
             Ok(Ok(id)) => id,
             Ok(Err(e @ AdapterError::Harness(_))) => {
-                // Rejected: the agent exits by itself.
-                exit.shutdown(policy.stop_grace, StopReason::Shutdown).await;
-                return Err(e);
+                // Rejected: the agent exits by itself, with the reason on its stderr too.
+                let info = exit.shutdown(policy.stop_grace, StopReason::Shutdown).await;
+                return Err(policy.with_stderr(e, &info.stderr_tail));
             }
             Ok(Err(e)) => {
                 exit.shutdown(Duration::ZERO, StopReason::Shutdown).await;
@@ -555,12 +739,15 @@ impl FakeSession {
             let _ = tx.send(ev);
         }
         let ack: AckSlot = Arc::new(parking_lot::Mutex::new(None));
+        let queries: QuerySlots = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let session = Arc::new(FakeSession {
             writer: SharedJsonLinesWriter::new(writer.into_inner()),
             exit: exit.clone(),
             policy,
             model: Mutex::new(settings.model),
+            modes: Mutex::new(modes),
             ack: ack.clone(),
+            queries: queries.clone(),
         });
         tokio::spawn(async move {
             loop {
@@ -576,6 +763,22 @@ impl FakeSession {
                                 tracing::warn!("the fake agent answered a prompt nobody waits for")
                             }
                         },
+                        Ok(ev @ Ev::QueryResult { .. }) => {
+                            let Ev::QueryResult { id, .. } = &ev else {
+                                unreachable!("matched above")
+                            };
+                            match queries.lock().remove(id) {
+                                Some(waiter) => {
+                                    let _ = waiter.send(ev);
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        id,
+                                        "the fake agent answered a query nobody waits for"
+                                    )
+                                }
+                            }
+                        }
                         Ok(ev) => {
                             if let Some(ev) = map_event(ev) {
                                 let _ = tx.send(ev);
@@ -602,8 +805,9 @@ impl FakeSession {
                     }
                 }
             }
-            // A prompt still waiting for its answer never gets one.
+            // A prompt or query still waiting for its answer never gets one.
             ack.lock().take();
+            queries.lock().clear();
             let info = exit.wait().await;
             let _ = tx.send(AdapterEvent::Exited { info });
         });
@@ -619,6 +823,34 @@ impl FakeSession {
             .send(&op)
             .await
             .map_err(|_| AdapterError::Closed)
+    }
+
+    /// Asks `query` and waits for its answer (bounded by `handshake_timeout`).
+    async fn query(&self, query: Query) -> Result<Ev, AdapterError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (waiter, answer) = oneshot::channel();
+        self.queries.lock().insert(id.clone(), waiter);
+        if let Err(e) = self
+            .write(Op::Query {
+                id: id.clone(),
+                query,
+            })
+            .await
+        {
+            self.queries.lock().remove(&id);
+            return Err(e);
+        }
+        let timeout = self.policy.handshake_timeout;
+        match tokio::time::timeout(timeout, answer).await {
+            Ok(Ok(ev)) => Ok(ev),
+            Ok(Err(_)) => Err(AdapterError::Closed),
+            Err(_) => {
+                self.queries.lock().remove(&id);
+                Err(AdapterError::Protocol(format!(
+                    "the fake agent did not answer within {timeout:?}"
+                )))
+            }
+        }
     }
 }
 
@@ -643,11 +875,38 @@ fn map_event(ev: Ev) -> Option<AdapterEvent> {
             message,
             code: None,
         },
-        Ev::SessionInfo { model } => AdapterEvent::SessionInfo {
+        Ev::SessionInfo {
             model,
-            permission_mode: None,
-            effort: None,
+            permission_mode,
+            effort,
+        } => AdapterEvent::SessionInfo {
+            model,
+            permission_mode,
+            effort,
         },
+        Ev::Modes { plan, fast_state } => AdapterEvent::ModesReported { plan, fast_state },
+        Ev::Title { title } => AdapterEvent::SessionTitle { title },
+        Ev::Anchor { turn } => AdapterEvent::TurnAnchor {
+            anchor: serde_json::json!({ "turn": turn }),
+        },
+        Ev::ProvisionalAnchor { turn } => AdapterEvent::TurnAnchor {
+            anchor: provisional_anchor(turn),
+        },
+        Ev::AnchorSettled { turn } => AdapterEvent::TurnAnchorReplaced {
+            previous: provisional_anchor(turn),
+            anchor: serde_json::json!({ "turn": turn }),
+        },
+        Ev::Backgroundable {
+            key,
+            backgroundable,
+        } => AdapterEvent::ItemBackgroundable {
+            key,
+            backgroundable,
+        },
+        Ev::SteerReturned { message_id } => AdapterEvent::SteerReturned { message_id },
+        Ev::EditorText { text } => AdapterEvent::ComposerText { text },
+        // Answers to queries go to the waiting call.
+        Ev::QueryResult { .. } => return None,
         Ev::Commands { commands } => AdapterEvent::CommandsChanged { commands },
         Ev::TurnStarted => AdapterEvent::TurnStarted,
         Ev::ItemStarted { key, body } => AdapterEvent::ItemStarted { key, body },
@@ -720,6 +979,72 @@ impl SessionControl for FakeSession {
         self.write(Op::Steer {
             text: input.to_plain_text(),
             images: image_paths(&input),
+            message_id: None,
+        })
+        .await
+    }
+
+    async fn steer_message(&self, message_id: &str, input: TurnInput) -> Result<(), AdapterError> {
+        self.write(Op::Steer {
+            text: input.to_plain_text(),
+            images: image_paths(&input),
+            message_id: Some(message_id.to_owned()),
+        })
+        .await
+    }
+
+    async fn apply_modes(&self, modes: &ThreadModes) -> Result<SettingsApplied, AdapterError> {
+        let mut current = self.modes.lock().await;
+        if *current != *modes {
+            *current = *modes;
+            drop(current);
+            self.write(Op::SetModes {
+                modes: Modes {
+                    plan: modes.plan,
+                    fast: modes.fast,
+                },
+            })
+            .await?;
+        }
+        Ok(SettingsApplied::Live)
+    }
+
+    async fn rename(&self, title: &str) -> Result<(), AdapterError> {
+        self.write(Op::Rename {
+            title: title.to_owned(),
+        })
+        .await
+    }
+
+    async fn status(&self) -> Result<Vec<StatusSection>, AdapterError> {
+        match self.query(Query::Status).await? {
+            Ev::QueryResult { sections, .. } => Ok(sections),
+            other => Err(AdapterError::Protocol(format!(
+                "a status answered with {other:?}"
+            ))),
+        }
+    }
+
+    async fn side_question(&self, question: &str) -> Result<SideAnswer, AdapterError> {
+        match self
+            .query(Query::SideQuestion {
+                question: question.to_owned(),
+            })
+            .await?
+        {
+            Ev::QueryResult { answer, .. } => Ok(SideAnswer {
+                answer,
+                synthetic: false,
+            }),
+            other => Err(AdapterError::Protocol(format!(
+                "a side question answered with {other:?}"
+            ))),
+        }
+    }
+
+    async fn move_to_background(&self, item_key: &str) -> Result<(), AdapterError> {
+        self.write(Op::Background {
+            key: item_key.to_owned(),
         })
         .await
     }
@@ -1374,6 +1699,460 @@ mod tests {
             session.events.recv().await.unwrap(),
             AdapterEvent::Notice { message, .. } if message.contains("nobody")
         ));
+    }
+
+    /// Events of one turn up to its completion (not after).
+    async fn turn_events(session: &mut SessionHandle, text: &str) -> Vec<AdapterEvent> {
+        turn(session, text).await
+    }
+
+    fn anchors(events: &[AdapterEvent]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AdapterEvent::TurnAnchor { anchor } => Some(anchor.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A stored session reports each turn's anchor (its index) before its completion, and a
+    /// fork at a turn keeps the turns up to it (included, or not: `before`), the anchors of
+    /// the copied turns staying valid.
+    #[tokio::test]
+    async fn turns_are_anchored_and_forks_branch_at_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let adapter = stored(dir.path());
+        assert!(adapter.features().fork_at_turn && adapter.features().fork_while_held);
+        let mut session = start_mode(&adapter, &cwd, StartMode::New).await.unwrap();
+        let id = session.native_session_id.clone().unwrap();
+        for (n, prompt) in ["one", "two", "three"].iter().enumerate() {
+            let events = turn_events(&mut session, prompt).await;
+            assert_eq!(anchors(&events), vec![serde_json::json!({ "turn": n })]);
+            let anchor_at = events
+                .iter()
+                .position(|e| matches!(e, AdapterEvent::TurnAnchor { .. }))
+                .unwrap();
+            assert!(matches!(
+                events[anchor_at + 1..].last(),
+                Some(AdapterEvent::TurnCompleted { .. })
+            ));
+        }
+        session.control.shutdown(StopReason::User).await;
+        let (history, anchored) = adapter
+            .read_native_history_anchored(&cwd, &id)
+            .await
+            .unwrap();
+        assert_eq!(history.turns.len(), 3);
+        assert_eq!(anchored[1], Some(serde_json::json!({ "turn": 1 })));
+
+        let fork_at = |turn: usize, before: bool| StartOptions {
+            fork_at: Some(ForkPoint {
+                anchor: serde_json::json!({ "turn": turn }),
+                before,
+                previous: turn
+                    .checked_sub(1)
+                    .map(|p| serde_json::json!({ "turn": p })),
+            }),
+            ..StartOptions::default()
+        };
+        let fork = StartMode::Fork {
+            native_session_id: id.clone(),
+        };
+        let request = |mode: StartMode| StartRequest {
+            thread_id: ThreadId::from("thr_fork"),
+            cwd: cwd.clone(),
+            settings: ThreadSettings::default(),
+            mode,
+        };
+        for (turn_at, before, kept) in [(1, false, 2), (1, true, 1), (2, false, 3)] {
+            let mut branch = adapter
+                .start_with(request(fork.clone()), fork_at(turn_at, before))
+                .await
+                .unwrap();
+            let branch_id = branch.native_session_id.clone().unwrap();
+            // The next turn of the branch comes right after what it kept.
+            let events = turn_events(&mut branch, "next").await;
+            assert_eq!(anchors(&events), vec![serde_json::json!({ "turn": kept })]);
+            branch.control.shutdown(StopReason::User).await;
+            let history = adapter.read_native_history(&cwd, &branch_id).await.unwrap();
+            assert_eq!(
+                history.turns.len(),
+                kept + 1,
+                "at {turn_at} before={before}"
+            );
+        }
+        // An anchor that is not this harness's is refused, and so is a fork before a turn
+        // without the anchor of the turn before it; the check says so without starting.
+        let wrong = ForkPoint {
+            anchor: serde_json::json!("t2"),
+            before: false,
+            previous: None,
+        };
+        let no_previous = ForkPoint {
+            anchor: serde_json::json!({ "turn": 1 }),
+            before: true,
+            previous: None,
+        };
+        for point in [wrong, no_previous] {
+            assert!(matches!(
+                adapter.check_fork_point(&point),
+                Err(AdapterError::Harness(_))
+            ));
+            let options = StartOptions {
+                fork_at: Some(point),
+                ..StartOptions::default()
+            };
+            assert!(matches!(
+                adapter.start_with(request(fork.clone()), options).await,
+                Err(AdapterError::Harness(_))
+            ));
+        }
+        assert_eq!(
+            adapter.check_fork_point(&fork_at(1, true).fork_at.unwrap()),
+            Ok(())
+        );
+    }
+
+    /// Under `@late-anchor` a turn reports a provisional anchor, which a fork refuses, and the
+    /// agent's next turn settles it first thing (`TurnAnchorReplaced`); `@settle-anchor`
+    /// settles it within the turn, and nothing more is reported at its end.
+    #[tokio::test]
+    async fn late_anchors_settle_at_the_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let adapter = stored(dir.path());
+        let mut session = start_mode(&adapter, &cwd, StartMode::New).await.unwrap();
+        let id = session.native_session_id.clone().unwrap();
+        let replaced = |events: &[AdapterEvent]| -> Vec<(serde_json::Value, serde_json::Value)> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    AdapterEvent::TurnAnchorReplaced { previous, anchor } => {
+                        Some((previous.clone(), anchor.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let events = turn_events(&mut session, "@late-anchor\n@text one").await;
+        assert_eq!(anchors(&events), vec![serde_json::json!({ "pending": 0 })]);
+        assert!(replaced(&events).is_empty());
+
+        let fork_at_first = StartOptions {
+            fork_at: Some(ForkPoint {
+                anchor: serde_json::json!({ "pending": 0 }),
+                before: false,
+                previous: None,
+            }),
+            ..StartOptions::default()
+        };
+        let request = StartRequest {
+            thread_id: ThreadId::from("thr_fork"),
+            cwd: cwd.clone(),
+            settings: ThreadSettings::default(),
+            mode: StartMode::Fork {
+                native_session_id: id.clone(),
+            },
+        };
+        match adapter.start_with(request, fork_at_first).await {
+            Err(AdapterError::Harness(message)) => {
+                assert!(message.contains("has not settled yet"), "{message}")
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        }
+
+        let events = turn_events(&mut session, "@late-anchor\n@settle-anchor\n@text two").await;
+        let first = events
+            .iter()
+            .position(|e| matches!(e, AdapterEvent::TurnAnchorReplaced { .. }))
+            .unwrap();
+        assert!(
+            events[..first]
+                .iter()
+                .all(|e| matches!(e, AdapterEvent::TurnStarted)),
+            "{events:?}"
+        );
+        assert_eq!(
+            replaced(&events),
+            vec![
+                (
+                    serde_json::json!({ "pending": 0 }),
+                    serde_json::json!({ "turn": 0 })
+                ),
+                (
+                    serde_json::json!({ "pending": 1 }),
+                    serde_json::json!({ "turn": 1 })
+                ),
+            ]
+        );
+        assert_eq!(anchors(&events), vec![serde_json::json!({ "pending": 1 })]);
+        session.control.shutdown(StopReason::User).await;
+    }
+
+    /// A session another process holds cannot be resumed (the CLI says so in colour, on its
+    /// stderr too); it can still be forked.
+    #[tokio::test]
+    async fn a_held_session_is_refused_for_a_resume_but_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let adapter = stored(dir.path());
+        let mut session = start_mode(&adapter, &cwd, StartMode::New).await.unwrap();
+        let id = session.native_session_id.clone().unwrap();
+        turn_events(&mut session, "hello").await;
+        session.control.shutdown(StopReason::User).await;
+        SessionStore::new(dir.path().join("store"))
+            .hold(&id)
+            .unwrap();
+        let resumed = start_mode(
+            &adapter,
+            &cwd,
+            StartMode::Resume {
+                native_session_id: id.clone(),
+            },
+        )
+        .await;
+        match resumed {
+            Err(e @ AdapterError::Harness(_)) => {
+                let text = e.to_string();
+                assert!(text.contains("is held by another process"), "{text}");
+                assert!(
+                    !text.contains('\u{1b}'),
+                    "escape sequences are removed: {text:?}"
+                );
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        }
+        let mut fork = start_mode(
+            &adapter,
+            &cwd,
+            StartMode::Fork {
+                native_session_id: id,
+            },
+        )
+        .await
+        .unwrap();
+        turn_events(&mut fork, "in the fork").await;
+        fork.control.shutdown(StopReason::User).await;
+    }
+
+    /// The agent's own reports: permission mode and effort it changed, plan mode it entered
+    /// (its answers become proposed plans), fast mode, its name, a composer text, another
+    /// session it switched to.
+    #[tokio::test]
+    async fn the_agent_reports_what_it_changed_by_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FakeAdapter::in_process("fake", ctx(dir.path()));
+        let mut session = start(&adapter, dir.path()).await;
+        let first = session.native_session_id.clone().unwrap();
+        let events = turn_events(
+            &mut session,
+            "@permission auto\n@effort high\n@plan-mode on\n@fast-state cooldown\n@rename Named\n@editor draft text\n@switch-session",
+        )
+        .await;
+        let has = |f: &dyn Fn(&AdapterEvent) -> bool| events.iter().any(f);
+        assert!(has(
+            &|e| matches!(e, AdapterEvent::SessionInfo { permission_mode: Some(m), .. } if m == "auto")
+        ));
+        assert!(has(
+            &|e| matches!(e, AdapterEvent::SessionInfo { effort: Some(m), .. } if m == "high")
+        ));
+        assert!(has(&|e| matches!(
+            e,
+            AdapterEvent::ModesReported {
+                plan: Some(true),
+                ..
+            }
+        )));
+        assert!(has(
+            &|e| matches!(e, AdapterEvent::ModesReported { fast_state: Some(s), .. } if s == "cooldown")
+        ));
+        assert!(has(
+            &|e| matches!(e, AdapterEvent::SessionTitle { title } if title == "Named")
+        ));
+        assert!(has(
+            &|e| matches!(e, AdapterEvent::ComposerText { text } if text == "draft text")
+        ));
+        assert!(has(
+            &|e| matches!(e, AdapterEvent::SessionIdentified { native_session_id } if *native_session_id != first)
+        ));
+        // In plan mode a plain prompt is answered with a proposed plan.
+        let events = turn_events(&mut session, "fix the bug").await;
+        let plan: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AdapterEvent::ItemDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(plan.starts_with("1. Look into: fix the bug\n"), "{plan}");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::ItemStarted {
+                body: ItemBody::ProposedPlan { .. },
+                ..
+            }
+        )));
+        // The harness's session switch, typed, does what the CLI would.
+        let events = turn_events(&mut session, "/fake-reset").await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::SessionIdentified { .. }))
+        );
+    }
+
+    /// Modes switched by the adapter are reported; fast mode is on only with `fake-fast`. The
+    /// status and side questions are answered right away, also while a turn runs. A rename is
+    /// echoed.
+    #[tokio::test]
+    async fn modes_status_side_questions_and_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FakeAdapter::in_process("fake", ctx(dir.path()));
+        let features = adapter.features();
+        assert_eq!(features.fast_mode_models, vec!["fake-fast".to_owned()]);
+        assert!(
+            features
+                .plan_mode
+                .as_ref()
+                .unwrap()
+                .implement_prompt
+                .is_some()
+        );
+        assert_eq!(
+            adapter.session_switching_names(),
+            vec!["fake-clear".to_owned(), "fake-reset".to_owned()]
+        );
+        let mut session = start(&adapter, dir.path()).await;
+        let modes = ThreadModes {
+            plan: true,
+            fast: true,
+        };
+        assert_eq!(
+            session.control.apply_modes(&modes).await,
+            Ok(SettingsApplied::Live)
+        );
+        let reported = loop {
+            if let AdapterEvent::ModesReported { plan, fast_state } =
+                session.events.recv().await.unwrap()
+            {
+                break (plan, fast_state);
+            }
+        };
+        assert_eq!(reported, (Some(true), Some("on".into())));
+        session
+            .control
+            .apply_settings(&ThreadSettings {
+                model: Some("fake-slow".into()),
+                ..ThreadSettings::default()
+            })
+            .await
+            .unwrap();
+        let fast = loop {
+            if let AdapterEvent::ModesReported { fast_state, .. } =
+                session.events.recv().await.unwrap()
+            {
+                break fast_state;
+            }
+        };
+        assert_eq!(fast.as_deref(), Some("off"), "fake-slow has no fast mode");
+
+        session
+            .control
+            .send(TurnInput::text("@sleep 300"))
+            .await
+            .unwrap();
+        let answer = session.control.side_question("why?").await.unwrap();
+        assert_eq!(answer.answer.as_deref(), Some("side answer: why?"));
+        let status = session.control.status().await.unwrap();
+        assert_eq!(status[0].title, "Fake agent");
+        assert!(
+            status[0]
+                .rows
+                .iter()
+                .any(|r| r.label == "Plan mode" && r.value == "on")
+        );
+        next_turn(&mut session.events).await;
+        session.control.rename("New name").await.unwrap();
+        loop {
+            if let AdapterEvent::SessionTitle { title } = session.events.recv().await.unwrap() {
+                assert_eq!(title, "New name");
+                break;
+            }
+        }
+        let harness = adapter.status(dir.path()).await.unwrap();
+        assert_eq!(harness[0].title, "Fake harness");
+    }
+
+    /// A running `@tool` command is reported backgroundable and moves to the background on
+    /// request (its item closes as backgrounded after its task is reported); a steer under
+    /// `@refuse-steers` is returned by its id; the project's trust decision reaches the agent.
+    #[tokio::test]
+    async fn running_work_moves_to_the_background_and_steers_can_come_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FakeAdapter::in_process("fake", ctx(dir.path()));
+        let mut session = adapter
+            .start_with(
+                StartRequest {
+                    thread_id: ThreadId::from("thr_test"),
+                    cwd: dir.path().to_path_buf(),
+                    settings: ThreadSettings::default(),
+                    mode: StartMode::New,
+                },
+                StartOptions {
+                    project_trusted: Some(false),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        session
+            .control
+            .send(TurnInput::text(
+                "@refuse-steers\n@tool 5000 npm run dev\n@trust",
+            ))
+            .await
+            .unwrap();
+        let key = loop {
+            if let AdapterEvent::ItemBackgroundable {
+                key,
+                backgroundable: true,
+            } = session.events.recv().await.unwrap()
+            {
+                break key;
+            }
+        };
+        session
+            .control
+            .steer_message("itm_steer", TurnInput::text("also this"))
+            .await
+            .unwrap();
+        loop {
+            if let AdapterEvent::SteerReturned { message_id } = session.events.recv().await.unwrap()
+            {
+                assert_eq!(message_id, "itm_steer");
+                break;
+            }
+        }
+        session.control.move_to_background(&key).await.unwrap();
+        let events = next_turn(&mut session.events).await;
+        let task_at = events
+            .iter()
+            .position(|e| matches!(e, AdapterEvent::BackgroundTask { task } if task.origin_item_key.as_deref() == Some(key.as_str())))
+            .expect("the task is reported");
+        let closed_at = events
+            .iter()
+            .position(|e| matches!(e, AdapterEvent::ItemCompleted { key: k, status: ItemStatus::Backgrounded, .. } if *k == key))
+            .expect("the item closes as backgrounded");
+        assert!(task_at < closed_at);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::ItemStarted { body: ItemBody::AgentMessage { text }, .. } if text == "project trusted: no"
+        )));
     }
 
     /// A recorded session is what a user of the CLI on the PC leaves behind: requests are

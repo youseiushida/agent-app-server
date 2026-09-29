@@ -86,6 +86,19 @@ pub enum Event {
     /// A background task started, progressed or ended (always the whole task).
     #[serde(rename = "backgroundTask/updated")]
     BackgroundTaskUpdated { task: BackgroundTask },
+    /// The harness reported that the thread's agent now works in another native session than
+    /// the one the thread had (the CLI switched sessions by itself). The thread's
+    /// `nativeSessionId` follows it.
+    #[serde(rename = "thread/nativeSessionChanged")]
+    NativeSessionChanged {
+        previous_native_session_id: String,
+        native_session_id: String,
+    },
+    /// The harness asks to put text into the thread's composer (e.g. a pi extension's
+    /// `setEditorText`). The client inserts it into the composer of the open thread; it never
+    /// sends it by itself.
+    #[serde(rename = "composer/insert")]
+    ComposerInsert { text: String },
     #[serde(rename = "native")]
     Native { harness_id: String, payload: Value },
 }
@@ -117,6 +130,8 @@ impl Event {
             Event::QueueUpdated { .. } => "queue/updated",
             Event::CommandsChanged {} => "commands/changed",
             Event::BackgroundTaskUpdated { .. } => "backgroundTask/updated",
+            Event::NativeSessionChanged { .. } => "thread/nativeSessionChanged",
+            Event::ComposerInsert { .. } => "composer/insert",
             Event::Native { .. } => "native",
         }
     }

@@ -26,9 +26,11 @@ import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -45,11 +47,13 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.aas.android.R
 import dev.aas.android.domain.InteractionTexts
+import dev.aas.android.domain.PlanChoices
 import dev.aas.android.domain.diff.UnifiedDiff
 import dev.aas.android.protocol.AasJson
 import dev.aas.android.protocol.Attachment
@@ -98,6 +102,12 @@ data class ItemActions(
     val onOpenImage: (BlobId) -> Unit,
     /** The background task an item launched, in the thread's バックグラウンド section. */
     val onOpenBackgroundTask: (BackgroundTaskId) -> Unit = {},
+    /** 裏に回す: move a running item's work to the background (`item/moveToBackground`). */
+    val onMoveToBackground: (Item) -> Unit = {},
+    /** 実装する on a proposed plan. */
+    val onImplementPlan: (Item.ProposedPlan) -> Unit = {},
+    /** 新しいスレッドで実装 on a proposed plan. */
+    val onImplementPlanInNewThread: (Item.ProposedPlan) -> Unit = {},
 ) {
     companion object {
         val None = ItemActions({}, {}, {})
@@ -107,12 +117,22 @@ data class ItemActions(
 /**
  * One item of the conversation, by kind (docs/ux/codex-desktop.md §3.2): the user's message
  * with its images, the agent's Markdown answer, folded reasoning, shell-like command cards with
- * streamed output, file changes with their diffs, tool calls, the plan checklist and notices.
+ * streamed output, file changes with their diffs, tool calls, the plan checklist, a proposed plan
+ * with the way to implement it ([planChoices]) and notices.
  * An item whose work goes on in the background ([Item.backgroundTaskId]) carries a chip bound to
- * that task's live status ([backgroundTask], when loaded).
+ * that task's live status ([backgroundTask], when loaded). A running item the harness can move
+ * to the background carries 裏に回す ([moveToBackground]: `null` when it does not apply, `true`
+ * while the request waits in the outbox).
  */
 @Composable
-fun ItemView(item: Item, actions: ItemActions, modifier: Modifier = Modifier, backgroundTask: BackgroundTask? = null) {
+fun ItemView(
+    item: Item,
+    actions: ItemActions,
+    modifier: Modifier = Modifier,
+    backgroundTask: BackgroundTask? = null,
+    moveToBackground: Boolean? = null,
+    planChoices: PlanChoices = PlanChoices.None,
+) {
     Column(modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
         when (item) {
             is Item.UserMessage -> UserMessageView(item, actions)
@@ -122,11 +142,55 @@ fun ItemView(item: Item, actions: ItemActions, modifier: Modifier = Modifier, ba
             is Item.FileChangeItem -> FileChangeView(item, actions)
             is Item.ToolCall -> ToolCallView(item, actions)
             is Item.Plan -> PlanView(item)
+            is Item.ProposedPlan -> ProposedPlanView(item, planChoices, actions)
             is Item.Notice -> NoticeView(item)
             is Item.Unknown -> Text(stringResource(R.string.item_unknown, item.kind), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         ItemStatusLabel(item)
+        moveToBackground?.let { pending -> MoveToBackgroundButton(pending) { actions.onMoveToBackground(item) } }
         item.backgroundTaskId?.let { taskId -> BackgroundChip(taskId, backgroundTask?.takeIf { it.id == taskId }, actions.onOpenBackgroundTask) }
+    }
+}
+
+/** 裏に回す, or that the request waits in the outbox. */
+@Composable
+private fun MoveToBackgroundButton(pending: Boolean, onMove: () -> Unit) {
+    if (pending) {
+        Text(stringResource(R.string.move_to_background_pending), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp))
+    } else {
+        TextButton(onClick = onMove) { Text(stringResource(R.string.move_to_background)) }
+    }
+}
+
+/**
+ * A plan the agent proposed in plan mode (Markdown, streamed), and on the latest one once its
+ * turn ended the harness's ways to continue: 実装する (plan mode off, then the harness's own
+ * text) and 新しいスレッドで実装 (its preamble and the plan as a new thread's first message).
+ */
+@Composable
+private fun ProposedPlanView(item: Item.ProposedPlan, choices: PlanChoices, actions: ItemActions) {
+    Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (item.status == ItemStatus.InProgress) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Outlined.Description, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSecondaryContainer)
+                }
+                Spacer(Modifier.width(8.dp))
+                Text(stringResource(R.string.proposed_plan_title), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSecondaryContainer, modifier = Modifier.weight(1f))
+                if (item.status != ItemStatus.InProgress && item.text.isNotEmpty()) CopyIconButton(item.text, R.string.copied_message)
+            }
+            Spacer(Modifier.height(6.dp))
+            SelectionContainer { MarkdownText(item.text) }
+            if (choices.any) {
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (choices.implement) Button(onClick = { actions.onImplementPlan(item) }) { Text(stringResource(R.string.proposed_plan_implement)) }
+                    if (choices.newThread) OutlinedButton(onClick = { actions.onImplementPlanInNewThread(item) }) { Text(stringResource(R.string.proposed_plan_new_thread)) }
+                }
+            }
+        }
     }
 }
 
@@ -134,6 +198,12 @@ fun ItemView(item: Item, actions: ItemActions, modifier: Modifier = Modifier, ba
 private fun ItemStatusLabel(item: Item) {
     // Commands and file changes say it in their own words.
     if (item is Item.CommandExecution || item is Item.FileChangeItem) return
+    // A message steered into a running turn that the harness did not take went back to the queue
+    // (protocol.md §3.1 「戻された steer」).
+    if (item is Item.UserMessage && item.status == ItemStatus.Declined) {
+        Text(stringResource(R.string.item_user_declined), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.statusColors.needsApproval, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.End)
+        return
+    }
     val label = when (item.status) {
         ItemStatus.Failed -> R.string.item_failed
         ItemStatus.Declined -> R.string.item_declined
@@ -498,11 +568,27 @@ private fun NoticeView(item: Item.Notice) {
         Icon(icon, contentDescription = stringResource(label), tint = color, modifier = Modifier.size(18.dp))
         Spacer(Modifier.width(8.dp))
         Column(Modifier.weight(1f)) {
+            // Notices the daemon adds for the app's own features say what happened in Japanese;
+            // the message follows verbatim.
+            noticeLeadIn(item.code)?.let { Text(stringResource(it), style = MaterialTheme.typography.labelLarge, color = color) }
             SelectionContainer { Text(item.message, style = MaterialTheme.typography.bodyMedium, color = if (item.level == NoticeLevel.Info) MaterialTheme.colorScheme.onSurfaceVariant else color) }
             item.code?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
     }
 }
+
+/** The Japanese lead-in of a notice the daemon adds with a known `code` (protocol.md §3.1). */
+private fun noticeLeadIn(code: String?): Int? = when (code) {
+    NOTICE_NATIVE_SESSION_CHANGED -> R.string.notice_native_session_changed
+    NOTICE_NATIVE_RENAME_FAILED -> R.string.notice_native_rename_failed
+    else -> null
+}
+
+/** The notice of a native session the harness moved the agent to (`thread/nativeSessionChanged`). */
+private const val NOTICE_NATIVE_SESSION_CHANGED = "nativeSessionChanged"
+
+/** The notice of a rename the harness refused when the agent started. */
+private const val NOTICE_NATIVE_RENAME_FAILED = "nativeRenameFailed"
 
 private fun prettyJson(element: JsonElement): String = PrettyJson.encodeToString(JsonElement.serializer(), element)
 

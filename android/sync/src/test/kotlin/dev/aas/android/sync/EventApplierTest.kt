@@ -486,4 +486,45 @@ class EventApplierTest {
         assertEquals(2, outcome.applied.size)
         assertEquals(before.copy(cursors = before.cursors + (stream to 2L)), store.state.value)
     }
+
+    /**
+     * `composer/insert` and `thread/nativeSessionChanged` store nothing but the cursor; they are
+     * relayed to the open thread's screen. An insert says whether it happened after the
+     * connection subscribed (the subscription's head) or is part of the catch-up.
+     */
+    @Test
+    fun composerInsertsAndSessionSwitchesAreRelayedWithoutBeingStored() = test {
+        seedThread(0)
+        val before = store.state.value
+        store.transaction {
+            EventApplier.applyBatch(
+                it,
+                StreamBatch(
+                    stream,
+                    4,
+                    listOf(
+                        env(1, Event.ComposerInsert("from before")),
+                        env(2, Event.NativeSessionChanged("ses-a", "ses-b")),
+                        env(3, Event.ComposerInsert("just now")),
+                    ),
+                ),
+                signals,
+                warnings::add,
+                liveAfter = 2,
+            )
+        }
+        assertEquals(before.copy(cursors = before.cursors + (stream to 3L)), store.state.value)
+        assertEquals<List<SyncSignal>>(
+            listOf(
+                SyncSignal.ComposerInsert("thr_1", "from before", live = false),
+                SyncSignal.NativeSessionChanged("thr_1", "ses-a", "ses-b"),
+                SyncSignal.ComposerInsert("thr_1", "just now", live = true),
+            ),
+            signals,
+        )
+        // Before the subscription's head is known, everything counts as catch-up.
+        signals.clear()
+        batch(stream, env(5, Event.ComposerInsert("unknown head")))
+        assertEquals<List<SyncSignal>>(listOf(SyncSignal.ComposerInsert("thr_1", "unknown head", live = false)), signals)
+    }
 }

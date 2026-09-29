@@ -26,6 +26,10 @@
 //! (`agentCapabilities._meta["cognition.ai/subagentControl"] = true`), never because of the
 //! executable's name. Only explicit fields are read: no text written for people is parsed,
 //! and nothing ends because time passed.
+//!
+//! [`Extensions`] is what the agent confirmed of Cognition's extensions as a whole: background
+//! work (here), steps and forks at a step (`crate::revert`), the session's name, and whether the
+//! agent is one of Cognition's at all (its own commands and notifications, `crate::stats`).
 
 use std::collections::HashMap;
 
@@ -40,12 +44,82 @@ use serde_json::{Value, json};
 
 use crate::mapping::ToolState;
 use crate::tracker::{Emit, Tracker};
-use crate::wire::{InitializeResponse, SessionUpdate, ToolCallFields};
+use crate::wire::{AvailableCommand, InitializeResponse, SessionUpdate, ToolCallFields};
 
 /// Client capability: send the structured sub-agent signals.
 const SUBAGENT_SUPPORT: &str = "cognition.ai/subagentSupport";
 /// Client capability (and the agent's confirmation of the extension): sub-agent control.
 const SUBAGENT_CONTROL: &str = "cognition.ai/subagentControl";
+/// Client capability (and the agent's confirmation): the steps of a session and forks at a
+/// step (`crate::revert`). Recorded with Devin CLI 3000.11.3: declaring it changes nothing
+/// else (the same `session/new` answer, commands and per-turn updates), and the agent then also
+/// confirms `cognition.ai/revertHistoryRewound`, which is only about `revert/execute` (not
+/// used).
+const REVERT: &str = "cognition.ai/revert";
+/// The agent's capability: `_cognition.ai/session/rename`.
+const SESSION_RENAME: &str = "cognition.ai/sessionRename";
+/// The namespace of Cognition's capabilities.
+const NAMESPACE: &str = "cognition.ai/";
+/// `_cognition.ai/session/rename {sessionId, title}`: gives the session a title (answers `{}`
+/// and echoes it as `session_info_update`).
+pub const RENAME_SESSION: &str = "_cognition.ai/session/rename";
+
+/// Commands of Cognition's agents this adapter does not offer, by name as Devin CLI 3000.11.3
+/// lists them (`available_commands_update`, `_meta["cognition.ai/category"] = "Account"`):
+///
+/// * `login`, `logout`: the CLI's own sign-in. Signing in from the phone is out of scope
+///   (design.md §1, the harness's login), and `/logout` signs the PC's Devin out, which breaks
+///   every Devin session of the daemon and of the user's own terminals. `status` (the
+///   sign-in status) stays: it changes nothing.
+///
+/// The list is only applied to an agent that declares Cognition's capabilities
+/// ([`Extensions::cognition`]); another ACP agent's commands of the same names are its own.
+pub const HIDDEN_COMMANDS: &[&str] = &["login", "logout"];
+
+/// Cognition's extensions the agent confirmed in its `initialize` answer
+/// (`agentCapabilities._meta`), never because of the executable's name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Extensions {
+    /// The agent declares capabilities in Cognition's namespace (`cognition.ai/…` set to a
+    /// value other than `false` or `null`): it is one of Cognition's agents, whose own commands
+    /// ([`HIDDEN_COMMANDS`]) and notifications (`crate::stats`) this adapter knows.
+    pub cognition: bool,
+    /// `cognition.ai/subagentControl`: background sub-agents and shells (this module).
+    pub background: bool,
+    /// `cognition.ai/revert`: steps and forks at a step (`crate::revert`).
+    pub revert: bool,
+    /// `cognition.ai/sessionRename`: [`RENAME_SESSION`].
+    pub rename: bool,
+}
+
+/// What the agent confirmed of Cognition's extensions.
+pub fn extensions(init: &InitializeResponse) -> Extensions {
+    let meta = init
+        .agent_capabilities
+        .meta
+        .as_ref()
+        .and_then(Value::as_object);
+    let flag = |key: &str| meta.and_then(|m| m.get(key)).and_then(Value::as_bool) == Some(true);
+    Extensions {
+        cognition: meta.is_some_and(|m| {
+            m.iter().any(|(k, v)| {
+                k.starts_with(NAMESPACE) && !matches!(v, Value::Null | Value::Bool(false))
+            })
+        }),
+        background: flag(SUBAGENT_CONTROL),
+        revert: flag(REVERT),
+        rename: flag(SESSION_RENAME),
+    }
+}
+
+/// The agent's commands without [`HIDDEN_COMMANDS`] when the agent is one of Cognition's.
+pub fn visible_commands(commands: &[AvailableCommand], ext: Extensions) -> Vec<AvailableCommand> {
+    commands
+        .iter()
+        .filter(|c| !(ext.cognition && HIDDEN_COMMANDS.contains(&c.name.as_str())))
+        .cloned()
+        .collect()
+}
 const SUBAGENT_CONTEXT: &str = "cognition.ai/subagent_context";
 const SUBAGENT_STARTED: &str = "cognition.ai/subagent_started";
 const SUBAGENT_COMPLETED: &str = "cognition.ai/subagent_completed";
@@ -63,21 +137,10 @@ const KILL_BACKGROUND_SHELL: &str = "_cognition.ai/terminal/killBackgroundShell"
 const AGENT_KEY_PREFIX: &str = "subagent:";
 const SHELL_KEY_PREFIX: &str = "shell:";
 
-/// `clientCapabilities._meta` every session declares.
+/// `clientCapabilities._meta` every session declares. Devin 3000.11.3 confirms
+/// `cognition.ai/subagentControl` and `cognition.ai/revert` only when the client declared them.
 pub fn client_meta() -> Value {
-    json!({ SUBAGENT_SUPPORT: true, SUBAGENT_CONTROL: true })
-}
-
-/// Whether the agent confirmed the extension (`agentCapabilities._meta
-/// ["cognition.ai/subagentControl"] = true`). Devin 3000.11.3 answers it only when the client
-/// declared the capability.
-pub fn confirmed(init: &InitializeResponse) -> bool {
-    init.agent_capabilities
-        .meta
-        .as_ref()
-        .and_then(|m| m.get(SUBAGENT_CONTROL))
-        .and_then(Value::as_bool)
-        == Some(true)
+    json!({ SUBAGENT_SUPPORT: true, SUBAGENT_CONTROL: true, REVERT: true })
 }
 
 /// Task key of a background sub-agent.
@@ -690,22 +753,75 @@ mod tests {
     }
 
     #[test]
-    fn the_extension_is_confirmed_only_by_the_agent() {
+    fn the_extensions_are_confirmed_only_by_the_agent() {
         let init = |caps: Value| -> InitializeResponse {
             serde_json::from_value(json!({"protocolVersion": 1, "agentCapabilities": caps}))
                 .unwrap()
         };
-        assert!(confirmed(&init(json!({"_meta": {SUBAGENT_CONTROL: true}}))));
-        assert!(!confirmed(&init(
-            json!({"_meta": {SUBAGENT_CONTROL: false}})
-        )));
-        assert!(!confirmed(&init(
-            json!({"_meta": {"cognition.ai/terminalLifecycle": true}})
-        )));
-        assert!(!confirmed(&init(json!({}))));
+        let all = extensions(&init(json!({"_meta": {
+            SUBAGENT_CONTROL: true, REVERT: true, SESSION_RENAME: true,
+            "cognition.ai/sessionListOrderBy": ["updated_at"]}})));
+        assert_eq!(
+            all,
+            Extensions {
+                cognition: true,
+                background: true,
+                revert: true,
+                rename: true
+            }
+        );
+        let off = extensions(&init(json!({"_meta": {SUBAGENT_CONTROL: false}})));
+        assert_eq!(off, Extensions::default());
+        // Another capability of the namespace makes it Cognition's agent, nothing more.
+        let other = extensions(&init(
+            json!({"_meta": {"cognition.ai/terminalLifecycle": true}}),
+        ));
+        assert_eq!(
+            other,
+            Extensions {
+                cognition: true,
+                ..Extensions::default()
+            }
+        );
+        // Other namespaces and no `_meta` at all: a plain ACP agent.
+        assert_eq!(
+            extensions(&init(json!({"_meta": {"example.com/x": true}}))),
+            Extensions::default()
+        );
+        assert_eq!(extensions(&init(json!({}))), Extensions::default());
         assert_eq!(
             client_meta(),
-            json!({"cognition.ai/subagentSupport": true, "cognition.ai/subagentControl": true})
+            json!({"cognition.ai/subagentSupport": true, "cognition.ai/subagentControl": true,
+                   "cognition.ai/revert": true})
+        );
+    }
+
+    #[test]
+    fn account_commands_are_hidden_only_for_cognitions_agents() {
+        let commands: Vec<AvailableCommand> = ["login", "logout", "status", "plan"]
+            .iter()
+            .map(|name| AvailableCommand {
+                name: (*name).into(),
+                description: None,
+                input: None,
+            })
+            .collect();
+        let names = |ext| -> Vec<String> {
+            visible_commands(&commands, ext)
+                .into_iter()
+                .map(|c| c.name)
+                .collect()
+        };
+        assert_eq!(
+            names(Extensions {
+                cognition: true,
+                ..Extensions::default()
+            }),
+            vec!["status", "plan"]
+        );
+        assert_eq!(
+            names(Extensions::default()),
+            vec!["login", "logout", "status", "plan"]
         );
     }
 

@@ -54,6 +54,37 @@
 //! answers to those requests are in, so the last one belongs to the turn — unless a new run
 //! has already started (above), which ends the turn at once.
 //!
+//! # The end of a turn: session switches, anchors, commands
+//!
+//! Before a turn's `TurnCompleted`, a task asks pi about the session (`finish_steps`), with
+//! pi's own requests only:
+//!
+//! * `get_state`: when `sessionId` is not the session's any more, pi switched sessions under the
+//!   thread (an extension command calling `ctx.newSession`, `ctx.fork` or `ctx.switchSession`
+//!   under a name the adapter cannot know; pi sends no event for it). The adapter reports the new
+//!   id (`SessionIdentified`, which the engine surfaces) and applies the thread's model and
+//!   thinking level again when pi reset them (pi 0.85.1 starts a new session with its defaults).
+//! * `get_entries { since: <leaf when the turn began> }`: the turn's entries and pi's leaf, for
+//!   the turn's anchor (see [`crate::anchor`]). Where the turn began is known from the previous
+//!   turn's answer (or the handshake's); when it is not (after a switch, or after a turn that
+//!   completed at once because a run started from its end), the anchor has only the leaf.
+//! * `get_commands`, after a turn that ran an extension command (it may have registered
+//!   commands, or reloaded the extensions: `/reload`) and after a switch: `CommandsChanged` when
+//!   the list changed.
+//!
+//! The requests are bounded by the request timeout together; without answers the turn
+//! completes without an anchor. A run that starts meanwhile completes the turn at once (without
+//! an anchor), like a run that starts while the turn waits for its context.
+//!
+//! # Steers after the run
+//!
+//! Between the run's end (`agent_settled`) and the turn's `TurnCompleted` (context, anchor), a
+//! steer would reach an idle pi, which keeps it for its next prompt. Such a steer is not sent:
+//! it is returned to the engine ([`AdapterEvent::SteerReturned`], right before the turn's
+//! `TurnCompleted`), which queues it again. A steer that is an extension command is sent as a
+//! `prompt` with `streamingBehavior`: pi's `steer` refuses extension commands, `prompt` runs them
+//! at once (recorded, pi 0.85.1).
+//!
 //! # Dialogs
 //!
 //! Every dialog stays pending until it is answered ([`SessionControl::respond`], or
@@ -74,7 +105,7 @@ use std::time::Duration;
 
 use aas_harness::{
     AdapterError, AdapterEvent, ExitInfo, InteractionResolution, SessionControl, SettingsApplied,
-    StopReason, ThreadSettings, TurnError, TurnInput, TurnStatus,
+    StatusSection, StopReason, ThreadSettings, TurnError, TurnInput, TurnStatus, Usage,
 };
 use aas_stdio::{JsonLinesReader, LineError, ReadLine, SharedJsonLinesWriter};
 use async_trait::async_trait;
@@ -84,10 +115,14 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::anchor::{Anchor, ForkTarget};
 use crate::commands;
 use crate::gate::{self, Dialog, PendingDialog};
 use crate::mapping::{self, Mapper};
-use crate::wire::{self, PiCommand, PiModel, PiState, Response};
+use crate::status;
+use crate::wire::{
+    self, PiCommand, PiEntries, PiForkMessage, PiModel, PiSessionStats, PiState, Response,
+};
 
 /// The process behind a session.
 #[async_trait]
@@ -127,7 +162,55 @@ enum Internal {
     Emit(AdapterEvent),
     /// A `get_session_stats` request got no answer within the request timeout.
     StatsTimeout(String),
+    /// What pi said at the end of the turn `serial` (see the module docs).
+    Finished {
+        serial: u64,
+        report: FinishReport,
+    },
 }
+
+/// What the adapter knows of pi's leaf (the current entry of the session tree) for the anchors
+/// of the turns (see the module docs).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Leaf {
+    /// Not known: not learnt yet, pi switched sessions, or pi did not answer.
+    #[default]
+    Unknown,
+    /// The leaf when the next turn begins (`None`: the session has no entries yet). The entries
+    /// after it are the next turn's (and entries written between turns: model changes, names).
+    At(Option<String>),
+    /// An entry of the session followed by entries of a turn that completed without its
+    /// anchor: the next turn's leaf can be learnt from it, not where that turn began.
+    Stale(Option<String>),
+}
+
+impl Leaf {
+    /// The same entry, known to be followed by entries of an earlier turn.
+    fn stale(self) -> Leaf {
+        match self {
+            Leaf::At(entry) => Leaf::Stale(entry),
+            other => other,
+        }
+    }
+}
+
+/// What `finish_steps` learnt at the end of a turn.
+#[derive(Debug, Default)]
+struct FinishReport {
+    anchor: Option<Value>,
+    /// The leaf for the next turn.
+    leaf: Leaf,
+    /// pi's session changed during the turn.
+    switched: bool,
+    /// pi's commands, when they changed.
+    commands: Option<Vec<PiCommand>>,
+}
+
+/// A turn's outcome, decided when its run is over.
+type Outcome = (TurnStatus, Option<Usage>, Option<TurnError>);
+
+/// Serial numbers of turns (unique in the process), to match `Internal::Finished` to its turn.
+static TURN_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 /// What began the turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +240,7 @@ type Decision = oneshot::Sender<Result<(), AdapterError>>;
 
 #[derive(Debug)]
 struct ActiveTurn {
+    serial: u64,
     kind: TurnKind,
     /// Id of the `prompt` (or `compact`) command that began the turn; `None` for a run pi
     /// started by itself.
@@ -185,11 +269,18 @@ struct ActiveTurn {
     relay_input: bool,
     /// Between the start of the turn's run and its first assistant message.
     input_phase: bool,
+    /// The run is over and the turn's end is being asked about (`finish_steps`): its outcome.
+    finishing: Option<Outcome>,
+    /// The turn ran an extension command (sent, or steered as a `prompt`).
+    extension_command: bool,
+    /// Engine ids of steers that came after the run was over: returned before `TurnCompleted`.
+    returned_steers: Vec<String>,
 }
 
 impl ActiveTurn {
     fn new(kind: TurnKind, command_id: Option<String>) -> Self {
         Self {
+            serial: TURN_SERIAL.fetch_add(1, Ordering::Relaxed),
             kind,
             command_id,
             started: false,
@@ -205,6 +296,9 @@ impl ActiveTurn {
             foreign: Foreign::None,
             relay_input: false,
             input_phase: false,
+            finishing: None,
+            extension_command: false,
+            returned_steers: Vec::new(),
         }
     }
 
@@ -230,6 +324,11 @@ impl ActiveTurn {
     fn in_preflight(&self) -> bool {
         self.kind == TurnKind::Prompt && !self.accepted && self.foreign == Foreign::None
     }
+
+    /// The run is over; the turn only waits for its context or its end (`finish_steps`).
+    fn run_over(&self) -> bool {
+        self.settle_waiting || self.finishing.is_some()
+    }
 }
 
 /// Hands pi's decision about a prompt to the waiting `send` (nothing when it gave up).
@@ -254,8 +353,16 @@ struct State {
     builtin_compact: bool,
     /// Invocation names of pi's extension commands (from the last `get_commands`).
     extension_commands: HashSet<String>,
+    /// pi's last `get_commands` listing.
+    listed_commands: Option<Vec<PiCommand>>,
     /// An agent loop is running: an `agent_start` arrived after the last `agent_end`.
     loop_running: bool,
+    /// The session pi runs, as its `get_state` last said (set by the handshake).
+    native_session_id: Option<String>,
+    /// pi's leaf, for the anchors of the turns.
+    leaf: Leaf,
+    /// Why the gate's fork command did not fork (its `forkFailed` report).
+    fork_error: Option<String>,
 }
 
 impl State {
@@ -425,8 +532,156 @@ impl PiSession {
             let mut st = self.shared.state.lock();
             st.builtin_compact = commands::builtin_compact(&commands);
             st.extension_commands = commands::extension_command_names(&commands);
+            st.listed_commands = Some(commands.clone());
         }
         Ok(commands)
+    }
+
+    /// pi's commands, when they differ from its previous listing.
+    async fn refresh_commands(&self) -> Result<Option<Vec<PiCommand>>, AdapterError> {
+        let before = self.shared.state.lock().listed_commands.clone();
+        let now = self.get_commands().await?;
+        Ok((before.as_ref() != Some(&now)).then_some(now))
+    }
+
+    /// `get_entries`: the entries after `since` (every entry without it) and pi's leaf.
+    pub async fn get_entries(&self, since: Option<&str>) -> Result<PiEntries, AdapterError> {
+        let fields = match since {
+            Some(id) => json!({ "since": id }),
+            None => json!({}),
+        };
+        let data = self
+            .request_ok("get_entries", fields)
+            .await?
+            .unwrap_or(Value::Null);
+        serde_json::from_value(data)
+            .map_err(|e| AdapterError::Protocol(format!("get_entries: {e}")))
+    }
+
+    /// `get_fork_messages`: the session's user messages with text, in file order.
+    pub async fn get_fork_messages(&self) -> Result<Vec<PiForkMessage>, AdapterError> {
+        let data = self
+            .request_ok("get_fork_messages", json!({}))
+            .await?
+            .unwrap_or(Value::Null);
+        serde_json::from_value(data.get("messages").cloned().unwrap_or(Value::Null))
+            .map_err(|e| AdapterError::Protocol(format!("get_fork_messages: {e}")))
+    }
+
+    pub async fn get_session_stats(&self) -> Result<PiSessionStats, AdapterError> {
+        let data = self
+            .request_ok("get_session_stats", json!({}))
+            .await?
+            .unwrap_or(Value::Null);
+        serde_json::from_value(data)
+            .map_err(|e| AdapterError::Protocol(format!("get_session_stats: {e}")))
+    }
+
+    /// pi's leaf, without transferring the whole session: `get_entries` needs an entry of the
+    /// session to answer with only the entries after it, and the last user message of
+    /// `get_fork_messages` is one (a session without one is small: every entry is asked for).
+    async fn learn_leaf(&self) -> Result<PiEntries, AdapterError> {
+        let last = self.get_fork_messages().await?.pop();
+        self.get_entries(last.as_ref().map(|m| m.entry_id.as_str()))
+            .await
+    }
+
+    /// The native session this process runs, as pi last reported it.
+    pub fn native_session_id(&self) -> Option<String> {
+        self.shared.state.lock().native_session_id.clone()
+    }
+
+    /// Records the session pi reported. Returns whether it replaced another one (pi switched
+    /// sessions by itself); the switch is reported with `SessionIdentified`.
+    fn note_session(&self, reported: Option<&str>) -> bool {
+        let Some(id) = reported else {
+            return false;
+        };
+        let switched = {
+            let mut st = self.shared.state.lock();
+            let switched = st
+                .native_session_id
+                .as_deref()
+                .is_some_and(|known| known != id);
+            st.native_session_id = Some(id.to_owned());
+            switched
+        };
+        if switched {
+            tracing::info!(session = %self.shared.cfg.label, native_session_id = %id, "pi switched to another session by itself");
+            self.emit(AdapterEvent::SessionIdentified {
+                native_session_id: id.to_owned(),
+            });
+        }
+        switched
+    }
+
+    /// After pi switched sessions by itself: the new session runs with pi's defaults (pi 0.85.1
+    /// resets the model and the thinking level for a new session, without an event), so the
+    /// thread's model and thinking level are applied again where they differ.
+    async fn reapply_after_switch(&self, state: &PiState) -> Result<(), AdapterError> {
+        let wanted = {
+            let st = self.shared.state.lock();
+            ThreadSettings {
+                model: st.model.clone(),
+                effort: st.effort.clone(),
+                permission_mode: st.permission_mode.clone(),
+            }
+        };
+        self.set_current(
+            state.model.as_ref().map(PiModel::qualified_id),
+            state.thinking_level.clone(),
+            wanted.permission_mode.clone(),
+        );
+        self.apply(&wanted).await
+    }
+
+    /// Branches the session pi runs at `target` with the approval gate's fork command
+    /// (`ctx.fork`); pi then runs the new session. Returns its id. The session pi ran before is
+    /// not changed (pi writes the branch to a new file).
+    pub async fn fork_to(&self, target: &ForkTarget) -> Result<String, AdapterError> {
+        if target.entry_id.is_empty() || target.entry_id.contains(char::is_whitespace) {
+            return Err(AdapterError::Other(format!(
+                "not an entry id of a pi session: {:?}",
+                target.entry_id
+            )));
+        }
+        let source = self.get_state().await?.session_id.ok_or_else(|| {
+            AdapterError::Protocol("pi reported no session id before the fork".into())
+        })?;
+        // Without the gate's command pi would take the text for a prompt to the model.
+        let gate_loaded = self
+            .get_commands()
+            .await?
+            .iter()
+            .any(|c| c.name == gate::FORK_COMMAND && c.source.as_deref() == Some("extension"));
+        if !gate_loaded {
+            return Err(AdapterError::Other(format!(
+                "pi did not load the approval gate's `/{}` command",
+                gate::FORK_COMMAND
+            )));
+        }
+        self.shared.state.lock().fork_error = None;
+        let command = format!(
+            "/{} {} {}",
+            gate::FORK_COMMAND,
+            target.entry_id,
+            target.position
+        );
+        // pi answers an extension command once its handler returned; the gate's report of a
+        // failure comes before that answer.
+        self.request_ok("prompt", json!({ "message": command }))
+            .await?;
+        let after = self.get_state().await?;
+        let failed = self.shared.state.lock().fork_error.take();
+        match after.session_id {
+            Some(id) if id != source => Ok(id),
+            _ => Err(AdapterError::Harness(failed.unwrap_or_else(|| {
+                format!(
+                    "pi did not branch session {source} at entry {}",
+                    target.entry_id
+                )
+            }))),
+        }
     }
 
     /// Records the model/effort/mode currently in effect (after the handshake).
@@ -516,7 +771,8 @@ impl PiSession {
 }
 
 /// Completes the start of a session: checks that pi opened the expected session, applies
-/// the thread's model/effort/mode (only what differs), and publishes commands and settings.
+/// the thread's model/effort/mode (only what differs), publishes commands and settings (and
+/// the session's name, when it has one), and learns pi's leaf for the turns' anchors.
 pub async fn handshake(
     session: &PiSession,
     expected_session_id: &str,
@@ -530,6 +786,7 @@ pub async fn handshake(
             state.session_id
         )));
     }
+    session.shared.state.lock().native_session_id = Some(expected_session_id.to_owned());
     session.set_current(
         state.model.as_ref().map(PiModel::qualified_id),
         state.thinking_level.clone(),
@@ -545,7 +802,93 @@ pub async fn handshake(
     session.emit(AdapterEvent::CommandsChanged {
         commands: commands::commands(commands),
     });
+    // A name given outside the daemon (pi's `/name`, an extension); the engine keeps a title
+    // the user gave the thread.
+    if let Some(name) = state.session_name.filter(|n| !n.trim().is_empty()) {
+        session.emit(AdapterEvent::SessionTitle { title: name });
+    }
+    // Where the first turn begins. Without it the turns still get anchors, with the leaf only
+    // until a turn's end has been seen.
+    let leaf = match session.learn_leaf().await {
+        Ok(entries) => Leaf::At(entries.leaf_id),
+        Err(e) => {
+            tracing::warn!(session = %session.shared.cfg.label, error = %e, "could not read where pi's session tree ends; the next turn gets no user entry in its anchor");
+            Leaf::Unknown
+        }
+    };
+    session.shared.state.lock().leaf = leaf;
     Ok(())
+}
+
+/// The end of a turn (see the module docs): session switch, anchor, commands.
+async fn finish_steps(
+    session: &PiSession,
+    leaf: Leaf,
+    refresh_commands: bool,
+) -> Result<FinishReport, AdapterError> {
+    let state = session.get_state().await?;
+    let switched = session.note_session(state.session_id.as_deref());
+    if switched && let Err(e) = session.reapply_after_switch(&state).await {
+        // The thread shows settings pi does not run with: the user is told (the turn still
+        // completes).
+        tracing::warn!(session = %session.shared.cfg.label, error = %e, "could not apply the thread's settings to the session pi switched to");
+        session.emit(AdapterEvent::Notice {
+            level: aas_harness::NoticeLevel::Warning,
+            message: format!(
+                "pi now runs another session, and the thread's model and thinking level could not be applied to it: {}",
+                e.detail()
+            ),
+            code: Some("settingsNotApplied".into()),
+        });
+    }
+    // `since` missing from the session (pi answers "Entry not found"): learn the leaf afresh.
+    let after = |since: Option<String>| async move {
+        match session.get_entries(since.as_deref()).await {
+            Ok(entries) => Ok(Some(entries)),
+            Err(AdapterError::Harness(e)) => {
+                tracing::warn!(session = %session.shared.cfg.label, error = %e, "pi does not know where the turn began");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    let (entries, began_known) = match leaf {
+        _ if switched => (session.learn_leaf().await?, false),
+        Leaf::At(since) => match after(since).await? {
+            Some(entries) => (entries, true),
+            None => (session.learn_leaf().await?, false),
+        },
+        Leaf::Stale(since) => match after(since).await? {
+            Some(entries) => (entries, false),
+            None => (session.learn_leaf().await?, false),
+        },
+        Leaf::Unknown => (session.learn_leaf().await?, false),
+    };
+    // A turn during which pi switched sessions belongs to neither session as a whole.
+    let anchor = entries
+        .leaf_id
+        .clone()
+        .filter(|_| !switched)
+        .map(|leaf_id| {
+            Anchor {
+                leaf_id,
+                user_entry_id: began_known
+                    .then(|| entries.first_user_message().map(str::to_owned))
+                    .flatten(),
+            }
+            .to_value()
+        });
+    let commands = if refresh_commands || switched {
+        session.refresh_commands().await?
+    } else {
+        None
+    };
+    Ok(FinishReport {
+        anchor,
+        leaf: Leaf::At(entries.leaf_id),
+        switched,
+        commands,
+    })
 }
 
 fn next_id(shared: &Shared) -> String {
@@ -622,6 +965,7 @@ impl SessionControl for PiSession {
             st.idle()?;
             let mut turn = ActiveTurn::new(kind, Some(id.clone()));
             turn.relay_input = extension_command;
+            turn.extension_command = extension_command;
             let rx = decision.map(|(tx, rx)| {
                 turn.decision = Some(tx);
                 rx
@@ -649,15 +993,45 @@ impl SessionControl for PiSession {
     }
 
     async fn steer(&self, input: TurnInput) -> Result<(), AdapterError> {
-        if self.shared.state.lock().turn.is_none() {
-            return Err(AdapterError::Other("no turn is running".into()));
-        }
-        let (message, images) = prompt_payload(&input).await?;
-        let mut fields = json!({ "message": message });
-        if !images.is_empty() {
-            fields["images"] = Value::Array(images);
-        }
-        self.request_ok("steer", fields).await.map(|_| ())
+        let command = {
+            let mut st = self.shared.state.lock();
+            let State {
+                turn,
+                extension_commands,
+                ..
+            } = &mut *st;
+            match turn.as_mut() {
+                None => return Err(AdapterError::Other("no turn is running".into())),
+                Some(turn) if turn.run_over() => {
+                    return Err(AdapterError::Other("the turn's run is over".into()));
+                }
+                Some(turn) => steered_command(turn, &input, extension_commands),
+            }
+        };
+        self.deliver_steer(input, command).await
+    }
+
+    /// Like [`steer`](Self::steer), except that a steer that comes after the run is over (pi is
+    /// idle and would keep it for its next prompt) is not sent: it is returned to the engine
+    /// right before the turn's `TurnCompleted` (see the module docs).
+    async fn steer_message(&self, message_id: &str, input: TurnInput) -> Result<(), AdapterError> {
+        let command = {
+            let mut st = self.shared.state.lock();
+            let State {
+                turn,
+                extension_commands,
+                ..
+            } = &mut *st;
+            match turn.as_mut() {
+                None => return Err(AdapterError::Other("no turn is running".into())),
+                Some(turn) if turn.run_over() => {
+                    turn.returned_steers.push(message_id.to_owned());
+                    return Ok(());
+                }
+                Some(turn) => steered_command(turn, &input, extension_commands),
+            }
+        };
+        self.deliver_steer(input, command).await
     }
 
     /// Sends `abort`, for the user's turn and for a run pi started by itself alike. pi's abort
@@ -669,7 +1043,9 @@ impl SessionControl for PiSession {
         {
             let mut st = self.shared.state.lock();
             match st.turn.as_mut() {
+                // Nothing runs any more (the turn only waits for its end).
                 None => return Ok(()),
+                Some(turn) if turn.finishing.is_some() => return Ok(()),
                 Some(turn) => {
                     turn.abort_requested = true;
                     if turn.kind == TurnKind::Prompt && !turn.run_started {
@@ -738,7 +1114,12 @@ impl SessionControl for PiSession {
             .shutdown
             .get_or_init(|| async move {
                 let started = tokio::time::Instant::now();
-                let running = shared.state.lock().turn.is_some();
+                let running = shared
+                    .state
+                    .lock()
+                    .turn
+                    .as_ref()
+                    .is_some_and(|t| t.finishing.is_none());
                 if running {
                     // Bounded: a pi that no longer reads its stdin must not keep the stop from
                     // reaching the termination stage.
@@ -757,6 +1138,51 @@ impl SessionControl for PiSession {
             })
             .await
             .clone()
+    }
+
+    /// `set_session_name` (pi trims the name and refuses an empty one). pi reports the new name
+    /// with `session_info_changed` before it answers: the engine takes that echo for its own.
+    async fn rename(&self, title: &str) -> Result<(), AdapterError> {
+        self.request_ok("set_session_name", json!({ "name": title }))
+            .await
+            .map(|_| ())
+    }
+
+    /// `get_state` and `get_session_stats`, in the sections of pi's `/session` screen.
+    async fn status(&self) -> Result<Vec<StatusSection>, AdapterError> {
+        let state = self.get_state().await?;
+        let stats = self.get_session_stats().await?;
+        Ok(status::sections(&state, &stats))
+    }
+}
+
+/// Whether the steered `input` is one of pi's extension commands (recorded on the turn: its end
+/// asks pi for its commands again).
+fn steered_command(
+    turn: &mut ActiveTurn,
+    input: &TurnInput,
+    extension_commands: &HashSet<String>,
+) -> bool {
+    let command = commands::is_extension_command(&input.to_plain_text(), extension_commands);
+    turn.extension_command |= command;
+    command
+}
+
+impl PiSession {
+    /// Sends a steer: `steer`, or for an extension command `prompt` with `streamingBehavior`
+    /// (pi runs the command at once and answers when its handler returned; `steer` refuses it).
+    async fn deliver_steer(&self, input: TurnInput, command: bool) -> Result<(), AdapterError> {
+        let (message, images) = prompt_payload(&input).await?;
+        let mut fields = json!({ "message": message });
+        if !images.is_empty() {
+            fields["images"] = Value::Array(images);
+        }
+        if command {
+            fields["streamingBehavior"] = json!("steer");
+            self.request_ok("prompt", fields).await.map(|_| ())
+        } else {
+            self.request_ok("steer", fields).await.map(|_| ())
+        }
     }
 }
 
@@ -808,11 +1234,25 @@ impl ReaderTask {
         };
         // pi ended before it decided about the prompt.
         decide(decision, Err(AdapterError::Closed));
-        // Drain events queued by control methods before the process ended.
+        // Drain events queued by control methods (and ends of turns) before the process ended.
         while let Ok(msg) = internal.try_recv() {
-            if let Internal::Emit(ev) = msg {
-                self.emit(ev);
+            match msg {
+                Internal::Emit(ev) => self.emit(ev),
+                Internal::Finished { serial, report } => self.on_finished(serial, report),
+                Internal::StatsTimeout(_) => {}
             }
+        }
+        // A turn whose run was over completes with what it had (its end can no longer be asked
+        // about); a turn whose run was going on is ended by the engine at `Exited`.
+        let over = self
+            .shared
+            .state
+            .lock()
+            .turn
+            .as_ref()
+            .is_some_and(ActiveTurn::run_over);
+        if over {
+            self.complete_turn_now().await;
         }
         let info = self.shared.link.wait().await;
         self.emit(AdapterEvent::Exited { info });
@@ -821,6 +1261,7 @@ impl ReaderTask {
     async fn handle_internal(&mut self, msg: Internal) {
         match msg {
             Internal::Emit(ev) => self.emit(ev),
+            Internal::Finished { serial, report } => self.on_finished(serial, report),
             Internal::StatsTimeout(id) => {
                 let settle_now = {
                     let mut st = self.shared.state.lock();
@@ -834,7 +1275,7 @@ impl ReaderTask {
                     }
                 };
                 if settle_now {
-                    self.complete_turn(None).await;
+                    self.finish_turn(None).await;
                 }
             }
         }
@@ -892,10 +1333,10 @@ impl ReaderTask {
             }
         };
         match settle {
-            Settle::Now => self.complete_turn(None).await,
+            Settle::Now => self.finish_turn(None).await,
             Settle::WaitForStats => {}
             Settle::NowThenNewRun => {
-                self.complete_turn(None).await;
+                self.complete_turn_now().await;
                 self.open_agent_turn();
             }
         }
@@ -984,7 +1425,7 @@ impl ReaderTask {
                     st.loop_running = true;
                     match st.turn.as_mut() {
                         None => Start::AgentRun,
-                        Some(turn) if turn.settle_waiting => Start::AfterSettled,
+                        Some(turn) if turn.run_over() => Start::AfterSettled,
                         // pi answers a plain prompt before its run starts: whatever starts
                         // before the answer is not this prompt's run.
                         Some(turn)
@@ -1018,7 +1459,7 @@ impl ReaderTask {
                 match start {
                     Start::AgentRun => self.open_agent_turn(),
                     Start::AfterSettled => {
-                        self.complete_turn(None).await;
+                        self.complete_turn_now().await;
                         self.open_agent_turn();
                     }
                     Start::Foreign { first } => {
@@ -1352,7 +1793,7 @@ impl ReaderTask {
                     };
                     (TurnStatus::Failed, None, Some(error))
                 };
-                self.complete_turn(Some(outcome)).await;
+                self.finish_turn(Some(outcome)).await;
             }
             Route::Stats { settle_now } => {
                 match resp
@@ -1374,7 +1815,7 @@ impl ReaderTask {
                     None => {}
                 }
                 if settle_now {
-                    self.complete_turn(None).await;
+                    self.finish_turn(None).await;
                 }
             }
             Route::Other => {
@@ -1445,6 +1886,11 @@ impl ReaderTask {
                     self.emit(AdapterEvent::InteractionWithdrawn { request_id });
                 }
             }
+            Dialog::ForkFailed { error } => {
+                tracing::warn!(session = %self.shared.cfg.label, %error, "the gate's fork command did not fork");
+                self.shared.state.lock().fork_error = Some(error);
+            }
+            Dialog::EditorText { text } => self.emit(AdapterEvent::ComposerText { text }),
             Dialog::Notify { level, message } => self.emit(AdapterEvent::Notice {
                 level,
                 message,
@@ -1455,23 +1901,160 @@ impl ReaderTask {
         }
     }
 
-    /// Ends the running turn. `outcome` overrides the outcome derived from the run (used by
-    /// `/compact`, whose result is its response).
-    async fn complete_turn(
-        &mut self,
-        outcome: Option<(TurnStatus, Option<aas_harness::Usage>, Option<TurnError>)>,
-    ) {
-        // Open dialogs stay: pi still waits for their answers. The engine expires those that
-        // belonged to this turn and answers them through `expire_request` (a dismissal).
+    /// The run of the turn is over: decides its outcome, then asks pi about the session before
+    /// the turn completes (`finish_steps`, see the module docs). `outcome` overrides the outcome
+    /// derived from the run (used by `/compact`, whose result is its response).
+    async fn finish_turn(&mut self, outcome: Option<Outcome>) {
         let taken = {
             let mut st = self.shared.state.lock();
-            st.turn
-                .take()
-                .map(|turn| (turn.abort_requested, std::mem::take(&mut st.steering)))
+            let leaf = st.leaf.clone();
+            let steering = std::mem::take(&mut st.steering);
+            match st.turn.as_mut().filter(|t| t.finishing.is_none()) {
+                Some(turn) => Some((
+                    turn.serial,
+                    turn.abort_requested,
+                    turn.extension_command,
+                    leaf,
+                    steering,
+                )),
+                None => {
+                    st.steering = steering;
+                    None
+                }
+            }
         };
-        let Some((abort_requested, steering)) = taken else {
+        let Some((serial, abort_requested, refresh_commands, leaf, steering)) = taken else {
             return;
         };
+        let outcome = self.close_out(abort_requested, steering, outcome).await;
+        match self
+            .shared
+            .state
+            .lock()
+            .turn
+            .as_mut()
+            .filter(|t| t.serial == serial)
+        {
+            Some(turn) => turn.finishing = Some(outcome),
+            None => return,
+        }
+        let session = PiSession {
+            shared: self.shared.clone(),
+        };
+        tokio::spawn(async move {
+            let timeout = session.shared.cfg.request_timeout;
+            let report = match tokio::time::timeout(
+                timeout,
+                finish_steps(&session, leaf, refresh_commands),
+            )
+            .await
+            {
+                Ok(Ok(report)) => report,
+                Ok(Err(e)) => {
+                    tracing::warn!(session = %session.shared.cfg.label, error = %e, "could not ask pi about the session at the end of the turn; the turn gets no anchor");
+                    FinishReport::default()
+                }
+                Err(_) => {
+                    tracing::warn!(session = %session.shared.cfg.label, ?timeout, "pi did not answer about the session at the end of the turn; the turn gets no anchor");
+                    FinishReport::default()
+                }
+            };
+            let _ = session
+                .shared
+                .internal
+                .send(Internal::Finished { serial, report });
+        });
+    }
+
+    /// What pi said at the end of turn `serial`: completes the turn when it still waits for it
+    /// (a run that started meanwhile has completed it already).
+    fn on_finished(&mut self, serial: u64, report: FinishReport) {
+        let done = {
+            let mut st = self.shared.state.lock();
+            let waiting = st
+                .turn
+                .as_ref()
+                .is_some_and(|t| t.serial == serial && t.finishing.is_some());
+            if waiting {
+                st.leaf = report.leaf;
+                st.turn
+                    .take()
+                    .and_then(|t| t.finishing.map(|outcome| (outcome, t.returned_steers)))
+            } else {
+                if report.switched {
+                    st.leaf = Leaf::Unknown;
+                }
+                None
+            }
+        };
+        if let Some(commands) = report.commands {
+            self.emit(AdapterEvent::CommandsChanged {
+                commands: commands::commands(commands),
+            });
+        }
+        if let Some((outcome, returned)) = done {
+            self.emit_completion(returned, report.anchor, outcome);
+        }
+    }
+
+    /// Completes the turn at once, without asking pi about the session (a run started from its
+    /// end, or pi's output ended): no anchor, and where the next turn begins is not known.
+    async fn complete_turn_now(&mut self) {
+        let taken = {
+            let mut st = self.shared.state.lock();
+            let taken = st.turn.take().map(|turn| {
+                (
+                    turn.finishing,
+                    turn.abort_requested,
+                    turn.returned_steers,
+                    std::mem::take(&mut st.steering),
+                )
+            });
+            if taken.is_some() {
+                st.leaf = std::mem::take(&mut st.leaf).stale();
+            }
+            taken
+        };
+        let Some((finishing, abort_requested, returned, steering)) = taken else {
+            return;
+        };
+        let outcome = match finishing {
+            Some(outcome) => outcome,
+            None => self.close_out(abort_requested, steering, None).await,
+        };
+        self.emit_completion(returned, None, outcome);
+    }
+
+    /// The turn's steers that came after its run, its anchor, and its `TurnCompleted`.
+    fn emit_completion(
+        &mut self,
+        returned: Vec<String>,
+        anchor: Option<Value>,
+        (status, usage, error): Outcome,
+    ) {
+        for message_id in returned {
+            self.emit(AdapterEvent::SteerReturned { message_id });
+        }
+        if let Some(anchor) = anchor {
+            self.emit(AdapterEvent::TurnAnchor { anchor });
+        }
+        self.emit(AdapterEvent::TurnCompleted {
+            trigger: None,
+            status,
+            usage,
+            error,
+        });
+    }
+
+    /// Drops the steers pi did not deliver (telling the user) and decides the turn's outcome.
+    async fn close_out(
+        &mut self,
+        abort_requested: bool,
+        steering: Vec<String>,
+        outcome: Option<Outcome>,
+    ) -> Outcome {
+        // Open dialogs stay: pi still waits for their answers. The engine expires those that
+        // belonged to this turn and answers them through `expire_request` (a dismissal).
         if !steering.is_empty() {
             // pi would deliver these with the next prompt; drop them so they do not leak into
             // an unrelated turn, and tell the user.
@@ -1490,18 +2073,12 @@ impl ReaderTask {
                 code: Some("steerNotDelivered".into()),
             });
         }
-        let (status, usage, error) = match outcome {
+        match outcome {
             Some(outcome) => outcome,
             None => {
                 let (status, error) = self.mapper.outcome(abort_requested);
                 (status, self.mapper.turn_usage(), error)
             }
-        };
-        self.emit(AdapterEvent::TurnCompleted {
-            trigger: None,
-            status,
-            usage,
-            error,
-        });
+        }
     }
 }

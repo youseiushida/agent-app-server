@@ -15,6 +15,7 @@ import dev.aas.android.AppPolicy
 import dev.aas.android.MainActivity
 import dev.aas.android.R
 import dev.aas.android.diagnostics.ConnectionLog
+import dev.aas.android.domain.ErrorTexts
 import dev.aas.android.domain.InteractionTexts
 import dev.aas.android.domain.RequestLabels
 import dev.aas.android.protocol.BackgroundTask
@@ -110,6 +111,8 @@ class Notifier(
             is SyncSignal.InteractionTaskKnown -> nameTheTask(signal.interaction, signal.task, prefs)
             is SyncSignal.OperationFinished -> showOperationFinished(signal.operation, prefs)
             is SyncSignal.ThreadRemoved -> cancelThread(signal.threadId)
+            // Shown by the open thread's screen, never notified.
+            is SyncSignal.ComposerInsert, is SyncSignal.NativeSessionChanged -> Unit
         }
     }
 
@@ -121,7 +124,7 @@ class Notifier(
             val known = id?.let { shown[it] }
             if (known != null) {
                 // The answer was rejected: offer the interaction again, with the reason.
-                showInteraction(known.interaction, known.thread, known.backgroundTaskTitle, settings.current(), error = result.error.message, force = true)
+                showInteraction(known.interaction, known.thread, known.backgroundTaskTitle, settings.current(), error = ErrorTexts.server(result.error).resolve(res), force = true)
                 return
             }
         }
@@ -408,7 +411,10 @@ class Notifier(
         val text = when (turn.status) {
             TurnStatus.Completed -> if (duration != null) res.getString(R.string.notify_turn_completed_after, duration) else res.getString(R.string.notify_turn_completed)
             TurnStatus.Interrupted -> res.getString(R.string.notify_turn_interrupted)
-            TurnStatus.Failed -> res.getString(R.string.notify_turn_failed, thread.lastError?.message ?: res.getString(R.string.error_unknown))
+            TurnStatus.Failed -> res.getString(
+                R.string.notify_turn_failed,
+                thread.lastError?.let { ErrorTexts.turnErrorLine(it.kind, it.message).resolve(res) } ?: res.getString(R.string.error_unknown),
+            )
             TurnStatus.Running, TurnStatus.Unknown -> res.getString(R.string.notify_turn_ended)
         }
         val channel = if (failed) NotificationChannels.ERRORS else NotificationChannels.TURNS

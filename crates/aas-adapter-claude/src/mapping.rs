@@ -2,12 +2,15 @@
 //! normalized model of `aas-harness`. Every table here is fixed and documented in
 //! `docs/adapters/claude.md`; nothing is inferred from human-readable text.
 
-use aas_harness::BackgroundTaskKind;
+use aas_harness::protocol::ThreadSettings;
 use aas_harness::protocol::{
-    ApprovalOption, ApprovalOptionKind, Command, CommandAction, CommandSource, ContextUsage,
-    EffortLevel, ExpireReason, FileChange, FileChangeKind, InteractionRequest,
-    InteractionResolution, ItemBody, ItemStatus, Model, PermissionMode, PlanEntry, PlanEntryStatus,
-    Question, QuestionChoice, Subject, ToolCategory, TurnError, TurnStatus, TurnTrigger, Usage,
+    ApprovalOption, ApprovalOptionKind, ContextUsage, EffortLevel, ExpireReason, FileChange,
+    FileChangeKind, InteractionRequest, InteractionResolution, ItemBody, ItemStatus, Model,
+    PermissionMode, PlanEntry, PlanEntryStatus, Question, QuestionChoice, Subject, ToolCategory,
+    TurnError, TurnStatus, TurnTrigger, Usage,
+};
+use aas_harness::{
+    BackgroundTaskKind, StatusRow, StatusSection, UpgradedSettings, sanitize_terminal_text,
 };
 use serde_json::{Map, Value, json};
 
@@ -28,7 +31,7 @@ pub enum ToolClass {
     Plan,
     /// `AskUserQuestion` → `toolCall` (the question itself becomes a `question` interaction).
     Question,
-    /// `ExitPlanMode` → `toolCall` (approval subject `plan`).
+    /// `ExitPlanMode` → `proposedPlan` with its `input.plan` (approval subject `plan`).
     ExitPlan,
     /// Everything else → `toolCall` with the given category.
     Generic(ToolCategory),
@@ -277,7 +280,10 @@ pub fn tool_started_body(name: &str, input: &Value) -> Option<ItemBody> {
             changes: requested_file_changes(name, input),
         },
         ToolClass::Question => generic_body(ToolCategory::Other, name, input),
-        ToolClass::ExitPlan => generic_body(ToolCategory::Think, name, input),
+        // The plan the agent presents for approval (plan mode): the tool's own `plan` text.
+        ToolClass::ExitPlan => ItemBody::ProposedPlan {
+            text: str_field(input, "plan").unwrap_or_default().to_owned(),
+        },
         ToolClass::Generic(category) => generic_body(category, name, input),
     })
 }
@@ -709,47 +715,8 @@ impl PermissionAsk {
     }
 }
 
-/// Removes ANSI escape sequences (`decision_reason` may carry them).
-pub fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    // CSI: parameters/intermediates until a final byte in 0x40..=0x7e.
-                    for c in chars.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    // OSC: until BEL or ESC \.
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' {
-                            break;
-                        }
-                        if c == '\u{1b}' {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    chars.next();
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// The interaction shown for a `can_use_tool` request.
+/// The interaction shown for a `can_use_tool` request. The CLI's texts may carry terminal
+/// escape sequences (`decision_reason`), which are removed ([`sanitize_terminal_text`]).
 pub fn permission_interaction(request: &Value, ask: &PermissionAsk) -> InteractionRequest {
     if ask.is_question()
         && let Some(q) = question_interaction(&ask.input)
@@ -777,7 +744,7 @@ pub fn permission_interaction(request: &Value, ask: &PermissionAsk) -> Interacti
         },
     };
     let title = match str_field(request, "title") {
-        Some(t) if !t.is_empty() => strip_ansi(t),
+        Some(t) if !t.is_empty() => sanitize_terminal_text(t),
         _ => match &subject {
             Subject::Command { .. } => "Run command?".to_owned(),
             Subject::FileChange { changes } => match (name, changes.first()) {
@@ -791,10 +758,10 @@ pub fn permission_interaction(request: &Value, ask: &PermissionAsk) -> Interacti
     };
     let mut detail_parts = Vec::new();
     if let Some(d) = str_field(request, "description").filter(|d| !d.is_empty()) {
-        detail_parts.push(strip_ansi(d));
+        detail_parts.push(sanitize_terminal_text(d));
     }
     if let Some(r) = str_field(request, "decision_reason").filter(|d| !d.is_empty()) {
-        detail_parts.push(strip_ansi(r));
+        detail_parts.push(sanitize_terminal_text(r));
     }
     if let Some(p) = str_field(request, "blocked_path").filter(|d| !d.is_empty()) {
         detail_parts.push(format!("Path: {p}"));
@@ -1080,6 +1047,255 @@ pub fn context_from_usage_response(response: &Value) -> Option<ContextUsage> {
     })
 }
 
+/// The text of a failed `result` that arrives before any turn: the CLI refused to start the
+/// session (an unknown `--resume-session-at` anchor: "No message found with message.uuid of:
+/// …", recording g6). Its `errors`, else its `result`, else its `subtype`; `None` for a result
+/// that is not an error.
+pub fn startup_error(result: &Value) -> Option<String> {
+    if result.get("is_error").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let errors: Vec<&str> = result
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|e| !e.is_empty())
+        .collect();
+    let text = if !errors.is_empty() {
+        errors.join("; ")
+    } else if let Some(r) = str_field(result, "result").filter(|r| !r.is_empty()) {
+        r.to_owned()
+    } else {
+        str_field(result, "subtype").unwrap_or("error").to_owned()
+    };
+    Some(sanitize_terminal_text(&text))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Status (`get_status`, `get_usage`, `get_plan`)
+// ---------------------------------------------------------------------------------------------
+
+/// The sections of a `get_status` response (`@internal` in Claude Code 2.1.284: "the rows of
+/// the terminal's /status screen …, every value already rendered as text"), verbatim.
+pub fn status_sections(response: &Value) -> Vec<StatusSection> {
+    response
+        .get("sections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|section| {
+            let title = str_field(section, "title")?.to_owned();
+            let rows = section
+                .get("rows")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|row| {
+                    Some(StatusRow {
+                        label: str_field(row, "label")?.to_owned(),
+                        value: match row.get("value") {
+                            Some(Value::String(v)) => v.clone(),
+                            Some(Value::Null) | None => String::new(),
+                            Some(other) => other.to_string(),
+                        },
+                    })
+                })
+                .collect();
+            Some(StatusSection { title, rows })
+        })
+        .collect()
+}
+
+/// Label of an entry of `get_usage.rate_limits.limits` by its `kind` (the windows Claude Code's
+/// `/usage` screen shows; another kind is shown by its own name), with the model of a scoped
+/// limit (`scope.model.display_name`).
+fn limit_label(limit: &Value) -> String {
+    let kind = str_field(limit, "kind").unwrap_or("limit");
+    let model = limit
+        .pointer("/scope/model/display_name")
+        .and_then(Value::as_str);
+    match (kind, model) {
+        ("session", _) => "Current session".to_owned(),
+        ("weekly_all", _) => "Current week (all models)".to_owned(),
+        ("weekly_scoped", Some(model)) => format!("Current week ({model})"),
+        (kind, Some(model)) => format!("{kind} ({model})"),
+        (kind, None) => kind.to_owned(),
+    }
+}
+
+fn number(v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// The sections of a `get_usage` response (Claude Code 2.1.284: "Experimental — the response
+/// shape may change"; requested with `skip_behaviors: true`, so `behaviors` is null):
+/// * "Plan usage": the plan (`subscription_type`), each entry of the normalised
+///   `rate_limits.limits` (`percent`, `resets_at`, `severity` when not normal) and the usage
+///   credits (`rate_limits.spend`: `percent` when enabled, else `disabled_reason`);
+/// * "Session usage" (`with_session`): the process's cost, durations, changed lines and tokens
+///   per model (`session`). Left out for the status without a session (a probe process has no
+///   conversation).
+pub fn usage_sections(response: &Value, with_session: bool) -> Vec<StatusSection> {
+    let mut out = Vec::new();
+    let mut plan = Vec::new();
+    if let Some(kind) = str_field(response, "subscription_type") {
+        plan.push(StatusRow {
+            label: "Plan".into(),
+            value: kind.to_owned(),
+        });
+    }
+    if response
+        .get("rate_limits_available")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        plan.push(StatusRow {
+            label: "Rate limits".into(),
+            value: "not available".into(),
+        });
+    }
+    let limits = response
+        .pointer("/rate_limits/limits")
+        .and_then(Value::as_array);
+    for limit in limits.into_iter().flatten() {
+        let mut value = match limit.get("percent").and_then(number) {
+            Some(p) => format!("{p}% used"),
+            None => "usage not reported".to_owned(),
+        };
+        if let Some(resets) = str_field(limit, "resets_at") {
+            value.push_str(&format!(", resets {resets}"));
+        }
+        if let Some(severity) = str_field(limit, "severity").filter(|s| *s != "normal") {
+            value.push_str(&format!(" ({severity})"));
+        }
+        plan.push(StatusRow {
+            label: limit_label(limit),
+            value,
+        });
+    }
+    if let Some(spend) = response
+        .pointer("/rate_limits/spend")
+        .filter(|s| s.is_object())
+    {
+        let value = if spend.get("enabled").and_then(Value::as_bool) == Some(true) {
+            match spend.get("percent").and_then(number) {
+                Some(p) => format!("on, {p}% used"),
+                None => "on".to_owned(),
+            }
+        } else {
+            match str_field(spend, "disabled_reason") {
+                Some(reason) => format!("off ({reason})"),
+                None => "off".to_owned(),
+            }
+        };
+        plan.push(StatusRow {
+            label: "Usage credits".into(),
+            value,
+        });
+    }
+    if !plan.is_empty() {
+        out.push(StatusSection {
+            title: "Plan usage".into(),
+            rows: plan,
+        });
+    }
+    let session = response.get("session").filter(|s| s.is_object());
+    if let (true, Some(session)) = (with_session, session) {
+        let mut rows = Vec::new();
+        if let Some(cost) = session.get("total_cost_usd").and_then(Value::as_f64) {
+            rows.push(StatusRow {
+                label: "Cost".into(),
+                value: format!("${cost:.4}"),
+            });
+        }
+        for (key, label) in [
+            ("total_duration_ms", "Duration"),
+            ("total_api_duration_ms", "API duration"),
+        ] {
+            if let Some(ms) = session.get(key).and_then(Value::as_u64) {
+                rows.push(StatusRow {
+                    label: label.into(),
+                    value: format!("{:.1} s", ms as f64 / 1000.0),
+                });
+            }
+        }
+        if let (Some(added), Some(removed)) = (
+            session.get("total_lines_added").and_then(Value::as_u64),
+            session.get("total_lines_removed").and_then(Value::as_u64),
+        ) {
+            rows.push(StatusRow {
+                label: "Lines changed".into(),
+                value: format!("+{added} -{removed}"),
+            });
+        }
+        if let Some(models) = session.get("model_usage").and_then(Value::as_object) {
+            for (model, u) in models {
+                let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+                rows.push(StatusRow {
+                    label: model.clone(),
+                    value: format!(
+                        "{} in, {} out, {} cache read, {} cache write",
+                        n("inputTokens"),
+                        n("outputTokens"),
+                        n("cacheReadInputTokens"),
+                        n("cacheCreationInputTokens")
+                    ),
+                });
+            }
+        }
+        if !rows.is_empty() {
+            out.push(StatusSection {
+                title: "Session usage".into(),
+                rows,
+            });
+        }
+    }
+    out
+}
+
+/// The section of a `get_plan` response (`@internal` in Claude Code 2.1.284: `{exists,
+/// content?, path?}`): the current plan of plan mode, when there is one.
+pub fn plan_section(response: &Value) -> Option<StatusSection> {
+    if response.get("exists").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let mut rows = Vec::new();
+    if let Some(path) = str_field(response, "path") {
+        rows.push(StatusRow {
+            label: "File".into(),
+            value: path.to_owned(),
+        });
+    }
+    rows.push(StatusRow {
+        label: "Plan".into(),
+        value: str_field(response, "content")
+            .unwrap_or_default()
+            .to_owned(),
+    });
+    Some(StatusSection {
+        title: "Plan".into(),
+        rows,
+    })
+}
+
+/// The anchor of a turn (`AdapterEvent::TurnAnchor`): the `uuid` of its last main-thread
+/// transcript entry, which `--resume-session-at` takes ("any chain element's UUID; normally
+/// the last element of the turn to keep"). Copied transcript entries keep their uuids in a fork,
+/// so an anchor stays valid in forks of forks (recording g2).
+pub fn turn_anchor(uuid: &str) -> Value {
+    json!({ "leafUuid": uuid })
+}
+
+/// The uuid of an anchor made by [`turn_anchor`].
+pub fn anchor_uuid(anchor: &Value) -> Option<&str> {
+    anchor.get("leafUuid").and_then(Value::as_str)
+}
+
 /// Why the CLI started a run by itself, from its `result.origin`: `task-notification` (the run
 /// takes up background tasks that ended). Other origins and none give no trigger.
 pub fn turn_trigger(result: &Value) -> Option<TurnTrigger> {
@@ -1104,13 +1320,13 @@ pub fn turn_outcome(result: &Value, interrupt_requested: bool) -> (TurnStatus, O
             .flatten()
             .filter_map(|e| e.as_str().map(str::to_owned))
             .collect();
-        let message = if !errors.is_empty() {
+        let message = sanitize_terminal_text(&if !errors.is_empty() {
             format!("{subtype}: {}", errors.join("; "))
         } else if let Some(r) = str_field(result, "result").filter(|r| !r.is_empty()) {
             format!("{subtype}: {r}")
         } else {
             subtype.to_owned()
-        };
+        });
         return (
             TurnStatus::Failed,
             Some(TurnError {
@@ -1196,6 +1412,24 @@ pub fn models_from_initialize(init: &Value) -> Vec<Model> {
         .collect()
 }
 
+/// The models (`initialize.models[].value`) the CLI marks `supportsFastMode` (feature
+/// `fastModeModels`).
+pub fn fast_mode_models(init: &Value) -> Vec<String> {
+    init.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("supportsFastMode").and_then(Value::as_bool) == Some(true))
+        .filter_map(|m| str_field(m, "value").map(str::to_owned))
+        .collect()
+}
+
+/// `apply_flag_settings.settings` for fast mode: `fastMode` is both the SDK's opt-in and the
+/// switch (recording e1: `true` turns it on, `false` off again).
+pub fn fast_mode_flag_settings(on: bool) -> Value {
+    json!({ "fastMode": on })
+}
+
 /// Effort levels offered by at least one model, in canonical order. Ultracode only for a model
 /// that lists xhigh (a model without a list of levels does not name it).
 pub fn effort_levels(models: &[Model]) -> Vec<EffortLevel> {
@@ -1220,8 +1454,34 @@ pub fn effort_levels(models: &[Model]) -> Vec<EffortLevel> {
         .collect()
 }
 
+/// Claude Code's permission mode for plan mode. It is not offered as a permission mode: plan
+/// mode is the thread's `modes.plan` (feature `planMode`, the app's `/plan`), which the adapter
+/// turns on and off with this mode over the thread's own permission mode.
+pub const PLAN_MODE: &str = "plan";
+
+/// Settings with the permission mode `plan`, which earlier versions of this adapter offered as a
+/// permission mode (threads and project defaults keep it): plan mode now (`modes.plan`), over the
+/// CLI's default permission mode (no `--permission-mode`), which is what the CLI returns to when
+/// plan mode ends. Other settings are unchanged.
+pub fn upgrade_settings(settings: ThreadSettings) -> UpgradedSettings {
+    if settings.permission_mode.as_deref() != Some(PLAN_MODE) {
+        return UpgradedSettings {
+            settings,
+            plan: false,
+        };
+    }
+    UpgradedSettings {
+        settings: ThreadSettings {
+            permission_mode: None,
+            ..settings
+        },
+        plan: true,
+    }
+}
+
 /// Permission modes (fixed table). `bypassPermissions` is only offered when the adapter
-/// option `allowBypassPermissions` is set.
+/// option `allowBypassPermissions` is set; `plan` is the thread's plan mode ([`PLAN_MODE`]).
+/// The default is the CLI's `current_permission_mode` (`default` when that is `plan`).
 pub fn permission_modes(current: Option<&str>, allow_bypass: bool) -> Vec<PermissionMode> {
     let table: &[(&str, &str, &str)] = &[
         (
@@ -1233,11 +1493,6 @@ pub fn permission_modes(current: Option<&str>, allow_bypass: bool) -> Vec<Permis
             "acceptEdits",
             "Accept edits",
             "Apply file edits without asking; ask for commands",
-        ),
-        (
-            "plan",
-            "Plan",
-            "Read-only planning; the plan is presented for approval",
         ),
         (
             "auto",
@@ -1255,7 +1510,7 @@ pub fn permission_modes(current: Option<&str>, allow_bypass: bool) -> Vec<Permis
             "Run every tool without asking",
         ),
     ];
-    let current = current.unwrap_or("default");
+    let current = current.filter(|m| *m != PLAN_MODE).unwrap_or("default");
     table
         .iter()
         .filter(|(id, _, _)| allow_bypass || *id != "bypassPermissions")
@@ -1268,64 +1523,44 @@ pub fn permission_modes(current: Option<&str>, allow_bypass: bool) -> Vec<Permis
         .collect()
 }
 
-/// Composer commands from the `initialize` response (`commands[]`: `name`, `description`,
-/// `argumentHint`).
-pub fn commands_from_initialize(init: &Value) -> Vec<Command> {
-    init.get("commands")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|c| {
-            let name = str_field(c, "name")?.trim_start_matches('/').to_owned();
-            if name.is_empty() {
-                return None;
-            }
-            Some(Command {
-                description: str_field(c, "description")
-                    .filter(|d| !d.is_empty())
-                    .map(str::to_owned),
-                source: CommandSource::Harness,
-                argument_hint: str_field(c, "argumentHint")
-                    .filter(|d| !d.is_empty())
-                    .map(str::to_owned),
-                action: CommandAction::InsertText {
-                    text: format!("/{name} "),
-                },
-                name,
-            })
-        })
-        .collect()
-}
-
-/// Commands for names reported in `system/init.slash_commands`, reusing descriptions from a
-/// known list where the name matches.
-pub fn commands_from_names(names: &[String], known: &[Command]) -> Vec<Command> {
-    names
-        .iter()
-        .map(|name| {
-            let name = name.trim_start_matches('/').to_owned();
-            known
-                .iter()
-                .find(|c| c.name == name)
-                .cloned()
-                .unwrap_or_else(|| Command {
-                    description: None,
-                    source: CommandSource::Harness,
-                    argument_hint: None,
-                    action: CommandAction::InsertText {
-                        text: format!("/{name} "),
-                    },
-                    name,
-                })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aas_harness::protocol::QuestionAnswer;
     use pretty_assertions::assert_eq;
+
+    /// The permission mode `plan` of earlier versions is plan mode over the CLI's default;
+    /// other settings are kept as they are.
+    #[test]
+    fn a_plan_permission_mode_is_upgraded_to_plan_mode() {
+        let legacy = ThreadSettings {
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            permission_mode: Some(PLAN_MODE.into()),
+        };
+        assert_eq!(
+            upgrade_settings(legacy),
+            UpgradedSettings {
+                settings: ThreadSettings {
+                    model: Some("opus".into()),
+                    effort: Some("high".into()),
+                    permission_mode: None,
+                },
+                plan: true,
+            }
+        );
+        let current = ThreadSettings {
+            permission_mode: Some("acceptEdits".into()),
+            ..ThreadSettings::default()
+        };
+        assert_eq!(
+            upgrade_settings(current.clone()),
+            UpgradedSettings {
+                settings: current,
+                plan: false,
+            }
+        );
+    }
 
     #[test]
     fn tool_table() {
@@ -1749,17 +1984,6 @@ mod tests {
             Some(ULTRACODE)
         );
         assert_eq!(effort_levels(&models).len(), 6);
-        let cmds = commands_from_initialize(&init);
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(
-            cmds[0].action,
-            CommandAction::InsertText {
-                text: "/compact ".into()
-            }
-        );
-        let named = commands_from_names(&["compact".into(), "review".into()], &cmds);
-        assert_eq!(named[0].description.as_deref(), Some("Compact"));
-        assert_eq!(named[1].description, None);
         let modes = permission_modes(Some("acceptEdits"), false);
         assert!(!modes.iter().any(|m| m.id == "bypassPermissions"));
         assert!(
@@ -1774,14 +1998,44 @@ mod tests {
                 .iter()
                 .any(|m| m.id == "bypassPermissions")
         );
+        // Plan mode is the thread's `modes.plan` (the app's `/plan`), not a permission mode.
+        assert!(!permission_modes(None, true).iter().any(|m| m.id == "plan"));
+        // A CLI whose default mode is plan: the thread's base mode is `default`.
+        assert!(
+            permission_modes(Some("plan"), false)
+                .iter()
+                .find(|m| m.id == "default")
+                .unwrap()
+                .is_default
+        );
     }
 
     #[test]
-    fn ansi_is_stripped() {
-        assert_eq!(
-            strip_ansi("\u{1b}[1;31mred\u{1b}[0m plain \u{1b}]0;title\u{7}x"),
-            "red plain x"
-        );
+    fn fast_mode_models_are_the_ones_the_cli_marks() {
+        // The shape of Claude Code 2.1.284's `initialize.models` (recording e1).
+        let init = json!({"models": [
+            {"value": "default", "resolvedModel": "claude-opus-4-6", "supportsEffort": true, "supportsAutoMode": true},
+            {"value": "opus", "resolvedModel": "claude-opus-5-5", "supportsEffort": true, "supportsFastMode": true},
+            {"value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001"},
+            {"value": "claude-opus-4-8", "supportsFastMode": true},
+            {"value": "claude-opus-4-7", "supportsFastMode": false}
+        ]});
+        assert_eq!(fast_mode_models(&init), ["opus", "claude-opus-4-8"]);
+        assert!(fast_mode_models(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn terminal_control_is_removed_from_request_details() {
+        let request = json!({"tool_name": "Bash", "input": {"command": "ls"},
+            "title": "\u{1b}[1mRun\u{1b}[0m ls?", "decision_reason": "\u{1b}[1;31mred\u{1b}[0m plain \u{1b}]0;title\u{7}x"});
+        let ask = PermissionAsk::from_request(&request);
+        let InteractionRequest::Approval { title, detail, .. } =
+            permission_interaction(&request, &ask)
+        else {
+            panic!("an approval")
+        };
+        assert_eq!(title, "Run ls?");
+        assert_eq!(detail.as_deref(), Some("red plain x"));
     }
 
     fn done(structured: Value) -> ToolResult {
@@ -1925,6 +2179,177 @@ mod tests {
         );
         assert_eq!(turn_trigger(&json!({"origin": {"kind": "human"}})), None);
         assert_eq!(turn_trigger(&json!({"subtype": "success"})), None);
+    }
+
+    /// `get_usage` as Claude Code 2.1.284 answers it (recording b1, shortened).
+    fn usage_response() -> Value {
+        json!({
+            "session": {"total_cost_usd": 0.012375899999999999, "total_api_duration_ms": 4742, "total_duration_ms": 33373,
+                "total_lines_added": 3, "total_lines_removed": 1,
+                "model_usage": {"claude-haiku-4-5-20251001": {"inputTokens": 10, "outputTokens": 330,
+                    "cacheReadInputTokens": 19759, "cacheCreationInputTokens": 4370, "costUSD": 0.0123}}},
+            "subscription_type": "max", "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": {"utilization": 43, "resets_at": "2026-09-28T20:20:00.469143+00:00"},
+                "limits": [
+                    {"kind": "session", "group": "session", "percent": 43, "severity": "normal",
+                     "resets_at": "2026-09-28T20:20:00.469143+00:00", "scope": null, "is_active": false},
+                    {"kind": "weekly_all", "group": "weekly", "percent": 54, "severity": "warning",
+                     "resets_at": "2026-10-01T16:00:00.469173+00:00", "scope": null, "is_active": true},
+                    {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "severity": "normal",
+                     "resets_at": "2026-10-01T16:00:00+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}],
+                "spend": {"percent": 0, "severity": "normal", "enabled": false, "disabled_reason": "out_of_credits"}},
+            "behaviors": null
+        })
+    }
+
+    fn rows(section: &StatusSection) -> Vec<(&str, &str)> {
+        section
+            .rows
+            .iter()
+            .map(|r| (r.label.as_str(), r.value.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn usage_becomes_the_plan_and_session_sections() {
+        let sections = usage_sections(&usage_response(), true);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].title, "Plan usage");
+        assert_eq!(
+            rows(&sections[0]),
+            [
+                ("Plan", "max"),
+                (
+                    "Current session",
+                    "43% used, resets 2026-09-28T20:20:00.469143+00:00"
+                ),
+                (
+                    "Current week (all models)",
+                    "54% used, resets 2026-10-01T16:00:00.469173+00:00 (warning)"
+                ),
+                (
+                    "Current week (Fable)",
+                    "0% used, resets 2026-10-01T16:00:00+00:00"
+                ),
+                ("Usage credits", "off (out_of_credits)"),
+            ]
+        );
+        assert_eq!(sections[1].title, "Session usage");
+        assert_eq!(
+            rows(&sections[1]),
+            [
+                ("Cost", "$0.0124"),
+                ("Duration", "33.4 s"),
+                ("API duration", "4.7 s"),
+                ("Lines changed", "+3 -1"),
+                (
+                    "claude-haiku-4-5-20251001",
+                    "10 in, 330 out, 19759 cache read, 4370 cache write"
+                ),
+            ]
+        );
+        // Without a session (a probe process): the plan only.
+        let sections = usage_sections(&usage_response(), false);
+        assert_eq!(sections.len(), 1);
+        // No rate limits for this login; enabled credits.
+        let sections = usage_sections(
+            &json!({"rate_limits_available": false, "rate_limits": {"spend": {"enabled": true, "percent": 12}}}),
+            false,
+        );
+        assert_eq!(
+            rows(&sections[0]),
+            [
+                ("Rate limits", "not available"),
+                ("Usage credits", "on, 12% used")
+            ]
+        );
+        assert!(usage_sections(&json!({}), true).is_empty());
+    }
+
+    #[test]
+    fn status_and_plan_sections_are_the_cli_rows() {
+        let status = json!({"sections": [
+            {"title": "Session", "rows": [{"label": "Version", "value": "2.1.284"}, {"label": "Session name", "value": null}]},
+            {"title": "Environment", "rows": [{"label": "Model", "value": "claude-haiku-4-5-20251001"}, {"value": "no label"}]},
+            {"rows": []}]});
+        let sections = status_sections(&status);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(
+            rows(&sections[0]),
+            [("Version", "2.1.284"), ("Session name", "")]
+        );
+        assert_eq!(rows(&sections[1]), [("Model", "claude-haiku-4-5-20251001")]);
+        assert_eq!(plan_section(&json!({"exists": false})), None);
+        let plan = plan_section(&json!({"exists": true, "content": "# Plan", "path": "C:\\p.md"}))
+            .unwrap();
+        assert_eq!(rows(&plan), [("File", "C:\\p.md"), ("Plan", "# Plan")]);
+        // A connection that does not get the path.
+        let plan = plan_section(&json!({"exists": true, "content": "# Plan"})).unwrap();
+        assert_eq!(rows(&plan), [("Plan", "# Plan")]);
+    }
+
+    #[test]
+    fn a_refused_start_is_the_result_text() {
+        // Recordings g6 and g3a.
+        assert_eq!(
+            startup_error(
+                &json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
+                "errors": ["No message found with message.uuid of: 1111"]})
+            )
+            .as_deref(),
+            Some("No message found with message.uuid of: 1111")
+        );
+        assert_eq!(
+            startup_error(&json!({"subtype": "error_during_execution", "is_error": true, "errors": ["\u{1b}[31mbad\u{1b}[0m"]}))
+                .as_deref(),
+            Some("bad")
+        );
+        assert_eq!(
+            startup_error(&json!({"subtype": "error_during_execution", "is_error": true}))
+                .as_deref(),
+            Some("error_during_execution")
+        );
+        assert_eq!(
+            startup_error(&json!({"subtype": "success", "is_error": false})),
+            None
+        );
+        assert_eq!(
+            anchor_uuid(&turn_anchor("cffd151b-1a78-4509-882b-5c8460ad0617")),
+            Some("cffd151b-1a78-4509-882b-5c8460ad0617")
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_is_the_proposed_plan() {
+        let input = json!({"plan": "# Plan\n\nCreate hello.txt", "planFilePath": "C:\\p.md"});
+        let started = tool_started_body("ExitPlanMode", &input).unwrap();
+        assert_eq!(
+            started,
+            ItemBody::ProposedPlan {
+                text: "# Plan\n\nCreate hello.txt".into()
+            }
+        );
+        let approved = ToolResult {
+            text: "User has approved your plan.".into(),
+            is_error: false,
+            structured: Some(
+                json!({"plan": "# Plan\n\nCreate hello.txt", "isAgent": false, "filePath": "C:\\p.md"}),
+            ),
+            denied_by_user: false,
+        };
+        assert_eq!(
+            tool_completed("ExitPlanMode", &input, &started, &approved),
+            (started.clone(), ItemStatus::Completed)
+        );
+        let rejected = ToolResult {
+            denied_by_user: true,
+            ..approved
+        };
+        assert_eq!(
+            tool_completed("ExitPlanMode", &input, &started, &rejected).1,
+            ItemStatus::Declined
+        );
     }
 
     #[test]

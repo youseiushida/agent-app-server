@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": -32014,
+    "data": {
+      "kind": "sessionSwitchingCommand"
+    },
+    "message": "example sessionSwitchingCommand"
+  },
+  "id": 99,
+  "jsonrpc": "2.0"
+}

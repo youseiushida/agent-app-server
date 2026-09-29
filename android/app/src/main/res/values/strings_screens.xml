@@ -214,8 +214,8 @@
     <string name="command_stop">エージェントのプロセスを停止する（次の送信で再開）</string>
     <string name="command_resume_queue">一時停止したキューを再開する</string>
     <string name="command_archive">このスレッドをアーカイブする</string>
-    <string name="command_new">同じプロジェクトとハーネスで新しいスレッド</string>
-    <string name="command_status">スレッド ID、コンテキスト使用量、プロセスの状態を表示</string>
+    <string name="command_new">同じプロジェクトとハーネスで新しいスレッド（/clear、/reset も同じ）</string>
+    <string name="command_status">スレッド ID、コンテキスト使用量、プロセスとハーネスの状態を表示</string>
     <string name="command_rename">スレッド名を変更</string>
     <string name="command_pin">スレッドをピン留め</string>
     <string name="command_unpin">スレッドのピン留めを外す</string>

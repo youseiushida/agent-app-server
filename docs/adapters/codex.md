@@ -2,8 +2,8 @@
 
 OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over stdio）を `aas-harness` のポートに対応させる。
 
-- 動作を確認した版: **codex-cli 0.148.0**（Windows 11、2026-09-27。バックグラウンドの作業は 2026-09-28。13章）。
-- 型は `codex app-server generate-ts` / `generate-json-schema` の出力に合わせてある。
+- 動作を確認した版: **codex-cli 0.148.0**（Windows 11、2026-09-27。バックグラウンドの作業は 2026-09-28（13章）。拡張機能（14章）は 2026-09-28 の2回目の記録と、2026-09-29 の実物のテスト）。
+- 型は `codex app-server generate-ts` / `generate-json-schema` の出力に合わせてある（標準と `--experimental` の両方を比べた。experimental なものは 14.10）。
 - 実物の CLI とのやりとりは `crates/aas-adapter-codex/tests/fixtures/` に記録してある。
 
 ## 1. 起動とハンドシェイク
@@ -17,16 +17,20 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 
 1. `initialize { clientInfo: { name: "agent-app-server", title, version }, capabilities: { experimentalApi: true, requestAttestation: false } }` を送り、続けて通知 `initialized` を送る。
    - `experimentalApi` を true にするのは `thread/backgroundTerminals/list` と `…/terminate` のため（13章）。false では app-server が `-32600 "<method> requires experimentalApi capability"` で断る。どのコマンドがターンのあとも動いているかを明示的に知る手段は、この一覧だけ。
-   - true と false の両方で記録を比べた（codex-cli 0.148.0）。違いは true で `thread/settings/updated` が届くこと（無視する）だけで、ほかの通知とサーバからの要求の形は同じ。
-2. スレッドを開く。どちらも `cwd` と、下記の設定からの上書きを付ける。
+   - true と false の両方で記録を比べた（codex-cli 0.148.0）。違いは true で `thread/settings/updated` が届くこと（プランモードと高速モードの報告に使う。14.3、14.4）だけで、ほかの通知とサーバからの要求の形は同じ。
+   - true にすると experimental なパラメータ（`collaborationMode`、`beforeTurnId`。14.10）も使える。
+2. スレッドを開く。どちらも `cwd` と、下記の設定からの上書きを付ける。エンジンは `start_with` で起動し、`StartOptions` の値もここで使う。
    - `StartMode::New` → `thread/start`
    - `Resume` → `thread/resume { threadId }`
-   - `Fork` → `thread/fork { threadId }`
+   - `Fork` → `thread/fork { threadId }`。`StartOptions::fork_at` があれば `lastTurnId` か `beforeTurnId` を付ける（14.1）。`fork_at` を fork 以外に渡されたら、Codex に何も送らずに起動の失敗にする。
+   - 高速モードで始めるとき（`StartOptions::modes.fast`）は `serviceTier` を付ける（14.4）。プランモードは `turn/start` のパラメータなので、最初のターンで送る（14.3）。
 3. `skills/list { cwds: [cwd] }` を送る。結果は `$skill` の補完と入力の変換に使う。失敗したらスキルなしで続ける。
 4. 最初のイベントとして `SessionInfo { model, permissionMode, effort }` を出す。値は Codex が応答で返した実効値。
-5. native session id は Codex のスレッド id（UUIDv7）。fork した場合は新しいスレッドの id になる。
+   - 応答の `serviceTier` が null でなければ `ModesReported { plan: None, fast_state }`（14.4）。プランモードは応答に含まれないので報告しない。
+   - 応答の `thread.name` が空でなければ `SessionTitle`（ほかのプロセスで付いた名前は、開いたときにしか見えない。14.5）。
+5. native session id は Codex のスレッド id（UUIDv7）。fork した場合は新しいスレッドの id になる。動いている app-server の中でスレッドの id が変わることはない（1プロセス1スレッドで、app-server にスレッドを替えるコマンドもない）。
 
-ハンドシェイクの各要求には `policy.handshake_timeout` を適用する。失敗したときはプロセスを段階停止し（design.md §4.3）、stderr の末尾をエラーに含める。
+ハンドシェイクの各要求には `policy.handshake_timeout` を適用する。失敗したときはプロセスを段階停止し（design.md §4.3）、`AdapterPolicy::with_stderr` で stderr の最後の `policy.exit_message_stderr_lines` 行（端末の制御文字を除いたもの）をエラーの文に足す。エラーの種類の前置き（「the harness reported an error: 」）は1回だけで、クライアントに渡る `detail` には付かない（例: `thread/resume: thread <id> already has an active writer`）。
 
 - 起動の直後から `StartGuard` を持つ。ハンドシェイクの途中で呼び出し側が `start` を捨てた場合（起動中のスレッドの停止など）も、別タスクで段階停止する（stdin を閉じる → `stop_grace` 待つ → ツリーごと終了。理由は `abandoned`）。すぐに kill はしない。
 - probe と一覧（`commands`、`list_native_sessions`、`read_native_history`）で起動する一時的な app-server も同じ。要求が取り消されて捨てられても段階停止する。
@@ -35,13 +39,17 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 
 | 操作 | Codex |
 |---|---|
-| `send` | `turn/start { threadId, input, …上書き }`。応答のターン id を実行中のターンとする。応答を待つのは `policy.handshake_timeout` まで（`/compact` の `thread/compact/start`、`/review` の `review/start` も同じ）。エージェントが自分で始めたターン（goal の継続。3章）が動いているあいだは `TurnInProgress` を返す（そのターンの `TurnStarted` はすでに出ている。状態のロックの中で出すので順番が逆にならない）。エンジンはそのターンが終わってから入力を送り直す |
-| `steer` | `turn/steer { threadId, expectedTurnId, input }`。応答を待つのは `policy.handshake_timeout` まで |
+| `send` | `turn/start { threadId, input, …上書き }`。応答のターン id を実行中のターンとし、その印（`TurnAnchor`）を報告する（14.1）。応答を待つのは `policy.handshake_timeout` まで（`/compact` の `thread/compact/start`、`/review` の `review/start`、`/goal` の `thread/goal/*` も同じ）。スレッドのモードと Codex のモードが違うときだけ `collaborationMode`（14.3）と `serviceTier`（14.4）を足す。エージェントが自分で始めたターン（goal の継続。14.6）が動いているあいだは `TurnInProgress` を返す（そのターンの `TurnStarted` はすでに出ている。状態のロックの中で出すので順番が逆にならない）。エンジンはそのターンが終わってから入力を送り直す。横取りするコマンドは6章 |
+| `steer` | `turn/steer { threadId, expectedTurnId, input }`。応答を待つのは `policy.handshake_timeout` まで。`/goal` は steer でも受け付ける（14.6）。ほかの横取りするコマンド（`/compact`、`/review`、`/init`）はそれぞれのターンとして動くので、ターンが動いているあいだはエラーにする（Codex の TUI もタスクの途中では使えない。文としてモデルに送ることはしない） |
 | `interrupt` | `turn/interrupt { threadId, turnId }`。ターンは `turn/completed`（interrupted）で終わる。実行中でなければ何もしない。Codex はターンを実際に止めてから応答するので、`policy.stop_grace` までに応答がなければエラーを返す（エンジンの強制停止は `interrupt_grace` で進む。応答しない app-server にエンジンを待たせない）。止まるのはこのスレッドのターンだけで、バックグラウンドのターミナルとサブエージェントは動き続ける（Codex の動作。13章） |
 | `respond` | サーバからの要求への JSON-RPC 応答（4章）。stdin を読まなくなった app-server への書き込みは `policy.handshake_timeout` で打ち切る |
 | `expire_request` | 既定の実装（`respond` に dismissed を渡す）。エンジンが期限切れにした要求（ターンやタスクの終わり）にも Codex への答え（decline、`{permissions:{}}`、`{answers:{}}`、elicitation の cancel）を返す。Codex がすでに片付けた要求（`serverRequest/resolved`）なら `UnknownRequest` で、何も書かない |
 | `stop_background` | ターミナル: `thread/backgroundTerminals/terminate { threadId, processId }`。サブエージェント: 子の実行中のターンへの `turn/interrupt { threadId: 子, turnId }`。どちらも応答は `policy.handshake_timeout` まで待つ。13.4 |
 | `apply_settings` | 状態を更新するだけ。次の `turn/start` で上書きとして送るので `SettingsApplied::Live` を返す |
+| `apply_modes` | 状態を更新するだけ（プランモードは `collaborationMode`、高速モードは `serviceTier` で、どちらも次の `turn/start` のパラメータ）。`Live` を返す。高速モードを持たないモデルで高速モードを求められたらエラー（14.4） |
+| `rename` | `thread/name/set { threadId, name }`。`policy.handshake_timeout` まで待つ。Codex のエラー（空の名前など）はそのまま返す（14.5） |
+| `status` | 14.7。`account/read` と `account/rateLimits/read` をこの順で送り、あとは Codex が最後に報告した値から作る |
+| `side_question`、`move_to_background` | 既定の実装（`Unsupported`）。Codex の app-server にその手段がない（14章の表） |
 | `shutdown` | 実行中なら `turn/interrupt`（`stop_grace` で打ち切る）→ stdin を閉じる（app-server は EOF で終了する）→ `stop_grace` → ツリーごと終了。2回目以降の呼び出しは1回目の結果を返す。停止を始めたあとのターンの終わりでは、ターミナルの一覧を取らない（プロセスごと終わるので、`Exited` がすべてのタスクを終わらせる） |
 
 - 期限で打ち切った要求は、JSON-RPC の待ち合わせからも外す（遅れて届いた応答は捨てる）。
@@ -56,10 +64,10 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 
 | Codex の通知 | AdapterEvent |
 |---|---|
-| `turn/started` | `TurnStarted`。`turn/start` を送っていないのに届くターンは、Codex の goal の継続（goal が設定されたスレッドがアイドルになるたびに Codex が自分で始める）で、エージェント起点のターンになる |
+| `turn/started` | `TurnStarted`。`turn/start` を送っていないのに届くターンは、Codex の goal の継続（active なゴールのあるスレッドがアイドルになるたびに Codex が自分で始める。14.6）で、エージェント起点のターンになり、`TurnAnchor` を続けて出す。`/goal` の答えを待っているあいだに届いたら、答えのターンを報告し終えるまで待つ。このスレッドのターンが動いているあいだに別の id で届いたもの（inline review のレビュー役のターン。14.9）は、このセッションのターンにしない |
 | `turn/completed` | 開いているコマンドの Item があれば、ターミナルの一覧でバックグラウンドのターミナルを決める（13.2）→ そのタスク → その Item を `Backgrounded` で閉じる → 開いている plan Item を閉じる → `TurnCompleted { status, usage, error, trigger: None }`。status の対応: completed→Completed、interrupted→Interrupted、failed / その他→Failed。Codex がターンを自分で始める理由は goal の継続だけで、それを表す値は `TurnTrigger` にないので `trigger` は付けない |
 | `item/started` / `item/completed` | `ItemStarted` / `ItemCompleted { body: 最終形, status }`（Item の対応は下表）。バックグラウンドのターミナルになったコマンドの遅れた `item/completed` は Item ではなくタスクの終わり（13.2） |
-| `item/agentMessage/delta`、`item/plan/delta` | `ItemDelta { field: text }` |
+| `item/agentMessage/delta`、`item/plan/delta` | `ItemDelta { field: text }`（`item/plan/delta` は plan Item（`ProposedPlan`）の本文。14.3）。inline review のレビュー役のメッセージのものは出さない（14.9） |
 | `item/reasoning/summaryTextDelta`、`item/reasoning/textDelta` | `ItemDelta { field: text }`。Item ごとに最初に届いた種類（summary か content）だけを流し、段落の index が変わったら `\n\n` を挟む |
 | `item/commandExecution/outputDelta` | `ItemDelta { field: output }`。バックグラウンドのターミナルになった Item の出力（ターンのあとも元のターン id で届く）は流さない（Item は閉じている。出力全体は終わりの `result.output` に入る） |
 | `item/fileChange/patchUpdated` | `ItemUpdated`（FileChange） |
@@ -73,6 +81,10 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 | `mcpServer/startupStatus/updated`（failed） | `Notice`（warning、一度だけ）。他の状態は出さない |
 | `serverRequest/resolved` | まだ答えていない要求なら `InteractionWithdrawn`（非ブロッキングの質問が自動で解決したとき、承認を待っているターンが中断されたときなど）。どのスレッドの要求でも同じ（要求の id は接続の中で一意） |
 | `skills/changed` | `skills/list` を取り直して `CommandsChanged` |
+| `thread/settings/updated` | Codex がこれから使う設定。`SessionInfo { model, permissionMode（プリセットに完全に一致するときだけ）, effort }` と `ModesReported { plan: collaborationMode.mode == "plan", fast_state }`（14.3、14.4）。Codex のモードと tier の記録も更新する |
+| `thread/name/updated` | このスレッドのものなら `SessionTitle`（14.5） |
+| `thread/goal/updated`、`thread/goal/cleared` | ゴールの記録。ターンの中で状態が変わったときだけ Notice（14.6） |
+| `account/rateLimits/updated` | 状態のための記録（まばらな更新なので、届いた値だけを前の値に重ねる。14.7） |
 | `thread/started` | このセッションのスレッドの木（自分とサブエージェント）を親に持つスレッドなら、サブエージェントとして登録する（13.3）。codex-cli 0.148.0 はサブエージェントについてこれを出さない |
 | 上記と下の無視リストにないもの | `Native { method, params }` |
 
@@ -83,7 +95,7 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 - 初めて見るスレッドが活動を報告したとき（`active` の状態、ターン、Item、使用量、要求）は `thread/read { threadId, includeTurns: false }` で調べる（13.3）。まだ知らないスレッドの `idle` の状態や名前、終了は何もしない。
 
 ### 意図的に無視する通知
-- スレッドの状態: `thread/goal/*`、`thread/settings/updated`、`thread/queue/changed`、`thread/archived|unarchived|reverted`、`thread/compacted`（contextCompaction Item と重なる）、`thread/environment/*`。このスレッドの `thread/status/changed`、`thread/closed`、`thread/deleted`（上の振り分け）
+- スレッドの状態: `thread/queue/changed`、`thread/archived|unarchived|reverted`、`thread/compacted`（contextCompaction Item と重なる）、`thread/environment/*`。このスレッドの `thread/status/changed`、`thread/closed`、`thread/deleted`（上の振り分け）
 - ターン関連
   - `turn/diff/updated`: 差分はエンジンが git で計算する（design.md §10）。
   - `turn/moderationMetadata`
@@ -91,7 +103,7 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
   - `item/reasoning/summaryPartAdded`: 段落の切れ目は index で判定する。
   - `item/fileChange/outputDelta`: apply_patch の出力。
   - `item/commandExecution/terminalInteraction`
-- その他: `hook/*`、`account/*`、`remoteControl/status/changed`、`app/list/updated`、`fs/changed`、`command/exec/outputDelta`、`process/*`、`model/verification`、`model/safetyBuffering/updated`、`windowsSandbox/setupCompleted`、`externalAgentConfig/*`、`mcpServer/oauthLogin/completed`、`fuzzyFileSearch/*`
+- その他: `hook/*`、`account/updated`、`account/login/completed`、`remoteControl/status/changed`、`app/list/updated`、`fs/changed`、`command/exec/outputDelta`、`process/*`、`model/verification`、`model/safetyBuffering/updated`、`windowsSandbox/setupCompleted`、`externalAgentConfig/*`、`mcpServer/oauthLogin/completed`、`fuzzyFileSearch/*`
 
 ### Item の対応（ThreadItem → ItemBody）
 
@@ -99,7 +111,7 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 |---|---|---|
 | userMessage | （出さない） | ユーザーメッセージの Item はエンジンが作る。steer のメッセージも同じ |
 | agentMessage | AgentMessage | |
-| plan（プランモードの計画本文） | AgentMessage | Markdown の本文。ItemBody::Plan は項目のリスト用なので使わない |
+| plan（プランモードの計画本文） | ProposedPlan | Markdown の本文（`<proposed_plan>` の中身。Codex はそのブロックをエージェントのメッセージから除く）。完了時の本文で置き換える（14.3）。ItemBody::Plan は `turn/plan/updated` の項目のリスト用 |
 | reasoning | Reasoning | summary があればそれを、なければ content を使う（ストリーミング中に選んだ種類を優先） |
 | commandExecution | CommandExecution | command、cwd、aggregatedOutput、exitCode、durationMs。status は inProgress / completed / failed / declined |
 | fileChange | FileChange | パスは cwd からの相対（`/` 区切り）に直す。add は内容全体を、delete は削除された内容を unified diff の hunk に変換する。update は diff をそのまま使う。追加行と削除行を数える |
@@ -110,8 +122,9 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 | webSearch | ToolCall（search。openPage / findInPage なら fetch） | |
 | imageView | ToolCall（read） | |
 | sleep、imageGeneration | ToolCall（other） | |
-| enteredReviewMode | Notice（info、`reviewStarted`） | |
-| exitedReviewMode | AgentMessage | review の本文がレビュー結果 |
+| enteredReviewMode | Notice（info、`reviewStarted`） | このあと exitedReviewMode まではレビュー役の出力（14.9） |
+| レビュー中の agentMessage | （出さない） | レビュー役の JSON（Codex のレビューの出力形式）。Codex 自身が表示用の文にして、exitedReviewMode のあとの agentMessage で送る（14.9） |
+| exitedReviewMode | 動いているターン: Notice（info、`reviewFinished`、「Review finished」）。取り込んだ履歴: AgentMessage（review の本文） | 動いているターンではレビュー結果が続く agentMessage で届く。`thread/read` にはその agentMessage がなく、この Item の本文だけが結果を持つ |
 | contextCompaction | Notice（info、`contextCompacted`） | |
 | hookPrompt | Notice（info、`hookPrompt`） | |
 | 未知の type | `Native`（item/started のとき） | |
@@ -191,6 +204,8 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 | model | `thread/start|resume|fork` と、毎回の `turn/start` の `model` |
 | effort | `turn/start` の `effort`（スレッドを開くパラメータに effort はない） |
 | permissionMode | プリセット（下表）。スレッドを開くときは `approvalPolicy`、`approvalsReviewer`、`sandbox`（モード）で送る。`turn/start` では、Codex 側で有効なプリセットと違うときだけ `approvalPolicy`、`approvalsReviewer`、`sandboxPolicy` を送る |
+| modes.plan | `turn/start` の `collaborationMode`（14.3） |
+| modes.fast | 起動時は `serviceTier`、以降は `turn/start` の `serviceTier`（14.4） |
 
 `turn/start` の `sandboxPolicy` はオブジェクトで、`config.toml` の細かい sandbox 設定（ネットワークなど）を上書きしてしまう。そのため、変更があったときだけ送る。
 
@@ -217,25 +232,30 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
   - ターンのテキスト全体がちょうど `/compact` のとき、`thread/compact/start` を呼ぶ。コンパクションはターンとして流れる（turn/started → contextCompaction）。
 - `review`
   - `/review [instructions]` を挿入する。
-  - ターンのテキスト全体が `/review` なら `review/start { target: uncommittedChanges, delivery: inline }` を呼ぶ。引数があれば `target: {type:"custom", instructions}` にする。
+  - ターンのテキスト全体が `/review` なら `review/start { target: uncommittedChanges, delivery: inline }` を呼ぶ。引数があれば `target: {type:"custom", instructions}` にする（14.9）。
+- `init`（説明は TUI の「create an AGENTS.md file with instructions for Codex」）
+  - `/init` を挿入する。
+  - ターンのテキスト全体がちょうど `/init` のとき、Codex の TUI が送るのと同じプロンプト（14.8）を入力にした `turn/start` を送る。ユーザーメッセージの Item はエンジンが作るので `/init` のまま見える。引数付きは通常のメッセージ。
+- `goal`（説明は TUI の「set or view the goal for a long-running task」）
+  - `/goal ` を挿入する。引数は TUI と同じ `[<objective>|clear|edit|pause|resume]`（14.6）。
 - スキル
   - `skills/list` の enabled なスキルを、名前はそのまま、動作は `$<name> ` の挿入として出す。
   - description は shortDescription があればそれ、なければ description。
 - 横取りするのは、単一のテキストで上の完全一致のときだけ。画像やメンションが付いていたり、`/compact now` のように余計な文字があったりすれば、通常のメッセージとして送る。
 - 一覧の取得には、動いているセッションの app-server があればそれを使い、なければ一時的な app-server を state_dir で起動して使う。
 - セッションを切り替えるコマンドはない（`session_switching_commands` は空。design.md 9.5）。上のどれも同じ Codex thread で動く。Codex のセッション操作（`/new`、`/resume`、`/fork`）はクライアントの機能で、app-server はコマンドとして出さない。スキルの名前が `resume` の場合だけは、エンジンがどのハーネスでも `resume` を出さないので一覧から消える（入力欄に `$resume` と打てば使える）。
+- アプリ自身のコマンドと重なる TUI のコマンドは、アプリのものとして動く（design.md 9.5）: `/status`（`thread/harnessStatus`。14.7）、`/plan`（`modes.plan`。14.3）、`/rename`（14.5）、`/new`。TUI の `/fast` はスレッドの高速モード（14.4）、`/fork` はアプリの途中のターンからの fork（14.1）が受け持つ。
 
 ### 公開していない Codex のコマンド
 `codex app-server generate-ts`（0.148.0）の `ClientRequest` にある、チャットに関わるメソッドのうち次のものはコマンドにしていない。
 
 | メソッド（TUI のコマンド） | 理由 |
 |---|---|
-| `thread/goal/set|get|clear`（`/goal`） | design.md の範囲外（スレッドのゴール） |
 | `mcpServerStatus/list`（`/mcp`） | design.md の範囲外（MCP サーバの状態表示） |
-| `thread/rollback`（ターンの取り消し） | ファイルは戻らず会話だけが巻き戻るため、git の書き込み操作と同じく範囲外（design.md §1） |
+| `thread/rollback`（ターンの取り消し）、`thread/revert` | ファイルは戻らず会話だけが巻き戻る（`thread/revert` は experimental）。会話は途中のターンからの fork（14.1）で分け直せる。ファイルの巻き戻しは design.md の範囲外 |
 | `thread/shellCommand`（`!` によるシェル） | ユーザーが直接実行するシェルは範囲外（チャットごとのターミナルと同じ扱い） |
-| `thread/name/set` | スレッドの名前は daemon が持つ（`thread/update`）。Codex が付けた名前は `thread/name/updated` で受け取る |
-| `/init` | Codex では AGENTS.md を作る指示のプロンプトで、プロトコルのメソッドではない。アプリが送る（docs/ux/codex-desktop.md） |
+| `review/start` の `baseBranch` / `commit`（TUI のレビュー対象の選択） | design.md の範囲外（対象を選ぶ画面）。未コミットの変更と、文で書いた指示（`custom`）で扱う |
+| `thread/approveGuardianDeniedAction`（`/approve`） | design.md の範囲外（自動レビューの拒否の表示と覆すこと） |
 
 ## 7. ネイティブセッション
 - `list_native_sessions(cwd)`
@@ -246,6 +266,7 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 - `read_native_history(cwd, id)`
   - `thread/read { threadId, includeTurns: true }` を呼ぶ。
   - ターンごとに Item を 3章の表で変換する。userMessage も含め、テキストとメンションを使う。画像は blob に移せないので `[image]` と書く。
+- `read_native_history_anchored(cwd, id)`: 同じ履歴と、各ターンの印（ターンの id。14.1）。取り込んだスレッドも途中のターンから fork できる。
 
 ## 8. probe
 1. 実行ファイルを解決する。
@@ -253,6 +274,8 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 3. 一時的な app-server で `model/list` を取得する。
 
 どこかで失敗したら `HarnessInfo::unavailable(理由)` を返す。capabilities はすべて true（interrupt、steer、approvals、questions、resume、fork、images、modelSwitchLive、nativeSessions、backgroundTasks、backgroundStop）。
+
+`model/list` からは、各モデルの高速モードの tier と既定のモデルも覚える。`features()`（エンジンが probe のたびに読む）の `fastModeModels` と、起動するセッションの高速モードに使う（14.4）。
 
 ## 9. オプション（`[[harness]] options`）
 | キー | 既定 | 下限 | 意味 |
@@ -262,7 +285,7 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
 - ほかのアダプタと同じく厳密に解析する。知らないキー（綴りの誤り、`native_session_list_limit` のような別のアダプタの書き方）、型の違う値、下限より小さい値は設定の誤りとして扱い、ハーネスを使えない（`unavailable`、理由は解析のエラー）にする。CLI を使う呼び出し（`start`、`commands`、`list_native_sessions`、`read_native_history`）も同じ理由で失敗する。黙って既定値で動かすと、設定が効いていないことに気づけないため。
 
 ## 10. テスト
-- 単体テスト 39件（対応表、承認、質問、使用量とコンテキスト、パス、設定、オプションの解析、バックグラウンドの作業の帳簿（`src/background.rs`）: ターンの終わりと一覧、遅れた終わりと停止、一覧の取り直し、サブエージェントの実行・使用量・進捗、孫、閉じたスレッド）。
+- 単体テスト 46件（対応表、承認、質問、使用量とコンテキスト、パス、設定、オプションの解析、バックグラウンドの作業の帳簿（`src/background.rs`）: ターンの終わりと一覧、遅れた終わりと停止、一覧の取り直し、サブエージェントの実行・使用量・進捗、孫、閉じたスレッド。拡張機能: `/init` と `/goal` の形、高速モードの tier（記録した bundled catalog）、collaborationMode のパラメータ、plan Item の対応、状態の文（数、時間、記録したレート制限、アカウント）、Codex 自身の文面、履歴の印）。
 - 再生テスト 16件（`tests/replay.rs`。どの記録も `initialize` の `experimentalApi: true` を照合する）:
   - 通常のターン（使用量とコンテキスト `12428 / 996147`）
   - 承認（許可 / 拒否）
@@ -275,6 +298,18 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
   - ファイル変更の承認
   - ターン開始前と実行中の shutdown
   - ネイティブセッションの一覧（`native_list_*.jsonl`。観察した形から作った台本）: rollout ごとの重複を1件にまとめ、最新の `updatedAt` を並び順によらず取ること、上限を異なるスレッドの数で数えて次のページを読むこと（ページの境目で同じスレッドが分かれる場合も含む）
+- 拡張機能の再生テスト 17件（`tests/features.rs`。2回目の記録から作ったスクリプト。作り方と加工は `tests/fixtures/README.md`。`"$absent"` で「そのパラメータを送らないこと」も照合する）:
+  - プランモード（`plan_mode.jsonl`）: 最初のターンに `collaborationMode { mode: "plan", … }`、`ModesReported { plan: true }`、plan Item が `ProposedPlan`（delta と完了時の本文）、ブロックを除いたメッセージ、印。次のターンはモードを送らない。`apply_modes` で切ると "Implement the plan." を default モードで送り、最上位の `effort` を送らない。
+  - resume のあとのプランモード（`resume_plan.jsonl`）: 最初のターンでモードを明示する。
+  - 途中のターンからの fork（`fork_at_turn.jsonl`、`fork_before_turn.jsonl`、`fork_unknown_turn.jsonl`）: `lastTurnId` / `beforeTurnId`（もう一方を送らない）、fork のスレッド id、fork の最初のターンの default モード、Codex が断った fork の文、印でない値は Codex に聞く前に断ること。
+  - ほかの app-server が書き込み中のスレッド（`resume_active_writer.jsonl`）: `detail` が Codex の文そのもの（前置きは1回）。`resume_named.jsonl`: 開いたときの名前が `SessionTitle` になる。
+  - 名前（`rename.jsonl`）: `thread/name/set`、エコーの `SessionTitle`（空白を除いた名前）、空の名前のエラー。
+  - `/init`（`init_command.jsonl`）: 入力が、インストールされた Codex のバイナリから取り出したプロンプトと一致すること。
+  - inline review（`review_inline.jsonl`、`review_interrupt.jsonl`）: レビュー役のターンと JSON を出さないこと、印はレビューのターン、「Review started」「Review finished」の Notice、表示用の結果、中断はレビューのターンに届くこと。
+  - 高速モードと状態（`service_tier.jsonl`）: 起動時の `serviceTier`、`fast_state` の「Fast」、ターンで送らないこと、状態の節（スレッド、アカウント、ロールしてきたレート制限）、切ると `serviceTier: null` と「default」、高速モードのないモデルで断ること。
+  - 動いている継続のターンへの `/goal`（`goal_steer.jsonl`、記録 goal3）: steer の `/goal pause` の答えがそのターンの Notice になり、ターンの終わりより前に出ること、ほかのコマンドの steer を断ること、`/goal clear` も同じ。
+  - ゴール（`goal.jsonl`）: `/goal`、`/goal clear`、ゴールがないときの `/goal pause` の Codex のエラー、形の誤りは Codex に聞かずに断ること、`/goal <objective>` のターンが継続のターンより先に終わること、継続のターンの印、集計の更新では Notice を出さないこと、継続の中断でゴールが一時停止されること（`turn/interrupt` の前の `thread/goal/set paused`、そのターンの「Goal paused」の Notice）と、Codex が一時停止を断ったときの warning の Notice（`goalNotPaused`。同じ記録の答えをエラーに替えたもの）、`/goal` の要約、`/goal resume` と、モデルが完了させたときの「Goal complete」の Notice、状態のゴールの節。
+  - features の値と、取り込んだ履歴の印。
 - `crates/aas-testkit/tests/adapter_start_cancel.rs`: ハンドシェイクに答えないプロセスに対して、`start` と `commands`（一時的な app-server）を途中で捨てると、`stop_grace` が過ぎるまでプロセスが残り、そのあと終了すること（段階停止であって即時の kill ではないこと）。
 - バックグラウンドの作業の再生テスト 6件（`tests/background.rs`。`bg_*.jsonl`。記録の方法と加工は `tests/fixtures/README.md`）:
   - ターンを越えるコマンド: タスク → `Backgrounded` → `TurnCompleted` の順、タイトルは一覧のコマンド、別のターンと中断のあいだも動き続けること、停止（`stopped`、-1 と出力と所要時間）、自然な終わり（`completed`、0 と出力）、ターンのあとの出力を Item に流さないこと、終わったタスクや知らないタスクは止められないこと
@@ -290,6 +325,8 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
     - 動いているセッションを使った commands、list、history
     - shutdown のあとに監督下のプロセスが0個になること
   - `live_codex_background_work`: インストールされた app-server を、台本のモデル（`tests/mock_model`。127.0.0.1 の Responses API。Codex 自身の結合テストと同じ手法）と一時的な `CODEX_HOME` で動かす。**トークンを使わず**、利用者の Codex の設定・認証・セッションを読み書きしない。確認すること: 2つのコマンドがターンを越えて `Backgrounded` とタスクになること、一方を止めて `stopped`、もう一方が自分で終わって `completed`（終了コード 0、出力）、v2 のサブエージェント（タイトル `/root/worker`）の進捗、停止、そのコマンドが子のターミナル（`parent_key`）として残り、止められること、`Native` が出ないこと、shutdown のあとに監督下のプロセスが0個になること。codex-cli 0.148.0 で通ることを確かめた（2026-09-28、約45秒）。
+- `live_codex_features`（`tests/live.rs`）: 同じ台本のモデルと一時的な `CODEX_HOME`（**トークンを使わない**）。確かめること: probe で bundled catalog の高速モード（`gpt-5.6-sol` など）、プランモードと高速モードで始めたスレッドの最初のターン（モデルへの要求に Plan Mode の指示と `service_tier: "priority"`）、`ProposedPlan` の本文、実装（default モード、`service_tier` なし、入力が "Implement the plan."）、名前のエコー、`/init`（入力が Codex のプロンプト）、inline review（表示用の結果だけ、「Review finished」）、状態の節、`/goal` と継続のターンでのモデルの `update_goal` による「Goal complete」、長いコマンドを待つ継続のターンの中断でゴールが paused になること（そのターンの「Goal paused」の Notice と状態の節）、2つ目の app-server からの resume が「already has an active writer」で断られ、同じスレッドの途中のターンからの fork（`lastTurnId` と `beforeTurnId`）は通り、その最初のターンで default モードを明示すること、取り込んだ履歴の印が動いていたターンの印と同じこと、`Native` が出ないこと、プロセスが残らないこと。codex-cli 0.148.0 で通ることを確かめた（2026-09-29、約11秒）。
+- `live_codex_texts_match_the_installed_binary`（`tests/live.rs`）: 14.8 の文面がインストールされた Codex のバイナリにそのままあること（Windows 版は CRLF）。プロセスは起動しない。0.148.0 で通ることを確かめた（2026-09-29）。
 - エンジンと組み合わせた実物のテスト（`tests/live_engine.rs`、`AAS_LIVE_TESTS=1 cargo test -p aas-adapter-codex --test live_engine -- --ignored`）。同じ台本のモデルで、エンジン（`aas-core`）とこのアダプタを組み合わせる。確認すること: ターンの終わりに2つのタスクが `running`、起動した Item が `backgrounded` でタスクを指すこと、`Thread.background.running` が 2、アイドルの待ち時間（1秒）の4倍待ってもプロセスが残ること（D1）、`backgroundTask/stop` で `stopped`（`endReason: harness`、-1）、もう一方が `completed`、どちらも終わるとアイドル回収でプロセスがなくなること。codex-cli 0.148.0 で通ることを確かめた（2026-09-28、約49秒）。
 
 - Windows のサンドボックスと Job Object（`crates/aas-testkit/tests/codex_sandbox.rs`、`AAS_LIVE_TESTS=1 cargo test -p aas-testkit --test codex_sandbox -- --ignored`）。**モデルのトークンは使わない**（`codex sandbox` はコマンドを Codex のサンドボックスで動かすだけで、モデルとは通信しない）。12章。
@@ -303,6 +340,9 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
   - 未知の通知は `Native` として素通しし、未知の Item 型は `Native` にするので、壊れずに劣化するだけで済む。
 - 1スレッドにつき1プロセスなので、Codex の app-server の、1プロセスで複数スレッドを扱う機能や、複数のクライアントが接続する機能は使わない。サブエージェントのスレッドは、Codex が同じプロセスの中で自分で作るもので、13章で扱う。
 - バックグラウンドの作業の制約は 13.6。
+- **inline review の履歴**: `thread/read` はレビューのターンを `[enteredReviewMode, exitedReviewMode]` として返し、そのあとにレビュー役のターン（interrupted、userMessage 2つと表示用の結果の agentMessage）を別のターンとして返す（codex-cli 0.148.0。14.9）。取り込むとこの形のまま2つのターンになる（レビュー役のターンを見分ける明示的な印がない）。
+- **レビュー役のスレッド**: inline review でも Codex はレビュー役を `source: {subAgent: "review"}` の別のスレッドとして保存し、親を消しても残す。既定の `thread/list` には出ないので、取り込みの一覧にも出ない。
+- **Codex desktop が開いているスレッド**: Codex は1つのスレッドに書き込めるプロセスを1つに限る（14.2）。desktop がそのスレッドを離すまで、スマホからは続けられない（fork はできる）。
 
 ## 12. Windows のサンドボックスと Job Object
 
@@ -396,3 +436,155 @@ Codex には「活動ではない」印の付いた作業はないので、`ambi
 - **一覧と終わりの間**: プロセスが終わってから `item/completed` が届くまでに、Codex は約 100 ミリ秒以上の出力の待ち合わせをする。その間にターンが終わって一覧を取ると、そのコマンドは一覧に載らず、エンジンがターンとともに閉じる（終了コードは付かない）。遅れて届いた完了は出さない。
 - **experimental API**: `thread/backgroundTerminals/*` は experimental。形が変わったら 13.2 の表と記録を更新する。一覧を断る Codex では 13.2 の最後のとおり今までの動作になる。
 - **予約した起床（D5）**: codex-cli 0.148.0 には、エージェントが自分の起床を予約する仕組み（durable sleep）を有効にするコードがない（ソースで確認）。goal の継続は、スレッドがアイドルになるたびに Codex がすぐにターンを始めるもので、予約ではない。`scheduled` のタスクは出さない。
+
+## 14. 拡張機能（`HarnessFeatures`。design.md §9.6）
+
+- 確かめた版: codex-cli 0.148.0。2回目の記録（2026-09-28。台本のモデル（Responses API）と一時的な `CODEX_HOME`。app-server とその動作は本物）と、実物のテスト `live_codex_features`（2026-09-29）。
+- 状態は Codex の明示的なシグナルからだけ作る: ターン id、`thread/settings/updated`、plan Item、`thread/goal/*`、`thread/name/updated`、`enteredReviewMode` / `exitedReviewMode`、要求の応答。
+
+| feature | 値 | 理由 |
+|---|---|---|
+| `forkAtTurn` | true | `thread/fork { lastTurnId \| beforeTurnId }`（14.1） |
+| `forkWhileHeld` | true | ほかの app-server が書き込み中のスレッドも `thread/fork` はできる（14.2） |
+| `rename` | true | `thread/name/set`（14.5） |
+| `status` | true | 14.7 |
+| `planMode` | `{ implementPrompt: "Implement the plan.", newThreadPreamble: "A previous agent produced the plan below …" }` | collaborationMode（14.3）。文面は Codex 自身のもの（14.8） |
+| `fastModeModels` | `model/list` の `serviceTiers` がちょうど1つのモデル | 14.4 |
+| `sideQuestion` | false | app-server に会話に入らない質問の手段がない（TUI の side conversation は、一時的な fork を作るクライアントの機能） |
+| `moveToBackground` | false | 動いているコマンドをバックグラウンドへ移す要求がない（ターンを越えるコマンドは Codex が自分でバックグラウンドのターミナルにする。13章） |
+| `projectTrust` | false | Codex のプロジェクトの信頼は `config.toml` の `projects.<path>.trust_level` で、app-server から聞く手段も渡す手段もない |
+
+### 14.1 途中のターンからの fork
+
+- **印**（`TurnAnchor`）: `{"turnId": "<ターン id>"}`。ターン id は `turn/start` の応答、`turn/started`、Item の通知、`turn/completed`、`thread/read` で同じで、fork でも変わらない（fork の fork も元のターン id で分けられた。記録 fork）。Item の id は `thread/read` で `item-1…` に変わるので使わない。
+- **報告のタイミング**（どのターンも `TurnCompleted` より前に1回）:
+  - `turn/start` と `review/start` の応答（inline review には `turn/started` がない）。
+  - Codex が自分で始めたターン（goal の継続）と `/compact` のターン（応答が `{}`）は `turn/started`。
+  - 応答を処理する前にターンが終わったとき（再生や非常に短いターン）は、そのターンの `turn/completed` の id。
+- **fork**（`StartMode::Fork` と `StartOptions::fork_at`）:
+  - `before: false` → `thread/fork { threadId, lastTurnId: <id> }`（そのターンまで）。
+  - `before: true` → `thread/fork { threadId, beforeTurnId: <id> }`（そのターンの前まで。experimental API）。
+  - `previous` は使わない（Codex はターン id だけで分けられる）。印でない値は Codex に聞く前に起動の失敗にする。
+- 記録の結果（ソース S のターン T1〜T3）:
+
+  | 要求 | 結果 |
+  |---|---|
+  | `lastTurnId` T2 | T1、T2（同じ id）。次のターンでモデルに渡る履歴もそこまで |
+  | `beforeTurnId` T2 | T1 |
+  | `beforeTurnId` T1 | 空のスレッド（エンジンはこれを求めない。新しいセッションにする） |
+  | 両方 | `-32600 "`beforeTurnId` cannot be combined with `lastTurnId`"`（送らない） |
+  | 知らない id | `-32600 "lastTurnId '<id>' was not found in the source thread"`。起動の失敗としてそのまま返す |
+  | 動いているターンの `lastTurnId` | `"… identifies an in-progress turn"`（`beforeTurnId` は通る） |
+
+- fork の応答のあと、`thread/tokenUsage/updated`（コピーした最後のターンの id）と `thread/started` が届く。前者は使用量の基準を更新するだけ、後者はこのスレッド自身の通知として扱わず、どちらもターンにはならない。
+- **取り込み**: `read_native_history_anchored` は `thread/read` の各ターンの id を印にする。
+
+### 14.2 ほかのプロセスが書き込み中のスレッド
+
+- 同じ `CODEX_HOME` のほかの app-server（Codex desktop を含む）がスレッドを読み込んでいると、`thread/resume` は `-32600 "thread <id> already has an active writer"` で断られる（アイドルでもターンの途中でも。lock は `<CODEX_HOME>/thread-writer-locks`）。エラーの種類は文でしか分からない（コードは汎用の -32600）ので分類しない。エンジンは resume の失敗を `Turn.error.kind = "resumeFailed"` にし、アプリは「再試行」と「新しいスレッドに分岐」を出す。
+- `thread/fork` は lock に関係なく通り、途中のターンの `lastTurnId` も使える（記録 writer。書き込み中のターンは fork に `interrupted` として入る）。→ `forkWhileHeld`。
+- 再試行が通るのは、持っているプロセスが終わったとき、またはアイドルで購読のないスレッドを Codex がアンロードしたとき（Codex のソースの `THREAD_UNLOADING_DELAY` = 30 分。`thread/unsubscribe` だけでは離さない）。
+
+### 14.3 プランモード（collaborationMode）
+
+- `turn/start` の `collaborationMode { mode: "plan" | "default", settings: { model, reasoning_effort, developer_instructions: null } }`（experimental。`developer_instructions: null` は Codex に組み込まれたそのモードの文）。
+  - `model`: スレッドのモデル、なければ Codex が報告したモデル。
+  - `reasoning_effort`: スレッドの effort、なければ Codex が報告した effort。モードのプリセットの effort（plan は `medium`）は使わない。送った値がそのままスレッドの effort になり、`medium` はモデルの一覧になくても通ってしまう（記録 planeffort）。
+  - モードといっしょに送った最上位の `effort` は無視される（Codex の説明でも mode が model・effort より優先）ので、モードを送るターンでは最上位の `effort` を送らない。
+- **送る条件**: Codex のモードとスレッドのモード（`StartOptions::modes`、`apply_modes`）が違うときだけ。Codex はモードを保持する（送らないターンも plan のまま。`thread/settings/updated` は変わったときだけ届く）。
+  - 新しいスレッド: default とみなす。
+  - resume と fork のあと: Codex はモードを戻さない（記録 planresume: 空の `<collaboration_mode>` がモデルに渡り、履歴の最後のモードの指示が残る。応答にもモードの欄がない）。最初のターンで plan か default を必ず明示する。
+- **報告**: `thread/settings/updated.threadSettings.collaborationMode.mode` → `ModesReported { plan: mode == "plan" }`。エンジンは `modes.plan` をこれに合わせる（design.md 5.5）。
+- **計画の Item**: plan モードでモデルの出力に `<proposed_plan>…</proposed_plan>` があると、Codex はその中身を plan Item（id は `<turnId>-plan`）にし、`item/plan/delta` で流し、エージェントのメッセージからはブロックを除く。`ItemBody::ProposedPlan`（delta で追記し、`item/completed` の本文で置き換える。`item/plan/delta` は EXPERIMENTAL と明記され、連結が完成形と一致するとは限らない）。`turn/completed` の `turn.items`（summary）には計画が入らないが、使わない。
+- plan モードの質問（`request_user_input`、`isOther: true` は Codex が付ける）は4章のとおり。
+- **実装する**: アプリがプランモードを切り（`apply_modes`）、`PlanModeFeature.implementPrompt` を送る → `collaborationMode { mode: "default", … }` 付きの "Implement the plan."。Codex の TUI の「Yes, implement this plan」と同じ（モデルに「You are now in Default mode…」の指示が渡る）。
+- **新しいスレッドで実装**: アプリが新しいスレッドを作り、`newThreadPreamble` + `"\n\n"` + 計画の本文を最初の入力にする（TUI の「Yes, clear context and implement」と同じ）。新しいスレッドは default モード。
+
+### 14.4 高速モード（serviceTier）
+
+- `model/list` の各モデルの `serviceTiers`（`{id, name, description}`）。codex-cli 0.148.0:
+  - bundled catalog: gpt-5.6-sol / terra / luna、gpt-5.5 は `[{id: "priority", name: "Fast", description: "1.5x speed, increased usage"}]`、gpt-5.2 は `[]`（非推奨の `additionalSpeedTiers` は `["fast"]` / `[]`）。
+  - 利用者の DeepSeek のモデルは `[]`（高速モードは出ない）。
+- **高速モードのあるモデル**: `serviceTiers` をちょうど1つ挙げるモデル。その tier が高速モード（TUI の「Fast mode」）。複数を挙げるモデルでは、どれが高速かが明示されない（名前の文で選ぶのは人向けの文を読むことになる）ので出さない。
+- **送り方**:
+  - 起動時に高速モードなら `thread/start|resume|fork` の `serviceTier: <id>`（スレッドにモデルがなければ Codex の既定のモデルの tier）。
+  - 以降は `turn/start` の `serviceTier`。Codex の tier（開いたときの応答と `thread/settings/updated`）と違うときだけ送る。切るときは `null`。消すのは高速モードの tier のときだけ（`config.toml` の `service_tier` は残す）。
+  - Codex は tier を保持し、知らない tier もエラーにせずモデルへの要求から落とす（記録 tiers）。
+- **状態**（`Thread.fastModeState`、`ModesReported.fast_state`）: 開いたときの応答の `serviceTier` と `thread/settings/updated` の値。高速モードの tier なら Codex の名前（`Fast`）、それ以外は Codex の値そのまま（切ったあとは `default`）。
+- 高速モードを持たないモデルで `apply_modes { fast: true }` はエラー（エンジンは `fastModeModels` のモデルでしか求めない）。
+
+### 14.5 名前
+
+- `rename` → `thread/name/set { threadId, name }` → `{}`。同じ接続に `thread/name/updated { threadName }` のエコーが届き、`SessionTitle` になる（利用者のタイトルは変わらない。design.md 5.5）。Codex は前後の空白を除く。空白だけ・空の名前は `-32600 "thread name must not be empty"`。最初のターンの前でも付けられる。
+- ほかのプロセスでの名前の変更は、このプロセスには通知されない（記録 writer）。スレッドを開いたときの応答の `thread.name` を `SessionTitle` で報告する（resume と取り込みで見える）。fork は名前を引き継ぐ。
+- Codex は自分で名前を付けない（記録では `thread/name/updated` は名前を付けたときだけ）。
+
+### 14.6 ゴール（`/goal`）
+
+| 入力 | 要求 | 答え（Notice、code `goal`） |
+|---|---|---|
+| `/goal` | `thread/goal/get` | `Goal <状態>: <objective> (<tokens> tokens, <時間> used[, budget <n>])`、なければ「No goal is currently set.」（TUI の文） |
+| `/goal <objective>` | `thread/goal/set { objective, status: "active" }` | `Goal active: <objective>`。ゴールがあれば目的を置き換えて active にする（使ったトークンと時間は引き継ぐ。0 から始めるには先に `/goal clear`） |
+| `/goal edit <objective>` | `thread/goal/set { objective }` | 目的だけを変え、状態はそのまま |
+| `/goal pause` | `thread/goal/set { status: "paused" }` | `Goal paused: …`。ゴールがなければ Codex のエラー（`cannot update goal for thread <id>: no goal exists`）でターンが失敗する |
+| `/goal resume` | `thread/goal/set { status: "active" }` | `Goal active: …` |
+| `/goal clear` | `thread/goal/clear` | `Goal cleared`、なければ「This thread does not currently have a goal.」（TUI の文） |
+
+- **ターンが動いているあいだ**（steer として届く）も `/goal` を受け付ける。答えはそのターンの Notice（そのターンの `TurnCompleted` は答えのあとに出す）。Codex は pause と clear で動いている継続のターンを止めず、それが終わると次を始めない（記録 goal3）。継続が続くあいだに送った `/goal pause` がキューで待たされ続けないように、アプリはこの経路を使える。
+- 使い方の形（TUI の `Usage: /goal [<objective>|clear|edit|pause|resume]`）に合わない入力（`/goal edit` だけ、`/goal clear now` など）は、Codex に聞かずにエラーにする。最初の語がちょうど `clear` / `edit` / `pause` / `resume` のときだけ下位のコマンドで、ほかは目的の文。
+- **コマンドは Codex のターンではない**: 応答が届いたら、アダプタが1つのターンとして報告する（`TurnStarted` → 答えの Notice → `TurnCompleted`）。印はない（fork できない）。
+- **継続のターン**: active なゴールがあると、Codex はスレッドがアイドルになるたびに自分でターンを始める（`turn/start` なしの `turn/started`。入力の Item はなく、モデルには隠れたユーザー入力 `<codex_internal_context source="goal">…` が渡る）。エージェント起点のターンとして記録する（印あり、`trigger` なし）。
+  - `/goal` の応答より先に継続の `turn/started` を処理しない（コマンドのターンを報告し終えるまで、最大 `policy.handshake_timeout` 待つ）。記録では継続は応答の約 60 ミリ秒後に始まる。
+  - **ゴールが active のあいだのターンの中断**: Codex の TUI と同じく、アダプタはゴールも一時停止する（TUI の `pause_active_goal_for_interrupt`: ターンが動いていてゴールが active なら、中断と一緒に `SetThreadGoalStatus Paused` を送る）。`turn/interrupt` の前に `thread/goal/set { threadId, status: "paused" }` を書き、両方を同じ `stop_grace` の中で待つ（中断の結果を返す）。答え（paused のゴール）は中断したターンの Notice（code `goalUpdated`、「Goal paused: <objective>」）になり、steer の `/goal` と同じく、そのターンの `TurnCompleted` は答えのあとに出す。一時停止に失敗したら warning の Notice（code `goalNotPaused`。Codex は次のターンのあとに継続を再開するので `/goal pause` を案内する）。一時停止しないと、Codex はゴールを active のまま残し、次のユーザーのターンのあとに継続を自分で再開する（記録 goal: 中断したターンの直後の `thread/goal/updated` は active のまま）。再開は `/goal resume`。
+- **通知**:
+  - `thread/goal/updated`: ゴールの記録を更新する。`turnId` 付き（ターンの中の変化: モデルの `update_goal`、上限）で状態が変わったときだけ Notice（code `goalUpdated`。complete / active / paused は info、blocked / usageLimited / budgetLimited は warning）。毎ターンの終わりの集計（状態は同じ）と、`turnId` のないもの（クライアントの要求の答え、resume のときの状態の通知）は Notice にしない。
+  - `thread/goal/cleared`: 記録を消す。
+- ゴールの機能は codex-cli 0.148.0 で `features.goals`（stable、既定で有効）。
+
+### 14.7 ハーネスの状態（`thread/harnessStatus`）
+
+節と行はアダプタが Codex の値から作る（英語。アプリはそのまま表示する）。
+
+| 節 | 行 | 値の出どころ |
+|---|---|---|
+| Codex thread | Thread、Model、Reasoning effort（なければ「model default」）、Collaboration mode（分かっているとき）、Service tier、Permissions、Context window、Tokens used | Codex が報告した最新の値（開いたときの応答、`thread/settings/updated`、`thread/tokenUsage/updated`）。セッションがあるときだけ |
+| Goal | Objective、Status、Tokens used、Time used、Token budget | ゴールの記録（14.6）。ゴールがあるときだけ |
+| Account | Signed in with / Email / Plan、または Sign-in | `account/read { refreshToken: false }`。アカウントがなく `requiresOpenaiAuth: false` なら「not required by the configured model provider」 |
+| Rate limits | Primary limit / Secondary limit（「13% used · 5h window · resets in 58m」）、Credits、Plan、Limit reached | `account/rateLimits/read`（パラメータなし）。断られたら、モデルの呼び出しのたびに届く `account/rateLimits/updated`（まばらな更新を重ねたもの）。どちらもなければ Codex の断りの文 |
+
+- OpenAI にサインインしていないと、`account/rateLimits/read` は `-32600 "codex account authentication required to read rate limits"`（利用者の環境でも同じ。記録 account-realhome）。Codex の rate limit のヘッダを返さないプロバイダ（利用者の DeepSeek）では `account/rateLimits/updated` の値もすべて null なので、行は「Not available: <Codex の文>」になる。
+- セッションがないとき（`HarnessAdapter::status`）は、動いているセッションの app-server か一時的な app-server で Account と Rate limits だけを返す。
+- 「resets in」は `resetsAt`（Unix 秒）と今の時刻の差（推定ではない）。
+
+### 14.8 Codex 自身の文面（版の固定）
+
+- アダプタが Codex の代わりに送る文は、Codex の TUI が送る文そのもの。app-server のプロトコルにはなく、TUI のバイナリに埋め込まれている。`src/texts.rs` に固定し、版を `CODEX_TEXTS_VERSION`（0.148.0）として持つ。
+  - `INIT_PROMPT`: `/init` のプロンプト（`codex-rs/tui/prompt_for_init_command.md`）。
+  - `IMPLEMENT_PLAN_PROMPT`: "Implement the plan."
+  - `NEW_THREAD_PREAMBLE`: 新しいスレッドで実装するときの前置き。
+- Windows 版のバイナリは CRLF で埋め込んでいる（ビルドのチェックアウトの都合）。アダプタは上流のファイルと同じ LF で送る。
+- 確かめ方: `live_codex_texts_match_the_installed_binary` がインストールされたバイナリにそのままあることを確かめ、再生テストの `init_command.jsonl` はバイナリから取り出した文で作ってある。Codex を更新したらこの2つを実行し、変わっていれば文と版を直す。
+
+### 14.9 `/review`
+
+- `/review <文>` → `review/start { threadId, target: { type: "custom", instructions: <文> }, delivery: "inline" }`。引数なしは未コミットの変更（`uncommittedChanges`）。Claude Code の `/review` は Claude 側のコマンド（claude.md）。
+- 記録（inline）:
+  1. 応答のターン R（`turn/started` は来ない）→ `TurnStarted` と印を応答から出す。
+  2. `enteredReviewMode`（R）→ Notice「Review started: <文>」。
+  3. 同じスレッドに別の id R′ の `turn/started`（レビュー役のターン。`turn/completed` は来ない）→ このセッションのターンにしない。R が動いているターンのまま（中断や steer は R に届く）。R′ が R の応答より先に届いたときも、応答で R に戻す。
+  4. レビュー役の agentMessage（出力形式の JSON。`item/completed` は来ない）→ 出さない（delta も）。
+  5. `exitedReviewMode` → Notice「Review finished」。
+  6. 表示用の文（「…Review comment: - [P2] <タイトル> — <パス>:<行>…」）の agentMessage → AgentMessage。
+  7. `turn/completed`（R）。
+- 取り込んだ履歴では形が違う（11章）。
+
+### 14.10 experimental な API と内部の文面
+
+| 使うもの | 状態 | 変わったときの影響 |
+|---|---|---|
+| `turn/start` の `collaborationMode` | experimental（`generate-ts --experimental` にだけある。「EXPERIMENTAL - Set a pre-set collaboration mode」） | プランモードが使えない。`turn/start` がエラーになればターンの失敗として見える |
+| `thread/fork` の `beforeTurnId` | experimental | 「このプロンプトを編集」の fork が失敗する（`lastTurnId` は標準） |
+| `item/plan/delta` | 標準だが説明に EXPERIMENTAL（連結が完成形と一致するとは限らない） | 完了時の本文で置き換えるので、途中の表示だけがずれる |
+| `thread/settings/updated` | 標準（experimental API を有効にしたときに届く） | プランモードと高速モードの報告が届かなくなる（送る側は変わらない） |
+| `thread/backgroundTerminals/*` | experimental | 13章 |
+| 14.8 の文面 | プロトコルの外（TUI の埋め込み） | 版の固定。上のテストで確かめる |

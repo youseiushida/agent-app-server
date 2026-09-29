@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -19,6 +20,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -43,10 +45,18 @@ import dev.aas.android.ui.components.SectionHeader
 /**
  * The model and reasoning-effort picker (docs/ux/codex-desktop.md §2.4 モデルと推論, §8.1): the
  * harness's `models`, and the `effortLevels` the chosen model allows. [onApply] receives the
- * chosen model and effort (`null` effort: the harness default).
+ * chosen model and effort (`null` effort: the harness default) and the fast-mode switch (`null`:
+ * not offered for the chosen model, or no switch at all).
  *
  * [allowDefaultEffort]: "既定" can be chosen. `thread/update` only sets fields, it cannot go back
  * to the default, so an existing thread with an effort must pick one.
+ *
+ * [fastMode]: a thread's fast mode (`modes.fast`; `null`: no switch, e.g. before the thread
+ * exists). The switch shows only for a model the harness lists in `features.fastModeModels`;
+ * [fastModeState] is what the harness last reported about it, verbatim.
+ *
+ * [initialModel]: the model chosen when the sheet opens (`/model <id>` whose model does not offer
+ * the effort in effect), as if the user had chosen it: an effort it does not offer is dropped.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -54,12 +64,18 @@ fun ModelSheet(
     harness: Harness,
     settings: ThreadSettings,
     allowDefaultEffort: Boolean,
-    onApply: (model: String?, effort: String?) -> Unit,
+    onApply: (model: String?, effort: String?, fast: Boolean?) -> Unit,
     onDismiss: () -> Unit,
+    fastMode: Boolean? = null,
+    fastModeState: String? = null,
+    initialModel: String? = null,
 ) {
     val current = HarnessSettings.model(harness, settings)
-    var model by rememberSaveable { mutableStateOf(current?.id) }
-    var effort by rememberSaveable { mutableStateOf(settings.effort) }
+    var model by rememberSaveable { mutableStateOf(initialModel ?: current?.id) }
+    // An effort the chosen model does not offer is dropped (the harness default applies).
+    var effort by rememberSaveable { mutableStateOf(settings.effort?.takeIf { e -> initialModel == null || HarnessSettings.effortLevels(harness, initialModel).any { it.id == e } }) }
+    var fast by rememberSaveable { mutableStateOf(fastMode ?: false) }
+    val fastOffered = fastMode != null && model != null && model in harness.features.fastModeModels
     val levels = HarnessSettings.effortLevels(harness, model)
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.fillMaxWidth().navigationBarsPadding().verticalScroll(rememberScrollState())) {
@@ -92,6 +108,19 @@ fun ModelSheet(
                     }
                 }
             }
+            if (fastOffered) {
+                Row(
+                    Modifier.fillMaxWidth().toggleable(value = fast, role = Role.Switch) { fast = it }.padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(stringResource(R.string.picker_fast), style = MaterialTheme.typography.bodyLarge)
+                        Text(stringResource(R.string.picker_fast_body), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        fastModeState?.let { Text(stringResource(R.string.picker_fast_state, it), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    }
+                    Switch(checked = fast, onCheckedChange = null)
+                }
+            }
             val effortMissing = levels.isNotEmpty() && effort == null && !allowDefaultEffort
             if (effortMissing) {
                 Text(stringResource(R.string.picker_effort_required), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
@@ -99,12 +128,13 @@ fun ModelSheet(
             Spacer(Modifier.height(16.dp))
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.End) {
                 TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+                val fastChoice = if (fastOffered) fast else null
                 Button(
                     onClick = {
-                        onApply(model, effort)
+                        onApply(model, effort, fastChoice)
                         onDismiss()
                     },
-                    enabled = (model != current?.id || effort != settings.effort) && !effortMissing,
+                    enabled = (model != current?.id || effort != settings.effort || (fastChoice != null && fastChoice != fastMode)) && !effortMissing,
                 ) { Text(stringResource(R.string.picker_apply)) }
             }
             Spacer(Modifier.height(16.dp))

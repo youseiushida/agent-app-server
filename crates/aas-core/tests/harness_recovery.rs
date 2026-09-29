@@ -408,6 +408,7 @@ async fn settings_changes_are_checked_only_for_what_they_set_against_an_availabl
         title: None,
         settings: Some(settings),
         pinned: None,
+        modes: None,
     };
     let mode = |id: &str| ThreadSettings {
         permission_mode: Some(id.into()),

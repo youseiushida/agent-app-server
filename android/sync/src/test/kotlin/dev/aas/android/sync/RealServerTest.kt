@@ -6,33 +6,45 @@ import dev.aas.android.protocol.BackgroundTaskKind
 import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.BackgroundTaskStopParams
 import dev.aas.android.protocol.ClientInfo
+import dev.aas.android.protocol.Delivery
 import dev.aas.android.protocol.DeviceRevokeParams
 import dev.aas.android.protocol.Disposition
+import dev.aas.android.protocol.ErrorKind
+import dev.aas.android.protocol.InputPart
 import dev.aas.android.protocol.InteractionRequest
-import dev.aas.android.protocol.InteractionRespondParams
 import dev.aas.android.protocol.InteractionResolution
+import dev.aas.android.protocol.InteractionRespondParams
 import dev.aas.android.protocol.InteractionStatus
 import dev.aas.android.protocol.Item
+import dev.aas.android.protocol.ItemMoveToBackgroundParams
 import dev.aas.android.protocol.ItemStatus
 import dev.aas.android.protocol.Methods
 import dev.aas.android.protocol.NativeImportParams
 import dev.aas.android.protocol.NativeListParams
+import dev.aas.android.protocol.NativeRenameStatus
 import dev.aas.android.protocol.ProjectCreateParams
 import dev.aas.android.protocol.ProjectInit
 import dev.aas.android.protocol.ProjectListParams
 import dev.aas.android.protocol.ProjectOpenParams
+import dev.aas.android.protocol.ProjectUpdateParams
 import dev.aas.android.protocol.QuestionAnswer
+import dev.aas.android.protocol.RpcException
 import dev.aas.android.protocol.ThreadBackground
 import dev.aas.android.protocol.ThreadCreateParams
 import dev.aas.android.protocol.ThreadForkParams
+import dev.aas.android.protocol.ThreadHarnessStatusParams
 import dev.aas.android.protocol.ThreadListParams
+import dev.aas.android.protocol.ThreadModesUpdate
 import dev.aas.android.protocol.ThreadReadParams
+import dev.aas.android.protocol.ThreadSettings
+import dev.aas.android.protocol.ThreadSideQuestionParams
 import dev.aas.android.protocol.ThreadStatus
 import dev.aas.android.protocol.ThreadStopParams
-import dev.aas.android.protocol.TurnTrigger
 import dev.aas.android.protocol.ThreadUpdateParams
 import dev.aas.android.protocol.Turn
+import dev.aas.android.protocol.TurnStartParams
 import dev.aas.android.protocol.TurnStatus
+import dev.aas.android.protocol.TurnTrigger
 import dev.aas.android.protocol.WORKSPACE_STREAM
 import dev.aas.android.protocol.threadStream
 import kotlinx.coroutines.CoroutineScope
@@ -59,6 +71,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
@@ -599,6 +612,249 @@ class RealServerTest {
         assertTrue(sourceState.value.items.none { it is Item.AgentMessage && it.text == "only in the fork" })
         c.assertThreadMatchesServer(source)
         c.assertThreadMatchesServer(fork.id)
+        c.assertWorkspaceMatchesServer()
+    }
+
+    // ----- the harnesses' own features (protocol.md §3.1 「ハーネスの機能」) ---------------------------
+
+    /** The lines of a native session's transcript that are turns (the fake CLI's session file). */
+    private fun nativeTurns(sessionId: String): Int =
+        java.io.File(server.ready.nativeSessionsDir, "$sessionId.jsonl").readLines().count { it.contains("\"type\":\"turn\"") }
+
+    /**
+     * A typed session-switching command (the harness's own name or alias) is refused definitively
+     * with the command's name, sent once and never retried; the harness moving the agent to
+     * another session by itself is followed: the thread's native session id changes, the phone
+     * hears of it, and the running turn carries a notice.
+     */
+    @Test
+    fun typedSessionSwitchesAreRefusedAndTheHarnessesOwnSwitchIsFollowed() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("switch"))
+        val state = openLive(c, threadId)
+        assertEquals(TurnStatus.Completed, c.runTurn(threadId, "hello").status)
+        val first = c.waitFor("the native session") { state.value.thread?.nativeSessionId }
+
+        val crid = c.engine.enqueue(Methods.TurnStart) { TurnStartParams(it, threadId, listOf(InputPart.Text("/fake-reset and more"))) }
+        val refused = c.waitFor("the refusal") { c.results.filterIsInstance<OutboxResult.Failed>().firstOrNull { it.entry.clientRequestId == crid } }
+        assertEquals(ErrorKind.SessionSwitchingCommand, refused.error.kind)
+        assertEquals("fake-reset", refused.error.command)
+        assertEquals(HARNESS, refused.error.harnessId)
+        assertEquals(1, c.sendsByRequestId(Methods.TurnStart.name)[crid], "a definitive refusal is not sent again")
+        assertEquals(first, state.value.thread?.nativeSessionId)
+
+        assertEquals(TurnStatus.Completed, c.runTurn(threadId, "@switch-session\n@text moved").status)
+        val switched = c.waitFor("the switch") { c.signals.filterIsInstance<SyncSignal.NativeSessionChanged>().firstOrNull { it.threadId == threadId } }
+        assertEquals(first, switched.previousNativeSessionId)
+        assertTrue(switched.nativeSessionId != first)
+        c.waitFor("the thread on the new session") { state.value.thread?.nativeSessionId?.takeIf { it == switched.nativeSessionId } }
+        assertTrue(state.value.items.any { it is Item.Notice && it.code == "nativeSessionChanged" }, "the running turn's notice")
+        c.assertThreadMatchesServer(threadId)
+    }
+
+    /**
+     * `thread/fork` at any turn with a recorded anchor: including a middle turn, right before it
+     * (「このプロンプトを編集」) and before the first turn (a new session). Each fork's history is
+     * the copied turns, its native session holds exactly those turns plus its own, and the
+     * source does not move.
+     */
+    @Test
+    fun forksBranchAtAnyTurnAndRightBeforeOne() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val features = c.engine.workspace.value.harnesses.single { it.id == HARNESS }.features
+        assertTrue(features.forkAtTurn && features.forkWhileHeld, "$features")
+        val source = c.createThread(c.createProject("fork-at"))
+        val sourceState = openLive(c, source)
+        val turns = listOf("one", "two", "three").map { c.runTurn(source, "@text $it") }
+        assertTrue(turns.all { it.status == TurnStatus.Completed && it.forkable }, "anchors recorded: $turns")
+
+        suspend fun fork(at: Turn, before: Boolean, expectedTurns: Int, prompt: String): Pair<String, StateFlow<ThreadState>> {
+            val fork = c.engine.mutate(Methods.ThreadFork) { crid -> ThreadForkParams(crid, source, at.id, before) }.thread
+            c.waitFor("the fork in the workspace") { c.engine.workspace.value.threads.find { it.thread.id == fork.id } }
+            val forkState = openLive(c, fork.id)
+            assertEquals(expectedTurns, forkState.value.turns.size, "turns copied into the fork (at ${at.index}, before $before)")
+            assertEquals(TurnStatus.Completed, c.runTurn(fork.id, prompt).status)
+            val session = c.waitFor("the fork's native session") { forkState.value.thread?.nativeSessionId }
+            c.waitFor("the fork's native turns") { nativeTurns(session).takeIf { it == expectedTurns + 1 } }
+            return fork.id to forkState
+        }
+
+        val (atMiddle, atMiddleState) = fork(turns[1], before = false, expectedTurns = 2, prompt = "@text after two")
+        assertEquals("two", atMiddleState.value.items.filterIsInstance<Item.AgentMessage>()[1].text)
+        val (beforeMiddle, beforeState) = fork(turns[1], before = true, expectedTurns = 1, prompt = "@text instead of two")
+        assertEquals(listOf("one", "instead of two"), beforeState.value.items.filterIsInstance<Item.AgentMessage>().map { it.text })
+        val (beforeFirst, _) = fork(turns[0], before = true, expectedTurns = 0, prompt = "@text from scratch")
+        assertEquals(3, sourceState.value.turns.size)
+        for (id in listOf(source, atMiddle, beforeMiddle, beforeFirst)) c.assertThreadMatchesServer(id)
+        c.assertWorkspaceMatchesServer()
+    }
+
+    /**
+     * A resume of a native session another process holds (like a conversation open in Codex
+     * desktop) ends the turn as `resumeFailed` with the harness's own words, without the daemon's
+     * lead-in or terminal escapes; the thread still forks into a new one that runs.
+     */
+    @Test
+    fun aFailedResumeSaysSoInTheHarnessesWordsAndForksIntoANewThread() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("held"))
+        val state = openLive(c, threadId)
+        assertEquals(TurnStatus.Completed, c.runTurn(threadId, "@text first").status)
+        val native = c.waitFor("the native session") { state.value.thread?.nativeSessionId }
+        c.engine.mutate(Methods.ThreadStop) { crid -> ThreadStopParams(crid, threadId) }
+        server.holdSession(native)
+        try {
+            val failed = c.runTurn(threadId, "again")
+            assertEquals(TurnStatus.Failed, failed.status)
+            val error = failed.error ?: throw AssertionError("no error on $failed")
+            assertEquals("resumeFailed", error.kind)
+            assertTrue('\u001b' !in error.message && !error.message.startsWith("the harness reported"), error.message)
+            val fork = c.engine.mutate(Methods.ThreadFork) { crid -> ThreadForkParams(crid, threadId) }.thread
+            openLive(c, fork.id)
+            assertEquals(TurnStatus.Completed, c.runTurn(fork.id, "@text carried on").status)
+            c.assertThreadMatchesServer(threadId)
+            c.assertThreadMatchesServer(fork.id)
+        } finally {
+            server.releaseSession(native)
+        }
+    }
+
+    /**
+     * Settings the harness changes by itself are followed (permission mode, effort, plan mode);
+     * the app's `/plan` (plan mode, then the body) gets a proposed plan, implemented with the
+     * harness's own text; fast mode needs a model that has it and goes off with another model;
+     * a rename reaches the native session, and the harness's own name for it does not replace
+     * the user's title.
+     */
+    @Test
+    fun modesSettingsAndRenamesFollowTheHarness() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val harness = c.engine.workspace.value.harnesses.single { it.id == HARNESS }
+        val planMode = harness.features.planMode ?: throw AssertionError("the fake harness offers /plan: ${harness.features}")
+        val threadId = c.createThread(c.createProject("modes"))
+        val state = openLive(c, threadId)
+
+        c.runTurn(threadId, "@permission auto\n@effort high\n@text changed")
+        c.waitFor("the harness's settings in the thread") {
+            state.value.thread?.settings?.takeIf { it.permissionMode == "auto" && it.effort == "high" }
+        }
+
+        val planOn = c.engine.mutate(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, modes = ThreadModesUpdate(plan = true)) }
+        assertTrue(planOn.thread.modes.plan)
+        assertEquals(TurnStatus.Completed, c.runTurn(threadId, "Add a login page").status)
+        val plan = state.value.items.filterIsInstance<Item.ProposedPlan>().lastOrNull() ?: throw AssertionError("no proposed plan: ${state.value.items}")
+        assertTrue("Add a login page" in plan.text, plan.text)
+        val implement = planMode.implementPrompt ?: throw AssertionError("no implement prompt: $planMode")
+        c.engine.mutate(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, modes = ThreadModesUpdate(plan = false)) }
+        c.runTurn(threadId, implement)
+        assertEquals("echo: $implement", (state.value.items.last() as Item.AgentMessage).text)
+        c.runTurn(threadId, "@plan-mode on\n@text planning by itself")
+        c.waitFor("plan mode the harness entered") { state.value.thread?.modes?.plan?.takeIf { it } }
+
+        val fastModel = harness.features.fastModeModels.single()
+        c.engine.mutate(Methods.ThreadUpdate) { crid ->
+            ThreadUpdateParams(crid, threadId, settings = ThreadSettings(model = fastModel), modes = ThreadModesUpdate(fast = true))
+        }
+        c.waitFor("fast mode on, as the harness reports it") { state.value.thread?.takeIf { it.modes.fast && it.fastModeState == "on" } }
+        val slow = harness.models.first { it.id != fastModel }.id
+        c.engine.mutate(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, settings = ThreadSettings(model = slow)) }
+        c.waitFor("fast mode off with a model without it") { state.value.thread?.modes?.takeIf { !it.fast } }
+
+        val renamed = c.engine.mutate(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, title = "Login work") }
+        val native = renamed.nativeRename ?: throw AssertionError("no nativeRename for a harness with the feature rename")
+        assertTrue(native.status == NativeRenameStatus.Applied || native.status == NativeRenameStatus.Pending, "$native")
+        c.runTurn(threadId, "@rename The harness's name\n@text named")
+        assertEquals("Login work", state.value.thread?.title)
+        c.assertThreadMatchesServer(threadId)
+    }
+
+    /**
+     * `/plan <request>` of a new thread as the app commits it: one chain of `thread/create`
+     * (without input), plan mode and the request (docs/android.md 6.3). The daemon creates the
+     * thread, the mode and the request reach it in this order, and the first turn plans. A chain
+     * whose creation is refused sends neither of the rest, and creates nothing.
+     */
+    @Test
+    fun aPlanChainCreatesTheThreadInPlanModeWithItsRequest() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val projectId = c.createProject("planchain")
+        val threadsBefore = c.engine.workspace.value.threads.size
+        val refused = c.engine.submitChain {
+            add(Methods.ThreadCreate) { crid -> ThreadCreateParams(crid, "prj_missing", HARNESS) } to
+                add(Methods.TurnStart) { crid -> TurnStartParams(crid, OutboxChain.CREATED_THREAD, listOf(InputPart.Text("never sent")), Delivery.Auto) }
+        }
+        val creationError = assertFailsWith<RpcException> { refused.first.await() }
+        val broken = assertFailsWith<OutboxChainBrokenException> { refused.second.await() }
+        assertEquals(creationError.kind, broken.error?.kind)
+
+        val (creation, request) = c.engine.submitChain {
+            val create = add(Methods.ThreadCreate) { crid -> ThreadCreateParams(crid, projectId, HARNESS) }
+            add(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, OutboxChain.CREATED_THREAD, modes = ThreadModesUpdate(plan = true)) }
+            create to add(Methods.TurnStart) { crid -> TurnStartParams(crid, OutboxChain.CREATED_THREAD, listOf(InputPart.Text("Add a login page")), Delivery.Auto) }
+        }
+        val threadId = creation.await().thread.id
+        val started = request.await()
+        assertEquals(Disposition.Started, started.disposition)
+        val state = openLive(c, threadId)
+        assertEquals(TurnStatus.Completed, c.awaitTurnEnd(threadId, started.turnId!!).status)
+        assertTrue(state.value.thread?.modes?.plan == true, "${state.value.thread?.modes}")
+        val plan = state.value.items.filterIsInstance<Item.ProposedPlan>().lastOrNull() ?: throw AssertionError("no proposed plan: ${state.value.items}")
+        assertTrue("Add a login page" in plan.text, plan.text)
+        assertEquals(1, state.value.turns.size, "the request is the thread's first turn")
+        assertEquals(threadsBefore + 1, c.engine.workspace.value.threads.size, "the refused chain created nothing")
+        assertTrue(c.engine.outbox.value.isEmpty(), "${c.engine.outbox.value}")
+        c.assertThreadMatchesServer(threadId)
+    }
+
+    /**
+     * The harness's status (without and with a running agent), a side question answered while a
+     * turn runs and kept out of the conversation, a running command moved to the background, text
+     * for the composer relayed live, and the project's trust decision reaching the agent.
+     */
+    @Test
+    fun statusSideQuestionsBackgroundMovesComposerTextAndTrust() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val projectId = c.createProject("extras")
+        val threadId = c.createThread(projectId)
+        val state = openLive(c, threadId)
+
+        val idle = c.engine.query(Methods.ThreadHarnessStatus, ThreadHarnessStatusParams(threadId))
+        assertTrue(!idle.live && idle.sections.isNotEmpty(), "$idle")
+        c.runTurn(threadId, "@text up")
+        val live = c.engine.query(Methods.ThreadHarnessStatus, ThreadHarnessStatusParams(threadId))
+        assertTrue(live.live && live.sections.all { it.rows.isNotEmpty() }, "$live")
+
+        val turnId = c.startTurn(threadId, "@tool 4000 compile")
+        val running = c.waitFor("a command that can move to the background") { state.value.items.firstOrNull { it.backgroundable } }
+        val answer = c.engine.query(Methods.ThreadSideQuestion, ThreadSideQuestionParams(threadId, "which file?"))
+        assertEquals("side answer: which file?", answer.answer)
+        assertTrue(!answer.synthetic)
+        c.engine.mutate(Methods.ItemMoveToBackground) { crid -> ItemMoveToBackgroundParams(crid, threadId, running.id) }
+        val moved = c.waitFor("the item backgrounded") {
+            state.value.items.firstOrNull { it.id == running.id && it.status == ItemStatus.Backgrounded && it.backgroundTaskId != null }
+        }
+        assertTrue(!moved.backgroundable)
+        c.awaitTurnEnd(threadId, turnId)
+        assertTrue(state.value.backgroundTasks.any { it.id == moved.backgroundTaskId }, "${state.value.backgroundTasks}")
+        assertTrue(state.value.items.none { it is Item.AgentMessage && "side answer" in it.text }, "side answers stay out of the conversation")
+
+        c.runTurn(threadId, "@editor draft for the composer\n@text offered")
+        val insert = c.waitFor("the composer text") { c.signals.filterIsInstance<SyncSignal.ComposerInsert>().firstOrNull { it.threadId == threadId } }
+        assertEquals("draft for the composer", insert.text)
+        assertTrue(insert.live, "it happened after the subscription")
+
+        c.engine.mutate(Methods.ProjectUpdate) { crid -> ProjectUpdateParams(crid, projectId, harnessTrust = mapOf(HARNESS to true)) }
+        c.waitFor("the decision in the workspace") { c.engine.workspace.value.projects.find { it.id == projectId && it.harnessTrust[HARNESS] == true } }
+        c.runTurn(threadId, "@trust")
+        assertEquals("project trusted: yes", (state.value.items.last() as Item.AgentMessage).text)
+        c.waitFor("the moved work to end") { state.value.backgroundTasks.firstOrNull { it.id == moved.backgroundTaskId && it.status.isTerminal } }
+        c.assertThreadMatchesServer(threadId)
         c.assertWorkspaceMatchesServer()
     }
 

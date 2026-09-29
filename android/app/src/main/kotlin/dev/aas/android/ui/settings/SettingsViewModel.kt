@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import dev.aas.android.AppContainer
 import dev.aas.android.AppVersion
 import dev.aas.android.R
+import dev.aas.android.domain.ErrorTexts
 import dev.aas.android.domain.composer.FollowUpDelivery
 import dev.aas.android.protocol.Device
 import dev.aas.android.protocol.Harness
@@ -46,7 +47,7 @@ internal suspend fun <T> fetch(block: suspend () -> T): Remote<T> = try {
 } catch (e: NotConnectedException) {
     Remote.Failed(UiText.of(R.string.error_not_connected))
 } catch (e: RpcException) {
-    Remote.Failed(UiText.of(R.string.error_server, e.error.message))
+    Remote.Failed(ErrorTexts.server(e.error))
 } catch (e: Exception) {
     Remote.Failed(requestFailed(e))
 }
@@ -167,7 +168,7 @@ class DevicesViewModel(private val container: AppContainer) : ViewModel() {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: RpcException) {
-                container.userMessages.show(UiText.of(R.string.error_server, e.error.message))
+                container.userMessages.show(ErrorTexts.server(e.error))
             } catch (e: Exception) {
                 container.userMessages.show(requestFailed(e))
             } finally {

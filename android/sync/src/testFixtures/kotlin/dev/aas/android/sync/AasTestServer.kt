@@ -196,6 +196,19 @@ class AasTestServer private constructor(
     }
 
     /** A fresh pairing code. */
+    /**
+     * Marks the native session [nativeSessionId] as held by another process (like a Codex thread
+     * open in Codex desktop): resuming it fails as `resumeFailed`, forking it works.
+     */
+    fun holdSession(nativeSessionId: String) {
+        command("hold-session $nativeSessionId")
+    }
+
+    /** Ends the hold of [holdSession]. */
+    fun releaseSession(nativeSessionId: String) {
+        command("release-session $nativeSessionId")
+    }
+
     fun pairingCode(): String =
         command("pairing-code").first { it.str("event") == "pairingCode" }.str("code") ?: throw AssertionError("pairingCode line without code")
 

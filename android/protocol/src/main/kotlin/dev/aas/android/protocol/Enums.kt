@@ -168,6 +168,23 @@ enum class SettingsOutcome(override val wire: String) : WireEnum {
     object Serializer : WireEnumSerializer<SettingsOutcome>("SettingsOutcome", SettingsOutcome.entries, Unknown)
 }
 
+/** What happened to the native session's name (`thread/update` result `nativeRename.status`). */
+@Serializable(with = NativeRenameStatus.Serializer::class)
+enum class NativeRenameStatus(override val wire: String) : WireEnum {
+    /** The running agent took the name. */
+    Applied("applied"),
+
+    /** No agent runs now: the name is given when the next one starts. */
+    Pending("pending"),
+
+    /** The harness refused the name; the thread keeps its new title. */
+    Failed("failed"),
+    Unknown("unknown"),
+    ;
+
+    object Serializer : WireEnumSerializer<NativeRenameStatus>("NativeRenameStatus", NativeRenameStatus.entries, Unknown)
+}
+
 @Serializable(with = SubscriptionState.Serializer::class)
 enum class SubscriptionState(override val wire: String) : WireEnum {
     Ok("ok"), NotFound("notFound"), Unknown("unknown");

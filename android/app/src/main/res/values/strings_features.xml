@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The harnesses' own features the app relays (docs/android.md 31) -->
+
+    <!-- Commands typed or chosen in the composer -->
+    <string name="command_plan">プランモードで計画を立てる（後ろに依頼を書くと、その計画を頼みます）</string>
+    <string name="command_btw">会話とは別にエージェントに質問する（答えは会話に残りません）</string>
+    <string name="command_hint_new">[最初のメッセージ]</string>
+    <string name="command_hint_rename">[新しい名前]</string>
+    <string name="command_hint_plan">[依頼]</string>
+    <string name="command_hint_btw">&lt;質問&gt;</string>
+    <string name="typed_model_unknown">「%1$s」はこのハーネスのモデルの一覧にありません</string>
+    <string name="typed_effort_unknown">「%1$s」はこのモデルの推論レベルの一覧にありません</string>
+    <string name="typed_model_effort_unavailable">%1$s には推論「%2$s」がありません。推論を選んでから反映してください</string>
+    <string name="btw_needs_question">/btw の後に質問を書いてください</string>
+    <string name="newthread_plan_needs_request">/plan の後に、計画してほしい依頼を書いてください</string>
+    <string name="newthread_already_new">新しいスレッドは新しい会話から始まります（/%1$s は要りません）</string>
+
+    <!-- Errors: a Japanese lead-in, then the harness's own words -->
+    <string name="error_harness_reported">ハーネスがエラーを報告しました: %1$s</string>
+    <string name="error_harness_unavailable">ハーネスを使えません: %1$s</string>
+    <string name="request_failed_harness">%1$sに失敗しました。ハーネスの報告:\n%2$s</string>
+    <string name="request_refused_switching">「/%1$s」はエージェントを別のセッションに切り替えるハーネスのコマンドなので、送りませんでした。新しい会話は /new、PC のセッションは /resume で開けます</string>
+    <string name="turn_error_format">%1$s\n%2$s</string>
+    <string name="turn_error_line">%1$s: %2$s</string>
+    <string name="turn_error_agent_exited">エージェントのプロセスが終了しました</string>
+    <string name="turn_error_adapter">ハーネスがエラーを報告しました</string>
+    <string name="turn_error_spawn">エージェントを起動できませんでした</string>
+    <string name="turn_error_resume">PC のセッションを再開できませんでした</string>
+    <string name="turn_error_unavailable">ハーネスを使えませんでした</string>
+    <string name="turn_error_forced">停止に応じなかったため、強制終了しました</string>
+    <string name="turn_error_interrupted">始まる前に停止しました</string>
+    <string name="turn_error_stopped">エージェントのプロセスを停止しました</string>
+    <string name="turn_error_daemon_shutdown">サーバが停止しました</string>
+    <string name="turn_error_system_shutdown">Windows の終了でサーバが停止しました</string>
+    <string name="turn_error_daemon_restarted">サーバが再起動しました</string>
+    <string name="turn_error_fork_outdated">分岐元のスレッドが先に進んだため、この分岐は始められませんでした。もう一度分岐してください</string>
+    <string name="turn_error_harness">ハーネスがエラーを報告しました</string>
+    <string name="turn_error_refusal">モデルが応答を断りました</string>
+    <string name="turn_error_codex">Codex がエラーを報告しました（%1$s）</string>
+    <string name="turn_error_other">エラーで終わりました（%1$s）</string>
+    <string name="resume_failed_retry">再試行</string>
+    <string name="resume_failed_fork">新しいスレッドに分岐</string>
+    <string name="resume_failed_note">別のアプリ（Codex desktop など）がこのセッションを開いていると再開できません。そこで閉じてから再試行してください。</string>
+    <string name="resume_failed_note_fork">別のアプリ（Codex desktop など）がこのセッションを開いていると再開できません。そこで閉じてから再試行するか、新しいスレッドに分岐して続けてください。</string>
+
+    <!-- Plan mode -->
+    <string name="plan_mode_on">プランモードにしました</string>
+    <string name="plan_mode_already">すでにプランモードです</string>
+    <string name="plan_ahead_title">先に待っているメッセージもプランモードになります</string>
+    <string name="plan_ahead_body">プランモードは次のターンから有効になります。この依頼より先に始まる %1$d 件のメッセージもプランモードで実行され、エージェントは計画を示すだけでファイルを変更しません。</string>
+    <string name="plan_ahead_send">このまま送る</string>
+    <string name="plan_ahead_clear">キューを消去して送る</string>
+    <string name="plan_mode_off_done">プランモードを終えました</string>
+    <string name="plan_chip">プラン</string>
+    <string name="plan_exit_title">プランモードを終えますか？</string>
+    <string name="plan_exit_body">エージェントは計画だけでなく、ファイルの変更やコマンドの実行もするようになります。</string>
+    <string name="plan_exit_confirm">終える</string>
+    <string name="proposed_plan_title">提案されたプラン</string>
+    <string name="proposed_plan_implement">実装する</string>
+    <string name="proposed_plan_new_thread">新しいスレッドで実装</string>
+    <string name="proposed_plan_implementing">プランモードを終えて、実装を依頼しました</string>
+    <string name="proposed_plan_new_thread_creating">新しいスレッドを作っています…</string>
+
+    <!-- Fast mode -->
+    <string name="fast_chip">高速</string>
+    <string name="fast_chip_state">高速 · %1$s</string>
+    <string name="picker_fast">高速モード</string>
+    <string name="picker_fast_body">このモデルで高速モードを使います</string>
+    <string name="picker_fast_state">ハーネスの報告: %1$s</string>
+
+    <!-- Status sheet -->
+    <string name="status_modes">モード</string>
+    <string name="status_mode_plan">プランモード</string>
+    <string name="status_mode_fast">高速モード</string>
+    <string name="status_mode_fast_state">高速モード（ハーネスの報告: %1$s）</string>
+    <string name="status_modes_none">なし</string>
+    <string name="status_harness_section">ハーネスの状態</string>
+    <string name="status_harness_live">エージェントのセッションから</string>
+    <string name="status_harness_idle">ハーネスから（エージェントは動いていません）</string>
+    <string name="status_harness_loading">読み込んでいます…</string>
+    <string name="status_harness_offline">接続していないため表示できません</string>
+    <string name="status_harness_failed">読み込めませんでした: %1$s</string>
+    <string name="status_harness_empty">ハーネスは何も報告していません</string>
+    <string name="status_trust">プロジェクトの信頼（%1$s）</string>
+    <string name="status_trust_yes">信頼しています（プロジェクトの拡張・プロンプト・スキルを読み込みます）</string>
+    <string name="status_trust_no">信頼していません</string>
+    <string name="status_trust_undecided">まだ決めていません</string>
+
+    <!-- Project trust -->
+    <string name="trust_title">このプロジェクトを信頼しますか？（%1$s）</string>
+    <string name="trust_body">「%1$s」は、信頼したプロジェクトでだけ、プロジェクト自身の拡張・プロンプト・スキル・設定を読み込みます。拡張はこの PC でコードを実行します。</string>
+    <string name="trust_yes">信頼する</string>
+    <string name="trust_no">信頼しない</string>
+    <string name="trust_saved_yes">「%1$s」はこのプロジェクトを信頼します（次のターンから）</string>
+    <string name="trust_saved_no">「%1$s」はこのプロジェクトを信頼しません（次のターンから）</string>
+
+    <!-- Side questions (/btw) -->
+    <string name="btw_title">会話とは別の質問</string>
+    <string name="btw_thinking">答えを待っています…</string>
+    <string name="btw_no_answer">ハーネスは答えませんでした</string>
+    <string name="btw_synthetic">モデルの答えではなく、ハーネスが返した定型の答えです</string>
+    <string name="btw_not_running">エージェントが動いていないため質問できません。メッセージを送ってエージェントを起動してから質問してください</string>
+    <string name="btw_offline">接続していないため質問できません</string>
+    <string name="btw_failed">質問できませんでした: %1$s</string>
+    <string name="close">閉じる</string>
+    <string name="btw_note">この質問と答えは会話の履歴に残りません</string>
+
+    <!-- Moving running work to the background -->
+    <string name="move_to_background">裏に回す</string>
+    <string name="move_to_background_pending">裏に回す要求の送信待ち…</string>
+    <string name="request_move_to_background">作業を裏に回す要求</string>
+    <string name="move_to_background_requested">作業を裏に回すよう求めました</string>
+
+    <!-- Forks from a turn -->
+    <string name="turn_menu">ターン %1$d の操作</string>
+    <string name="fork_here">ここから分岐</string>
+    <string name="fork_edit_prompt">このプロンプトを編集</string>
+    <string name="fork_edit_opened">分岐したスレッドの入力欄にプロンプトを入れました</string>
+
+    <!-- Text the harness puts into the composer -->
+    <string name="composer_insert_title">エージェントが入力欄に入れる文を送ってきました</string>
+    <string name="composer_insert_put">入力欄に入れる</string>
+    <string name="composer_insert_replace">置き換える</string>
+    <string name="composer_insert_append">後ろに追加</string>
+    <string name="composer_insert_dismiss">閉じる</string>
+    <string name="composer_inserted">エージェントが入力欄に文を入れました</string>
+
+    <!-- The harness's own session changes and names -->
+    <string name="native_session_changed">エージェントが別のセッションに移りました。このスレッドは新しいセッションで続きます</string>
+    <string name="notice_native_session_changed">エージェントが別のセッションに移りました</string>
+    <string name="notice_native_rename_failed">PC のセッションの名前を変えられませんでした</string>
+    <string name="rename_native_applied">PC のセッションの名前も変えました</string>
+    <string name="rename_native_pending">次にエージェントが起動したときに、PC のセッションにも名前を付けます</string>
+    <string name="rename_native_failed">スレッドの名前は変えましたが、PC のセッションの名前は変えられませんでした: %1$s</string>
+    <string name="item_user_declined">ハーネスが取り込まなかったため、キューに戻しました</string>
+
+    <!-- Import screen -->
+    <string name="import_codex_desktop_note">Codex desktop で開いている会話は、スマホから続けられません（Codex は 1 つの会話に書き込むアプリを 1 つに限ります）。Codex desktop で閉じてから続けるか、取り込んだあとに新しいスレッドへ分岐してください。</string>
+</resources>

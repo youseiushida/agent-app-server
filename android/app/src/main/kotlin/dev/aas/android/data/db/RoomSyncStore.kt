@@ -344,6 +344,7 @@ class RoomSyncStore(private val db: AasDatabase) : SyncStore {
                     lastError = entry.lastError,
                     nextAttemptAt = entry.nextAttemptAtMs,
                     waitingForHarness = entry.waitingForHarness,
+                    after = entry.after,
                 ),
             )
         }
@@ -360,6 +361,7 @@ class RoomSyncStore(private val db: AasDatabase) : SyncStore {
                 lastError = entry.lastError,
                 nextAttemptAt = entry.nextAttemptAtMs,
                 waitingForHarness = entry.waitingForHarness,
+                after = entry.after,
             )
         }
 
@@ -384,6 +386,7 @@ class RoomSyncStore(private val db: AasDatabase) : SyncStore {
             lastError = lastError,
             nextAttemptAtMs = nextAttemptAt,
             waitingForHarness = waitingForHarness,
+            after = after,
         )
     }
 

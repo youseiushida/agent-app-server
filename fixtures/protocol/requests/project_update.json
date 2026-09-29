@@ -7,6 +7,9 @@
     "defaults": {
       "harnessId": "codex"
     },
+    "harnessTrust": {
+      "pi": true
+    },
     "name": "aas",
     "projectId": "prj_01K6A0000000000000000PRJ01"
   }

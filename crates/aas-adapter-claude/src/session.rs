@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use aas_harness::protocol::{
     Command, DeltaField, ExpireReason, InteractionResolution, ItemBody, ItemStatus, NoticeLevel,
-    ThreadSettings, TurnError, TurnStatus, TurnTrigger, Usage,
+    ThreadModes, ThreadSettings, TurnError, TurnStatus, TurnTrigger, Usage,
 };
 use aas_harness::{
     AdapterError, AdapterEvent, BackgroundTaskInfo, ExitInfo, SessionControl, SettingsApplied,
-    StopReason, TurnInput, TurnInputPart,
+    SideAnswer, StatusSection, StopReason, TurnInput, TurnInputPart,
 };
 use aas_stdio::{JsonLinesReader, LineError, ReadLine, SharedJsonLinesWriter, WriteError};
 use aas_supervisor::ChildHandle;
@@ -29,7 +29,10 @@ use tokio::sync::{Notify, OnceCell, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::background::{CRON_KEY_PREFIX, Cron, Requester, Tracker};
-use crate::mapping::{self, BackgroundEffect, PermissionAsk, TaskList, ToolClass, ToolResult};
+use crate::commands::{CommandCache, CommandView};
+use crate::mapping::{
+    self, BackgroundEffect, PLAN_MODE, PermissionAsk, TaskList, ToolClass, ToolResult,
+};
 
 /// The callback id of the Stop hook the adapter registers at `initialize`: its input lists the
 /// pending scheduled wakeups (`session_crons`). The id is ours to choose (the SDK's
@@ -39,6 +42,9 @@ pub(crate) const STOP_HOOK_ID: &str = "aas_stop";
 /// `system/init.capabilities` entry of a CLI that reports `command_lifecycle` frames for user
 /// messages that carry a `uuid`.
 const LIFECYCLE_CAPABILITY: &str = "msg_lifecycle_v1";
+
+/// Prefix of the item key of a tool call (`tool:<tool_use_id>`).
+const TOOL_KEY_PREFIX: &str = "tool:";
 
 /// How the session learns that its process ended.
 pub(crate) enum ProcessLink {
@@ -93,9 +99,6 @@ impl ProcessLink {
         }
     }
 }
-
-/// Commands per working directory, shared between the adapter and its sessions.
-pub(crate) type CommandCache = Arc<Mutex<HashMap<PathBuf, Vec<Command>>>>;
 
 /// Static parameters of a session.
 pub(crate) struct SessionParams {
@@ -155,12 +158,30 @@ struct State {
     /// `total_cost_usd` of the previous `result` (cumulative per process).
     last_total_cost: f64,
     plan: TaskList,
-    /// Commands with descriptions from `initialize`.
-    commands: Vec<Command>,
-    /// Names last reported through `CommandsChanged`.
-    reported_command_names: Vec<String>,
+    /// What the CLI said about its commands (docs/adapters/claude.md §8).
+    commands: CommandView,
+    /// The menu last reported through `CommandsChanged`.
+    reported_commands: Vec<Command>,
     reported_model: Option<String>,
+    /// The permission mode other than plan last reported through `SessionInfo`.
     reported_permission_mode: Option<String>,
+    /// Plan mode last reported through `ModesReported`.
+    reported_plan: Option<bool>,
+    /// `fast_mode_state` last reported through `ModesReported`.
+    reported_fast_state: Option<String>,
+    /// The CLI's permission mode is `plan` (as it last reported, or as we set it). The thread's
+    /// own permission mode is `settings.permission_mode` meanwhile.
+    plan_on: bool,
+    /// Fast mode is requested (`apply_flag_settings {fastMode}`).
+    fast_on: bool,
+    /// Steers written into the running turn, by their uuid, until the CLI ends them.
+    steers: HashMap<String, Steer>,
+    /// `cancel_async_message` requests for steers the turn did not take, by request id.
+    withdrawals: HashMap<String, Steer>,
+    /// The `initialize` handshake completed.
+    initialized: bool,
+    /// A failed `result` before the handshake completed: why the CLI refused to start.
+    startup_error: Option<String>,
     asks: HashMap<String, PermissionAsk>,
     denied_tool_ids: HashSet<String>,
     rate_limit_notices: HashSet<(String, String)>,
@@ -180,6 +201,19 @@ struct State {
     background: Tracker,
     /// The CLI's output ended.
     closed: bool,
+}
+
+/// A message steered into a running turn ([`SessionControl::steer_message`]).
+#[derive(Debug, Clone)]
+struct Steer {
+    /// The message's `uuid` (its `command_lifecycle` frames name it).
+    uuid: String,
+    /// The engine's id of the message.
+    message_id: String,
+    /// The run it was written into (`turn_seq`).
+    turn_seq: u64,
+    /// The CLI took it into a run (`command_lifecycle started`).
+    started: bool,
 }
 
 /// A user message on its way into a run (see [`SessionControl::send`]).
@@ -203,7 +237,13 @@ struct Outgoing {
 /// emits `TurnCompleted` with the answer. The answer is bounded by the request timeout; a new
 /// CLI-initiated turn or the end of the output publishes the completion without it.
 struct PendingCompletion {
-    request_id: String,
+    /// The run that ended (`turn_seq`).
+    turn_seq: u64,
+    /// The `get_context_usage` request still waiting for its answer.
+    context_request: Option<String>,
+    /// The `cancel_async_message` requests for the run's steers still waiting for their answer:
+    /// a returned steer is reported before the run's `TurnCompleted`.
+    withdrawals: HashSet<String>,
     status: TurnStatus,
     usage: Option<Usage>,
     error: Option<TurnError>,
@@ -212,6 +252,10 @@ struct PendingCompletion {
 }
 
 impl PendingCompletion {
+    fn answered(&self) -> bool {
+        self.context_request.is_none() && self.withdrawals.is_empty()
+    }
+
     fn into_event(self) -> AdapterEvent {
         AdapterEvent::TurnCompleted {
             status: self.status,
@@ -237,6 +281,13 @@ struct Turn {
     tools: HashMap<String, ToolItem>,
     plan_item: Option<String>,
     standalone: u64,
+    /// The `uuid` of the run's last main-thread transcript entry the CLI streamed: its prompt
+    /// (our message's `uuid`), then every `assistant` message and `user` tool result. It is the
+    /// run's anchor (`--resume-session-at`, docs/adapters/claude.md §19).
+    anchor: Option<String>,
+    /// Tool uses whose work the CLI reported running in the foreground
+    /// (`task_started {is_backgrounded: false}`), which `background_tasks` can move.
+    backgroundable: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,39 +388,59 @@ impl ClaudeSession {
     }
 
     /// Sends the `initialize` control request and records models/commands/mode. Then, when
-    /// the session starts with the ultracode effort, confirms it through `get_settings`.
+    /// the session starts with the ultracode effort, confirms it through `get_settings`. A CLI
+    /// that refuses to start says why in a failed `result` before it ends; that text is the
+    /// error then ([`mapping::startup_error`]).
     pub(crate) async fn initialize(&self) -> Result<InitializeInfo, AdapterError> {
-        let raw = self
+        let raw = match self
             .inner
             .control(initialize_request(self.inner.agent_progress_summaries))
-            .await?;
-        let commands = mapping::commands_from_initialize(&raw);
+            .await
+        {
+            Ok(raw) => raw,
+            Err(e) => {
+                return Err(match self.startup_error() {
+                    Some(refusal) => AdapterError::Harness(refusal),
+                    None => e,
+                });
+            }
+        };
         let mode = raw
             .get("current_permission_mode")
             .and_then(Value::as_str)
             .map(str::to_owned);
         let effort = {
-            let mut st = self.inner.state.lock();
-            st.commands = commands.clone();
-            st.reported_command_names = commands.iter().map(|c| c.name.clone()).collect();
-            if st.settings.permission_mode.is_none() {
-                st.settings.permission_mode = mode.clone();
+            let mut guard = self.inner.state.lock();
+            let st = &mut *guard;
+            st.initialized = true;
+            st.commands.terminal = self
+                .inner
+                .command_cache
+                .lock()
+                .terminal_for(&self.inner.cwd);
+            st.commands.set_listed(raw.get("commands"));
+            let commands = self.inner.publish_menu(st);
+            self.inner.emit(AdapterEvent::CommandsChanged { commands });
+            // Plan mode is never the mode to return to (a thread's permission mode `plan` of
+            // earlier versions is plan mode over the CLI's default).
+            if st
+                .settings
+                .permission_mode
+                .as_deref()
+                .is_none_or(|m| m == PLAN_MODE)
+            {
+                st.settings.permission_mode = mode.clone().filter(|m| m != PLAN_MODE);
             }
-            st.reported_permission_mode = mode.clone();
+            // A report the reader handled meanwhile (`system/status` right after the handshake)
+            // is newer than the handshake's answer.
+            if let Some(mode) = mode.as_deref().filter(|_| st.reported_plan.is_none()) {
+                self.inner.report_permission_mode(st, mode);
+            }
+            if st.reported_fast_state.is_none() {
+                self.inner.report_fast_state(st, &raw);
+            }
             st.settings.effort.clone()
         };
-        self.inner
-            .command_cache
-            .lock()
-            .insert(self.inner.cwd.clone(), commands.clone());
-        self.inner.emit(AdapterEvent::CommandsChanged { commands });
-        if mode.is_some() {
-            self.inner.emit(AdapterEvent::SessionInfo {
-                model: None,
-                permission_mode: mode,
-                effort: None,
-            });
-        }
         if effort.as_deref() == Some(mapping::ULTRACODE) {
             self.inner.confirm_effort(effort.as_deref()).await?;
         }
@@ -379,6 +450,22 @@ impl ClaudeSession {
     pub(crate) fn stderr_tail(&self) -> String {
         self.inner.link.stderr_tail()
     }
+
+    /// Why the CLI refused to start (a failed `result` before the handshake completed).
+    pub(crate) fn startup_error(&self) -> Option<String> {
+        self.inner.state.lock().startup_error.clone()
+    }
+
+    /// `get_usage {skip_behaviors: true}` (the status without a session, from a probe process).
+    pub(crate) async fn usage(&self) -> Result<Value, AdapterError> {
+        self.inner.control(usage_request()).await
+    }
+}
+
+/// The `get_usage` request: without the scan of seven days of transcripts that fills
+/// `behaviors` (24.5 s instead of 0.36 s in recording b1; the status does not show it).
+fn usage_request() -> Value {
+    json!({ "subtype": "get_usage", "skip_behaviors": true })
 }
 
 /// The `initialize` control request.
@@ -487,6 +574,13 @@ impl Inner {
         self.write_bounded(&msg).await
     }
 
+    /// `set_permission_mode {mode}`.
+    async fn set_permission_mode(&self, mode: &str) -> Result<(), AdapterError> {
+        self.control(json!({ "subtype": "set_permission_mode", "mode": mode }))
+            .await
+            .map(|_| ())
+    }
+
     /// Reads back what the CLI applied (`get_settings`) and checks that ultracode is on
     /// exactly when `target` is ultracode. The CLI answers `apply_flag_settings` with success
     /// even when it does not turn ultracode on (a model without xhigh effort, workflows
@@ -505,15 +599,20 @@ impl Inner {
             .and_then(|a| a.get("model"))
             .and_then(Value::as_str)
             .unwrap_or("?");
-        self.emit(AdapterEvent::SessionInfo {
-            model: None,
-            permission_mode: None,
-            effort: if on {
-                Some(mapping::ULTRACODE.to_owned())
-            } else {
-                effort.map(str::to_owned)
-            },
-        });
+        // What the CLI applied is its explicit report of the effort (reflected into the thread),
+        // except when the thread asked for the CLI's default: the level the default resolves
+        // to is the CLI's business, and reporting it would replace the user's "default".
+        if target.is_some() || on {
+            self.emit(AdapterEvent::SessionInfo {
+                model: None,
+                permission_mode: None,
+                effort: if on {
+                    Some(mapping::ULTRACODE.to_owned())
+                } else {
+                    effort.map(str::to_owned)
+                },
+            });
+        }
         let want = target == Some(mapping::ULTRACODE);
         match (want, on) {
             (true, false) => Err(AdapterError::Harness(format!(
@@ -523,6 +622,72 @@ impl Inner {
                 "Claude Code kept ultracode on for {model} (get_settings: applied.ultracode is true)"
             ))),
             _ => Ok(()),
+        }
+    }
+
+    /// Makes the menu from what the CLI said ([`CommandView::visible`]), shares it (the
+    /// adapter's `commands`, the session-switching aliases) and records it as reported.
+    fn publish_menu(&self, st: &mut State) -> Vec<Command> {
+        let menu = st.commands.visible();
+        {
+            let mut cache = self.command_cache.lock();
+            cache.learn(&st.commands);
+            cache.set_menu(&self.cwd, menu.clone());
+        }
+        st.reported_commands = menu.clone();
+        menu
+    }
+
+    /// Emits `CommandsChanged` when the menu differs from the one last reported.
+    fn update_menu(&self, st: &mut State) {
+        if st.commands.visible() != st.reported_commands {
+            let commands = self.publish_menu(st);
+            self.emit(AdapterEvent::CommandsChanged { commands });
+        }
+    }
+
+    /// The CLI's permission mode (`initialize.current_permission_mode`, every `system/init`,
+    /// and `system/status` whenever it changes): `plan` is plan mode (`ModesReported`), any
+    /// other mode is the thread's permission mode (`SessionInfo`, and plan mode off). Both are
+    /// reflected into the thread by the engine; nothing is reported twice.
+    fn report_permission_mode(&self, st: &mut State, mode: &str) {
+        let plan = mode == PLAN_MODE;
+        st.plan_on = plan;
+        if !plan {
+            // What the CLI now runs with, so that `apply_settings` compares with it.
+            st.settings.permission_mode = Some(mode.to_owned());
+            if st.reported_permission_mode.as_deref() != Some(mode) {
+                st.reported_permission_mode = Some(mode.to_owned());
+                self.emit(AdapterEvent::SessionInfo {
+                    model: None,
+                    permission_mode: Some(mode.to_owned()),
+                    effort: None,
+                });
+            }
+        }
+        if st.reported_plan != Some(plan) {
+            st.reported_plan = Some(plan);
+            self.emit(AdapterEvent::ModesReported {
+                plan: Some(plan),
+                fast_state: None,
+            });
+        }
+    }
+
+    /// `fast_mode_state` (`off` / `cooldown` / `on`) of `initialize`, `system/init` or `result`:
+    /// what the CLI intends for fast mode, shown as it is (`Thread.fastModeState`). Whether a
+    /// request was served fast is the API's business (`usage.speed`); a refusal comes as a
+    /// `system/notification` (a notice).
+    fn report_fast_state(&self, st: &mut State, msg: &Value) {
+        let Some(state) = msg.get("fast_mode_state").and_then(Value::as_str) else {
+            return;
+        };
+        if st.reported_fast_state.as_deref() != Some(state) {
+            st.reported_fast_state = Some(state.to_owned());
+            self.emit(AdapterEvent::ModesReported {
+                plan: None,
+                fast_state: Some(state.to_owned()),
+            });
         }
     }
 
@@ -625,28 +790,51 @@ impl Inner {
         let Some(id) = response.get("request_id").and_then(Value::as_str) else {
             return;
         };
-        let completion = {
-            let mut st = self.state.lock();
-            match st.completion.as_ref() {
-                Some(c) if c.request_id == id => st.completion.take(),
-                _ => None,
-            }
-        };
-        if let Some(mut completion) = completion {
-            if response.get("subtype").and_then(Value::as_str) == Some("error") {
-                let error = response
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error");
-                tracing::warn!(label = %self.label, error, "get_context_usage failed; the turn completes without it");
-            } else if let Some(context) = response
-                .get("response")
-                .and_then(mapping::context_from_usage_response)
+        let failed = response.get("subtype").and_then(Value::as_str) == Some("error");
+        let error = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        {
+            let mut guard = self.state.lock();
+            let st = &mut *guard;
+            if let Some(completion) = st
+                .completion
+                .as_mut()
+                .filter(|c| c.context_request.as_deref() == Some(id))
             {
-                completion.usage.get_or_insert_with(Usage::default).context = Some(context);
+                completion.context_request = None;
+                if failed {
+                    tracing::warn!(label = %self.label, error, "get_context_usage failed; the turn completes without it");
+                } else if let Some(context) = response
+                    .get("response")
+                    .and_then(mapping::context_from_usage_response)
+                {
+                    completion.usage.get_or_insert_with(Usage::default).context = Some(context);
+                }
+                self.complete_if_answered(st);
+                return;
             }
-            self.emit(completion.into_event());
-            return;
+            if let Some(steer) = st.withdrawals.remove(id) {
+                let cancelled = !failed
+                    && response
+                        .pointer("/response/cancelled")
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                if cancelled {
+                    // Claude Code dropped it from its queue: it goes back to the engine's.
+                    self.return_steer(st, &steer);
+                } else if failed {
+                    tracing::warn!(label = %self.label, error, "withdrawing a steer that the turn did not take failed; the CLI runs it as its next run");
+                } else {
+                    tracing::info!(label = %self.label, "a steer the turn did not take had been dequeued already; the CLI runs it as its next run");
+                }
+                if let Some(completion) = st.completion.as_mut() {
+                    completion.withdrawals.remove(id);
+                }
+                self.complete_if_answered(st);
+                return;
+            }
         }
         let sender = self.pending.lock().as_mut().and_then(|m| m.remove(id));
         let Some(sender) = sender else {
@@ -666,6 +854,43 @@ impl Inner {
                 .unwrap_or_else(|| json!({})))
         };
         let _ = sender.send(outcome);
+    }
+
+    /// Publishes the pending completion once every answer it waits for has come.
+    fn complete_if_answered(&self, st: &mut State) {
+        if st
+            .completion
+            .as_ref()
+            .is_some_and(PendingCompletion::answered)
+            && let Some(c) = st.completion.take()
+        {
+            self.emit(c.into_event());
+        }
+    }
+
+    /// Hands a steer the CLI did not take back to the engine (`SteerReturned`), which queues it
+    /// again — while its turn is still open for the engine (running, or its completion still
+    /// pending). Once that turn completed, the engine has no steer to return it to: the user is
+    /// told that the message was not delivered.
+    fn return_steer(&self, st: &mut State, steer: &Steer) {
+        st.steers.retain(|_, s| s.message_id != steer.message_id);
+        let open = st.turn.as_ref().map(|_| st.turn_seq) == Some(steer.turn_seq)
+            || st
+                .completion
+                .as_ref()
+                .is_some_and(|c| c.turn_seq == steer.turn_seq);
+        if open {
+            self.emit(AdapterEvent::SteerReturned {
+                message_id: steer.message_id.clone(),
+            });
+        } else {
+            tracing::warn!(label = %self.label, message = %steer.message_id, "a steer came back after its turn completed");
+            self.emit(AdapterEvent::Notice {
+                level: NoticeLevel::Warning,
+                message: "A message sent while the previous turn was running was not delivered to Claude Code; send it again".into(),
+                code: Some("steerNotDelivered".into()),
+            });
+        }
     }
 
     async fn on_control_request(&self, msg: Value) {
@@ -764,8 +989,9 @@ impl Inner {
         let subtype = msg.get("subtype").and_then(Value::as_str).unwrap_or("");
         match subtype {
             "init" => {
-                let mut st = self.state.lock();
-                self.ack_turn(&mut st, Some(msg));
+                let mut guard = self.state.lock();
+                let st = &mut *guard;
+                self.ack_turn(st, Some(msg));
                 if let Some(id) = msg.get("session_id").and_then(Value::as_str)
                     && !id.is_empty()
                     && id != st.native_session_id
@@ -776,32 +1002,58 @@ impl Inner {
                     });
                 }
                 let model = msg.get("model").and_then(Value::as_str).map(str::to_owned);
-                let mode = msg
-                    .get("permissionMode")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                if model != st.reported_model || mode != st.reported_permission_mode {
+                if model.is_some() && model != st.reported_model {
                     st.reported_model = model.clone();
-                    st.reported_permission_mode = mode.clone();
                     self.emit(AdapterEvent::SessionInfo {
                         model,
-                        permission_mode: mode,
+                        permission_mode: None,
                         effort: None,
                     });
                 }
-                if let Some(names) = msg.get("slash_commands").and_then(Value::as_array) {
-                    let names: Vec<String> = names
-                        .iter()
-                        .filter_map(|n| n.as_str().map(str::to_owned))
-                        .collect();
-                    if names != st.reported_command_names {
-                        let commands = mapping::commands_from_names(&names, &st.commands);
-                        st.reported_command_names = names;
-                        self.command_cache
-                            .lock()
-                            .insert(self.cwd.clone(), commands.clone());
-                        self.emit(AdapterEvent::CommandsChanged { commands });
-                    }
+                if let Some(mode) = msg.get("permissionMode").and_then(Value::as_str) {
+                    self.report_permission_mode(st, mode);
+                }
+                self.report_fast_state(st, msg);
+                st.commands.set_init(msg);
+                if msg.get("terminal_slash_commands").is_some() {
+                    self.command_cache
+                        .lock()
+                        .remember_terminal(&self.cwd, &st.commands.terminal);
+                }
+                self.update_menu(st);
+            }
+            // The whole command list again, after it changed (skills, MCP prompts).
+            "commands_changed" => {
+                let mut guard = self.state.lock();
+                let st = &mut *guard;
+                st.commands.set_listed(msg.get("commands"));
+                self.update_menu(st);
+            }
+            // The permission mode changed (`set_permission_mode`, an approval's `setMode`,
+            // leaving plan mode after its approval). Other `status` messages are progress.
+            "status" => {
+                if let Some(mode) = msg.get("permissionMode").and_then(Value::as_str) {
+                    let mut st = self.state.lock();
+                    self.report_permission_mode(&mut st, mode);
+                }
+            }
+            // A notification the CLI shows its user (e.g. `fast-mode-overage-rejected`, "Fast
+            // mode disabled · usage credits exhausted"), in its words.
+            "notification" => {
+                let level = match msg.get("color").and_then(Value::as_str) {
+                    Some("error") => NoticeLevel::Error,
+                    Some("warning") => NoticeLevel::Warning,
+                    _ => NoticeLevel::Info,
+                };
+                match msg.get("text").and_then(Value::as_str) {
+                    Some(text) => self.emit(AdapterEvent::Notice {
+                        level,
+                        message: aas_harness::sanitize_terminal_text(text),
+                        code: msg.get("key").and_then(Value::as_str).map(str::to_owned),
+                    }),
+                    None => self.emit(AdapterEvent::Native {
+                        payload: msg.clone(),
+                    }),
                 }
             }
             "background_tasks_changed" => {
@@ -811,13 +1063,25 @@ impl Inner {
             }
             "task_started" => {
                 let mut st = self.state.lock();
-                let origin = msg
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
+                let tool_use_id = msg.get("tool_use_id").and_then(Value::as_str);
+                let origin = tool_use_id
                     .and_then(|t| st.turn.as_ref().and_then(|turn| turn.tools.get(t)))
                     .and_then(|tool| tool.key.clone());
-                let changes = st.background.started(msg, origin);
+                let changes = st.background.started(msg, origin.clone());
                 self.emit_tasks(changes);
+                // Work the turn's tool waits for in the foreground: from now on
+                // `background_tasks {tool_use_id}` can move it (Ctrl+B; recording f3: before
+                // this message the CLI answers `backgrounded: false`).
+                if msg.get("is_backgrounded").and_then(Value::as_bool) == Some(false)
+                    && let (Some(tool_use_id), Some(key)) = (tool_use_id, origin)
+                    && let Some(turn) = st.turn.as_mut()
+                    && turn.backgroundable.insert(tool_use_id.to_owned())
+                {
+                    self.emit(AdapterEvent::ItemBackgroundable {
+                        key,
+                        backgroundable: true,
+                    });
+                }
             }
             "task_progress" => {
                 let mut st = self.state.lock();
@@ -839,8 +1103,10 @@ impl Inner {
                     });
                 }
             }
-            // Progress signals with no user-visible state: the result marks the turn end.
-            "status" | "thinking_tokens" | "session_state_changed" => {}
+            // Progress signals with no user-visible state: the result marks the turn end;
+            // `control_request_progress` tells that one of our requests (a side question) is
+            // being worked on, which its answer ends.
+            "thinking_tokens" | "session_state_changed" | "control_request_progress" => {}
             "compact_boundary" => self.emit(AdapterEvent::Notice {
                 level: NoticeLevel::Info,
                 message: "Conversation compacted".into(),
@@ -881,6 +1147,10 @@ impl Inner {
                 st.queued_commands.remove(uuid);
             }
         }
+        if st.steers.contains_key(uuid) {
+            self.steer_lifecycle(st, uuid, state);
+            return;
+        }
         let open_run = st.turn.as_ref().map(|_| st.turn_seq);
         let Some(out) = st.outgoing.as_mut().filter(|o| o.uuid == uuid) else {
             return;
@@ -896,10 +1166,12 @@ impl Inner {
                         turn.own = Some(uuid.to_owned());
                     }
                 } else {
-                    // Our message starts the next run.
+                    // Our message starts the next run; its uuid is the run's first transcript
+                    // entry.
                     st.turn_seq += 1;
                     st.turn = Some(Turn {
                         own: Some(uuid.to_owned()),
+                        anchor: Some(uuid.to_owned()),
                         ..Turn::default()
                     });
                 }
@@ -911,6 +1183,48 @@ impl Inner {
             }
             // queued, completed; a cancel after the start is the aborted run's end, which its
             // result reports.
+            _ => {}
+        }
+    }
+
+    /// The fate of a steered message (docs/adapters/claude.md §3, "steer"):
+    /// * `started` while its turn runs: the CLI took it into the turn at a tool boundary
+    ///   (recording a1: `started` before the turn's `result`, no new `system/init`);
+    /// * `started` after the turn's `result`: the CLI runs it as its next run (recording a2),
+    ///   which answers the message; the previous turn completes first;
+    /// * `refused` / `discarded`, or `cancelled` that we did not ask for, before it started: the
+    ///   CLI will not run it, and it goes back to the engine;
+    /// * `completed`, or `cancelled` by our withdrawal (whose answer returns it): over.
+    fn steer_lifecycle(&self, st: &mut State, uuid: &str, state: &str) {
+        let Some(steer) = st.steers.get_mut(uuid) else {
+            return;
+        };
+        match state {
+            "started" if !steer.started => {
+                steer.started = true;
+                if st.turn.is_none() {
+                    if let Some(c) = st.completion.take() {
+                        self.emit(c.into_event());
+                    }
+                    st.turn_seq += 1;
+                    st.turn = Some(Turn {
+                        own: Some(uuid.to_owned()),
+                        anchor: Some(uuid.to_owned()),
+                        ..Turn::default()
+                    });
+                }
+            }
+            "refused" | "discarded" | "cancelled" if !steer.started => {
+                let withdrawing = st.withdrawals.values().any(|w| w.uuid == uuid);
+                let steer = st.steers.remove(uuid).expect("the steer is known");
+                if !withdrawing {
+                    tracing::info!(label = %self.label, state, "Claude Code did not take a steered message");
+                    self.return_steer(st, &steer);
+                }
+            }
+            "completed" | "refused" | "discarded" | "cancelled" => {
+                st.steers.remove(uuid);
+            }
             _ => {}
         }
     }
@@ -956,6 +1270,7 @@ impl Inner {
                 st.turn_seq += 1;
                 st.turn = Some(Turn {
                     acked: true,
+                    anchor: own.clone(),
                     own,
                     ..Turn::default()
                 });
@@ -1120,6 +1435,9 @@ impl Inner {
         let mut st = self.state.lock();
         self.ack_turn(&mut st, None);
         let turn = st.turn.as_mut().expect("turn exists after ack");
+        if let Some(uuid) = msg.get("uuid").and_then(Value::as_str) {
+            turn.anchor = Some(uuid.to_owned());
+        }
         let single = blocks.len() == 1;
         for block in blocks {
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
@@ -1283,6 +1601,11 @@ impl Inner {
         };
         let mut st = self.state.lock();
         self.ack_turn(&mut st, None);
+        if let (Some(uuid), Some(turn)) =
+            (msg.get("uuid").and_then(Value::as_str), st.turn.as_mut())
+        {
+            turn.anchor = Some(uuid.to_owned());
+        }
         for block in results {
             let Some(tool_id) = block.get("tool_use_id").and_then(Value::as_str) else {
                 continue;
@@ -1359,14 +1682,44 @@ impl Inner {
         }
     }
 
+    fn next_request_id(&self) -> String {
+        format!("aas_{}", self.next_request.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// A run ended: its completion waits for the context usage (`get_context_usage`) and for
+    /// the withdrawal of the steers the run did not take (`cancel_async_message`; a steer the
+    /// CLI takes only at a tool boundary, and one that came after the last is still queued).
+    /// Both requests are written here and answered in [`Self::on_control_response`].
     async fn on_result(&self, msg: &Value) {
-        let request_id = format!("aas_{}", self.next_request.fetch_add(1, Ordering::Relaxed));
-        {
-            let mut st = self.state.lock();
-            if !self.finish_turn(&mut st, msg, &request_id) {
+        let request_id = self.next_request_id();
+        let withdrawals: Vec<(String, String)> = {
+            let mut guard = self.state.lock();
+            let st = &mut *guard;
+            self.report_fast_state(st, msg);
+            if !self.finish_turn(st, msg, &request_id) {
                 return;
             }
-        }
+            let ended = st.turn_seq;
+            // Steers the CLI took into this run or an earlier one are over with it (their
+            // `completed` frame normally said so already).
+            st.steers.retain(|_, s| !s.started || s.turn_seq > ended);
+            let unstarted: Vec<Steer> = st
+                .steers
+                .values()
+                .filter(|s| !s.started && s.turn_seq == ended)
+                .cloned()
+                .collect();
+            let mut requests = Vec::new();
+            for steer in unstarted {
+                let id = self.next_request_id();
+                requests.push((id.clone(), steer.uuid.clone()));
+                if let Some(c) = st.completion.as_mut() {
+                    c.withdrawals.insert(id.clone());
+                }
+                st.withdrawals.insert(id, steer);
+            }
+            requests
+        };
         let request = json!({
             "type": "control_request",
             "request_id": request_id,
@@ -1375,6 +1728,19 @@ impl Inner {
         if let Err(e) = self.write(&request).await {
             tracing::debug!(label = %self.label, error = %e, "could not ask for the context usage");
             self.flush_completion();
+        }
+        for (id, uuid) in withdrawals {
+            if let Err(e) = self.write(&withdraw_request(&id, &uuid)).await {
+                // The CLI's input is gone (the process ends): nothing runs the message.
+                tracing::warn!(label = %self.label, error = %e, "could not withdraw a steer the turn did not take");
+                let mut guard = self.state.lock();
+                let st = &mut *guard;
+                st.withdrawals.remove(&id);
+                if let Some(c) = st.completion.as_mut() {
+                    c.withdrawals.remove(&id);
+                }
+                self.complete_if_answered(st);
+            }
         }
     }
 
@@ -1390,6 +1756,15 @@ impl Inner {
     /// usage is known). Returns `false` when there was no turn.
     fn finish_turn(&self, st: &mut State, msg: &Value, request_id: &str) -> bool {
         let Some(turn) = st.turn.take() else {
+            if !st.initialized
+                && let Some(refusal) = mapping::startup_error(msg)
+            {
+                // The CLI refused to start the session (e.g. an unknown resume anchor) and
+                // ends: `initialize` reports it.
+                tracing::info!(label = %self.label, refusal, "Claude Code refused to start the session");
+                st.startup_error = Some(refusal);
+                return false;
+            }
             // A result without any turn activity (should not happen); still report it.
             self.emit(AdapterEvent::Native {
                 payload: msg.clone(),
@@ -1450,8 +1825,16 @@ impl Inner {
             Some(_) => None,
             None => mapping::turn_trigger(msg),
         };
+        // The run's anchor, before its completion (the engine records it with the turn).
+        if let Some(uuid) = &turn.anchor {
+            self.emit(AdapterEvent::TurnAnchor {
+                anchor: mapping::turn_anchor(uuid),
+            });
+        }
         st.completion = Some(PendingCompletion {
-            request_id: request_id.to_owned(),
+            turn_seq: st.turn_seq,
+            context_request: Some(request_id.to_owned()),
+            withdrawals: HashSet::new(),
             status,
             usage,
             error,
@@ -1579,6 +1962,28 @@ impl Inner {
     }
 }
 
+/// `cancel_async_message` for the steer `uuid` ("Drops a pending async user message from the
+/// command queue by uuid. No-op if already dequeued for execution."): `{cancelled: true}` when it
+/// was dropped (recording a3).
+fn withdraw_request(request_id: &str, uuid: &str) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "cancel_async_message", "message_uuid": uuid }
+    })
+}
+
+/// A status section in place of one whose request failed, with the error's text.
+fn failed_section(title: &str, error: &AdapterError) -> StatusSection {
+    StatusSection {
+        title: title.to_owned(),
+        rows: vec![aas_harness::StatusRow {
+            label: "Error".into(),
+            value: error.detail(),
+        }],
+    }
+}
+
 /// Main-thread messages have `parent_tool_use_id: null`; subagent internals are not shown
 /// (the subagent's `Task`/`Agent` tool item and its background task carry its result).
 fn is_main_thread(msg: &Value) -> bool {
@@ -1682,8 +2087,67 @@ impl SessionControl for ClaudeSession {
         }
     }
 
-    async fn steer(&self, _input: TurnInput) -> Result<(), AdapterError> {
-        Err(AdapterError::Unsupported("steer"))
+    /// A steer without the engine's id of the message (the engine always names it, see
+    /// [`Self::steer_message`]).
+    async fn steer(&self, input: TurnInput) -> Result<(), AdapterError> {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        self.steer_message(&message_id, input).await
+    }
+
+    /// Writes the message into the running turn as an ordinary user message (no `priority`;
+    /// `priority: "now"` would abort the turn, recording a4). Claude Code takes it at the turn's
+    /// next tool boundary: `command_lifecycle started` before the turn's `result`, with no new
+    /// `system/init` (recording a1). A message the turn did not take by its `result` is
+    /// withdrawn (`cancel_async_message`) and handed back with `SteerReturned` before the
+    /// turn's `TurnCompleted` (docs/adapters/claude.md §3).
+    async fn steer_message(&self, message_id: &str, input: TurnInput) -> Result<(), AdapterError> {
+        let content = user_content(&input).await?;
+        let uuid = uuid::Uuid::new_v4().to_string();
+        {
+            let mut guard = self.inner.state.lock();
+            let st = &mut *guard;
+            if st.closed {
+                return Err(AdapterError::Closed);
+            }
+            if st.lifecycle != Some(true) {
+                return Err(AdapterError::Harness(
+                    "this Claude Code does not report when it takes a message into a turn (no msg_lifecycle_v1), so a steer could not be followed".into(),
+                ));
+            }
+            match (&st.turn, &st.completion) {
+                (Some(_), _) => {
+                    let steer = Steer {
+                        uuid: uuid.clone(),
+                        message_id: message_id.to_owned(),
+                        turn_seq: st.turn_seq,
+                        started: false,
+                    };
+                    st.steers.insert(uuid.clone(), steer);
+                }
+                // The turn's `result` came already; its completion waits for its answers, so the
+                // engine still has the turn: the message goes back to its queue right away.
+                (None, Some(_)) => {
+                    self.inner.emit(AdapterEvent::SteerReturned {
+                        message_id: message_id.to_owned(),
+                    });
+                    return Ok(());
+                }
+                (None, None) => {
+                    return Err(AdapterError::Other(
+                        "the turn ended before the message could be added to it; send it as a new message".into(),
+                    ));
+                }
+            }
+        }
+        if let Err(e) = self
+            .inner
+            .write_bounded(&user_message(content, &uuid))
+            .await
+        {
+            self.inner.state.lock().steers.remove(&uuid);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Sends the `interrupt` control request. Claude Code acknowledges it right away and ends
@@ -1733,16 +2197,26 @@ impl SessionControl for ClaudeSession {
         &self,
         settings: &ThreadSettings,
     ) -> Result<SettingsApplied, AdapterError> {
-        let current = self.inner.state.lock().settings.clone();
-        if settings.permission_mode != current.permission_mode {
-            let mode = settings
-                .permission_mode
-                .clone()
-                .unwrap_or_else(|| "default".to_owned());
-            self.inner
-                .control(json!({ "subtype": "set_permission_mode", "mode": mode }))
-                .await?;
-            self.inner.state.lock().settings.permission_mode = settings.permission_mode.clone();
+        let (current, plan_on) = {
+            let st = self.inner.state.lock();
+            (st.settings.clone(), st.plan_on)
+        };
+        // The permission mode `plan` of earlier versions is plan mode, which `apply_modes`
+        // handles: the mode plan mode returns to stays.
+        let wanted_mode = match settings.permission_mode.as_deref() {
+            Some(PLAN_MODE) => current.permission_mode.clone(),
+            _ => settings.permission_mode.clone(),
+        };
+        if wanted_mode != current.permission_mode {
+            let mode = wanted_mode.clone().unwrap_or_else(|| "default".to_owned());
+            self.inner.set_permission_mode(&mode).await?;
+            self.inner.state.lock().settings.permission_mode = wanted_mode;
+            if plan_on {
+                // In plan mode the thread's permission mode is the one Claude Code returns to
+                // when plan mode ends (after the plan's approval), which it remembers when plan
+                // mode begins (recordings h1, h2): plan mode begins again from the new mode.
+                self.inner.set_permission_mode(PLAN_MODE).await?;
+            }
         }
         let model_changed = settings.model != current.model;
         if model_changed {
@@ -1772,6 +2246,133 @@ impl SessionControl for ClaudeSession {
                 .await?;
         }
         Ok(SettingsApplied::Live)
+    }
+
+    /// Plan mode is Claude Code's permission mode `plan` (`set_permission_mode`), entered from
+    /// the thread's permission mode, to which the CLI returns when the plan is approved; leaving
+    /// it by request sets the thread's permission mode again (`default` when there is none:
+    /// `plan` is never a mode to return to). Fast mode is the flag setting `fastMode`
+    /// (`apply_flag_settings`), the SDK's opt-in and switch in one (recording e1).
+    ///
+    /// After a change the CLI's next word on plan mode always goes to the engine (which asked
+    /// for the change), also when it says the CLI kept or left plan mode after all.
+    async fn apply_modes(&self, modes: &ThreadModes) -> Result<SettingsApplied, AdapterError> {
+        let (plan_on, fast_on, base) = {
+            let st = self.inner.state.lock();
+            (st.plan_on, st.fast_on, st.settings.permission_mode.clone())
+        };
+        if modes.plan != plan_on {
+            let mode = if modes.plan {
+                PLAN_MODE.to_owned()
+            } else {
+                base.filter(|m| m != PLAN_MODE)
+                    .unwrap_or_else(|| "default".to_owned())
+            };
+            self.inner.set_permission_mode(&mode).await?;
+            let mut st = self.inner.state.lock();
+            st.plan_on = modes.plan;
+            st.reported_plan = None;
+        }
+        if modes.fast != fast_on {
+            self.inner
+                .control(json!({
+                    "subtype": "apply_flag_settings",
+                    "settings": mapping::fast_mode_flag_settings(modes.fast)
+                }))
+                .await?;
+            self.inner.state.lock().fast_on = modes.fast;
+        }
+        Ok(SettingsApplied::Live)
+    }
+
+    /// `rename_session` for the session this process runs (`session_id`: the CLI refuses the
+    /// request when it moved to another one) as a rename the user made in the hosting
+    /// application (`source: "host"`, which the CLI counts as a user rename). The CLI answers
+    /// with no body and reports nothing on stdout; the name goes to the transcript
+    /// (`custom-title`) (recording b1).
+    async fn rename(&self, title: &str) -> Result<(), AdapterError> {
+        let session_id = self.inner.state.lock().native_session_id.clone();
+        self.inner
+            .control(json!({
+                "subtype": "rename_session",
+                "title": title,
+                "source": "host",
+                "session_id": session_id
+            }))
+            .await
+            .map(|_| ())
+    }
+
+    /// The CLI's own `/status` sections (`get_status`, `@internal`), its usage (`get_usage`
+    /// with `skip_behaviors`, experimental) and, in plan mode, the current plan (`get_plan`,
+    /// `@internal`); see [`mapping::status_sections`]. A failed `get_usage` or `get_plan`
+    /// becomes a section that says so; a failed `get_status` fails the request.
+    async fn status(&self) -> Result<Vec<StatusSection>, AdapterError> {
+        let status = self
+            .inner
+            .control(json!({ "subtype": "get_status" }))
+            .await?;
+        let mut sections = mapping::status_sections(&status);
+        match self.inner.control(usage_request()).await {
+            Ok(usage) => sections.extend(mapping::usage_sections(&usage, true)),
+            Err(e) => sections.push(failed_section("Plan usage", &e)),
+        }
+        if self.inner.state.lock().plan_on {
+            match self.inner.control(json!({ "subtype": "get_plan" })).await {
+                Ok(plan) => sections.extend(mapping::plan_section(&plan)),
+                Err(e) => sections.push(failed_section("Plan", &e)),
+            }
+        }
+        Ok(sections)
+    }
+
+    /// `/btw`: `side_question {question}` -> `{response, synthetic}`. The CLI answers beside the
+    /// conversation, also while a turn runs, and records nothing in the transcript (recording
+    /// b1).
+    async fn side_question(&self, question: &str) -> Result<SideAnswer, AdapterError> {
+        let reply = self
+            .inner
+            .control(json!({ "subtype": "side_question", "question": question }))
+            .await?;
+        Ok(SideAnswer {
+            answer: reply
+                .get("response")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            synthetic: reply.get("synthetic").and_then(Value::as_bool) == Some(true),
+        })
+    }
+
+    /// Ctrl+B for one tool: `background_tasks {tool_use_id}` -> `{backgrounded: true}`. The
+    /// tool's result then says the work goes on in the background, which closes the item as
+    /// `backgrounded` with its task (recordings f1b, f2).
+    async fn move_to_background(&self, item_key: &str) -> Result<(), AdapterError> {
+        let tool_use_id = {
+            let st = self.inner.state.lock();
+            item_key
+                .strip_prefix(TOOL_KEY_PREFIX)
+                .filter(|id| {
+                    st.turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.backgroundable.contains(*id))
+                })
+                .map(str::to_owned)
+        };
+        let Some(tool_use_id) = tool_use_id else {
+            return Err(AdapterError::Other(format!(
+                "{item_key} is not work Claude Code runs in the foreground of the current turn"
+            )));
+        };
+        let reply = self
+            .inner
+            .control(json!({ "subtype": "background_tasks", "tool_use_id": tool_use_id }))
+            .await?;
+        match reply.get("backgrounded").and_then(Value::as_bool) {
+            Some(true) => Ok(()),
+            _ => Err(AdapterError::Harness(format!(
+                "Claude Code did not move the work to the background (background_tasks answered {reply})"
+            ))),
+        }
     }
 
     /// Stops background task `key` with `stop_task`. The CLI answers `{}` also for a task

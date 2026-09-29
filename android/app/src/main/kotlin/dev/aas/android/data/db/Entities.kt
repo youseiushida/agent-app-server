@@ -149,6 +149,8 @@ data class OutboxEntity(
     @ColumnInfo(name = "next_attempt_at") val nextAttemptAt: Long,
     /** The harness the request waits for after `harnessUnavailable` (schema version 2). */
     @ColumnInfo(name = "waiting_for_harness") val waitingForHarness: String?,
+    /** The `clientRequestId` of the entry before it in its chain, while that one waits (schema version 4). */
+    @ColumnInfo(name = "after_request_id") val after: String?,
 )
 
 /** Keys of the [MetaEntity] table. */

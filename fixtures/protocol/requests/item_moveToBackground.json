@@ -1,0 +1,10 @@
+{
+  "id": 46,
+  "jsonrpc": "2.0",
+  "method": "item/moveToBackground",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000023",
+    "itemId": "itm_01K6A00000000000000000IT11",
+    "threadId": "thr_01K6A0000000000000000THR01"
+  }
+}

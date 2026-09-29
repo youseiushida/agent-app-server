@@ -88,6 +88,9 @@ class ReliabilityE2eTest : E2eTest() {
         flows.pairFresh(AppFlows.unique("e2e-kill"))
         flows.newProjectAndThread(AppFlows.unique("e2e-kill"), FIRST_PROMPT)
         app.waitFor(app.inApp(By.text("echo: $FIRST_PROMPT")), "the first turn's answer", Waits.TURN_MS)
+        // The answer streams before the turn ends: going offline in between leaves the thread
+        // running in the app, whose composer then queues (キューに追加) instead of sending.
+        app.waitFor(app.inApp(By.text(app.textPattern("turn_worked"))), "the end of the first turn", Waits.TURN_MS)
         val approvalTitle = app.text("notify_approval_title", FIRST_PROMPT)
         try {
             app.setAirplaneMode(true)

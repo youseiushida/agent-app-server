@@ -12,6 +12,8 @@ mod mapping;
 mod server;
 mod session;
 mod settings;
+mod status;
+mod texts;
 mod wire;
 
 use std::path::{Path, PathBuf};
@@ -19,9 +21,10 @@ use std::sync::{Arc, Weak};
 
 use aas_harness::protocol::{Command, HarnessCapabilities, HarnessKind};
 use aas_harness::{
-    AdapterContext, AdapterError, AdapterPolicy, CommandContext, HarnessAdapter, HarnessConfig,
-    HarnessInfo, NativeHistory, NativeSessionSet, NativeSessionSummary, SessionHandle,
-    StartRequest,
+    AdapterContext, AdapterError, AdapterPolicy, CommandContext, ForkPoint, HarnessAdapter,
+    HarnessConfig, HarnessFeatures, HarnessInfo, NativeHistory, NativeSessionSet,
+    NativeSessionSummary, PlanModeFeature, SessionHandle, StartOptions, StartRequest,
+    StatusSection,
 };
 use aas_stdio::{RpcCallError, RpcPeer};
 use aas_supervisor::{StopReason, ToolSpec, resolve_program};
@@ -31,6 +34,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub use link::ProcessLink;
+pub use texts::{CODEX_TEXTS_VERSION, IMPLEMENT_PLAN_PROMPT, INIT_PROMPT, NEW_THREAD_PREAMBLE};
 
 /// Adapter options (`[[harness]] options = { … }` in config.toml). Parsed strictly, like the
 /// options of every other adapter: an unknown key (a typo, another adapter's key style) or a
@@ -99,6 +103,32 @@ pub(crate) fn rpc_err(method: &str, error: RpcCallError) -> AdapterError {
     }
 }
 
+/// What the last probe learned from `model/list` that sessions and features need.
+#[derive(Debug, Clone, Default)]
+struct Catalog {
+    fast_tiers: settings::FastTiers,
+    default_model: Option<String>,
+}
+
+/// The features of a Codex whose last probe learned `catalog` (see
+/// [`CodexAdapter::features`]).
+fn features_of(catalog: &Catalog) -> HarnessFeatures {
+    HarnessFeatures {
+        fork_at_turn: true,
+        fork_while_held: true,
+        rename: true,
+        side_question: false,
+        move_to_background: false,
+        status: true,
+        project_trust: false,
+        plan_mode: Some(PlanModeFeature {
+            implement_prompt: Some(texts::IMPLEMENT_PLAN_PROMPT.into()),
+            new_thread_preamble: Some(texts::NEW_THREAD_PREAMBLE.into()),
+        }),
+        fast_mode_models: catalog.fast_tiers.keys().cloned().collect(),
+    }
+}
+
 /// The Codex harness.
 pub struct CodexAdapter {
     config: HarnessConfig,
@@ -108,6 +138,7 @@ pub struct CodexAdapter {
     options: Result<CodexOptions, String>,
     display_name: String,
     live: Mutex<Vec<Weak<session::Shared>>>,
+    catalog: Mutex<Catalog>,
 }
 
 impl CodexAdapter {
@@ -123,6 +154,7 @@ impl CodexAdapter {
             options,
             display_name,
             live: Mutex::new(Vec::new()),
+            catalog: Mutex::new(Catalog::default()),
         }
     }
 
@@ -308,12 +340,18 @@ impl HarnessAdapter for CodexAdapter {
             {
                 Ok(m) => m,
                 Err(e) => {
+                    // The error's own words (without its kind's prefix, so none is repeated).
                     return HarnessInfo::unavailable(format!(
-                        "codex app-server did not start: {e}"
+                        "codex app-server did not start: {}",
+                        e.detail()
                     ));
                 }
             };
         let catalog = settings::model_catalog(&models);
+        *self.catalog.lock() = Catalog {
+            fast_tiers: catalog.fast_tiers.clone(),
+            default_model: catalog.default_model.clone(),
+        };
         HarnessInfo {
             available: true,
             unavailable_reason: None,
@@ -329,6 +367,18 @@ impl HarnessAdapter for CodexAdapter {
     }
 
     async fn start(&self, req: StartRequest) -> Result<SessionHandle, AdapterError> {
+        self.start_with(req, StartOptions::default()).await
+    }
+
+    /// Opens the thread with the start options: a fork at a turn (`lastTurnId` /
+    /// `beforeTurnId`), fast mode (`serviceTier`), and plan mode (sent with the first turn:
+    /// `collaborationMode` is a `turn/start` parameter). The options the features do not offer
+    /// are not set by the engine (`projectTrust`).
+    async fn start_with(
+        &self,
+        req: StartRequest,
+        options: StartOptions,
+    ) -> Result<SessionHandle, AdapterError> {
         let program = self.program()?;
         let spawned = server::spawn_app_server(
             &self.config,
@@ -345,6 +395,7 @@ impl HarnessAdapter for CodexAdapter {
         let guard = server::start_guard(&spawned.peer, &handle, self.policy().stop_grace);
         let result = async {
             server::initialize(&spawned.peer, self.policy().handshake_timeout).await?;
+            let catalog = self.catalog.lock().clone();
             session::establish(
                 spawned.peer.clone(),
                 spawned.incoming,
@@ -354,6 +405,9 @@ impl HarnessAdapter for CodexAdapter {
                     cwd: req.cwd.clone(),
                     settings: req.settings.clone(),
                     policy: self.policy().clone(),
+                    options,
+                    fast_tiers: catalog.fast_tiers,
+                    default_model: catalog.default_model,
                 },
             )
             .await
@@ -368,9 +422,25 @@ impl HarnessAdapter for CodexAdapter {
             Err(e) => {
                 // Stopped first so the stderr tail is complete.
                 guard.stop(StopReason::Shutdown).await;
-                Err(server::with_stderr(e, &handle))
+                Err(self.policy().with_stderr(e, &handle.stderr_tail()))
             }
         }
+    }
+
+    /// Everything Codex's app-server offers for the port's features except the ones it has no
+    /// signal for (side questions, moving running work to the background, project trust).
+    /// Fast mode is offered for the models whose `model/list` entry names one service tier
+    /// (see `settings::FastTier`), as the last probe learned.
+    fn features(&self) -> HarnessFeatures {
+        features_of(&self.catalog.lock())
+    }
+
+    /// The anchor is a Codex turn id, which `thread/fork` takes as `lastTurnId` or
+    /// `beforeTurnId` (Codex cuts before a turn itself: no other anchor is needed).
+    fn check_fork_point(&self, point: &ForkPoint) -> Result<(), AdapterError> {
+        session::anchor_turn_id(&point.anchor)
+            .map(|_| ())
+            .map_err(AdapterError::Other)
     }
 
     async fn commands(&self, ctx: CommandContext) -> Result<Vec<Command>, AdapterError> {
@@ -382,12 +452,35 @@ impl HarnessAdapter for CodexAdapter {
         Ok(commands::commands(&skills))
     }
 
-    /// None. The adapter offers `/compact` and `/review` (both act on the thread's own Codex
-    /// thread) and the skills (`$name`, run in the same thread); Codex's session commands
-    /// (`/new`, `/resume`, `/fork`) are features of its clients that app-server does not
-    /// expose as commands.
+    /// None. The adapter offers `/compact`, `/review`, `/init` and `/goal` (all act on the
+    /// thread's own Codex thread) and the skills (`$name`, run in the same thread); Codex's
+    /// session commands (`/new`, `/resume`, `/fork`) are features of its clients that
+    /// app-server does not expose as commands, and app-server never moves a running thread to
+    /// another one (one process serves one thread, and its id stays).
     fn session_switching_commands(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// The account and its rate limits, from a running session's app-server or a short-lived
+    /// one (`account/read`, `account/rateLimits/read`).
+    async fn status(&self, _cwd: &Path) -> Result<Vec<StatusSection>, AdapterError> {
+        let timeout = self.policy().handshake_timeout;
+        self.with_peer(|peer| async move {
+            let account = session::read_account(&peer, timeout).await;
+            let limits = session::read_rate_limits(&peer, timeout).await;
+            let limits = match &limits {
+                Ok(snapshot) => status::RateLimits::Read(snapshot),
+                Err(error) => status::RateLimits::Rolling {
+                    snapshot: None,
+                    read_error: error,
+                },
+            };
+            Ok(vec![
+                status::account_section(account.as_ref().map_err(String::as_str)),
+                status::rate_limit_section(limits, session::unix_now()),
+            ])
+        })
+        .await
     }
 
     async fn list_native_sessions(
@@ -409,6 +502,18 @@ impl HarnessAdapter for CodexAdapter {
         cwd: &Path,
         native_session_id: &str,
     ) -> Result<NativeHistory, AdapterError> {
+        Ok(self
+            .read_native_history_anchored(cwd, native_session_id)
+            .await?
+            .0)
+    }
+
+    /// Each turn's anchor is its id in `thread/read` (the same id the live turn had).
+    async fn read_native_history_anchored(
+        &self,
+        cwd: &Path,
+        native_session_id: &str,
+    ) -> Result<(NativeHistory, Vec<Option<Value>>), AdapterError> {
         let policy = self.policy().clone();
         let id = native_session_id.to_owned();
         let thread = self
@@ -424,7 +529,7 @@ impl HarnessAdapter for CodexAdapter {
                 Ok(resp.thread)
             })
             .await?;
-        Ok(history::history(&thread, cwd, self.policy()))
+        Ok(history::anchored_history(&thread, cwd, self.policy()))
     }
 }
 
@@ -436,6 +541,7 @@ pub mod testing {
     use tokio::io::{AsyncRead, AsyncWrite};
 
     pub use crate::mapping::UsageTracker;
+    pub use crate::texts::ALL as CODEX_TEXTS;
 
     /// Runs the `initialize` + thread handshake over arbitrary streams and returns the session.
     pub async fn establish<R, W>(
@@ -443,6 +549,33 @@ pub mod testing {
         writer: W,
         link: Arc<dyn ProcessLink>,
         req: StartRequest,
+        policy: AdapterPolicy,
+    ) -> Result<SessionHandle, AdapterError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        establish_with(
+            reader,
+            writer,
+            link,
+            req,
+            StartOptions::default(),
+            &[],
+            policy,
+        )
+        .await
+    }
+
+    /// [`establish`] with start options and the fast tiers a probe would have learned
+    /// (`(model, tier id, tier name)`; the first model is the default one).
+    pub async fn establish_with<R, W>(
+        reader: R,
+        writer: W,
+        link: Arc<dyn ProcessLink>,
+        req: StartRequest,
+        options: StartOptions,
+        fast_tiers: &[(&str, &str, &str)],
         policy: AdapterPolicy,
     ) -> Result<SessionHandle, AdapterError>
     where
@@ -459,8 +592,8 @@ pub mod testing {
             },
         );
         server::initialize(&peer, policy.handshake_timeout).await?;
-        let (handle, _shared) = session::establish(
-            peer,
+        let established = session::establish(
+            peer.clone(),
             incoming,
             link,
             session::EstablishArgs {
@@ -468,10 +601,53 @@ pub mod testing {
                 cwd: req.cwd,
                 settings: req.settings,
                 policy,
+                options,
+                fast_tiers: fast_tiers
+                    .iter()
+                    .map(|(model, id, name)| {
+                        (
+                            (*model).to_owned(),
+                            settings::FastTier {
+                                id: (*id).to_owned(),
+                                name: (*name).to_owned(),
+                            },
+                        )
+                    })
+                    .collect(),
+                default_model: fast_tiers.first().map(|(model, ..)| (*model).to_owned()),
             },
         )
-        .await?;
-        Ok(handle)
+        .await;
+        match established {
+            Ok((handle, _shared)) => Ok(handle),
+            Err(e) => {
+                // Like `start`'s guard: the process sees its stdin close.
+                peer.close_writer().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The features of an adapter whose probe listed `models` (raw `model/list` entries).
+    pub fn features_for_models(models: Value) -> Result<HarnessFeatures, String> {
+        let models: Vec<wire::WireModel> =
+            serde_json::from_value(models).map_err(|e| e.to_string())?;
+        let catalog = settings::model_catalog(&models);
+        Ok(features_of(&Catalog {
+            fast_tiers: catalog.fast_tiers,
+            default_model: catalog.default_model,
+        }))
+    }
+
+    /// Maps a raw `thread/read` result to history with each turn's anchor.
+    pub fn anchored_history_from_thread_read(
+        result: Value,
+        cwd: &Path,
+        policy: &AdapterPolicy,
+    ) -> Result<(NativeHistory, Vec<Option<Value>>), String> {
+        let resp: wire::ThreadReadResponse =
+            serde_json::from_value(result).map_err(|e| e.to_string())?;
+        Ok(history::anchored_history(&resp.thread, cwd, policy))
     }
 
     /// Commands advertised for the given skills (`name`, `description`, `path`).

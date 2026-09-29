@@ -25,6 +25,10 @@
         "startedAt": 1790000002000,
         "status": "running"
       },
+      "modes": {
+        "fast": false,
+        "plan": false
+      },
       "nativeSessionId": "7c2d1c1e-5b0e-4a51-9b1e-2f0c3a1b9d10",
       "pendingInteractions": 0,
       "pinned": false,

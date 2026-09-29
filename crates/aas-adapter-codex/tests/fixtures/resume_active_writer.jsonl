@@ -1,0 +1,5 @@
+{"c":{"method":"initialize","recId":"1","params":{"capabilities":{"experimentalApi":true,"requestAttestation":false}}}}
+{"s":{"id":1,"result":{"userAgent":"agent-app-server/0.148.0 (Windows 10.0.26200; x86_64) WindowsTerminal (agent-app-server; 0.1.0)","codexHome":"C:\\Users\\USER\\.codex","platformFamily":"windows","platformOs":"windows"}},"respondsTo":"1"}
+{"c":{"method":"initialized"}}
+{"c":{"method":"thread/resume","recId":"4","params":{"threadId":"01a0e940-cbba-7b32-bd56-b0cef3dad5f5"}}}
+{"s":{"error":{"code":-32600,"message":"thread 01a0e940-cbba-7b32-bd56-b0cef3dad5f5 already has an active writer"},"id":4},"respondsTo":"4"}

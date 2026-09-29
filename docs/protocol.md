@@ -14,7 +14,7 @@ daemon とクライアント（Android アプリ）の間の契約。型の実�
   - 値のない任意フィールドは出力しない（`null` にしない）。
   - クライアントから送るフレームの上限は `initialize` の応答の `policy.maxClientFrameBytes`。超えた要求には、その要求の `id` で確定エラー `payloadTooLarge` が返る（outbox から外す）。サーバの読み取り上限（既定 16MiB）を超えるフレームでは、接続が close code 1009 で閉じられる。
 - 前方互換: クライアントは知らないフィールド、知らないイベントの `type`、知らない enum 値を無視する（壊れない）。v1 の範囲では、サーバは追加だけを行う。
-- 要求の順序: 同じスレッドを対象にする要求（`thread/update`、`thread/archive`、`thread/fork`、`thread/stop`、`turn/start`、`turn/interrupt`、`queue/remove`、`queue/resume`、`queue/update`、`queue/steer`、`backgroundTask/stop`）と、同じプロジェクトを対象にする要求（`thread/create`、`project/update`、`project/archive`、`project/remove`）は、到着順に1つずつ処理される。それ以外の要求は並行に処理されるので、応答の順序は送った順と一致するとは限らない（`id` で対応付ける）。
+- 要求の順序: 同じスレッドを対象にする要求（`thread/update`、`thread/archive`、`thread/fork`、`thread/stop`、`turn/start`、`turn/interrupt`、`queue/remove`、`queue/resume`、`queue/update`、`queue/steer`、`backgroundTask/stop`、`item/moveToBackground`）と、同じプロジェクトを対象にする要求（`thread/create`、`project/update`、`project/archive`、`project/remove`）は、到着順に1つずつ処理される。それ以外の要求は並行に処理されるので、応答の順序は送った順と一致するとは限らない（`id` で対応付ける）。
 - サーバからクライアントへの JSON-RPC 要求はない。サーバが送るのは応答と通知だけ。クライアントからの通知（`id` のないメッセージ）は無視される。
 
 ### 1.1 JSON-RPC
@@ -55,16 +55,17 @@ daemon とクライアント（Android アプリ）の間の契約。型の実�
 | -32001 | `unauthorized` | × | 予約。現在のサーバは、接続中にデバイスが失効したら close code 4001 で接続を閉じる |
 | -32002 | `notFound` | ○ | 対象がない（`data.entity`、`data.id`） |
 | -32003 | `invalidState` | ○ | 状態が合わない（例: アーカイブ済みのスレッドに turn/start、git のないフォルダで差分） |
-| -32004 | `capabilityUnsupported` | ○ | ハーネスがその機能を持たない（`data.capability`: `steer`、`images`、`fork`、`forkAtTurn`、`nativeSessions` など） |
+| -32004 | `capabilityUnsupported` | ○ | ハーネスがその機能を持たない（`data.capability`: `steer`、`images`、`fork`、`forkAtTurn`、`nativeSessions`、`planMode`、`fastMode`、`sideQuestion`、`status`、`moveToBackground` など） |
 | -32005 | `harnessUnavailable` | × | ハーネスが使えない（`data.harnessId`、`data.reason`）。確定ではない: サーバは使えないハーネスを予定に従って、また断る前に毎回 probe し直す（design.md 9.4）ので、CLI のインストールやログインのあとは同じ要求が成功しうる。クライアントは黙って再送し続けず、送信待ちの操作に `data.reason` を表示して利用者が取り消せるようにし、`harness/updated` で `available: true` になったら待たずに再送する |
 | -32006 | `idempotencyKeyReused` | ○ | 同じ clientRequestId で別の内容が送られた |
 | -32007 | `pathNotAllowed` | ○ | `projects.roots` の外のパス |
 | -32008 | `rateLimited` | × | 回数制限（現在は HTTP のペアリングだけで使う） |
 | -32009 | `protocolVersionUnsupported` | ○ | プロトコルのバージョンが合わない（`data.supported`） |
 | -32010 | `alreadyExists` | ○ | 既に存在する（フォルダ、clone 先など） |
-| -32011 | `adapterError` | × | ハーネス側の失敗（`data.harnessId`、`data.detail`） |
+| -32011 | `adapterError` | × | ハーネス側の失敗（`data.harnessId`、`data.detail`）。`data.detail` はハーネス（アダプタ）自身の文で、daemon の英語の前置きを含まず、端末の制御文字（ANSI / VT のエスケープシーケンス）も含まない。クライアントは自分の言語の導入文を前に置いて、`data.detail` をそのまま表示する |
 | -32012 | `payloadTooLarge` | ○ | 大きすぎる |
 | -32013 | `draining` | × | 停止準備中のため、新しいターンを受け付けない。サーバが保存の失敗で止まる途中（`server/shuttingDown` の `storageFailure`）は、すべての要求がこれになる（再起動したサーバに送り直す） |
+| -32014 | `sessionSwitchingCommand` | ○ | 入力の最初の語が、エージェントを別のネイティブセッションに移すハーネスのコマンド（`data.command`、`data.harnessId`）。1つのスレッドは1つのネイティブセッション（design.md 9.5）。クライアントは送らずに、アプリの対応する操作（新しいスレッド、取り込み）を案内する |
 
 ## 2. 接続の流れ
 
@@ -91,7 +92,7 @@ daemon とクライアント（Android アプリ）の間の契約。型の実�
 
 - 購読ごとに、イベントは seq の昇順で届く。
 - seq は連続するとは限らない（圧縮による欠番がある）。クライアントは「適用済みの最大 seq」を読み取り位置として保存し、それ以下の seq のイベントは無視する。
-- 圧縮で消えるのは、後のイベントが内容をすべて持つイベントだけ（完了した Item の `item/delta`、同じ実体の後の `thread/updated` / `thread/upserted` / `project/upserted` / `harness/updated` / `operation/updated` / `queue/updated` / `commands/changed` / `backgroundTask/updated` がある古いもの、`item/completed` より前の `item/updated`、`turn/completed` より前の `turn/usageUpdated`、`interaction/closed` より前の `interaction/pending`）と、古い `native` イベント。古い読み取り位置から追いかけても、残ったイベントを順に適用すれば同じ状態になる（クライアントはイベントで丸ごと置き換える。7章）。消すのは一定時間（既定 24 時間）より古いものだけなので、短い切断からの再接続ではイベントがそのまま届く。
+- 圧縮で消えるのは、後のイベントが内容をすべて持つイベントだけ（完了した Item の `item/delta`、同じ実体の後の `thread/updated` / `thread/upserted` / `project/upserted` / `harness/updated` / `operation/updated` / `queue/updated` / `commands/changed` / `backgroundTask/updated` がある古いもの、`item/completed` より前の `item/updated`、`turn/completed` より前の `turn/usageUpdated`、`interaction/closed` より前の `interaction/pending`）と、古い `native` と `composer/insert` のイベント。古い読み取り位置から追いかけても、残ったイベントを順に適用すれば同じ状態になる（クライアントはイベントで丸ごと置き換える。7章）。消すのは一定時間（既定 24 時間）より古いものだけなので、短い切断からの再接続ではイベントがそのまま届く。
 - 削除したスレッドのイベントは、thread ストリームごと消える（`subscribe` は `notFound`）。workspace ストリームのそのスレッドに関するイベントも消え、`thread/removed` だけが残る。
 - `seqFrom` がある場合は、`seqFrom`〜`seq` の delta を結合したもの。
 - `head` はバッチを読んだ時点のストリームの head。
@@ -127,6 +128,22 @@ type Harness = {
   models: Model[]; defaultModel?: string;
   effortLevels: EffortLevel[];            // 空なら推論量の指定はできない
   permissionModes: PermissionMode[]; defaultPermissionMode?: string;
+  features: HarnessFeatures;              // 能力のほかに提供するもの（3.1「ハーネスの機能」）
+};
+type HarnessFeatures = {                  // 省略されたフィールドは false / なし
+  forkAtTurn?: boolean;                   // 途中のターンで fork できる（thread/fork の atTurnId・before）
+  forkWhileHeld?: boolean;                // ほかのプロセスが持っているセッションも fork できる（resumeFailed のあとの分岐）
+  rename?: boolean;                       // 利用者のタイトルをネイティブセッションにも付ける
+  sideQuestion?: boolean;                 // thread/sideQuestion
+  moveToBackground?: boolean;             // item/moveToBackground
+  status?: boolean;                       // thread/harnessStatus
+  projectTrust?: boolean;                 // プロジェクト自身の資源を読むかを利用者に聞く（Project.harnessTrust）
+  planMode?: PlanModeFeature;             // アプリの /plan（ThreadModes.plan）。なければアプリは /plan を出さない
+  fastModeModels?: string[];              // 高速モード（ThreadModes.fast）を持つモデルの id
+};
+type PlanModeFeature = {
+  implementPrompt?: string;               // 提案されたプランを同じスレッドで実装するときに送る文（ハーネス自身の文面）
+  newThreadPreamble?: string;             // 新しいスレッドで実装するときの前置き（このあとに空行とプランの本文が続く）
 };
 type HarnessCapabilities = {
   interrupt: boolean; steer: boolean; approvals: boolean; questions: boolean;
@@ -143,9 +160,12 @@ type Project = {
   id: string; name: string; path: string; createdAt: number; updatedAt: number; archived: boolean;
   defaults: { harnessId?: string; model?: string; effort?: string; permissionMode?: string };
   git: { isRepo: boolean; branch?: string; root?: string };
+  harnessTrust?: { [harnessId: string]: boolean };   // プロジェクト自身の資源を読むことへの利用者の判断（3.1）
 };
 
 type ThreadSettings = { model?: string; effort?: string; permissionMode?: string };
+type ThreadModes = { plan: boolean; fast: boolean };   // プランモードと高速モード（3.1）
+type ThreadModesUpdate = { plan?: boolean; fast?: boolean };
 type Workspace = { kind: "local" } | { kind: "worktree"; path: string; branch: string; baseRef: string };
 type ThreadStatus = "idle"|"queued"|"starting"|"ready"|"running"|"stopping";
 type Thread = {
@@ -161,6 +181,8 @@ type Thread = {
   createdAt: number; updatedAt: number; lastActivityAt: number; archived: boolean;
   pinned: boolean;                                // 利用者がピン留めした（thread/update の pinned）
   background: ThreadBackground;                   // バックグラウンドタスクの要約（3.1）
+  modes: ThreadModes;                             // プランモードと高速モード（thread/update の modes。3.1）
+  fastModeState?: string;                         // 高速モードについてハーネスが最後に報告した語そのまま（表示用。3.1）
   head: number;                                   // この要約を作った時点の thread ストリームの head（下記）
 };
 type ThreadBackground = {
@@ -178,12 +200,14 @@ type Turn = {
   error?: { message: string; kind: string };
   usage?: Usage; diff?: DiffSummary;
   trigger?: "backgroundTask"|"scheduled";         // エージェントが自分で始めたターンの理由（ハーネスが明示したときだけ。3.1）
+  forkable?: boolean;                             // このターンでの fork に要るハーネスの印（アンカー）を記録した（3.1）
 };
 type DiffSummary = { files: number; insertions: number; deletions: number };
 
 type ItemStatus = "inProgress"|"completed"|"failed"|"declined"|"interrupted"|"backgrounded";
 type ItemBase = { id: string; threadId: string; turnId: string; status: ItemStatus; startedAt: number; completedAt?: number;
-                  backgroundTaskId?: string };   // この Item が起動したバックグラウンドタスク（3.1）
+                  backgroundTaskId?: string;     // この Item が起動したバックグラウンドタスク（3.1）
+                  backgroundable?: boolean };    // 動いているこの Item を今バックグラウンドに移せる（item/moveToBackground。3.1）
 type Item = ItemBase & (
   | { kind: "userMessage"; text: string; attachments: Attachment[]; mentions: { path: string }[]; delivery: "normal"|"steer" }
   | { kind: "agentMessage"; text: string }                       // Markdown
@@ -195,6 +219,7 @@ type Item = ItemBase & (
       input?: unknown; output?: string; outputTruncated: boolean; outputBlobId?: string }
   | { kind: "plan"; entries: { text: string; status: "pending"|"inProgress"|"completed" }[] }
   | { kind: "notice"; level: "info"|"warning"|"error"; message: string; code?: string }
+  | { kind: "proposedPlan"; text: string }                         // プランモードでエージェントが提案したプラン（Markdown。3.1）
 );
 type Attachment = { type: "image"; blobId: string; mime: string };
 type FileChange = { path: string; kind: "add"|"delete"|"update"|"move"; movePath?: string; diff?: string; added?: number; removed?: number };
@@ -267,6 +292,7 @@ type Operation = { id: string; kind: "gitClone"; status: "running"|"succeeded"|"
 type NativeSession = { nativeSessionId: string; title?: string; updatedAt?: number; cwd?: string; importedThreadId?: string };  // nativeSessionId は native/list の結果の中で一意
 type Device = { id: string; name: string; platform?: string; createdAt: number; lastSeenAt?: number; current: boolean };
 type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: number; removed: number; binary: boolean };
+type StatusSection = { title: string; rows: { label: string; value: string }[] };   // ハーネス自身の状態（表示用）
 ```
 
 ### 3.1 型の補足
@@ -290,7 +316,8 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - 求めたバックグラウンドタスク（`backgroundTaskId`。ハーネスが明示したとき）。ターンが終わっても残り、タスクが終わると `taskEnded`。
   - スレッド（`turnId` も `backgroundTaskId` もない。ターンが動いていないときに、タスクを示さずに求められたもの）。プロセスが終わるまで残る。
   - どれも、ハーネスが取り下げれば `harnessCancelled`、プロセスが終われば `processExited`。サーバが Interaction を `expired` にするとき、プロセスが動いていればエージェントにも答え（辞退）を返すので、エージェントが答えを待ち続けることはない。
-- **`Turn.error.kind`**: `agentExited`（プロセスが想定外に終了）、`adapterError`、`spawnFailed`、`harnessUnavailable`、`forced`（中断に応じず強制終了）、`interrupted`（起動前に中断）、`stopped`（`thread/stop`、アーカイブ、アイドル回収）、`daemonShutdown`、`systemShutdown`（Windows のサインアウト・シャットダウン・再起動で daemon が止まった。design.md 18.8）、`daemonRestarted`、`forkOutdated`（fork の最初のターンを待つ間に元のスレッドが次のターンに進んだ。`thread/fork` の補足）、ハーネス由来の `harnessError`、`refusal`、`codex:<種別>` など。クライアントは知らない値を一般的な失敗として表示する。
+- **`Turn.error.kind`**: `agentExited`（プロセスが想定外に終了）、`adapterError`、`spawnFailed`、`resumeFailed`（スレッドのネイティブセッションを resume する起動が失敗した。ほかのプロセスがそのセッションを持っているときなど。クライアントは「再試行」を出し、ハーネスが `features.forkWhileHeld` を持つときは「新しいスレッドに分岐」（`thread/fork`）も出す）、`harnessUnavailable`、`forced`（中断に応じず強制終了）、`interrupted`（起動前に中断）、`stopped`（`thread/stop`、アーカイブ、アイドル回収）、`daemonShutdown`、`systemShutdown`（Windows のサインアウト・シャットダウン・再起動で daemon が止まった。design.md 18.8）、`daemonRestarted`、`forkOutdated`（fork の最初のターンを待つ間に元のスレッドが次のターンに進んだ。`thread/fork` の補足）、ハーネス由来の `harnessError`、`refusal`、`codex:<種別>` など。クライアントは知らない値を一般的な失敗として表示する。
+  - 起動と送信の失敗（`spawnFailed`、`resumeFailed`、`harnessUnavailable`、`adapterError`）の `message` は、ハーネス（アダプタ）自身の文そのまま（daemon の英語の前置きを含まない）。stderr から来た部分は端末の制御文字を除いてある。クライアントは `kind` に応じた自分の言語の導入文を前に置いて表示する。`agentExited` の `message` は終了の様子と stderr の最後の数行（制御文字を除く）。
 - **タイトル**: 指定がなければ "New thread" で作られ、最初のメッセージの1行目で置き換わる。ハーネスが名前を付けた場合はそれに置き換わる（`thread/update` で利用者が付けたタイトルは置き換えない）。
 - **`Thread.pinned`**: `thread/update { pinned }` で変える。`thread/list` の並び順と `lastActivityAt` は変わらない（ピン留めしたスレッドを先頭にまとめるのはクライアントの表示）。fork したスレッドには引き継がない。
 - **`Usage.context`**: コンテキストウィンドウの使用量（`usedTokens`）と大きさ（`windowTokens`）。composer の「ctx NN%」表示に使う。
@@ -301,6 +328,21 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - 行の区切りは `\r` と `\n`（端末と同じ）。空白だけの行は送らない。1行は `policy.max_progress_line_bytes`（既定 1KiB）で切る。
   - 更新は `operation/updated` で届く。前の更新を確定してから、`policy.operation_progress_interval`（既定 1 秒）が経つまで次を出さない。その間に出た行は、最新の1行だけが次の更新に載る。
   - running の間だけ付く。終わった Operation には付かない。
+- **ハーネスの機能（`Harness.features`）**: 能力（`capabilities`）のほかにハーネスが提供するもの。どれも既定はなしで、クライアントはないものの操作を出さない。
+  - `forkAtTurn`: `Turn.forkable` のターンで `thread/fork` できる（そのターンを含める、またはその前まで。`thread/fork` の補足）。
+  - `forkWhileHeld`: ほかのプロセスが持っている（resume できない）セッションも fork できる。`resumeFailed` で終わったターンのあとに「新しいスレッドに分岐」を出してよい。`forkAtTurn` もあるハーネスでは、エージェントが最後に実行したターン（`forkable`）の `atTurnId` で分けるとよい。印を持って分けるので、持たれているセッションを読めないハーネス（Devin）でも分けられ、エージェントに届かなかったプロンプトが新しいスレッドの履歴に入らない（セッション全体の fork は、ソースを読めないと失敗しうる）。
+  - `rename`: `thread/update { title }` のタイトルをネイティブセッションにも付ける（結果の `nativeRename`）。ハーネスが自分で付けた名前は、利用者のタイトルを置き換えない（下の「タイトル」）。
+  - `sideQuestion`、`status`、`moveToBackground`: それぞれのメソッド（4章）。
+  - `projectTrust`: ハーネスがプロジェクト自身の資源（拡張、テンプレート、スキルなど）を、利用者がそのプロジェクトを信頼したときだけ読む。クライアントはプロジェクトごとに明示的に聞き（自動では決めない）、`project/update { harnessTrust }` で記録する。記録がなければエージェントは判断なしで起動する（ハーネス自身の保存済みの判断が使われる）。
+  - `planMode`: アプリの `/plan` を出す（ない場合は出さない。同じ名前のハーネスのコマンドはハーネスのもの）。`/plan <本文>` は `thread/update { modes: { plan: true } }` のあとに本文を `turn/start` で送る。エージェントが提案したプランは `proposedPlan` の Item で届く。`implementPrompt` があれば「実装する」は `modes.plan` を `false` にしてからその文を送る。`newThreadPreamble` があれば「新しいスレッドで実装」は `thread/create` の入力を「前置き + 空行 + プランの本文」にする（プランモードは付けない）。
+  - `fastModeModels`: 高速モードを持つモデル。スレッドのモデルがこの中にあるときだけ `modes.fast` を `true` にできる。
+- **`ThreadModes`**: プランモード（`plan`）と高速モード（`fast`）。`thread/update { modes }` で変える（指定したフィールドだけ）。`plan` はハーネスが自分でプランモードに入った・抜けたと報告したときにも追従する（下の「ハーネスが変えた設定」）。`fast` は利用者の選択で、ハーネスが実際にどうしたかは `Thread.fastModeState` に報告どおりに入る（Claude Code の `on` / `off` / `cooldown`。表示用）。高速モードを持たないモデルに変えると `fast` は `false` になる。
+- **ハーネスが変えた設定**: ハーネスが自分で権限モードや推論量を変えたと明示的に報告したとき（Claude Code の「このセッションは許可」による `acceptEdits`、プランの承認のあとの元のモード、Devin の `/plan`・`/ask` など）、スレッドの `settings.permissionMode` と `settings.effort`、`modes.plan` はそれに追従する（`thread/updated`）。ただし、利用者が同じ値を変えて次のターンの反映を待っているときは利用者の値が優先され、次のターンの前にエージェントへ反映される。ハーネスの一覧にない値には追従しない。モデルは追従しない（CLI が `opus` を完全な ID に解決するなど、利用者の選択を CLI の解釈で置き換えないため。ターンの `model` には報告値が入る）。
+- **ネイティブセッションの切り替わり**: ハーネスがスレッドのエージェントを自分で別のネイティブセッションに移したと報告したとき（手で打ったコマンドや拡張など）、スレッドの `nativeSessionId` はそれに追従し、`thread/nativeSessionChanged`（前と後の ID）が届く。そのとき動いているターンには `code: "nativeSessionChanged"` の notice の Item が付く。
+- **`Turn.forkable`**: そのターンが動いている間に、ハーネス自身のそのターンの印（アンカー。Codex の turn id、Claude Code の最後のメッセージの uuid、pi のエントリ ID、Devin のステップ ID など）を記録できた。数えて推定した印は使わない。fork したスレッドにコピーされたターンは印を引き継ぐ。取り込んだ履歴のターンは、ハーネスの履歴が印を持つときだけ `true`。印があとで確定するハーネス（Devin のノードの ID は次のプロンプトで届く）では、確定するまでの fork がハーネスに断られることがある（新しいスレッドの最初のターンが `spawnFailed` で終わり、`Turn.error.message` がハーネスの理由）。確定した印は daemon が自動で置き換えるので、アプリは何もしなくてよい。
+- **`backgroundable`（Item）**: 動いている Item を今バックグラウンドに移せると、ハーネスが明示的に報告した（Claude Code の前面のコマンドの `task_started` など）。`item/moveToBackground` で移すと、その Item は `backgrounded` で閉じ、作業はバックグラウンドタスクとして続く（ほかの `backgrounded` の Item と同じ）。Item が終われば `false` になる。
+- **`proposedPlan`（Item）**: プランモードのエージェントが提案したプラン（Markdown）。`item/delta`（`field: "text"`）で本文が流れる。`Harness.features.planMode` に従って、クライアントは「実装する」「新しいスレッドで実装」を出す。
+- **戻された steer**: ハーネスが実行中のターンに steer を取り込まず返したとき（Claude Code は取り込めるのがツールの区切りだけ）、その userMessage の Item は `item/updated` で `status: "declined"`（届かなかった）になり、同じ入力がキューに戻る（送った時刻の位置）。キューの規則どおり、ターンが `completed` で終われば次のターンになる。
 - **`Operation.status`**: `cancelled` は `operation/cancel` で取り消されたもの（ツールのプロセスツリーを終了させ、作りかけのものは残さない）。daemon の停止や再起動で途中終了したものは `failed`（`message` に理由）。
 
 ## 4. メソッド（クライアント → サーバ）
@@ -352,7 +394,7 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 | `project/get` | `{projectId}` | `{project}` |
 | `project/create` ★ | `{parentPath, name, init:{kind:"empty"}\|{kind:"gitInit"}\|{kind:"gitClone", url}}` | `{project?, operation?}` |
 | `project/open` ★ | `{path, name?}` | `{project}` |
-| `project/update` ★ | `{projectId, name?, defaults?}` | `{project}` |
+| `project/update` ★ | `{projectId, name?, defaults?, harnessTrust?}` | `{project}` |
 | `project/archive` ★ | `{projectId, archived}` | `{project}` |
 | `project/remove` ★ | `{projectId}` | `{}` |
 | `fs/roots` | `{}` | `{roots:[{path,name}]}` |
@@ -369,7 +411,7 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - `empty` と `gitInit` の場合は `project` を返す。
   - git が見つからない PC では `gitInit` と `gitClone` は `invalidState`。
 - `project/open` の補足: 既に登録済みのフォルダなら、同じプロジェクトを返す（アーカイブされていれば戻す）。`name` の既定はフォルダ名。
-- `project/update` の補足: `defaults` は丸ごと置き換える。`defaults.harnessId` は設定にあるハーネスだけ。
+- `project/update` の補足: `defaults` は丸ごと置き換える。`defaults.harnessId` は設定にあるハーネスだけ。`harnessTrust` は `Project.harnessTrust` に足す（指定したハーネスの判断だけが変わる。設定にないハーネスは `invalidParams`）。判断が変わったハーネスのエージェントが動いていれば、次のターンの前に新しい判断で起動し直す（バックグラウンドの作業がある間は待つ。design.md 5.4）。
 - `project/remove` の補足
   - 登録を外すだけで、プロジェクトのフォルダのファイルは消さない。`idle` でないスレッドがあれば `invalidState` になる。
   - そのプロジェクトのスレッドについてサーバが保存しているもの（ターン、Item、Interaction、キュー、イベント、スナップショット）はすべて消える。workspace に各スレッドの `thread/removed` と `project/removed` が流れる。
@@ -393,9 +435,9 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 | `thread/get` | `{threadId}` | `{thread}` |
 | `thread/create` ★ | `{projectId, harnessId, settings?, workspace?:{kind:"local"}\|{kind:"worktree", baseRef?, branch?}, title?, input?:InputPart[]}` | `{thread, turnId?, disposition?}` |
 | `thread/read` | `{threadId, beforeTurnIndex?, limitTurns?}` | `{thread, turns, items, interactions, queued, backgroundTasks, head, hasMoreBefore}` |
-| `thread/update` ★ | `{threadId, title?, settings?, pinned?}` | `{thread, settingsOutcome?:"appliedLive"\|"appliesNextTurn"}` |
+| `thread/update` ★ | `{threadId, title?, settings?, pinned?, modes?:ThreadModesUpdate}` | `{thread, settingsOutcome?:"appliedLive"\|"appliesNextTurn", nativeRename?:{status:"applied"\|"pending"\|"failed", message?}}` |
 | `thread/archive` ★ | `{threadId, archived, removeWorktree?, force?}` | `{thread}` |
-| `thread/fork` ★ | `{threadId, atTurnId?}` | `{thread}` |
+| `thread/fork` ★ | `{threadId, atTurnId?, before?}` | `{thread}` |
 | `thread/stop` ★ | `{threadId}` | `{thread}` |
 | `thread/diff` | `{threadId, scope:{kind:"turn", turnId}\|{kind:"thread"}}` | `{summary, files:DiffFile[], patch?, patchBlobId?}` |
 | `turn/start` ★ | `{threadId, input:InputPart[], delivery?:"auto"\|"steer"\|"queue"}` | `{disposition:"started"\|"steered"\|"queued", turnId?, queuedId?}` |
@@ -404,10 +446,13 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 | `queue/resume` ★ | `{threadId}` | `{turnId?}` |
 | `queue/update` ★ | `{threadId, queuedId, input:InputPart[]}` | `{updated}` |
 | `queue/steer` ★ | `{threadId, queuedId}` | `{disposition?:"steered"\|"started", turnId?}` |
+| `thread/harnessStatus` | `{threadId}` | `{sections:StatusSection[], live}` |
+| `thread/sideQuestion` | `{threadId, question}` | `{answer?, synthetic}` |
+| `item/moveToBackground` ★ | `{threadId, itemId}` | `{}` |
 
 - `thread/list` の補足: `lastActivityAt` の降順（同じなら id の降順）で返す。`limit` の既定は `policy.thread_list_default_limit`（既定 50）、上限は `policy.thread_list_max_limit`（既定 500）。続きは最後の要素の `{lastActivityAt, id}` を `before` に渡す。
 - `thread/create` の補足
-  - `settings` で指定しなかった値は、プロジェクトの `defaults`（`defaults.harnessId` がこのハーネスの場合だけ）、次にハーネスの既定（`defaultModel`、`defaultPermissionMode`）で埋める。値はハーネスの一覧にあるものだけ（なければ `invalidParams`）。
+  - `settings` で指定しなかった値は、プロジェクトの `defaults`（`defaults.harnessId` がこのハーネスの場合だけ）、次にハーネスの既定（`defaultModel`、`defaultPermissionMode`）で埋める。値はハーネスの一覧にあるものだけ（なければ `invalidParams`）。ハーネスが以前の版で出していた形の値（Claude Code の権限モード `plan`。今はプランモード）は、先にハーネスの今の形にする（権限モードは既定、`modes.plan` はオン。design.md 9.6）。
   - 未知のハーネスは `invalidParams`、使えないハーネスは（probe し直してもなお使えなければ）`harnessUnavailable`。
   - `worktree` はプロジェクトが git リポジトリの場合だけ（それ以外は `invalidState`）。`branch` の既定は `aas/<スレッド ID の末尾 8 文字>`、`baseRef` の既定は `HEAD`。
   - `baseRef` はコミットに解決できる名前（ブランチ、タグ、コミット ID など）。`-` で始まるもの、空のもの、コミットに解決できないもの（存在しない名前、tree など）は、worktree もブランチも作らずに `invalidParams`。`-` で始まる `branch` も `invalidParams`。
@@ -421,6 +466,8 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - `title` は空にできない。`settings` は指定したフィールドだけを変える。
   - 未知の値の `invalidParams` になるのは、`settings` で指定した値が、使えるハーネスの一覧（`models` / `effortLevels` / `permissionModes`）にないときだけ。スレッドがすでに持っている値は検査しない。ハーネスが使えない間（`available: false`）は一覧が分からないので検査せずに受け付け、次のターンで反映する（design.md 5.4）。
   - `pinned` でピン留めする（`true`）・外す（`false`）。
+  - `modes` でプランモード（`plan`）と高速モード（`fast`）を変える。`plan: true` はハーネスに `features.planMode` がなければ、`fast: true` はスレッドのモデル（この要求で変えるならその値）が `features.fastModeModels` になければ `capabilityUnsupported`（`data.capability` は `planMode` / `fastMode`）。反映の仕方は `settings` と同じ（`settingsOutcome` は両方をまとめたもの）。高速モードを持たないモデルに変えると `modes.fast` は `false` になる。
+  - `title` はハーネスに `features.rename` があれば、ネイティブセッションにも付ける。結果の `nativeRename`: `applied`（動いているエージェントが受け取った）、`pending`（エージェントが動いていない。次に起動したときに付ける）、`failed`（ハーネスが断った。`message` にハーネスの文。スレッドのタイトルは変わる）。`thread/create` の `title` も、最初のエージェントの起動時に付ける。
   - `settingsOutcome` は `settings` を指定したときだけ付く。`appliedLive` は実行中のプロセスに反映済み（または値が変わらなかった）、`appliesNextTurn` は次のターンの開始時に反映する（ターンの実行中に変えたとき、プロセスがないとき、プロセスを作り直す必要があるとき）。実行中のターンには影響しない。
   - 要求が失敗した場合（未知の値の `invalidParams`、プロセスが設定を受け付けなかった `adapterError` など）は、`title` と `pinned` も含めて何も変わらない。プロセスが設定の一部だけを反映した可能性があるときは、次のターンでプロセスを作り直す（スレッドの設定で起動する）。
 - `thread/archive` の補足
@@ -429,9 +476,11 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - アーカイブ中のスレッドへの `turn/start` は `invalidState`。
 - `thread/fork` の補足
   - 能力 `fork` が必要（なければ `capabilityUnsupported`）。ネイティブセッションがまだない、または実行中のターンがあれば `invalidState`。
-  - `atTurnId` は最後のターンだけを受け付ける（それ以外は `capabilityUnsupported`、`data.capability: "forkAtTurn"`）。
-  - 新しいスレッドは、元の履歴（ターンと Item を新しい ID で複製）、cwd、設定を引き継ぎ、`forkedFrom` を持つ。最初のターンでネイティブの fork を行う。
-  - ネイティブの fork は、その時点の元のセッションを複製する。fork したあとで元のスレッドが次のターンに進んでいたら（元のスレッドの最後のターンが `forkedFrom.turnId` と違えば）、fork 側の履歴に見えない内容がエージェントに入るので、fork 側の最初の `turn/start`（と、それを始める `queue/resume` / `queue/steer`）は `invalidState` で断る。もう一度 fork する。最初のターンがプロセスの空きを待っている間に元のスレッドが進んだ場合は、そのターンが `failed`（`error.kind: "forkOutdated"`）で終わる。元のスレッドが削除されていれば、それ以上進まないので断らない。
+  - `atTurnId` がなければセッション全体を fork する。`atTurnId` があれば、そのターンを含めて（`before: true` ならそのターンの前まで）fork する。途中のターン、または `before` には `features.forkAtTurn` が要る（なければ `capabilityUnsupported`、`data.capability: "forkAtTurn"`。最後のターンを含める fork だけはセッション全体の fork として受け付ける）。そのターンの印が記録されていなければ（`Turn.forkable` が `false`）`invalidState`。ハーネスがその位置では分けられないと印だけで分かるとき（`before` で、前のターンの印が要るのにない。印がまだ確定していない、など）も、スレッドを作らずに `invalidState`（`message` にハーネスの理由）。スレッドにないターンは `notFound`。`atTurnId` なしの `before` は `invalidParams`。
+  - 「このプロンプトを編集」は `before: true` の fork で、クライアントはそのターンの入力を新しいスレッドの入力欄に入れる。最初のターンの前の fork（その前のターンがどれもエージェントに届いていない、つまり起動に失敗したターンだけのときも同じ）は、履歴のない新しいセッションになる（ネイティブの fork はしない）。
+  - 新しいスレッドは、元の履歴のうち fork の位置までのターンと Item（新しい ID で複製。ターンの印も引き継ぐ）、cwd、設定、`modes` を引き継ぎ、`forkedFrom`（`turnId` は複製した最後のターン）を持つ。最初のターンでネイティブの fork を行う。
+  - ターンを指定した fork は、そのターンの印で元のセッションを分ける。元のスレッドがそのあとに進んでも影響しない。ハーネスがスレッドを別のネイティブセッションに移した（`thread/nativeSessionChanged`）あとも、それより前のターンは `forkable` のままで、その fork はそのターンのときのセッションを分ける。
+  - セッション全体の fork は、その時点の元のセッションを複製する。fork したあとで元のスレッドが次のターンに進んでいたら（元のスレッドの最後のターンが `forkedFrom.turnId` と違えば）、fork 側の履歴に見えない内容がエージェントに入るので、fork 側の最初の `turn/start`（と、それを始める `queue/resume` / `queue/steer`）は `invalidState` で断る。もう一度 fork する。最初のターンがプロセスの空きを待っている間に元のスレッドが進んだ場合は、そのターンが `failed`（`error.kind: "forkOutdated"`）で終わる。元のスレッドが削除されていれば、それ以上進まないので断らない。
 - `thread/stop` の補足: プロセスを段階停止し、終了してから応答する。起動待ち・起動中のターンは `interrupted` になる。起動中のプロセスは、起動が終わるのを待ってから止める。キューは一時停止する（`queuePaused = true`）。
 - `thread/diff` の補足
   - `turn` は、そのターンの開始時点から終了時点まで（実行中なら現在まで）。`thread` は、スレッドの最初のスナップショットから現在の作業ツリーまで。
@@ -455,11 +504,16 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
   - どちらの場合も、その入力はキューから外れる（同じトランザクションで）。既に処理されたか存在しなければ `{}`（`disposition` なし）。
   - 停止準備中は `draining`、アーカイブ済みのスレッドは `invalidState`。
   - クライアントが `queue/remove` と `turn/start` を続けて送る方法と違い、その間にキューが進んで同じ入力が二重に送られることがない。
+- `turn/start` の最初の語: 入力の最初の部分がテキストで、その最初の語（前の空白は除く）が `/` とハーネスのセッションを切り替えるコマンドの名前（ハーネス自身の一覧にある別名を含む。どのハーネスでも `resume`）なら、`sessionSwitchingCommand` で断る（`data.command`）。`delivery` によらず（steer も queue も）、`queue/update`、`queue/steer`、`thread/create` の `input` でも同じ。キューに残っていた古い入力も、ターンを始める前に確かめて除く。
 - キューの進み方
   - ターンが `completed` で終わると、キューの先頭が自動で次のターンになる。
   - `interrupted` か `failed` で終わると、キューは一時停止する（`thread.queuePaused = true`）。daemon の再起動後も、キューが残っていれば一時停止の状態で始まる。
   - 一時停止は、`queue/resume`（実行中でなければ先頭を開始し、その `turnId` を返す）、新しい `turn/start`、キューが空になったときに解除される。
   - 停止準備中はキューから次のターンを始めない。
+
+- `thread/harnessStatus` の補足: ハーネス自身の状態（アカウント、使用量の上限、セッションの情報など）を、ハーネスの節と言葉のまま返す（表示用。値は解釈しない）。エージェントが動いていればそのセッションから（`live: true`）、動いていなければハーネスから（`live: false`。セッションに属さないものだけ）。`features.status` がなければ `capabilityUnsupported`。上限は `policy.handshake_timeout`（超えれば `adapterError`）。
+- `thread/sideQuestion` の補足: 会話とは別に、動いているエージェントに質問する（Claude Code の `/btw`）。答えは会話の履歴に入らない（クライアントはシートなどに出す）。実行中のターンを待たない。`answer` がなければハーネスは答えなかった。`synthetic` はハーネスが「モデルの答えではない」と示したもの。エージェントが動いていなければ `invalidState`、`features.sideQuestion` がなければ `capabilityUnsupported`、空の質問は `invalidParams`。上限は `policy.handshake_timeout`。
+- `item/moveToBackground` の補足: 動いている Item（`backgroundable: true`）の作業をバックグラウンドに移すようハーネスに求める（Claude Code の Ctrl+B）。応答は求めたことだけを表し、移ったことは Item の `backgrounded` での完了とバックグラウンドタスクで届く。Item がない（ほかのスレッドのものを含む）: `notFound`。終わった Item、ハーネスが移せると報告していない Item、エージェントが動いていない: `invalidState`。`features.moveToBackground` がない: `capabilityUnsupported`。ハーネスが断った: `adapterError`。
 
 ### バックグラウンドタスク
 | method | params | result |
@@ -490,7 +544,8 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 - `command/list` の補足
   - アプリ側のコマンド（`source: "app"`）とハーネスのコマンド（`source: "harness"`）を合わせて返す。アプリ側のコマンドと同じ名前のハーネスのコマンドは返さない。
   - アプリ側のコマンド: `model` / `effort` / `permissions`（ピッカー。ハーネスに一覧があるときだけ）。スレッドを指定したときは加えて `fork`（能力があるとき）、`diff`、`stop`、`resume-queue`、`archive`（`method` アクション）。
-  - 動いているプロセスの中でネイティブセッションを切り替えるハーネスのコマンドは返さない（1つのスレッドは1つのネイティブセッション。design.md 9.5）。どのハーネスでも `resume` は返さない。ほかにハーネスごとに名前で決めたもの（Claude の `clear`、pi の `new` / `fork` / `clone` / `tree`）も返さない。クライアントは独自の `/resume`（`native/list` と `native/import` で PC のセッションを取り込む）を出してよい。
+  - 動いているプロセスの中でネイティブセッションを切り替えるハーネスのコマンドは返さない（1つのスレッドは1つのネイティブセッション。design.md 9.5）。どのハーネスでも `resume` は返さない。ほかにハーネスごとに決めたもの（Claude の `clear` と、その一覧にある別名、`continue`、pi の `new` / `fork` / `clone` / `tree` など）も、別名を含めて返さない。手で打った入力も `turn/start` が断る（`sessionSwitchingCommand`）。クライアントは独自の `/resume`（`native/list` と `native/import` で PC のセッションを取り込む）や `/new` を出し、最初の語がアプリのコマンドなら送らずに実行してよい。
+  - ハーネスの一覧にある別名は、それぞれ独立したコマンドとして返ることがある（Claude の `code-review` の別名 `review` など）。ハーネスが別名を解決する。
 - `native/list` の補足: 能力 `nativeSessions` が必要。そのプロジェクトのフォルダで作られたネイティブセッションを返し、取り込み済みなら `importedThreadId` を付ける。
   - 結果の中で `nativeSessionId` は一意（どのハーネスでも）。CLI が同じセッションを何度も並べても（Codex の `thread/list` は、resume されたスレッドを rollout ごとに同じ id で並べる）、1件にまとめて返す。位置は最初に現れた位置、内容（`title`、`updatedAt`、`cwd`）は `updatedAt` が最も新しいもの。クライアントは `nativeSessionId` を一覧のキーにしてよい。
 - `native/import` の補足: 取り込み済みなら既存のスレッドを返す。履歴は完了済みのターンとして取り込まれ、差分は持たない。次の入力でネイティブセッションを resume して続きから話せる。
@@ -540,6 +595,8 @@ type DiffFile = { path: string; kind: "add"|"delete"|"update"|"move"; added: num
 | `queue/updated` | `{queued:[QueuedInput]}`（キュー全体） |
 | `commands/changed` | `{}`（`command/list` を取り直す合図） |
 | `backgroundTask/updated` | `{task}`（バックグラウンドタスクの開始・進捗・終了。常にタスク全体。3.1） |
+| `thread/nativeSessionChanged` | `{previousNativeSessionId, nativeSessionId}`（ハーネスがエージェントを別のネイティブセッションに移した。3.1） |
+| `composer/insert` | `{text}`（ハーネスが入力欄にテキストを入れるよう求めた（pi の拡張の `setEditorText` など）。クライアントは開いているスレッドの入力欄に入れる。自分で送信はしない。古い読み取り位置から追いかけて受け取ったものは、入れずに提案として出してよい） |
 | `native` | `{harnessId, payload}`（アダプタが解釈しなかった生のイベント。ターンの外で届いた通知は `payload.notice` に入る。通常は表示しない） |
 
 ## 6. HTTP

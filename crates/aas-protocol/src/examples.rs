@@ -114,6 +114,25 @@ pub fn harness() -> Harness {
             },
         ],
         default_permission_mode: Some("default".into()),
+        features: HarnessFeatures {
+            fork_at_turn: true,
+            fork_while_held: true,
+            rename: true,
+            side_question: true,
+            move_to_background: true,
+            status: true,
+            project_trust: false,
+            plan_mode: Some(PlanModeFeature::default()),
+            fast_mode_models: vec!["opus".into()],
+        },
+    }
+}
+
+/// The plan mode of a harness that continues from a proposed plan with its own texts (Codex).
+pub fn implementing_plan_mode() -> PlanModeFeature {
+    PlanModeFeature {
+        implement_prompt: Some("Implement the plan.".into()),
+        new_thread_preamble: Some("A previous agent produced the plan below to accomplish the user's task. Implement the plan in a fresh context. Treat the plan as the source of user intent, re-read files as needed, and carry the work through implementation and verification.".into()),
     }
 }
 
@@ -136,6 +155,7 @@ pub fn project() -> Project {
             branch: Some("main".into()),
             root: Some(r"C:\Users\me\Documents\agent-app-server".into()),
         },
+        harness_trust: [("pi".to_owned(), true)].into_iter().collect(),
     }
 }
 
@@ -156,6 +176,7 @@ pub fn turn() -> Turn {
             deletions: 3,
         }),
         trigger: None,
+        forkable: true,
     }
 }
 
@@ -168,6 +189,7 @@ pub fn triggered_turn() -> Turn {
         completed_at: Some(T0 + 95_000),
         diff: None,
         trigger: Some(TurnTrigger::BackgroundTask),
+        forkable: false,
         ..turn()
     }
 }
@@ -234,6 +256,11 @@ pub fn thread() -> Thread {
                 ended_at: T0 + 88_000,
             }),
         },
+        modes: ThreadModes {
+            plan: false,
+            fast: true,
+        },
+        fast_mode_state: Some("on".into()),
         head: 42,
     }
 }
@@ -256,6 +283,8 @@ pub fn worktree_thread() -> Thread {
         }),
         pinned: false,
         background: ThreadBackground::default(),
+        modes: ThreadModes::default(),
+        fast_mode_state: None,
         ..thread()
     }
 }
@@ -269,6 +298,7 @@ fn item(n: u32, status: ItemStatus, body: ItemBody) -> Item {
         started_at: T0 + 2_000 + n as i64,
         completed_at: (status != ItemStatus::InProgress).then_some(T0 + 3_000 + n as i64),
         background_task_id: None,
+        backgroundable: false,
         body,
     }
 }
@@ -376,7 +406,35 @@ pub fn items() -> Vec<Item> {
             },
         ),
         backgrounded_item(),
+        item(
+            10,
+            ItemStatus::Completed,
+            ItemBody::ProposedPlan {
+                text: "1. Reproduce the race\n2. Order the ack before the heartbeat\n3. Run the reconnect tests\n".into(),
+            },
+        ),
+        backgroundable_item(),
     ]
+}
+
+/// A running command the harness says can be moved to the background now.
+pub fn backgroundable_item() -> Item {
+    Item {
+        backgroundable: true,
+        ..item(
+            11,
+            ItemStatus::InProgress,
+            ItemBody::CommandExecution {
+                command: "npm run dev".into(),
+                cwd: Some(r"C:\Users\me\Documents\agent-app-server".into()),
+                output: "ready on http://localhost:5173\n".into(),
+                output_truncated: false,
+                output_blob_id: None,
+                exit_code: None,
+                duration_ms: None,
+            },
+        )
+    }
 }
 
 /// The item that launched background task 1 (a sub-agent that goes on after the turn).
@@ -868,6 +926,7 @@ pub fn request_examples() -> Vec<(ClientRequest, Value)> {
                     harness_id: Some("codex".into()),
                     ..Default::default()
                 }),
+                harness_trust: Some([("pi".to_owned(), true)].into_iter().collect()),
             }),
             v(&ProjectResult { project: project() }),
         ),
@@ -1020,10 +1079,18 @@ pub fn request_examples() -> Vec<(ClientRequest, Value)> {
                     ..Default::default()
                 }),
                 pinned: Some(true),
+                modes: Some(ThreadModesUpdate {
+                    plan: Some(true),
+                    fast: None,
+                }),
             }),
             v(&ThreadUpdateResult {
                 thread: thread(),
                 settings_outcome: Some(SettingsOutcome::AppliesNextTurn),
+                native_rename: Some(NativeRename {
+                    status: NativeRenameStatus::Applied,
+                    message: None,
+                }),
             }),
         ),
         (
@@ -1046,6 +1113,7 @@ pub fn request_examples() -> Vec<(ClientRequest, Value)> {
                 client_request_id: crid(11),
                 thread_id: thread_id(),
                 at_turn_id: Some(turn_id()),
+                before: true,
             }),
             v(&ThreadResult {
                 thread: worktree_thread(),
@@ -1235,6 +1303,54 @@ pub fn request_examples() -> Vec<(ClientRequest, Value)> {
                 },
             }),
         ),
+        (
+            ClientRequest::ThreadHarnessStatus(ThreadHarnessStatusParams {
+                thread_id: thread_id(),
+            }),
+            v(&ThreadHarnessStatusResult {
+                sections: vec![
+                    StatusSection {
+                        title: "Session".into(),
+                        rows: vec![
+                            StatusRow {
+                                label: "Version".into(),
+                                value: "2.1.284".into(),
+                            },
+                            StatusRow {
+                                label: "Login method".into(),
+                                value: "Claude Max account".into(),
+                            },
+                        ],
+                    },
+                    StatusSection {
+                        title: "Usage limits".into(),
+                        rows: vec![StatusRow {
+                            label: "5-hour".into(),
+                            value: "13% used, resets 18:00".into(),
+                        }],
+                    },
+                ],
+                live: true,
+            }),
+        ),
+        (
+            ClientRequest::ThreadSideQuestion(ThreadSideQuestionParams {
+                thread_id: thread_id(),
+                question: "Which file holds the heartbeat timer?".into(),
+            }),
+            v(&ThreadSideQuestionResult {
+                answer: Some("crates/aas-server/src/conn.rs (`InboundDeadline`).".into()),
+                synthetic: false,
+            }),
+        ),
+        (
+            ClientRequest::ItemMoveToBackground(ItemMoveToBackgroundParams {
+                client_request_id: crid(23),
+                thread_id: thread_id(),
+                item_id: item_id(11),
+            }),
+            v(&Empty {}),
+        ),
     ]
 }
 
@@ -1322,6 +1438,13 @@ pub fn events() -> Vec<EventEnvelope> {
         env(Event::CommandsChanged {}),
         env(Event::BackgroundTaskUpdated {
             task: background_task(),
+        }),
+        env(Event::NativeSessionChanged {
+            previous_native_session_id: "7c2d1c1e-5b0e-4a51-9b1e-2f0c3a1b9d10".into(),
+            native_session_id: "0b6f3a52-91c4-4f1e-8d2a-5e7c9a0d4b11".into(),
+        }),
+        env(Event::ComposerInsert {
+            text: "Summarize the changes so far".into(),
         }),
         env(Event::Native {
             harness_id: "codex".into(),
@@ -1540,6 +1663,8 @@ mod tests {
             "queue/updated",
             "commands/changed",
             "backgroundTask/updated",
+            "thread/nativeSessionChanged",
+            "composer/insert",
             "native",
         ] {
             assert!(types.contains(t), "missing example for {t}");

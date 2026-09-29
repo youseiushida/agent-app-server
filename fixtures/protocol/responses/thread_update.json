@@ -2,6 +2,9 @@
   "id": 25,
   "jsonrpc": "2.0",
   "result": {
+    "nativeRename": {
+      "status": "applied"
+    },
     "settingsOutcome": "appliesNextTurn",
     "thread": {
       "archived": false,
@@ -18,6 +21,7 @@
       "createdAt": 1790000000000,
       "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
       "diffAvailable": true,
+      "fastModeState": "on",
       "harnessId": "claude",
       "head": 42,
       "id": "thr_01K6A0000000000000000THR01",
@@ -32,6 +36,10 @@
         "index": 0,
         "startedAt": 1790000002000,
         "status": "running"
+      },
+      "modes": {
+        "fast": true,
+        "plan": false
       },
       "nativeSessionId": "7c2d1c1e-5b0e-4a51-9b1e-2f0c3a1b9d10",
       "pendingInteractions": 1,

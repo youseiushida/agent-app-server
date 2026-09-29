@@ -22,6 +22,7 @@ use aas_harness::{
 use aas_protocol::UserMessageDelivery;
 use serde_json::Value;
 
+use crate::anchor::Anchor;
 use crate::paths::{PathInputs, same_dir, unreadable};
 use crate::tools::{self, ToolKind};
 use crate::wire::content_text;
@@ -224,8 +225,37 @@ pub fn read_history(path: &Path, policy: &AdapterPolicy) -> std::io::Result<Nati
     Ok(history_from_entries(&entries, policy))
 }
 
+/// [`read_history`] with the anchor of each turn (see [`history_with_anchors`]).
+pub fn read_history_anchored(
+    path: &Path,
+    policy: &AdapterPolicy,
+) -> std::io::Result<(NativeHistory, Vec<Option<Value>>)> {
+    let entries = read_lines(path)?;
+    Ok(history_with_anchors(&entries, policy))
+}
+
 /// Builds the history from parsed entries (header included or not).
 pub fn history_from_entries(entries: &[Value], policy: &AdapterPolicy) -> NativeHistory {
+    history_with_anchors(entries, policy).0
+}
+
+/// Entry ids of one history turn, for its anchor.
+#[derive(Debug, Default)]
+struct Mark {
+    /// The user message the turn starts with.
+    user: Option<String>,
+    /// The last entry of the active branch before the next turn (or the branch's end).
+    leaf: Option<String>,
+}
+
+/// Builds the history from parsed entries, with each turn's anchor ([`crate::anchor`]): the
+/// ids of the entry the turn starts with, when it is a user message, and of the turn's last
+/// entry on the active branch (the entries between two user messages belong to the turn before,
+/// like pi's own leaf when the next prompt came). Turns before any entry with an id have none.
+pub fn history_with_anchors(
+    entries: &[Value],
+    policy: &AdapterPolicy,
+) -> (NativeHistory, Vec<Option<Value>>) {
     let (title, _) = summarize(entries, policy);
     let tree: Vec<&Value> = entries
         .iter()
@@ -254,6 +284,7 @@ pub fn history_from_entries(entries: &[Value], policy: &AdapterPolicy) -> Native
     branch.reverse();
 
     let mut turns: Vec<HistoryTurn> = Vec::new();
+    let mut marks: Vec<Mark> = Vec::new();
     // Tool items awaiting their result: tool_call_id -> (turn index, item index, kind)
     let mut open_tools: HashMap<String, (usize, usize, ToolKind)> = HashMap::new();
 
@@ -265,12 +296,15 @@ pub fn history_from_entries(entries: &[Value], policy: &AdapterPolicy) -> Native
     }
 
     for entry in branch {
+        let entry_id = entry.get("id").and_then(Value::as_str);
+        let mut opens_turn = false;
         match entry.get("type").and_then(Value::as_str) {
             Some("message") => {
                 let msg = &entry["message"];
                 let ts = msg.get("timestamp").and_then(Value::as_i64);
                 match msg.get("role").and_then(Value::as_str) {
                     Some("user") => {
+                        opens_turn = true;
                         turns.push(HistoryTurn {
                             started_at: ts,
                             completed_at: ts,
@@ -443,6 +477,13 @@ pub fn history_from_entries(entries: &[Value], policy: &AdapterPolicy) -> Native
             }
             _ => {}
         }
+        marks.resize_with(turns.len(), Mark::default);
+        if let (Some(id), Some(mark)) = (entry_id, marks.last_mut()) {
+            if opens_turn {
+                mark.user = Some(id.to_owned());
+            }
+            mark.leaf = Some(id.to_owned());
+        }
     }
     // Tool calls without a result were cut off.
     for (t, i, _) in open_tools.into_values() {
@@ -450,7 +491,19 @@ pub fn history_from_entries(entries: &[Value], policy: &AdapterPolicy) -> Native
             turns[t].items[i].status = ItemStatus::Interrupted;
         }
     }
-    NativeHistory { title, turns }
+    let anchors = marks
+        .into_iter()
+        .map(|mark| {
+            mark.leaf.map(|leaf_id| {
+                Anchor {
+                    leaf_id,
+                    user_entry_id: mark.user,
+                }
+                .to_value()
+            })
+        })
+        .collect();
+    (NativeHistory { title, turns }, anchors)
 }
 
 fn notice_item(message: String, code: &str) -> HistoryItem {
@@ -535,6 +588,38 @@ mod tests {
         );
         let t2 = &h.turns[1];
         assert_eq!(t2.items[1].status, ItemStatus::Interrupted);
+    }
+
+    #[test]
+    fn turns_are_anchored_at_their_user_message_and_last_entry() {
+        let (history, anchors) = history_with_anchors(&entries(), &AdapterPolicy::default());
+        assert_eq!(history.turns.len(), 2);
+        // The abandoned branch (x1) is not part of any anchor; the compaction after a2 belongs
+        // to the first turn (it comes before the next user message).
+        assert_eq!(
+            anchors,
+            vec![
+                Some(serde_json::json!({"leafId": "c", "userEntryId": "u1"})),
+                Some(serde_json::json!({"leafId": "n", "userEntryId": "u2"})),
+            ]
+        );
+        // A history that starts with something other than a user message: its first turn has
+        // no user entry.
+        let entries = vec![
+            json!({"type":"session","version":3,"id":"s2","cwd":"/w"}),
+            json!({"type":"message","id":"m1","parentId":null,"message":{"role":"custom","display":true,"content":"hi","timestamp":1}}),
+            json!({"type":"message","id":"a1","parentId":"m1","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stopReason":"stop","timestamp":2}}),
+            json!({"type":"message","id":"u1","parentId":"a1","message":{"role":"user","content":"next","timestamp":3}}),
+        ];
+        let (history, anchors) = history_with_anchors(&entries, &AdapterPolicy::default());
+        assert_eq!(history.turns.len(), 2);
+        assert_eq!(
+            anchors,
+            vec![
+                Some(serde_json::json!({"leafId": "a1"})),
+                Some(serde_json::json!({"leafId": "u1", "userEntryId": "u1"})),
+            ]
+        );
     }
 
     #[test]

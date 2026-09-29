@@ -594,6 +594,7 @@ impl Env {
                 ..ThreadSettings::default()
             }),
             pinned,
+            modes: None,
         })
         .await
     }
@@ -735,6 +736,7 @@ async fn a_turn_sent_during_an_idle_stop_runs_on_a_new_process() {
                 ..ThreadSettings::default()
             }),
             pinned: None,
+            modes: None,
         })
         .await
         .unwrap();
@@ -796,6 +798,7 @@ async fn settings_changed_while_starting_are_applied_before_the_input_is_sent() 
                     ..ThreadSettings::default()
                 }),
                 pinned: None,
+                modes: None,
             })
             .await
             .unwrap();
@@ -1099,6 +1102,7 @@ async fn a_worktree_shared_with_a_fork_is_not_removed() {
             client_request_id: crid(),
             thread_id: parent.id.clone(),
             at_turn_id: None,
+            before: false,
         })
         .await
         .unwrap()
@@ -1403,6 +1407,7 @@ async fn a_fork_whose_parent_has_moved_on_is_refused() {
             client_request_id: crid(),
             thread_id: parent.id.clone(),
             at_turn_id: None,
+            before: false,
         })
         .await
         .unwrap()
@@ -1439,6 +1444,7 @@ async fn a_fork_whose_parent_has_moved_on_is_refused() {
             client_request_id: crid(),
             thread_id: parent.id.clone(),
             at_turn_id: None,
+            before: false,
         })
         .await
         .unwrap()
@@ -1468,6 +1474,7 @@ async fn a_fork_whose_parent_moves_on_while_it_waits_for_its_process_is_refused_
             client_request_id: crid(),
             thread_id: parent.id.clone(),
             at_turn_id: None,
+            before: false,
         })
         .await
         .unwrap()

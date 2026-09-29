@@ -344,6 +344,22 @@ pub struct PromptResponse {
     /// UNSTABLE in ACP v1: token usage of the turn.
     #[serde(default)]
     pub usage: Option<PromptUsage>,
+    /// Extension data. Devin puts the prompt's step id here
+    /// (`"cognition.ai/userMessageId"`, see `crate::revert`).
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+}
+
+impl PromptResponse {
+    /// Devin's id of the prompt (its step id): `_meta["cognition.ai/userMessageId"]`.
+    pub fn user_message_id(&self) -> Option<String> {
+        self.meta
+            .as_ref()?
+            .get("cognition.ai/userMessageId")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]

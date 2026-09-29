@@ -9,6 +9,7 @@ import dev.aas.android.data.BlobRepository
 import dev.aas.android.data.ComposerDrafts
 import dev.aas.android.data.HarnessRepository
 import dev.aas.android.data.ProjectRepository
+import dev.aas.android.data.SentDrafts
 import dev.aas.android.data.ThreadRepository
 import dev.aas.android.domain.diff.DiffLine
 import dev.aas.android.protocol.AasJson
@@ -335,7 +336,7 @@ class NewThreadViewModelTest {
 
     private suspend fun viewModel(route: NewThreadRoute = NewThreadRoute("prj_1")): NewThreadViewModel {
         val vm = onMain {
-            NewThreadViewModel(route, env.engine.workspace, ThreadRepository(env.engine, env.reads, env.lists), ProjectRepository(env.engine, env.reads, env.lists), env.engine.status, messages, drafts, FakeUploader(), AppPolicy(), PromptTemplates("R", "I"), env.engine.outbox, HarnessRepository(env.engine))
+            NewThreadViewModel(route, env.engine.workspace, ThreadRepository(env.engine, env.reads, env.lists), ProjectRepository(env.engine, env.reads, env.lists), env.engine.status, messages, drafts, FakeUploader(), AppPolicy(), PromptTemplates("R", "I"), env.engine.outbox, HarnessRepository(env.engine), SentDrafts(env.scope, drafts))
         }
         viewModels += vm
         jobs += CoroutineScope(Dispatchers.Default).launch { vm.state.collect {} }
@@ -557,6 +558,141 @@ class NewThreadViewModelTest {
         val params = AasJson.decodeFromJsonElement(ThreadCreateParams.serializer(), entry.params)
         assertEquals(WorkspaceSpec.Local, params.workspace)
         assertTrue(vm.state.value.creating)
+    }
+
+    /**
+     * `/plan <request>` as the first message (a harness with the app's plan mode): the thread is
+     * created without input, then plan mode and the request go to it, in this order; `/clear`
+     * is not needed in a new thread and keeps what followed it.
+     */
+    @Test
+    fun planCreatesTheThreadInPlanModeWithTheRequestAndClearIsNotNeeded() = blockingTest {
+        val planning = harness.copy(features = dev.aas.android.protocol.HarnessFeatures(planMode = dev.aas.android.protocol.PlanModeFeature(implementPrompt = "Implement the plan.")))
+        env.serve(null, harnesses = listOf(planning), projects = listOf(project))
+        env.answers[Methods.ThreadCreate.name] = {
+            json(dev.aas.android.protocol.ThreadCreateResult.serializer(), dev.aas.android.protocol.ThreadCreateResult(Samples.thread("thr_new", projectId = "prj_1")))
+        }
+        env.connect()
+        val vm = viewModel()
+        val created = java.util.concurrent.CopyOnWriteArrayList<NewThreadEvent>()
+        jobs += CoroutineScope(Dispatchers.Default).launch { vm.eventFlow.collect { created += it } }
+
+        onMain { vm.composer.setText("/clear fix the build") }
+        eventually(what = "sendable") { vm.state.value.send.enabled.takeIf { it } }
+        onMain { vm.create() }
+        kotlinx.coroutines.withTimeout(MESSAGE_TIMEOUT_MS) { messages.messages.first { it.text == UiText.of(R.string.newthread_already_new, "clear") } }
+        assertEquals("fix the build", vm.composer.state.value.value.text)
+        assertEquals(0, env.requests(Methods.ThreadCreate.name).size)
+
+        onMain { vm.composer.setText("/plan Add a login page") }
+        eventually(what = "sendable") { vm.state.value.send.enabled.takeIf { it } }
+        onMain { vm.create() }
+        assertEquals(NewThreadEvent.Created("thr_new"), eventually(what = "created") { created.firstOrNull { it is NewThreadEvent.Created } })
+        val create = AasJson.decodeFromJsonElement(Methods.ThreadCreate.params, env.requests(Methods.ThreadCreate.name).single().params!!)
+        assertEquals(null, create.input, "created without input")
+        val update = eventually(what = "plan mode") { env.requests(Methods.ThreadUpdate.name).singleOrNull() }
+        assertEquals(dev.aas.android.protocol.ThreadModesUpdate(plan = true), AasJson.decodeFromJsonElement(Methods.ThreadUpdate.params, update.params!!).modes)
+        val start = eventually(what = "the request") { env.requests(Methods.TurnStart.name).singleOrNull() }
+        val params = AasJson.decodeFromJsonElement(Methods.TurnStart.params, start.params!!)
+        assertEquals("thr_new", params.threadId)
+        assertEquals(listOf(dev.aas.android.protocol.InputPart.Text("Add a login page")), params.input)
+        assertTrue(env.server.requests.indexOfFirst { it.second.method == Methods.ThreadUpdate.name } < env.server.requests.indexOfFirst { it.second.method == Methods.TurnStart.name })
+    }
+
+    /**
+     * `/plan <request>` while the creation cannot be sent (offline), and the user leaves at once:
+     * plan mode and the request are committed with the creation (one chain), so they reach the
+     * created thread once it exists, in this order. Nothing waits for the screen.
+     */
+    @Test
+    fun leavingWhileAPlanCreationWaitsStillSendsPlanModeAndTheRequest() = blockingTest {
+        val planning = harness.copy(features = dev.aas.android.protocol.HarnessFeatures(planMode = dev.aas.android.protocol.PlanModeFeature(implementPrompt = "Implement the plan.")))
+        env.store.transaction { tx ->
+            tx.setEpoch("e")
+            tx.setCursor(WORKSPACE_STREAM, 0)
+            tx.replaceHarnesses(listOf(planning))
+            tx.upsertProject(project)
+        }
+        env.startOffline()
+        val vm = viewModel()
+        onMain { vm.composer.setText("/plan Add a login page") }
+        eventually(what = "enabled") { vm.state.value.send.takeIf { it.enabled } }
+        onMain {
+            vm.create()
+            vm.viewModelScope.cancel()
+        }
+        val methods = eventually(what = "all four requests in the outbox") { env.engine.outbox.value.map { it.method }.takeIf { it.size == 4 } }
+        assertEquals(listOf(Methods.ThreadCreate.name, Methods.ThreadUpdate.name, Methods.TurnStart.name, Methods.ProjectUpdate.name), methods)
+        assertEquals("", drafts.get(ComposerDrafts.newThreadKey("prj_1")).text, "the request left the composer for the outbox")
+
+        // Connected later: the creation's answer releases plan mode, then the request, to the new thread.
+        env.serve(null, harnesses = listOf(planning), projects = listOf(project))
+        env.answers[Methods.ThreadCreate.name] = { json(ThreadCreateResult.serializer(), ThreadCreateResult(Samples.thread("thr_new", projectId = "prj_1"))) }
+        env.connect()
+        val start = eventually(what = "the request") { env.requests(Methods.TurnStart.name).singleOrNull() }
+        val request = AasJson.decodeFromJsonElement(Methods.TurnStart.params, start.params!!)
+        assertEquals("thr_new", request.threadId)
+        assertEquals(listOf(InputPart.Text("Add a login page")), request.input)
+        val update = AasJson.decodeFromJsonElement(Methods.ThreadUpdate.params, env.requests(Methods.ThreadUpdate.name).single().params!!)
+        assertEquals("thr_new", update.threadId)
+        assertEquals(dev.aas.android.protocol.ThreadModesUpdate(plan = true), update.modes)
+        val order = env.server.requests.map { it.second.method }
+        assertTrue(order.indexOf(Methods.ThreadCreate.name) < order.indexOf(Methods.ThreadUpdate.name) && order.indexOf(Methods.ThreadUpdate.name) < order.indexOf(Methods.TurnStart.name), "$order")
+    }
+
+    /**
+     * A refused `/plan` creation sends neither plan mode nor the request, and the typed text comes
+     * back to the project's new-thread composer, also when the screen was left meanwhile.
+     */
+    @Test
+    fun aRefusedPlanCreationGivesTheRequestBackEvenAfterLeaving() = blockingTest {
+        val planning = harness.copy(features = dev.aas.android.protocol.HarnessFeatures(planMode = dev.aas.android.protocol.PlanModeFeature(implementPrompt = "Implement the plan.")))
+        env.serve(null, harnesses = listOf(planning), projects = listOf(project))
+        env.answers[Methods.ThreadCreate.name] = { dev.aas.android.sync.FakeServer.rpcError(dev.aas.android.protocol.ErrorKind.InvalidState, "the project folder is gone") }
+        env.connect()
+        val vm = viewModel()
+        onMain { vm.composer.setText("/plan Add a login page") }
+        eventually(what = "enabled") { vm.state.value.send.takeIf { it.enabled } }
+        onMain {
+            vm.create()
+            vm.viewModelScope.cancel()
+        }
+        eventually(what = "the creation answered") { env.engine.outbox.value.takeIf { it.none { e -> e.method == Methods.ThreadCreate.name } && env.requests(Methods.ThreadCreate.name).isNotEmpty() } }
+        // The screen opened again gets the request back.
+        val again = viewModel()
+        eventually(what = "the request back") { again.composer.textValue.text.takeIf { it == "/plan Add a login page" } }
+        assertTrue(env.requests(Methods.ThreadUpdate.name).isEmpty() && env.requests(Methods.TurnStart.name).isEmpty(), "never sent")
+        assertTrue(env.engine.outbox.value.none { it.method == Methods.ThreadUpdate.name || it.method == Methods.TurnStart.name })
+    }
+
+    /**
+     * Typed `/init` and `/review <text>` while the daemon's command list is not loaded go as typed
+     * (the harness may have its own, e.g. Codex's bundled `/init`): the app's templates only when
+     * the loaded list says the harness has no such command.
+     */
+    @Test
+    fun typedPromptTemplatesWaitForTheLoadedListToReplaceTheText() = blockingTest {
+        env.serve(null, harnesses = listOf(harness), projects = listOf(project))
+        var n = 0
+        env.answers[Methods.ThreadCreate.name] = { json(ThreadCreateResult.serializer(), ThreadCreateResult(Samples.thread("thr_${++n}", projectId = "prj_1"))) }
+        env.connect()
+        val vm = viewModel()
+        onMain { vm.composer.setText("/init") }
+        eventually(what = "enabled") { vm.state.value.send.takeIf { it.enabled } }
+        onMain { vm.create() }
+        val first = eventually(what = "thread/create") { env.requests(Methods.ThreadCreate.name).firstOrNull() }
+        assertEquals(listOf(InputPart.Text("/init")), AasJson.decodeFromJsonElement(ThreadCreateParams.serializer(), first.params!!).input, "sent as typed")
+
+        // Loaded, and the harness lists no `init`: the app's template.
+        env.answers[Methods.CommandList.name] = { json(dev.aas.android.protocol.CommandListResult.serializer(), dev.aas.android.protocol.CommandListResult(emptyList())) }
+        eventually(what = "not creating") { vm.state.value.takeIf { !it.creating } }
+        onMain { vm.loadCommands() }
+        eventually(what = "commands loaded") { vm.composer.state.value.commands as? dev.aas.android.ui.composer.CommandsState.Loaded }
+        onMain { vm.composer.setText("/init") }
+        eventually(what = "enabled") { vm.state.value.send.takeIf { it.enabled } }
+        onMain { vm.create() }
+        val second = eventually(what = "the second thread/create") { env.requests(Methods.ThreadCreate.name).getOrNull(1) }
+        assertEquals(listOf(InputPart.Text("I")), AasJson.decodeFromJsonElement(ThreadCreateParams.serializer(), second.params!!).input, "the app's template")
     }
 }
 

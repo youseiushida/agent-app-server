@@ -13,6 +13,9 @@
         "isRepo": true,
         "root": "C:\\Users\\me\\Documents\\agent-app-server"
       },
+      "harnessTrust": {
+        "pi": true
+      },
       "id": "prj_01K6A0000000000000000PRJ01",
       "name": "agent-app-server",
       "path": "C:\\Users\\me\\Documents\\agent-app-server",

@@ -232,6 +232,8 @@ async fn dropping_every_handle_terminates_the_tree() {
         line.contains("outcome=stopped (abandoned)"),
         "unexpected outcome: {line}"
     );
+    // The supervisor settles its bookkeeping before it logs the end, so the count is already
+    // down when the line can be read.
     assert_eq!(supervisor.running_count(), 0);
 }
 

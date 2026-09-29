@@ -140,6 +140,17 @@ class AppFlows(val app: AppDriver, val control: HostControl, val server: ServerA
             "ここに作成",
         )
         app.waitFor(app.inApp(By.text(name)), "the new project's name on the new-thread screen")
+        trustTheProject()
+    }
+
+    /**
+     * The fake harness loads a project's own resources only in projects the user trusts (the
+     * feature `projectTrust`): the new-thread screen asks for each new project until it is
+     * decided. The test user trusts it (its folder is the test's own), and the question goes.
+     */
+    fun trustTheProject() {
+        app.waitFor(app.inApp(By.text(app.textPattern("trust_title"))), "the project-trust question")
+        app.tapUntilGone(app.inApp(app.button(app.text("trust_yes"))), "信頼する")
     }
 
     /**
@@ -163,6 +174,7 @@ class AppFlows(val app: AppDriver, val control: HostControl, val server: ServerA
             "このフォルダーを開く",
         )
         app.waitFor(app.inApp(By.text(folder)), "the project's name on the new-thread screen")
+        trustTheProject()
     }
 
     /**

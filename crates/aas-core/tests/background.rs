@@ -837,6 +837,7 @@ async fn queued_events_beat_the_idle_deadline() {
                     ..Default::default()
                 }),
                 pinned: None,
+                modes: None,
             };
             engine
                 .handle(
@@ -1841,6 +1842,7 @@ async fn a_settings_restart_waits_for_background_work() {
                 ..Default::default()
             }),
             pinned: None,
+            modes: None,
         })
         .await;
     assert!(failed.is_err(), "the process refused the settings");

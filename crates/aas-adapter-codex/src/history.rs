@@ -6,6 +6,8 @@ use aas_harness::protocol::{ItemBody, ItemStatus, Mention, UserMessageDelivery};
 use aas_harness::{AdapterPolicy, HistoryItem, HistoryTurn, NativeHistory, NativeSessionSummary};
 use serde_json::Value;
 
+use crate::session::turn_anchor;
+
 use crate::mapping::{MappedItem, map_item};
 use crate::wire::{WireItem, WireThread};
 
@@ -56,6 +58,20 @@ pub fn user_message_body(content: &[Value]) -> ItemBody {
         mentions,
         delivery: UserMessageDelivery::Normal,
     }
+}
+
+/// [`history`] with each turn's anchor: its id, the one the live turn had (`TurnAnchor`).
+pub fn anchored_history(
+    thread: &WireThread,
+    cwd: &Path,
+    policy: &AdapterPolicy,
+) -> (NativeHistory, Vec<Option<Value>>) {
+    let anchors = thread
+        .turns
+        .iter()
+        .map(|turn| Some(turn_anchor(&turn.id)))
+        .collect();
+    (history(thread, cwd, policy), anchors)
 }
 
 pub fn history(thread: &WireThread, cwd: &Path, policy: &AdapterPolicy) -> NativeHistory {
@@ -160,5 +176,9 @@ mod tests {
             summary(&thread, &AdapterPolicy::default()).updated_at,
             Some(10_000)
         );
+        let (anchored, anchors) =
+            anchored_history(&thread, Path::new("/p"), &AdapterPolicy::default());
+        assert_eq!(anchored, h);
+        assert_eq!(anchors, [Some(serde_json::json!({"turnId": "u1"}))]);
     }
 }

@@ -59,9 +59,10 @@ android/               Android アプリ（:protocol、:sync、:app）
 - プロトコルの golden fixtures の更新: `AAS_UPDATE_FIXTURES=1 cargo test -p aas-protocol --test fixtures`
 - pi の承認ゲート拡張（TypeScript。Node.js 22.18 以上）: `node --test crates/aas-adapter-pi/extension/aas-gate.test.ts`
 - Android（`android\` で実行する）:
-  - ビルドとテスト: `.\gradlew.bat :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :protocol:test :sync:test`
+  - ビルドとテスト: `.\gradlew.bat :app:assembleDebug :app:assembleStaging :app:testDebugUnitTest :app:lintDebug :protocol:test :sync:test :e2e:assembleDebug`
   - APK: `android\app\build\outputs\apk\debug\app-debug.apk`（`adb install -r app\build\outputs\apk\debug\app-debug.apk`）
   - Android SDK がない環境では `:app` がビルドに含まれないので `.\gradlew.bat :protocol:test :sync:test`
+  - 端末のテスト（エミュレータの上で、本物の daemon を相手に debug と R8 の staging を回す。`docs/android.md` 23章）: `android\scripts\start-emulator.ps1` → `android\scripts\run-device-tests.ps1 -BuildType both` → `android\scripts\stop-emulator.ps1`
 - Android の結合テスト用サーバ（`aas-test-server`、使い方は `docs/design.md` §16）:
   - サーバを変えたら作り直す: `cargo build -p aas-testkit --bins` のあと、`target\debug\aas-test-server.exe` と `target\debug\aas-dummy-agent.exe` を `target\aas-test-bin\` にコピーする。
   - `AAS_TEST_SERVER` に `target\aas-test-bin\aas-test-server.exe` の絶対パスを入れて `.\gradlew.bat :sync:test` を実行すると、`RealServerTest` が本物の daemon を相手に走る（未設定なら skip される。走ったかは `android\sync\build\test-results\test\TEST-dev.aas.android.sync.RealServerTest.xml` の `skipped` で確かめる）。

@@ -5,48 +5,61 @@ pi（earendil-works/pi、`@earendil-works/pi-coding-agent`）を RPC モード�
 - 検証済みの環境: **pi 0.85.1 / Windows 11**
   - 実機で確認した内容: プローブ、ターン、承認ゲート、実行中のモード切り替え、終了、履歴の取り込み、resume、fork
   - 実機で記録・確認した内容（2026-09-28）: 拡張が自分で始める実行（`sendMessage` の `triggerTurn`、`sendUserMessage`）、その実行とプロンプトの競合、`agent_settled` のハンドラから始まる実行、その実行の中断と承認ゲート、ターンの外のダイアログ（3章、6章）
+  - 実機で記録した内容（2026-09-28、記録「rec2」）: `get_fork_messages` / `fork` / `clone` / `get_entries`、`set_session_name` と `session_info_changed`、streaming 中の拡張コマンド、拡張の `ctx.reload()` / `ctx.newSession()` / `ctx.fork()` / `ctx.navigateTree()` のあとの `get_state`、`set_editor_text`（13章）
+  - 実機で確かめた内容（2026-09-29、`live_features`）: プロジェクトの信頼（`--approve` / `--no-approve`）、ターンのアンカーと途中からの fork（含める・前まで）、名前、状態、`/reload`、入力欄への差し込み、streaming 中の拡張コマンド、拡張によるセッションの切り替えの検出（11章、13章）
 - 実装: `crates/aas-adapter-pi`
-- テスト用の記録: `crates/aas-adapter-pi/tests/fixtures/`
-- ライブテスト用の拡張: `crates/aas-adapter-pi/tests/extension/aas-live.ts`（pi に自分で実行やダイアログを始めさせる。11章）
+- テスト用の記録: `crates/aas-adapter-pi/tests/fixtures/`（`rec2.json` は記録 rec2 の pi の出力。ローカルのパスは `C:\rec` に置き換えた）
+- ライブテスト用の拡張: `crates/aas-adapter-pi/tests/extension/aas-live.ts`（pi に自分で実行やダイアログを始めさせる、入力欄への差し込み、セッションの切り替え。11章）
 
 ## 1. 起動
 
 1セッションにつき1プロセス。起動は `aas-supervisor` を通す。
 
 ```
-pi [config.args…] --mode rpc <セッション引数> [--session-dir <options.session_dir>] -e <state_dir>/aas-gate-v2.ts
-環境変数: AAS_PI_GATE_FILE=<state_dir>/gate/<session id>.json（と config.env）
+pi [config.args…] --mode rpc <セッション引数> [--session-dir <options.session_dir>] [--approve | --no-approve] -e <state_dir>/aas-gate-v3.ts
+環境変数: AAS_PI_GATE_FILE=<state_dir>/gate/<thread id>.json（と config.env）
 ```
 
-| StartMode | セッション引数 |
+エンジンは `start_with`（`StartOptions`）で起動する。`start` は既定の `StartOptions` での `start_with`。
+
+| StartMode（`fork_at`） | セッション引数 |
 |---|---|
 | New | `--session-id <新しい UUID>`。ID はアダプタが決めるので、起動の時点で確定する |
 | Resume | `--session <セッションファイルのパス>`。ファイルはヘッダの `id` で探す（6章） |
-| Fork | `--fork <元のファイル> --session-id <新しい UUID>`（pi が `forkFrom` で ID を指定して複製する） |
+| Fork（なし） | `--fork <元のファイル> --session-id <新しい UUID>`（pi が `forkFrom` で ID を指定して複製する。エントリの ID はそのまま） |
+| Fork（`fork_at` あり） | `--session <元のファイル>` で開き、承認ゲートの `/aas-gate-fork` で分ける。新しい ID は pi が決める（13.1） |
 
 - Resume で `--session-id` を使わない理由: 見つからなかったときに黙って新しいセッションを作るため。
 - パスで指定すれば曖昧さがない。見つからなければ `AdapterError::Harness` を返す。
+- `fork_at` を New / Resume と一緒に渡されたら断る（`Other`）。
+- プロジェクトの信頼（`StartOptions::project_trusted`。13.4）: `Some(true)` は `--approve`、`Some(false)` は `--no-approve`、`None` は何も付けない。
+- ゲートのモードのファイルはスレッドごと（`<thread id>.json`）。同じスレッドのプロセスは順に起動し直すだけで、途中からの fork では pi が分けるまでセッションの ID が分からないため。
 
 ### ハンドシェイク
-1. `get_state` を送り、`sessionId` が期待した ID と一致するか確かめる。違えば `Protocol` エラー。
+1. `get_state` を送り、`sessionId` が期待した ID と一致するか確かめる。違えば `Protocol` エラー。一致した ID を、このプロセスが動かしているセッションとして覚える（3.5 の比較に使う）。
 2. スレッドのモデル・推論量が現在の値と違うときだけ、`set_model` / `set_thinking_level` を送る。
    - pi は変更のたびにセッションファイルへ記録するので、同じ値は送らない。
 3. 権限モードをゲートのファイルに書く。
-4. `get_commands` を送り、`CommandsChanged` を出す（アダプタが実装するコマンドを加える。8章）。
+4. `get_commands` を送り、`CommandsChanged` を出す（アダプタが実装するコマンドを加え、出さないものを除く。8章）。
 5. `SessionInfo { model, effort, permission_mode }` を出す。
+6. `get_state` の `sessionName` があれば `SessionTitle` を出す（daemon の外で付いた名前。利用者のタイトルはエンジンが置き換えない）。
+7. pi の葉（木の今の位置）を覚える（最初のターンのアンカーのため。13.1）。`get_fork_messages` の最後のユーザーメッセージを `since` にして `get_entries` を送り、その `leafId` を使う（セッション全体を転送しないため。ユーザーメッセージがなければ `since` なし）。失敗しても起動は続ける（warn ログ。最初のターンのアンカーは葉だけになる）。
 
-失敗した場合はプロセスを段階停止し、stderr の末尾を付けて `AdapterError::Spawn` を返す。
+失敗した場合はプロセスを段階停止し、`AdapterPolicy::with_stderr` で stderr の最後の行（`policy.exit_message_stderr_lines`。端末の制御文字を除く）を付けて返す（エラーの種類はそのまま）。
 
 ## 2. 使う RPC コマンド
 
 | コマンド | 用途 |
 |---|---|
-| `prompt` | `send`（画像は base64 の `images`） |
+| `prompt` | `send`（画像は base64 の `images`）。steer が拡張コマンドのときは `streamingBehavior: "steer"` 付き（3.6）。途中からの fork では `/aas-gate-fork`（13.1） |
 | `compact` | `/compact [instructions]` のターン（`customInstructions`。8章） |
-| `get_session_stats` | assistant のメッセージが終わるたびに、コンテキストの使用量を取る（10章） |
+| `get_session_stats` | assistant のメッセージが終わるたびに、コンテキストの使用量を取る（10章）。`status`（13.3） |
 | `steer` | `steer`（応答を待つ） |
+| `get_entries` | ターンの終わりにそのターンのエントリと葉を取る（`since` = ターンの始まりの葉。3.5、13.1）。ハンドシェイクでは葉だけ |
+| `get_fork_messages` | 葉を知らないときに、`get_entries` の `since` にする既存のエントリを1つ得る（最後のユーザーメッセージ） |
+| `set_session_name` | `rename`（13.2） |
 | `abort` | `interrupt`、および実行中に `shutdown` したとき。`agent_start` の前に送った `abort` は、その `agent_start` でもう一度送る（3章）。`interrupt` の書き込みは `policy.stop_grace` で打ち切る（stdin を読まなくなった pi でエンジンの強制停止を待たせない） |
-| `get_state` | ハンドシェイク、プローブ、「エージェントが動き始めたか」の確認（3章） |
+| `get_state` | ハンドシェイク、プローブ、「エージェントが動き始めたか」の確認、ターンの終わりのセッションの比較（3章）、`status` |
 | `get_available_models` | プローブ（モデル一覧） |
 | `get_commands` | `/` コマンドの一覧 |
 | `set_model` / `set_thinking_level` | 設定の変更（すぐ反映される） |
@@ -56,8 +69,8 @@ pi [config.args…] --mode rpc <セッション引数> [--session-dir <options.s
 使わないもの:
 - `follow_up`: キューはエンジンが持つ。
 - `bash`: ユーザーが直接実行するシェルは範囲外。
-- RPC の `fork` / `clone`: CLI の `--fork` を使う。
-- `new_session`、`switch_session`。
+- RPC の `fork` / `clone`: `fork` はユーザーメッセージの前でしか分けられず、`clone` は今の葉でしか分けられない。途中のターンを含めて分けるには拡張の `ctx.fork(entryId, { position: "at" })` が要るので、承認ゲートのコマンドに揃える（13.1）。セッション全体の fork は CLI の `--fork`。
+- `new_session`、`switch_session`、`get_tree`（木の移動は範囲外）、`export_html`（範囲外）。
 
 終了は stdin を閉じて行う。pi の RPC モードは stdin の終わりで正常終了する。
 
@@ -88,6 +101,7 @@ pi（0.85.1）は一度に1つの実行（run）だけを動かす。実行は `
 - ターンの終了時の処理
   - まだ届いていない steer（`queue_update` の `steering`）があれば `clear_queue` で捨て、`Notice(steerNotDelivered)` で知らせる。
   - 未回答のダイアログは閉じない（pi はまだ答えを待っている）。そのターンに属していたものはエンジンが期限切れにし、`expire_request` で pi に答える（6章）。
+  - 結果（状態・使用量・エラー）はこの時点で決め、`TurnCompleted` の前にセッションについて pi に聞く（3.5）。
 - 実行中にプロセスが終了した場合は `Exited` だけを出す（`TurnCompleted` は出さない。ターンを失敗にするのはエンジン）。
 - `/compact` のターン（8章）: `compaction_start` か `compact` の応答のうち先に来た方で `TurnStarted`、`compact` の応答で `TurnCompleted`。
   - 成功 → `completed`（usage は応答の `usage`。要約を作ったモデル呼び出しの分）。
@@ -138,6 +152,33 @@ pi は通常の prompt に、前処理（`input` ハンドラ、自動圧縮、�
 - ターンが `get_session_stats` の応答だけを待っている（実行は終わっている）ときの `agent_start` も、新しい実行。ターンをその場で完了させ、新しいターンを始める。遅れて届いた応答は古いターンのものなので、新しいターンには付けない。
 - この判定は `agent_end` が必ず出ることに依る（pi 0.85.1 の `runAgentLoop` と `handleRunFailure` で確認。記録したすべての実行で出ている）。
 
+### 3.5 ターンの終わり: セッションの切り替え、アンカー、コマンド
+
+実行が終わった（`agent_settled`、または「動いていない」の確認。`/compact` は `compact` の応答）あと、`TurnCompleted` の前に、別のタスクが pi に次を聞く（`finish_steps`）。どれも pi 自身の要求で、推定はしない。
+
+1. `get_state`: `sessionId` がこのプロセスのセッションと違えば、pi がスレッドの下でセッションを替えた（拡張のコマンドが別の名前で `ctx.newSession` / `ctx.fork` / `ctx.switchSession` を呼んだなど。pi はイベントを出さない。記録 rec2）。
+   - 新しい ID を `SessionIdentified` で出す。エンジンはそれに従い、`thread/nativeSessionChanged` と notice で知らせる（design.md 9.5）。
+   - pi は新しいセッションを既定のモデルと thinking level で始める（記録: `ctx.newSession` のあと、モデルと thinking が既定に戻り、イベントもない）。スレッドの値と違えば、`set_model` / `set_thinking_level` で付け直す（`SessionInfo` を出す）。付け直せなければ `Notice(settingsNotApplied)` で知らせ、ターンは続ける。
+   - `navigateTree`（同じセッションの中の移動）は `sessionId` が変わらないので、切り替えとしては扱わない（範囲外。名前で除く、8章）。
+2. `get_entries { since: <ターンが始まったときの葉> }`: そのターンが足したエントリと、pi の今の葉（`leafId`）。アンカー（13.1）を作り、`TurnAnchor` で出す。答えの `leafId` が次のターンの始まりの葉になる。
+   - セッションが替わったターンにはアンカーを付けない（どちらのセッションのものとも言えない）。
+   - ターンの始まりの葉が分からないとき（ハンドシェイクで取れなかった、セッションが替わった、前のターンが下の理由でアンカーなしに終わった）は、葉だけのアンカーにする（13.1）。
+   - `since` のエントリがセッションにない（pi が「Entry not found」と答えた）ときは、葉を取り直す（`get_fork_messages` → `get_entries`）。
+3. `get_commands`: そのターンで拡張コマンドを送った（`send` または steer）とき、またはセッションが替わったとき。一覧が変わっていれば `CommandsChanged`（`/reload` のあとなど）。
+
+- 3つの要求は合わせて `policy.handshake_timeout` で打ち切る。答えがなければアンカーなしで `TurnCompleted` を出す（warn ログ）。
+- 待っている間に新しい実行が始まったら（`agent_start`）、3.4 と同じく、そのターンをアンカーなしでその場で完了させ、新しい実行のターンを始める。遅れて届いた答えは使わない。その場で完了したターンのあとのターンは、始まりが分からないので葉だけのアンカーになる。
+- 待っている間の `interrupt` は何もしない（実行は終わっている）。
+- pi の出力がその間に終わったら、決めてあった結果で `TurnCompleted` を出してから `Exited` を出す（実行はもう終わっていたため）。
+
+### 3.6 実行中の steer
+
+| いつ | 送るもの |
+|---|---|
+| 実行中（拡張コマンドでない） | `steer` |
+| 実行中で、先頭が拡張コマンド（`get_commands` の `source: "extension"`。pi と同じ照合） | `prompt { message, streamingBehavior: "steer" }`。pi はすぐにコマンドを実行し、ハンドラが終わってから応答する。`steer` だと pi は「Extension command … cannot be queued」で断る（記録 rec2） |
+| 実行が終わったあと、`TurnCompleted` の前（`agent_settled` のあと context やアンカーを待っている間） | 送らない。`steer_message` はその id を覚え、ターンの `TurnCompleted` の直前に `SteerReturned` を出す。エンジンは入力をキューに戻す。アイドルの pi に `steer` を送ると、pi は次のプロンプトまで持ち越すため。`steer`（id なし）はエラー |
+
 ## 4. イベントの対応表
 
 | pi のイベント | AdapterEvent |
@@ -153,11 +194,13 @@ pi は通常の prompt に、前処理（`input` ハンドラ、自動圧縮、�
 | `tool_execution_update` | `partialResult`（それまでの累積）との差分を delta で出す。前方一致しない場合は `ItemUpdated` で丸ごと置き換える |
 | `tool_execution_end` | 最終内容で完了。ゲートで拒否したものは `declined`、`isError` なら `failed`、それ以外は `completed` |
 | `thinking_level_changed` | `SessionInfo { effort }` |
+| `session_info_changed`（`name` あり） | `SessionTitle`（13.2） |
 | `compaction_start/end` | Notice（`compaction`）。失敗の文言は pi の `errorMessage` をそのまま使う。`/compact` のターンでは `compaction_start` がターンの開始にもなる |
 | `auto_retry_start` | Notice（`autoRetry`）。失敗の `auto_retry_end` は Notice にして、ターンを failed にする |
 | `summarization_retry_scheduled` | Notice |
 | `extension_error` | Notice（`extensionError`） |
 | `turn_start/end`、`queue_update`、user（上の場合を除く）と toolResult の message、`toolcall_*` の delta、`summarization_retry_attempt_start/finished`、`bash_execution_update` | 無視（ほかの経路で扱っている） |
+| `extension_ui_request` の `set_editor_text` | `ComposerText`（アプリの `composer/insert`。13.5） |
 | ターンの外で来たアイテム系のイベント（実行の外で拡張が追加した custom メッセージなど）、未知のイベント、JSON でない行 | `Native` |
 
 - 次の場合は、ブロックが一度も配信されていないので、`message_end` の内容をまるごと1件として報告する。
@@ -181,7 +224,7 @@ pi は通常の prompt に、前処理（`input` ハンドラ、自動圧縮、�
 
 ## 6. 承認ゲート（aas-gate）
 
-pi には実行前の確認がない。そこでアダプタは TypeScript の拡張 `extension/aas-gate.ts` を `state_dir` に書き出して `-e` で読み込ませる（内容が同じなら書き直さない）。
+pi には実行前の確認がない。そこでアダプタは TypeScript の拡張 `extension/aas-gate.ts` を `state_dir` に書き出して `-e` で読み込ませる（内容が同じなら書き直さない）。この拡張は、RPC にないコマンド `/reload` と `/aas-gate-fork` も持つ（8章、13.1）。
 
 - ツールを呼ぶたびに `AAS_PI_GATE_FILE` が指す `{"mode": …}` を読む。
   - モードを変えるときはこのファイルを書き換えるだけなので、再起動なしで効く（`apply_settings` は `Live` を返す）。
@@ -203,20 +246,25 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
   - `aborted` は、ターンの中断（`abort`）で pi がダイアログを閉じた（こちらの回答は使われていない）という意味。
   - アダプタは、その `toolCallId` のゲートのダイアログがまだ開いていれば `InteractionWithdrawn` を出し、ツールを declined として扱う（ゲートはそのツールをブロックする）。すでに答えたダイアログの報告は何もしない。
   - `interrupt()` の時点では取り下げない。pi が閉じたことをゲートが報告してから取り下げる。
+- **fork の失敗の報告**: `/aas-gate-fork` が分けられなかったとき（pi の例外、ほかの拡張による取り消し、引数の誤り）は `aas-gate:` + `{"v":1,"event":"forkFailed","error"}` を送る。アダプタはその `error` を fork の失敗の理由にする（Notice にはしない）。分けられたときは報告しない（コマンドの ctx は置き換わったセッションのもので、使ってはいけない。pi の docs）。アダプタは `get_state` の `sessionId` で確かめる。
 - Interaction にしたときの内容
   - `approval` で、subject はコマンドまたは fileChange。
   - 選択肢は `allow`(allowOnce) / `allowSession`(allowForSession) / `deny` / `denyWithFeedback`。
   - `item_key` はツールのアイテム。
 - `allowSession` の範囲
   - シェルは同じコマンド文字列だけ、`edit` / `write` はすべて。
-  - 有効なのはその pi プロセスの間だけ（アイドル回収や再起動でリセットされる）。
+  - 有効なのはその pi プロセスの間だけ（アイドル回収や再起動でリセットされる）。`/reload` でも拡張が読み直されるのでリセットされる（記録 rec2: `-e` の拡張はディスクから読み直される）。
 - 拒否すると、フィードバックを添えた理由とともにツールがブロックされる（モデルにも伝わる）。
-- 拡張のファイル名は、アダプタとのやりとりの形が変わったら版を上げる（`aas-gate-v2.ts`: 閉じた理由の報告を追加）。
-- ゲートのテスト（TypeScript）: `node --test crates/aas-adapter-pi/extension/aas-gate.test.ts`（Node.js 22.18 以上。型の除去が既定で有効な版）。`crates/aas-adapter-pi/extension` で `npm test` でもよい。pi の拡張 API を模したオブジェクトで、次を確かめる（12件）。
+- 拡張のファイル名は、アダプタとのやりとりの形が変わったら版を上げる（`aas-gate-v2.ts`: 閉じた理由の報告を追加。`aas-gate-v3.ts`: `/reload`、`/aas-gate-fork`、`forkFailed` の報告を追加）。
+- ゲートのコマンド
+  - `/reload`: pi の TUI の `/reload` と同じく、エージェントが動いている間は「Wait for the current response to finish before reloading.」（pi の文言）を notify して何もしない。アイドルなら `await ctx.reload()` して、そのあと ctx に触れずに戻る（pi の docs の注意どおり）。
+  - `/aas-gate-fork <entryId> <at|before>`: `ctx.fork(entryId, { position })`。アダプタだけが送る（一覧に出さず、手で打った入力はエンジンが断る。8章）。
+- ゲートのテスト（TypeScript）: `node --test crates/aas-adapter-pi/extension/aas-gate.test.ts`（Node.js 22.18 以上。型の除去が既定で有効な版）。`crates/aas-adapter-pi/extension` で `npm test` でもよい。pi の拡張 API を模したオブジェクトで、次を確かめる（16件）。
   - モード（ask / askCommands / auto）ごとの確認の有無、モードのファイルがない・壊れている・不明な値なら ask、呼び出しのたびにモードを読み直すこと
   - allow / allowSession（同じコマンドだけ、編集はすべて）/ deny（フィードバック付き）/ 素の文字列の回答 / 壊れた回答
   - ダイアログに timeout がなく、ターンの abort シグナルを渡していること
   - 閉じた理由の報告（answered / aborted）と、確認しないツールでは報告しないこと
+  - `/reload`（アイドルなら reload して何も続けない、動いている間は pi の文言で断る）、`/aas-gate-fork`（位置を渡す、分けたあとは何も報告しない、失敗・取り消し・引数の誤りを `forkFailed` で報告する）
 
 ### ダイアログの所属と期限切れの答え
 
@@ -234,7 +282,8 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
 | `input` | `question`（自由記述） |
 | `editor` | `question`（自由記述。空の回答なら初期値をそのまま返す） |
 | `notify` | Notice（`extensionNotify`） |
-| `setStatus` / `setWidget` / `setTitle` / `set_editor_text` | 無視（TUI 専用） |
+| `set_editor_text`（拡張の `ctx.ui.setEditorText` と `pasteToEditor`） | `ComposerText`（13.5） |
+| `setStatus` / `setWidget` / `setTitle` | 無視（TUI 専用） |
 
 - **ほかの拡張の `timeout` 付きのダイアログ**: 期限が来ると pi が既定値で自動的に解決するが、クライアントには何も通知しない（`rpc-mode.js` の `createDialogPromise`。ゲートからも観測できない）。
   - アダプタは時間を計って取り下げたりしない（経過時間からの推定になるため）。Interaction は、回答、エンジンによる期限切れ（ターンに属していれば、そのターンの終わり）、プロセスの終了で閉じる。
@@ -267,12 +316,19 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
 - それに加えて、RPC にコマンドがある組み込みの機能を返す（アダプタが実行する）。
   - `compact`（`/compact [instructions]`）: ターンのテキスト全体（1つのテキストだけ。画像やメンションなし）が `/compact` か `/compact <指示>` のとき、`prompt` ではなく RPC の `compact`（`customInstructions` = 指示）を送る（3章）。
   - pi の `get_commands` に同じ名前（`compact`）のコマンドがあれば（拡張が独自の `/compact` を登録した場合）、追加も横取りもしない。そのコマンドとして pi に送る。
-- ほかの組み込みコマンド（`/model`、`/new`、`/fork` など）は、ピッカーや daemon の操作で扱うか、範囲外（`bash` の直接実行など）。RPC の `export_html`、`get_fork_messages` / `fork`（途中からの fork）、`set_session_name` は使わない（それぞれ HTML の出力は範囲外、途中からの fork は design.md の範囲外、スレッド名は daemon が持つ）。
-- ライブのセッションがあればそのプロセスに聞き、なければ `--no-session` の一時プロセスを cwd で起動して聞く。
+- 承認ゲートの `/reload`（pi の reload。6章）は、ほかの拡張コマンドと同じく一覧に出る。pi の組み込みの `/reload` は TUI 専用で RPC にないため。
+- ほかの組み込みコマンド（`/model`、`/new`、`/fork` など）は、ピッカーや daemon の操作で扱うか、範囲外（`bash` の直接実行など）。名前（`/name`）、途中からの fork、状態（`/session`）はアプリの操作として中継する（13章）。RPC の `export_html` は使わない（HTML の出力は範囲外）。
+- ライブのセッションがあればそのプロセスに聞き、なければ `--no-session` の一時プロセスを cwd で起動して聞く。一時プロセスには、エンジンが `CommandContext::project_trusted` で渡すそのプロジェクトの利用者の信頼の判断（13.4）を、起動と同じ引数で渡す（判断がなければ何も渡さず、pi 自身の保存済みの判断になる）。
 - TUI 専用の組み込みコマンド（`/settings` など）は RPC では動かないので含まれない（pi の仕様）。
-- セッションを切り替えるコマンド（`session_switching_commands`）: `new`、`resume`、`fork`、`clone`、`tree`。エンジンが `command/list` から除く（design.md 9.5）。
-  - pi の組み込みのセッション操作の名前（pi の docs の usage.md「Sessions」）。組み込みは TUI 専用で `get_commands` には出ないが、拡張が同じ名前でコマンドを登録すると、RPC でも `ctx.newSession` / `ctx.switchSession` / `ctx.fork` / `ctx.navigateTree` で同じことができる。スレッドの下でセッション（や木の位置）が替わると履歴が食い違うので出さない。
-  - 別の名前でこれらを呼ぶ拡張のコマンドは区別できない（説明文から推測しない）。
+- **一覧に出さないもの**（`commands::TUI_ONLY_COMMANDS` と承認ゲートの内部のコマンド）
+  - `llama`（`sourceInfo.path` が `<inline:llama.cpp>`。pi 0.85.1 が同梱する llama.cpp の拡張）: ハンドラは `ctx.mode` が `tui` でなければ「/llama is available in interactive mode」を notify して戻るだけなので、スマホから選んでもその notice しか出ない。pi はこのコマンドに印を付けていない（`inline` は拡張が factory から読み込まれたという意味で、TUI 専用の印ではない）ので、名前と `sourceInfo.path` の組で除く。利用者自身の同じ名前の拡張は残る。pi の版を上げたら見直す。
+  - `aas-gate-fork`（`source: "extension"`）: 承認ゲートの内部のコマンド（13.1）。
+- セッションを切り替えるコマンド（`session_switching_commands`）: `new`、`resume`、`import`、`fork`、`clone`、`tree`、`aas-gate-fork`。エンジンが `command/list` から除き、手で打った入力を断る（`sessionSwitchingCommand`。design.md 9.5）。
+  - pi の組み込みのセッション操作の名前（pi 0.85.1 の `BUILTIN_SLASH_COMMANDS`。`import` は JSONL ファイルのセッションに置き換える）。組み込みは TUI 専用で `get_commands` には出ず、RPC で打つと本文としてモデルに届くだけだが、拡張が同じ名前でコマンドを登録すると、RPC でも `ctx.newSession` / `ctx.switchSession` / `ctx.fork` / `ctx.navigateTree` で同じことができる。スレッドの下でセッション（や木の位置）が替わると履歴が食い違うので出さない。
+  - `aas-gate-fork` は承認ゲートの fork。アダプタだけが送る。
+  - 別の名前でこれらを呼ぶ拡張のコマンド（例: pi の docs の `handoff`）は区別できない（説明文から推測しない）。そのかわり、ターンの終わりに `get_state.sessionId` を比べて、替わったことを `SessionIdentified` で知らせる（3.5）。
+- 拡張コマンドを送ったターンの終わりには `get_commands` を送り直し、変わっていれば `CommandsChanged` を出す（3.5。`/reload` で拡張のコマンドが変わるなど）。
+- 実行中に打った拡張コマンドは `prompt` の `streamingBehavior` で送る（3.6）。
 
 ## 9. ネイティブセッション（取り込み）
 
@@ -286,6 +342,7 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
   - `bashExecution` は commandExecution にする。
   - 圧縮とブランチの要約は Notice にする。
   - 結果のないまま途切れたツールは `interrupted`。
+- ターンのアンカー（`read_native_history_anchored`。13.1）: 各ターンについて、そのターンを始めたユーザーメッセージのエントリの ID と、次のユーザーメッセージの前の（有効なブランチの上の）最後のエントリの ID。ユーザーメッセージで始まらないターン（先頭の custom メッセージや圧縮）は葉だけ。取り込んだスレッドのターンも途中から fork できる。
 - **読めないもの**（失敗を空の一覧にしない）:
   - セッションの置き場所がない場合は 0 件（pi がまだ書いていない）。それ以外の理由で読めない場合は一覧全体をエラーにする。
   - 読めないフォルダやファイル（開けない、最初の行が JSON でない、ヘッダに id がない）は飛ばし、パス付きで返す（`scan_native_sessions` の `unreadable`。`list_native_sessions` はパス付きの warn ログ）。最初の行が JSON でも pi のセッションのヘッダでないファイルは、pi のセッションではないので黙って除く。
@@ -308,6 +365,7 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
   - 応答を待つ上限は `policy.handshake_timeout`。それまでに答えがなければ context なしで進める（ログに警告）。
   - 実機（0.85.1）の応答の形: `{"sessionId", "userMessages", …, "tokens": {…}, "cost", "contextUsage": {"tokens": 0, "contextWindow": 262144, "percent": 0}}`。
 - 能力: interrupt, steer, approvals（ゲート）, questions, resume, fork, images, modelSwitchLive, nativeSessions が、すべて true。backgroundTasks と backgroundStop は false（pi の拡張が始める実行はエージェント起点のターンになる。3.2）。
+- 拡張機能（`features`。13章）: `forkAtTurn`、`rename`、`status`、`projectTrust` が true。`forkWhileHeld`、`sideQuestion`、`moveToBackground`、`planMode`、`fastModeModels` は出さない（理由は 13章）。
 - プローブの内容
   - `pi --version` を実行する。
   - `--no-session` の一時プロセスで `get_available_models` と `get_state` を取る。
@@ -316,8 +374,8 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
 
 ## 11. テスト
 
-- 単体テスト（33件）: 対応表（custom メッセージを `message_end` でだけ Notice にすること、利用者が打っていない実行の入力の Notice）、ゲートのエンコードと閉じた理由の報告、timeout の注記、コマンド（`/compact` の追加と判定、拡張コマンドの判定、セッションを切り替える名前の除外）、パスの解決、履歴（タイトルの長さはポリシー値）、wire。
-- replay（35件）: 記録したトランスクリプトを duplex の上で再生する。偽の pi は `get_state`、`get_session_stats`（0.85.1 で記録した応答の形）、`clear_queue` に自分で答える。
+- 単体テスト（43件）: 対応表（custom メッセージを `message_end` でだけ Notice にすること、利用者が打っていない実行の入力の Notice、`session_info_changed` の名前）、ゲートのエンコードと閉じた理由・fork の失敗の報告、`set_editor_text`、timeout の注記、コマンド（`/compact` の追加と判定、拡張コマンドの判定、セッションを切り替える名前の除外、`/llama` と内部のコマンドの除外）、パスの解決、履歴（タイトルの長さはポリシー値、ターンのアンカー）、アンカーと fork の位置、状態の節（pi の `/session` と同じ形と数の書き方）、信頼の判断の引数、`features`、wire。
+- replay（48件）: 記録したトランスクリプトを duplex の上で再生する。偽の pi は `get_state`（シナリオが決めた欄と `isStreaming`）、`get_session_stats`（0.85.1 で記録した応答の形）、`clear_queue`、`get_entries` / `get_fork_messages`（シナリオが決めたエントリから、pi 0.85.1 の `rpc-mode.js` と同じ規則で）、一覧を決めたあとの `get_commands` に自分で答える。
   - 通常のターン（コンテキストの使用量が `TurnUsage` と `TurnCompleted` に付く）、ゲートでの許可、フィードバック付きの拒否、steer、中断（`agent_start` の前の中断は、その `agent_start` でもう一度送ること）
   - 動かずに終わる prompt、拒否された prompt、二重の send
   - ターン中のプロセス終了、shutdown、ハンドシェイク（`CommandsChanged` に `compact` が入る）
@@ -327,11 +385,14 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
   - `/compact`（成功、実機で記録した "Nothing to compact" の失敗、中断）、pi 自身に `compact` コマンドがあるときは横取りしないこと
   - pi が自分で始める実行（2026-09-28 に実機で記録した `agent_*.jsonl`、`dialog_outside_turn.jsonl`。応答の id は `resp-<n>` に置き換えた）: custom メッセージとユーザーメッセージで始まる実行が入力なしのターンになること、その間の `send` が何も書かずに `TurnInProgress` を返すこと、競合（拒否 → `TurnInProgress`、先に終わった実行、受け付け → 1つのターン、待つのをやめたあとの拒否 → `promptNotTaken`）、`agent_settled` のハンドラから始まる実行が別のターンになること、context の応答待ちの間に始まる実行、中断、実行の中の承認ゲート、ターンの外のダイアログとその回答、ターンをまたいで残るダイアログ
   - `send` の待ち: 応答まで待つこと、前処理のダイアログと圧縮で待つのをやめること、pi の終了で `Closed` になること
-- ゲートの拡張のテスト（TypeScript、12件）: 6章。
+  - 記録 rec2（`rec2.json`）: 3つのターンのエントリからアンカーを作ること（`since` が前のターンの葉であること。記録のときの要求と同じ）、アンカーなしで終わったターンのあとは葉だけのアンカー、`/aas-gate-fork` での fork（記録した `ctx.fork` の出力と、そのあとのセッション）、pi の理由での fork の失敗、ゲートのコマンドがないときは何も送らないこと、名前（`set_session_name` と `session_info_changed`、空の名前の拒否、拡張の名前）、状態、`set_editor_text`、streaming 中の拡張コマンドを `prompt` で送ること、`/reload` のあとの `CommandsChanged`、拡張の `ctx.newSession` の検出と設定の付け直し（付け直せないときの Notice）、実行のあとの steer を `SteerReturned` で返すこと
+- ゲートの拡張のテスト（TypeScript、16件）: 6章。
 - live（`AAS_LIVE_TESTS=1 cargo test -p aas-adapter-pi --test live -- --ignored`）。セッションは一時フォルダ（`session_dir`）に作るので、ユーザーのセッション一覧は汚さない。
   - `live_session_lifecycle`: 本物の pi でプローブ → 3ターン（通常、ゲートでの承認、auto に切り替え）→ コマンド → 終了 → 一覧 → 履歴 → resume → fork を確かめる。
   - `live_runs_pi_starts_by_itself`: テスト用の拡張 `tests/extension/aas-live.ts` を `-e` で読み込み、pi に自分で実行を始めさせて、3章の対応（エージェント起点のターン、その間の `TurnInProgress`、競合、`agent_settled` からの実行、ユーザーメッセージの Notice、中断、実行の中の承認、ターンの外のダイアログ）を確かめる。すべての子プロセスが終わったことも確かめる。
-  - 2026-09-28 に pi 0.85.1（モデル orcarouter/deepseek/deepseek-v4.1-flash、effort low）で2件とも成功した（54 秒）。
+  - `live_features`: 13章の機能を本物の pi で確かめる。プロジェクトの `.pi/prompts` が `--no-approve` では出ず `--approve` では出ること（セッションのない一覧は `CommandContext` の判断に従うこと）、`/llama` と内部のコマンドが出ず `/reload` が出ること、名前（`SessionTitle` のエコー）、3つのターンのアンカー、状態の節、拡張の `setEditorText` → `ComposerText`、streaming 中の拡張コマンド、`/reload`（拡張が読み直されたことを拡張自身が知らせる）、取り込んだ履歴のアンカーがライブのものと同じこと、TWO を含む fork（ONE・TWO・次のターン）と TWO の前までの fork（ONE だけ）、拡張の `ctx.newSession`（アダプタの知らない名前）の検出と、その次のターンのアンカー。pi の保存済みの信頼（`trust.json`）が変わらないことも確かめる。
+  - 2026-09-28 に pi 0.85.1（モデル orcarouter/deepseek/deepseek-v4.1-flash、effort low）で最初の2件が成功した（54 秒）。
+  - 2026-09-29 に同じ環境で3件とも成功した（`live_features` 32 秒、ほかの2件 54 秒）。
 
 ## 12. 制限事項
 
@@ -350,3 +411,72 @@ pi には実行前の確認がない。そこでアダプタは TypeScript の�
 - `<cwd>/.pi/settings.json` の `sessionDir` は、プロジェクトの信頼状態に関係なくマージする（pi 側で信頼の要否が変わる場合は、`session_dir` を明示すると確実）。
 - ほかの拡張の `timeout` 付きのダイアログは、pi が期限で閉じても知らせがないので、ターンが終わるまで開いたまま見える。ターンの外で届いたものは、答えるかプロセスが終わるまで見える（6章）。
 - コンテキストの使用量は assistant のメッセージが終わるたびに更新される（ツールの実行中は変わらない）。
+- ターンの終わりの問い合わせ（3.5）の分だけ、`TurnCompleted` が `agent_settled` より遅れる（ローカルの RPC の往復が2〜3回）。
+- 実行の途中で届いて pi に残った steer（`queue_update` の `steering`）はキューに戻さず、捨てて知らせる（`steerNotDelivered`）。pi の一覧は文だけで、アプリのメッセージとの対応が文の比較になるため（design.md の範囲外）。実行のあとに届いた steer は返す（3.6）。
+- エージェントが動いていないスレッドの `thread/harnessStatus` は空（13.3）。
+
+## 13. 拡張機能（`features`）
+
+| 機能 | pi の手段 | 版と注意 |
+|---|---|---|
+| `forkAtTurn` | アンカーは `get_entries` の ID。分けるのは承認ゲートの `ctx.fork`（13.1） | `get_entries` / `get_fork_messages` は rpc.md に載っている。`ctx.fork` の `position` は extensions.md に載っている。pi 0.85.1 で記録・確認 |
+| `rename` | `set_session_name`、`session_info_changed`（13.2） | `session_info_changed` は rpc.md のイベントの表にない（RPC モードはセッションのイベントをすべて出す。記録で確認）。版を上げたら確かめる |
+| `status` | `get_state`、`get_session_stats`（13.3） | どちらも rpc.md にある |
+| `projectTrust` | `--approve` / `--no-approve`（13.4） | `pi --help` と usage.md「Project Trust」 |
+| （`composer/insert`） | 拡張の `set_editor_text`（13.5） | rpc.md の Extension UI にある |
+
+### 13.1 途中のターンからの fork（`forkAtTurn`）
+
+- **アンカー**（`anchor.rs`）: `{"leafId": <ターンの最後のエントリ>, "userEntryId"?: <ターンが足した最初のユーザーメッセージ>}`。どちらも pi がそのターンについて答えた `get_entries` の ID で、ターンやメッセージを数えて作らない（steer は別のユーザーエントリになるので、数えるとずれる）。
+  - `leafId`: ターンの終わりの `get_entries` の `leafId`。
+  - `userEntryId`: `since`（ターンの始まりの葉）のあとのエントリのうち、最初の `message`（role `user`）。始まりが分からないとき（3.5）と、ユーザーメッセージで始まらないターン（拡張の custom メッセージで始まる実行、拡張コマンドだけのターン、`/compact`）では付けない。
+  - エントリの ID はセッションのどの複製でも同じ（`fork`、`--fork` の複製。記録で確認）ので、fork したスレッドに引き継いだアンカーもそのまま使える。
+- **分け方**（`ForkPoint`）
+
+  | 要求 | 送るもの |
+  |---|---|
+  | そのターンを含める（`before: false`） | `/aas-gate-fork <leafId> at` → `ctx.fork(leafId, { position: "at" })`（葉までの道を複製） |
+  | そのターンの前まで（`before: true`） | `userEntryId` があれば `/aas-gate-fork <userEntryId> before`（そのユーザーメッセージの前まで。RPC の `fork` と同じ意味）。なければ前のターンの `leafId` で `at` |
+  | 最後のターンを含める | エンジンがセッション全体の fork として頼む（1章の `--fork`） |
+
+- **手順**: `--session <元のファイル>` で pi を起動する（元のファイルは書き換わらない。記録 rec2: 別のプロセスが持っていても fork でき、元のファイルのハッシュは変わらなかった）→ `get_state` で元のセッションか確かめる → `get_commands` にゲートの `aas-gate-fork` があるか確かめる（ないと pi は文をプロンプトとしてモデルに送ってしまうので、送らずに失敗にする）→ `prompt` で `/aas-gate-fork` を送る（pi はハンドラが終わってから応答する）→ `get_state` の `sessionId` が変わっていれば、それが新しいセッション（ID は pi が決める）。変わっていなければ、ゲートの `forkFailed` の理由（例「Invalid entry ID for forking」）で失敗にする → 通常のハンドシェイク（モデル・推論量は新しいセッションに付ける）。
+- 新しいセッションのファイルは元のファイルと同じフォルダ（`--session-dir` があればそこ）に書かれるので、あとの resume でも見つかる。ただし分けた道に assistant のメッセージがないと、pi は最初の応答までファイルを書かない（pi 0.85.1 の `createBranchedSession`）。その前にプロセスが終わると、そのスレッドは resume できない（エンジンは最初のターンの前までの fork を頼まないので、起きるのは assistant の応答がないターンだけのとき）。
+- **`forkWhileHeld` は出さない**: pi にはセッションを書き込むプロセスを1つに限る仕組み（ロック）がなく、別のプロセスが持っているセッションの resume も失敗しない（記録 rec2）。resume の失敗はファイルがない・pi が起動できないなど fork でも直らない理由なので、「新しいスレッドに分岐」を出す意味がない。
+
+### 13.2 名前（`rename`）
+
+- `rename(title)` → `set_session_name { name }`。pi は名前の前後の空白を除き、空なら「Session name cannot be empty」で断る（`Harness` エラー。エンジンは `nativeRename.status = failed`）。
+- pi は応答の前に `session_info_changed { name }` を出す（記録）。これは `SessionTitle` になるが、利用者のタイトルのエコーなのでエンジンは何も変えない。
+- 拡張の `pi.setSessionName` も同じイベントを出す（記録）。ほかで付いた名前は `SessionTitle` でスレッドのタイトルになる（利用者のタイトルは置き換えない。design.md 9.6）。起動時の `get_state.sessionName` も同じ（1章）。
+- fork は道の上の名前を引き継ぐ（イベントは出ない）。fork したスレッドのタイトルはエンジンが決める。
+
+### 13.3 状態（`status`）
+
+- `SessionControl::status` → `get_state` と `get_session_stats`。節と行は pi の TUI の `/session`（pi 0.85.1 `handleSessionCommand`）と同じ: 「Session Info」（Name、File、ID）、「Messages」（Total、User、Assistant、Tools）、「Tokens」（Input = input + cacheRead + cacheWrite、キャッシュがあれば Cached（率）と Uncached、Output、Total）、「Cost」（0 より大きいとき、`$` と小数3桁）。数は3桁ごとのカンマ（pi の `toLocaleString`）。
+- それに `get_state` の「State」（Model、Thinking level、Context（pi のフッターと同じく、分からないときは `?`）、Steering mode、Follow-up mode、Auto-compact、Pending messages）を足す。
+- 値は表示用（design.md 9.6）。動いているターンの間も聞ける。
+- エージェントが動いていないときの `HarnessAdapter::status` は何も返さない（既定）。pi の状態はセッションのプロセスのもので、プロセスなしで出すにはセッションファイルから pi の集計を作り直すことになる（design.md の範囲外）。
+
+### 13.4 プロジェクトの信頼（`projectTrust`）
+
+- pi は、プロジェクトの資源（`.pi/settings.json`、`.pi` のプロンプト・スキル・拡張、`.agents/skills`）を、信頼したプロジェクトでだけ読む。RPC モードは確認を出さず、保存された判断（`~/.pi/agent/trust.json`）がなければ `defaultProjectTrust`（既定 `ask` = 読まない）に従う（usage.md「Project Trust」）。
+- アプリがプロジェクトごとに利用者に聞き（自動では決めない）、エンジンが `StartOptions::project_trusted` で渡す。`Some(true)` → `--approve`、`Some(false)` → `--no-approve`（どちらも「この実行だけ」。pi の保存済みの判断は書き換えない。`live_features` で `trust.json` が変わらないことを確かめる）、`None` → 何も渡さない。
+- 判断が変わると、エンジンは次のターンの前にプロセスを起動し直す（design.md 9.6）。
+- エージェントが動いていないときのコマンドの一覧（`commands`）も、エンジンが `CommandContext::project_trusted` で渡す判断で一時プロセスを起動する（8章）。プロジェクトのテンプレートが一覧に出るかは、起動したエージェントと同じになる。
+- 確かめたこと: `.pi/prompts` のテンプレートは `--approve` のときだけ `get_commands` に出る（記録と `live_features`）。
+- 承認ゲートの `project_trust` イベントで決める方法もある（`-e` の拡張は信頼の判断より前に読み込まれる）が、フラグの方が単純で、pi の優先順位でも拡張より上なので使わない。
+
+### 13.5 入力欄への差し込み
+
+- 拡張の `ctx.ui.setEditorText(text)`（と `pasteToEditor`）は `extension_ui_request { method: "set_editor_text", text }` として届く（応答は要らない。記録）→ `ComposerText { text }`（`composer/insert`）。
+- RPC では `ctx.ui.getEditorText()` はいつも `""`（pi の仕様）。アプリの入力欄の中身を拡張に渡す手段はない。
+
+### 13.6 出さない機能
+
+| 機能 | 理由 |
+|---|---|
+| `sideQuestion` | pi に会話に入らない質問の手段がない |
+| `moveToBackground` | pi にはバックグラウンドの作業がない（3.2） |
+| `planMode` | pi に組み込みのプランモードがない。利用者が plan-mode 拡張を入れれば、その `/plan` がハーネスのコマンドのまま出る |
+| `fastModeModels` | pi のモデルに高速モードの印がない |
+| `forkWhileHeld` | 13.1 |

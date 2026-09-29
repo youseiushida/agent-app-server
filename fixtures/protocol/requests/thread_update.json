@@ -4,6 +4,9 @@
   "method": "thread/update",
   "params": {
     "clientRequestId": "0199a5f0-0000-7000-8000-000000000009",
+    "modes": {
+      "plan": true
+    },
     "pinned": true,
     "settings": {
       "model": "sonnet"

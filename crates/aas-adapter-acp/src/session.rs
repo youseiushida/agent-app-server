@@ -15,6 +15,11 @@
 //! arrives while no turn runs is shown to the user (it belongs to the thread, or to the
 //! background task it names), and one the engine expires is answered `cancelled`
 //! (`SessionControl::expire_request`).
+//!
+//! With Cognition's revert extension (`crate::revert`) the router also anchors each turn at
+//! its steps: the steps first listed while the turn ran, reported before `TurnCompleted`, and
+//! their node ids from `listSteps`, asked right after the prompt answered (a replacement of the
+//! anchor, `TurnAnchorReplaced`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aas_harness::protocol::{
-    ContextUsage, ExpireReason, InteractionResolution, NoticeLevel, TurnError, TurnStatus,
+    ContextUsage, ExpireReason, InteractionResolution, NoticeLevel, StatusSection, TurnError,
+    TurnStatus,
 };
 use aas_harness::{
     AdapterError, AdapterEvent, AdapterPolicy, ExitInfo, NativeHistory, SessionControl,
@@ -37,10 +43,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use crate::cache::OptionsCache;
-use crate::cognition::{self, Background, Routed};
+use crate::cognition::{self, Background, Extensions, Routed};
 use crate::elicitation::{self, Elicitation, Form};
 use crate::history::HistoryBuilder;
 use crate::mapping::{self, SessionOptions, SettingKind};
+use crate::revert::{self, SessionSteps, Step, StepIndex};
+use crate::stats::{self, BillingInformation, TurnStats};
 use crate::tracker::{Emit, Tracker};
 use crate::wire::{
     self, ConfigOption, InitializeResponse, PromptCapabilities, RequestPermissionParams,
@@ -86,8 +94,14 @@ pub enum SetupMode {
     New,
     /// Continue a session (`session/resume`, else `session/load` with the replay discarded).
     Resume(String),
-    /// Branch a session (`session/fork`, unstable).
+    /// Branch a whole session (`session/fork`, unstable).
     Fork(String),
+    /// Branch `source` at node `node` (Cognition's `forkFromStep`, `crate::revert`), then load
+    /// the branch (its replay discarded).
+    ForkFromStep {
+        source: String,
+        node: i64,
+    },
     /// `session/load` only to collect the replayed history.
     History(String),
 }
@@ -104,12 +118,22 @@ pub struct LaunchParams<R, W> {
     pub options: AdapterOptions,
     pub policy: AdapterPolicy,
     pub cache: OptionsCache,
+    /// The steps the adapter's sessions listed (`crate::revert`).
+    pub index: StepIndex,
 }
 
 pub struct Launched {
     pub handle: SessionHandle,
+    /// The agent's `initialize` answer.
+    pub init: InitializeResponse,
     pub history: Option<NativeHistory>,
+    /// With `history`: each turn's anchor (`crate::revert::history_anchors`); empty without
+    /// Cognition's revert extension.
+    pub history_anchors: Vec<Option<Value>>,
 }
+
+/// A history read by `SetupMode::History`, with each turn's anchor.
+type ReadHistory = (NativeHistory, Vec<Option<Value>>);
 
 pub fn client_init() -> wire::InitializeRequest {
     wire::InitializeRequest {
@@ -134,6 +158,28 @@ pub fn peer_config(label: &str, policy: &AdapterPolicy) -> RpcPeerConfig {
     }
 }
 
+/// The text of an agent's JSON-RPC error: its message, and its `data` when that is a text
+/// (Devin puts the reason there, e.g. "Failed to fork session: Target node 99999 not found").
+pub fn wire_message(e: &RpcWireError) -> String {
+    match e.data.as_ref().and_then(Value::as_str).map(str::trim) {
+        Some(data) if !data.is_empty() && data != e.message => format!("{}: {data}", e.message),
+        _ => e.message.clone(),
+    }
+}
+
+/// Maps a failed request after the setup (an extension method) to an adapter error.
+pub fn request_error(method: &str, err: RpcCallError) -> AdapterError {
+    match err {
+        RpcCallError::Rpc(e) => AdapterError::Harness(format!("{method}: {}", wire_message(&e))),
+        RpcCallError::Closed => AdapterError::Closed,
+        RpcCallError::Timeout(t) => {
+            AdapterError::Protocol(format!("{method} did not answer within {t:?}"))
+        }
+        RpcCallError::Decode(e) => AdapterError::Protocol(format!("{method}: {e}")),
+        RpcCallError::Io(e) => AdapterError::Other(format!("{method}: {e}")),
+    }
+}
+
 /// Maps a failed setup request to an adapter error.
 pub fn setup_error(
     method: &str,
@@ -146,7 +192,7 @@ pub fn setup_error(
         RpcCallError::Rpc(e) if e.code == wire::AUTH_REQUIRED => {
             AdapterError::Unavailable(auth_message(agent, options, init))
         }
-        RpcCallError::Rpc(e) => AdapterError::Harness(format!("{method}: {}", e.message)),
+        RpcCallError::Rpc(e) => AdapterError::Harness(format!("{method}: {}", wire_message(&e))),
         RpcCallError::Timeout(t) => {
             AdapterError::Protocol(format!("{method} did not answer within {t:?}"))
         }
@@ -205,6 +251,7 @@ where
         options,
         policy,
         cache,
+        index,
     } = p;
     let (peer, incoming) = RpcPeer::start(reader, writer, peer_config(&label, &policy));
     let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -216,7 +263,12 @@ where
         tx: events_tx,
         self_tx: cmd_tx.clone(),
         tracker: Tracker::new(),
+        ext: Extensions::default(),
         background: None,
+        steps: None,
+        index,
+        turn_stats: None,
+        billing: None,
         history: collect.then(|| (Tracker::new(), HistoryBuilder::new())),
         live: false,
         session_id: None,
@@ -229,6 +281,7 @@ where
         turn: None,
         turn_lost: false,
         cost_usd: None,
+        // A branch loaded from `forkFromStep` reports its cost like a resumed session.
         cost_baseline_zero: matches!(mode, SetupMode::New | SetupMode::Fork(_)),
         forward_ext: options.forward_extension_notifications,
         request_timeout: policy.handshake_timeout,
@@ -266,13 +319,19 @@ where
                 prompt_caps: init.agent_capabilities.prompt_capabilities.clone(),
                 exit: OnceCell::new(),
             });
+            let (history, history_anchors) = match history {
+                Some((history, anchors)) => (Some(history), anchors),
+                None => (None, Vec::new()),
+            };
             Ok(Launched {
                 handle: SessionHandle {
                     native_session_id: Some(session_id),
                     control,
                     events: events_rx,
                 },
+                init,
                 history,
+                history_anchors,
             })
         }
         Err(e) => {
@@ -295,7 +354,7 @@ async fn handshake(
     peer: &RpcPeer,
     cmd_tx: &mpsc::UnboundedSender<Cmd>,
     p: &Handshake<'_>,
-) -> Result<(InitializeResponse, String, Option<NativeHistory>), AdapterError> {
+) -> Result<(InitializeResponse, String, Option<ReadHistory>), AdapterError> {
     let timeout = p.policy.handshake_timeout;
     let init: InitializeResponse = peer
         .request_timeout("initialize", client_init(), timeout)
@@ -316,12 +375,10 @@ async fn handshake(
     }
     // The router must know the confirmed extensions before the session exists: `session/load`
     // replays updates right away.
+    let ext = cognition::extensions(&init);
     let (reply, rx) = oneshot::channel();
     cmd_tx
-        .send(Cmd::Initialized {
-            background: cognition::confirmed(&init),
-            reply,
-        })
+        .send(Cmd::Initialized { ext, reply })
         .map_err(|_| AdapterError::Closed)?;
     rx.await.map_err(|_| AdapterError::Closed)?;
 
@@ -369,6 +426,45 @@ async fn handshake(
             None,
         ),
         SetupMode::Fork(_) => return Err(AdapterError::Unsupported("fork")),
+        SetupMode::ForkFromStep { source, node } => {
+            if !ext.revert {
+                return Err(AdapterError::Unsupported(
+                    "fork at a turn (the agent did not confirm cognition.ai/revert)",
+                ));
+            }
+            if !caps.load_session {
+                return Err(AdapterError::Unsupported(
+                    "fork at a turn (the agent does not support session/load)",
+                ));
+            }
+            let forked: revert::ForkFromStepResponse = peer
+                .request_timeout(
+                    revert::FORK_FROM_STEP,
+                    json!({ "sessionId": source, "targetNodeId": node }),
+                    timeout,
+                )
+                .await
+                .map_err(|e| {
+                    setup_error(
+                        revert::FORK_FROM_STEP,
+                        e,
+                        p.agent_name,
+                        p.options,
+                        Some(&init),
+                    )
+                })?;
+            if forked.forked_session_id.is_empty() {
+                return Err(AdapterError::Protocol(format!(
+                    "{} returned no forkedSessionId",
+                    revert::FORK_FROM_STEP
+                )));
+            }
+            (
+                "session/load",
+                serde_json::to_value(existing(&forked.forked_session_id)).expect("serializes"),
+                Some(forked.forked_session_id),
+            )
+        }
     };
     let setup: SessionSetupResponse = peer
         .request_timeout(method, params, timeout)
@@ -382,6 +478,20 @@ async fn handshake(
             )));
         }
     };
+    // The session's steps as it is set up (at rest, so their node ids are settled): the steps
+    // earlier turns hold, and the anchors of a history. A new session has none. A failure
+    // costs only the anchors, so it does not fail the start.
+    let listed = match (&p.mode, ext.revert) {
+        (_, false) => None,
+        (SetupMode::New, true) => Some(Vec::new()),
+        (_, true) => match list_steps(peer, &session_id, timeout).await {
+            Ok(steps) => Some(steps),
+            Err(e) => {
+                tracing::warn!(session = %session_id, error = %e, "could not list the session's steps; its turns before now cannot be told from new ones");
+                None
+            }
+        },
+    };
 
     let (reply, rx) = oneshot::channel();
     cmd_tx
@@ -389,6 +499,7 @@ async fn handshake(
             session_id: session_id.clone(),
             setup,
             is_new: *p.mode == SetupMode::New,
+            listed,
             reply,
         })
         .map_err(|_| AdapterError::Closed)?;
@@ -410,6 +521,51 @@ async fn handshake(
 
 pub fn path_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+/// `_cognition.ai/revert/listSteps` of a session this process has loaded.
+pub async fn list_steps(
+    peer: &RpcPeer,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<Vec<Step>, AdapterError> {
+    let list: revert::StepList = peer
+        .request_timeout(
+            revert::LIST_STEPS,
+            json!({ "sessionId": session_id }),
+            timeout,
+        )
+        .await
+        .map_err(|e| request_error(revert::LIST_STEPS, e))?;
+    Ok(revert::parse_steps(&list.steps))
+}
+
+/// The steps of `source` read by loading it (`session/load`, its replay ignored) and listing
+/// them, on a connection that is initialized and whose agent confirmed Cognition's revert
+/// extension: for a fork at a turn whose node ids were never listed after the turn. Loading
+/// fails while another process holds the session.
+pub async fn read_source_steps(
+    peer: &RpcPeer,
+    cwd: &Path,
+    source: &str,
+    options: &AdapterOptions,
+    timeout: Duration,
+) -> Result<Vec<Step>, AdapterError> {
+    let params = wire::ExistingSessionRequest {
+        session_id: source.to_owned(),
+        cwd: path_string(cwd),
+        mcp_servers: options.mcp_servers.clone(),
+    };
+    let unreadable = |e: AdapterError| {
+        AdapterError::Harness(format!(
+            "the node of the turn to fork at was not listed yet, and the session could not be read to list it: {}",
+            e.detail()
+        ))
+    };
+    peer.request_timeout::<_, Value>("session/load", params, timeout)
+        .await
+        .map_err(|e| unreadable(request_error("session/load", e)))?;
+    list_steps(peer, source, timeout).await.map_err(unreadable)
 }
 
 /// Converts the input of a turn to ACP content blocks. Mentions become `resource_link`
@@ -460,17 +616,33 @@ pub async fn prompt_blocks(
 // ----- router ---------------------------------------------------------------------------------
 
 enum Cmd {
-    /// `initialize` answered; `background`: the agent confirmed Cognition's background
-    /// extension (`crate::cognition`).
+    /// `initialize` answered; `ext`: what the agent confirmed of Cognition's extensions
+    /// (`crate::cognition`).
     Initialized {
-        background: bool,
+        ext: Extensions,
         reply: oneshot::Sender<()>,
     },
     SetupDone {
         session_id: String,
         setup: SessionSetupResponse,
         is_new: bool,
-        reply: oneshot::Sender<Option<NativeHistory>>,
+        /// The session's steps when it was set up (Cognition's revert extension; `None`
+        /// without it or when they could not be listed).
+        listed: Option<Vec<Step>>,
+        reply: oneshot::Sender<Option<ReadHistory>>,
+    },
+    /// `SessionControl::rename`.
+    Rename {
+        title: String,
+        reply: oneshot::Sender<Result<(), AdapterError>>,
+    },
+    /// `SessionControl::status`.
+    Status {
+        reply: oneshot::Sender<Vec<StatusSection>>,
+    },
+    /// The answer of the `listSteps` asked after a prompt answered.
+    StepsListed {
+        result: Result<Vec<Step>, AdapterError>,
     },
     Send {
         blocks: Vec<Value>,
@@ -577,6 +749,8 @@ struct TurnState {
     start_cost: Option<f64>,
     /// Context-window occupancy from the turn's last `usage_update` that carried a size.
     context: Option<ContextUsage>,
+    /// Devin's id of the prompt from its answer (`crate::revert`).
+    user_message_id: Option<String>,
 }
 
 struct Router {
@@ -585,8 +759,19 @@ struct Router {
     tx: mpsc::UnboundedSender<AdapterEvent>,
     self_tx: mpsc::UnboundedSender<Cmd>,
     tracker: Tracker,
+    /// Cognition's extensions the agent confirmed.
+    ext: Extensions,
     /// Background work, when the agent confirmed Cognition's extension (`crate::cognition`).
     background: Option<Background>,
+    /// The session's steps and the anchors of its turns, when the agent confirmed Cognition's
+    /// revert extension (`crate::revert`); set up with the session.
+    steps: Option<SessionSteps>,
+    /// The steps the adapter's sessions listed.
+    index: StepIndex,
+    /// Devin's statistics of the last turn (`crate::stats`).
+    turn_stats: Option<TurnStats>,
+    /// Devin's last billing information (`crate::stats`).
+    billing: Option<BillingInformation>,
     /// Present while collecting a replay for `read_native_history`.
     history: Option<(Tracker, HistoryBuilder)>,
     /// `false` until the setup response has been handled.
@@ -719,6 +904,38 @@ impl Router {
                 Ok(n) => self.on_update(n),
                 Err(_) => self.native(json!({ "method": method, "params": params })),
             }
+        } else if method == revert::STEPS_UPDATED && self.ext.revert {
+            match serde_json::from_value::<revert::StepList>(params.clone()) {
+                Ok(list) if self.is_ours(list.session_id.as_deref()) => {
+                    self.on_listing(revert::parse_steps(&list.steps));
+                }
+                Ok(list) => {
+                    tracing::debug!(label = %self.label, session = ?list.session_id, "steps of another session; ignored");
+                }
+                Err(_) => self.native(json!({ "method": method, "params": params })),
+            }
+        } else if method == stats::TURN_STATS {
+            match serde_json::from_value::<TurnStats>(params.clone()) {
+                Ok(s) if self.is_ours(s.session_id.as_deref()) => self.turn_stats = Some(s),
+                Ok(s) => {
+                    tracing::debug!(label = %self.label, session = ?s.session_id, "turn statistics of another session; ignored");
+                }
+                Err(_) => self.native(json!({ "method": method, "params": params })),
+            }
+        } else if method == stats::BILLING_INFORMATION {
+            match serde_json::from_value::<BillingInformation>(params.clone()) {
+                Ok(b) if self.is_ours(b.session_id.as_deref()) => match b.text() {
+                    Some(text) => {
+                        self.notice(NoticeLevel::Info, text, "billingInformation");
+                        self.billing = Some(b);
+                    }
+                    None => self.native(json!({ "method": method, "params": params })),
+                },
+                Ok(b) => {
+                    tracing::debug!(label = %self.label, session = ?b.session_id, "billing information of another session; ignored");
+                }
+                Err(_) => self.native(json!({ "method": method, "params": params })),
+            }
         } else if method.starts_with('_') {
             if self.forward_ext {
                 self.native(json!({ "method": method, "params": params }));
@@ -727,6 +944,26 @@ impl Router {
             }
         } else {
             self.native(json!({ "method": method, "params": params }));
+        }
+    }
+
+    /// Whether a notification that names `session_id` is about this session (one without an
+    /// id, or one that arrives before the session id is known, is).
+    fn is_ours(&self, session_id: Option<&str>) -> bool {
+        match (session_id.filter(|s| !s.is_empty()), &self.session_id) {
+            (Some(theirs), Some(ours)) => theirs == ours,
+            _ => true,
+        }
+    }
+
+    /// A listing of the session's steps: replacements of the anchors it settles.
+    fn on_listing(&mut self, steps: Vec<Step>) {
+        let Some(session_steps) = self.steps.as_mut() else {
+            // Not set up yet (the setup lists the steps itself), or a history read.
+            return;
+        };
+        for event in session_steps.on_listing(steps) {
+            self.emit(event);
         }
     }
 
@@ -751,11 +988,22 @@ impl Router {
                     // A sub-agent's own work is not part of the conversation's history.
                     return;
                 }
+                if matches!(update, SessionUpdate::UserMessageChunk(_)) {
+                    // The prompt's step id, from which the turn's anchor is found.
+                    builder.user_message_id(
+                        meta.as_ref()
+                            .and_then(|m| m.get(revert::CLIENT_MESSAGE_ID))
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned),
+                    );
+                }
                 let mut out = Vec::new();
                 if tracker.on_update(&update, &mut out) {
                     for e in out {
                         builder.push(e);
                     }
+                    builder.user_chunk_done();
                     return;
                 }
             } else if is_item_update(&update) {
@@ -802,8 +1050,9 @@ impl Router {
         // Session state updates.
         match update {
             SessionUpdate::AvailableCommands(c) => {
-                self.cache.record_commands(&c.available_commands);
-                let commands = c.available_commands.iter().map(mapping::command).collect();
+                let visible = cognition::visible_commands(&c.available_commands, self.ext);
+                self.cache.record_commands(&visible);
+                let commands = visible.iter().map(mapping::command).collect();
                 self.emit(AdapterEvent::CommandsChanged { commands });
             }
             SessionUpdate::ConfigOptions(c) => {
@@ -1181,8 +1430,9 @@ impl Router {
 
     async fn on_cmd(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Initialized { background, reply } => {
-                if background {
+            Cmd::Initialized { ext, reply } => {
+                self.ext = ext;
+                if ext.background {
                     self.background = Some(Background::new());
                 }
                 let _ = reply.send(());
@@ -1192,12 +1442,33 @@ impl Router {
                 let result = self.expire(&request_id).await;
                 let _ = reply.send(result);
             }
+            Cmd::Rename { title, reply } => self.rename(title, reply),
+            Cmd::Status { reply } => {
+                let _ = reply.send(stats::sections(
+                    self.turn_stats.as_ref(),
+                    self.billing.as_ref(),
+                ));
+            }
+            Cmd::StepsListed { result } => match result {
+                Ok(steps) => self.on_listing(steps),
+                Err(e) => {
+                    tracing::warn!(label = %self.label, error = %e, "could not list the steps after the turn; its anchor stays without node ids until Devin lists them");
+                }
+            },
             Cmd::SetupDone {
                 session_id,
                 setup,
                 is_new,
+                listed,
                 reply,
             } => {
+                if self.ext.revert && self.history.is_none() {
+                    self.steps = Some(SessionSteps::new(
+                        session_id.clone(),
+                        self.index.clone(),
+                        listed.clone(),
+                    ));
+                }
                 self.session_id = Some(session_id);
                 if let Some(opts) = setup.config_options {
                     self.options.config_options = opts;
@@ -1218,7 +1489,12 @@ impl Router {
                     for e in out {
                         builder.push(e);
                     }
-                    builder.finish()
+                    let (history, message_ids) = builder.finish();
+                    let anchors = listed
+                        .as_deref()
+                        .map(|steps| revert::history_anchors(&message_ids, steps))
+                        .unwrap_or_default();
+                    (history, anchors)
                 });
                 self.live = true;
                 self.publish_info();
@@ -1247,7 +1523,11 @@ impl Router {
                     cancel_requested: false,
                     start_cost,
                     context: None,
+                    user_message_id: None,
                 });
+                if let Some(steps) = self.steps.as_mut() {
+                    steps.turn_started();
+                }
                 self.emit(AdapterEvent::TurnStarted);
                 let peer = self.peer.clone();
                 let tx = self.self_tx.clone();
@@ -1292,6 +1572,42 @@ impl Router {
                 let _ = reply.send(());
             }
         }
+    }
+
+    /// Gives the session the user's title (`_cognition.ai/session/rename`, when the agent
+    /// confirmed `cognition.ai/sessionRename`). Sent from its own task, like a stop request.
+    /// Devin answers `{}` after echoing the title as `session_info_update` (a `SessionTitle`
+    /// that changes nothing). An empty title is refused here: Devin would name the session
+    /// "Untitled".
+    fn rename(&mut self, title: String, reply: oneshot::Sender<Result<(), AdapterError>>) {
+        if !self.ext.rename {
+            let _ = reply.send(Err(AdapterError::Unsupported("rename")));
+            return;
+        }
+        if title.trim().is_empty() {
+            let _ = reply.send(Err(AdapterError::Other(
+                "an empty title cannot name the session".into(),
+            )));
+            return;
+        }
+        let Some(session_id) = self.session_id.clone() else {
+            let _ = reply.send(Err(AdapterError::Closed));
+            return;
+        };
+        let peer = self.peer.clone();
+        let timeout = self.request_timeout;
+        tokio::spawn(async move {
+            let result = peer
+                .request_timeout::<_, Value>(
+                    cognition::RENAME_SESSION,
+                    json!({ "sessionId": session_id, "title": title }),
+                    timeout,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| request_error(cognition::RENAME_SESSION, e));
+            let _ = reply.send(result);
+        });
     }
 
     /// Asks the agent to stop background task `key` (Cognition's extension). The request is
@@ -1384,6 +1700,9 @@ impl Router {
                 if resp.stop_reason.is_empty() {
                     self.native(json!({ "promptResponseWithoutStopReason": value }));
                 }
+                if let Some(turn) = self.turn.as_mut() {
+                    turn.user_message_id = resp.user_message_id();
+                }
                 let outcome = mapping::stop_reason(&resp.stop_reason);
                 let cost = match (self.turn.as_ref().and_then(|t| t.start_cost), self.cost_usd) {
                     (Some(start), Some(now)) if now >= start => Some(now - start),
@@ -1431,6 +1750,9 @@ impl Router {
         {
             self.emit(AdapterEvent::TurnUsage { usage });
         }
+        // The steps the turn made are its anchor (their node ids are listed when the session
+        // is read again for a fork).
+        self.anchor_turn();
         let mut out = Vec::new();
         self.tracker.end_turn(TurnStatus::Failed, &mut out);
         self.emit_all(out);
@@ -1456,6 +1778,7 @@ impl Router {
         if let Some((level, message, code)) = notice {
             self.notice(level, message, &code);
         }
+        let anchored = self.anchor_turn();
         // Requests still pending stay pending: the engine expires those of this turn and has
         // them answered (`expire_request`); those of the thread or of a background task
         // outlive the turn.
@@ -1466,6 +1789,42 @@ impl Router {
             status,
             usage,
             error,
+        });
+        if anchored {
+            self.list_steps_after_turn();
+        }
+    }
+
+    /// Reports the anchor of the turn that is ending (Cognition's revert extension): its steps,
+    /// before its `TurnCompleted`. Returns whether it has one.
+    fn anchor_turn(&mut self) -> bool {
+        let user_message_id = self.turn.as_ref().and_then(|t| t.user_message_id.clone());
+        let Some(anchor) = self
+            .steps
+            .as_mut()
+            .and_then(|s| s.turn_ended(user_message_id.as_deref()))
+        else {
+            return false;
+        };
+        self.emit(AdapterEvent::TurnAnchor { anchor });
+        true
+    }
+
+    /// Asks the steps right after a prompt answered: their node ids settle the anchor of the
+    /// turn (`Cmd::StepsListed`). Sent from its own task so the router keeps serving the agent.
+    fn list_steps_after_turn(&self) {
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        if self.peer.is_closed() {
+            return;
+        }
+        let peer = self.peer.clone();
+        let tx = self.self_tx.clone();
+        let timeout = self.request_timeout;
+        tokio::spawn(async move {
+            let result = list_steps(&peer, &session_id, timeout).await;
+            let _ = tx.send(Cmd::StepsListed { result });
         });
     }
 
@@ -1695,11 +2054,14 @@ fn reply_closed(cmd: Cmd) {
     match cmd {
         Cmd::SetupDone { reply, .. } => drop(reply),
         Cmd::Initialized { reply, .. } => drop(reply),
+        // Dropped: the caller gets `Closed`.
+        Cmd::Status { reply } => drop(reply),
         Cmd::Send { reply, .. }
         | Cmd::Interrupt { reply }
         | Cmd::Respond { reply, .. }
         | Cmd::StopBackground { reply, .. }
-        | Cmd::Expire { reply, .. } => {
+        | Cmd::Expire { reply, .. }
+        | Cmd::Rename { reply, .. } => {
             let _ = reply.send(Err(AdapterError::Closed));
         }
         Cmd::ApplySettings { reply, .. } | Cmd::SettingsDone { reply, .. } => {
@@ -1708,7 +2070,7 @@ fn reply_closed(cmd: Cmd) {
         Cmd::PrepareShutdown { reply } => {
             let _ = reply.send(());
         }
-        Cmd::PromptDone { .. } => {}
+        Cmd::PromptDone { .. } | Cmd::StepsListed { .. } => {}
     }
 }
 
@@ -1791,6 +2153,18 @@ impl SessionControl for AcpControl {
         let key = key.to_owned();
         self.call(|reply| Cmd::StopBackground { key, reply })
             .await?
+    }
+
+    /// `_cognition.ai/session/rename` (Cognition's `cognition.ai/sessionRename`).
+    async fn rename(&self, title: &str) -> Result<(), AdapterError> {
+        let title = title.to_owned();
+        self.call(|reply| Cmd::Rename { title, reply }).await?
+    }
+
+    /// Devin's statistics of the last turn and its last billing information
+    /// (`crate::stats`), in Devin's groups and words.
+    async fn status(&self) -> Result<Vec<StatusSection>, AdapterError> {
+        self.call(|reply| Cmd::Status { reply }).await
     }
 
     /// Answers the agent `cancelled` (permission) or `{action: "cancel"}` (elicitation): the

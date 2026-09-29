@@ -2,6 +2,7 @@ package dev.aas.android.ui.thread
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -152,7 +153,53 @@ fun InteractionBanner(pending: List<Interaction>, onOpen: (Interaction) -> Unit)
     }
 }
 
+/**
+ * Text the harness asked to put into the composer (`composer/insert`) that waits for the user
+ * (the composer had text, or it arrived with the catch-up or while the screen was not shown):
+ * into the composer, in place of its text or after it, or dismissed. Never sent by itself.
+ */
+@Composable
+fun ComposerInsertOffer(text: String, composerEmpty: Boolean, onReplace: () -> Unit, onAppend: () -> Unit, onDismiss: () -> Unit) {
+    Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
+        Column(Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp)) {
+            Text(stringResource(R.string.composer_insert_title), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSecondaryContainer)
+            Text(text, style = MaterialTheme.typography.bodyMedium, maxLines = OFFER_PREVIEW_LINES, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(end = 8.dp, top = 2.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.composer_insert_dismiss)) }
+                if (composerEmpty) {
+                    TextButton(onClick = onReplace) { Text(stringResource(R.string.composer_insert_put)) }
+                } else {
+                    TextButton(onClick = onAppend) { Text(stringResource(R.string.composer_insert_append)) }
+                    TextButton(onClick = onReplace) { Text(stringResource(R.string.composer_insert_replace)) }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The harness loads a project's own resources (extensions, prompts, skills) only in projects the
+ * user trusts (`features.projectTrust`): asked here, per project, until decided (never decided by
+ * the app). The status sheet changes it later.
+ */
+@Composable
+fun ProjectTrustBanner(harnessName: String, onTrust: () -> Unit, onDistrust: () -> Unit) {
+    Surface(color = MaterialTheme.statusColors.needsInput.copy(alpha = BANNER_ALPHA), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(start = 16.dp, end = 8.dp, top = 8.dp)) {
+            Text(stringResource(R.string.trust_title, harnessName), style = MaterialTheme.typography.labelLarge)
+            Text(stringResource(R.string.trust_body, harnessName), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(end = 8.dp, top = 2.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = onDistrust) { Text(stringResource(R.string.trust_no)) }
+                TextButton(onClick = onTrust) { Text(stringResource(R.string.trust_yes)) }
+            }
+        }
+    }
+}
+
 private const val BANNER_ALPHA = 0.16f
+
+/** Lines of an offered composer text shown before the ellipsis: enough to recognise it. */
+private const val OFFER_PREVIEW_LINES = 3
 
 /** Height of the queue list before it scrolls: about four messages. */
 private val QUEUE_MAX_HEIGHT = 200.dp

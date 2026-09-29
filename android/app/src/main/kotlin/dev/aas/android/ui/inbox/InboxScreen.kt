@@ -40,6 +40,7 @@ import dev.aas.android.AppContainer
 import dev.aas.android.R
 import dev.aas.android.data.InteractionRepository
 import dev.aas.android.data.WorkspaceRepository
+import dev.aas.android.domain.ErrorTexts
 import dev.aas.android.domain.InboxInteraction
 import dev.aas.android.domain.InboxModel
 import dev.aas.android.domain.InboxThread
@@ -50,6 +51,7 @@ import dev.aas.android.protocol.ThreadId
 import dev.aas.android.ui.common.UiText
 import dev.aas.android.ui.common.UserMessages
 import dev.aas.android.ui.common.aasViewModel
+import dev.aas.android.ui.common.asString
 import dev.aas.android.ui.components.EmptyState
 import dev.aas.android.ui.components.SectionHeader
 import dev.aas.android.ui.components.ThreadActivityChip
@@ -64,10 +66,10 @@ import dev.aas.android.ui.navigation.InboxRoute
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.onStart
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -242,7 +244,7 @@ private fun InboxThreadRow(row: InboxThread, onOpen: () -> Unit, onMarkRead: () 
                 )
             }
             row.thread.lastError?.takeIf { row.activity == ThreadActivity.Error }?.let {
-                Text(it.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(ErrorTexts.turnErrorLine(it.kind, it.message).asString(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
         }
         if (row.unread) {

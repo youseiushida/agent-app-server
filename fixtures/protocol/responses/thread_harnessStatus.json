@@ -1,0 +1,31 @@
+{
+  "id": 44,
+  "jsonrpc": "2.0",
+  "result": {
+    "live": true,
+    "sections": [
+      {
+        "rows": [
+          {
+            "label": "Version",
+            "value": "2.1.284"
+          },
+          {
+            "label": "Login method",
+            "value": "Claude Max account"
+          }
+        ],
+        "title": "Session"
+      },
+      {
+        "rows": [
+          {
+            "label": "5-hour",
+            "value": "13% used, resets 18:00"
+          }
+        ],
+        "title": "Usage limits"
+      }
+    ]
+  }
+}

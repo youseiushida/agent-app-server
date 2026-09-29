@@ -162,8 +162,11 @@ async fn http(
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).await.unwrap();
-    stream.write_all(body).await.unwrap();
+    // One write for the head and the body: the server may answer from the head alone (415,
+    // 404) and close the connection, and a second write after that fails (WSAECONNABORTED).
+    let mut request = req.into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request).await.unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
     let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();

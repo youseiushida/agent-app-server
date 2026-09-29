@@ -62,8 +62,19 @@ internal object EventApplier {
      * to the head, so the heartbeat's head no longer looks ahead of it (protocol.md §2.1, §7.2).
      *
      * [warn] reports data that had to be corrected to be stored (see [uniqueQueued]).
+     *
+     * [liveAfter] is the stream's head when this connection subscribed to it (from the
+     * `subscribe` answer; `null` while it is not known): events up to it are the catch-up from the
+     * stored cursor, later ones happen now. Transient requests of the harness say which
+     * ([SyncSignal.ComposerInsert.live]).
      */
-    suspend fun applyBatch(tx: SyncTx, batch: StreamBatch, signals: MutableList<SyncSignal>, warn: (String) -> Unit): BatchOutcome {
+    suspend fun applyBatch(
+        tx: SyncTx,
+        batch: StreamBatch,
+        signals: MutableList<SyncSignal>,
+        warn: (String) -> Unit,
+        liveAfter: Long? = null,
+    ): BatchOutcome {
         val cursor = tx.cursor(batch.stream) ?: return BatchOutcome(emptyList(), cursorMoved = false, overlapAtSeq = null)
         if (batch.events.isEmpty()) {
             if (batch.head <= cursor) return BatchOutcome(emptyList(), cursorMoved = false, overlapAtSeq = null)
@@ -80,7 +91,7 @@ internal object EventApplier {
                 overlap = env.seq
                 break
             }
-            apply(tx, batch.stream, env, signals, warn)
+            apply(tx, batch.stream, env, signals, warn, live = liveAfter != null && env.seq > liveAfter)
             applied += env
             last = env.seq
         }
@@ -88,8 +99,18 @@ internal object EventApplier {
         return BatchOutcome(applied, cursorMoved = last > cursor, overlapAtSeq = overlap)
     }
 
-    /** Applies one event of [stream]. The caller filtered `seq <= cursor` already. */
-    suspend fun apply(tx: SyncTx, stream: String, envelope: EventEnvelope, signals: MutableList<SyncSignal>, warn: (String) -> Unit) {
+    /**
+     * Applies one event of [stream]. The caller filtered `seq <= cursor` already. [live]: the
+     * event happened after this connection subscribed (see [applyBatch]).
+     */
+    suspend fun apply(
+        tx: SyncTx,
+        stream: String,
+        envelope: EventEnvelope,
+        signals: MutableList<SyncSignal>,
+        warn: (String) -> Unit,
+        live: Boolean = false,
+    ) {
         when (val e = envelope.event) {
             // ----- workspace -----
             is Event.ProjectUpserted -> tx.upsertProject(e.project)
@@ -129,6 +150,13 @@ internal object EventApplier {
                 val meta = tx.threadMeta(id)
                 tx.setThreadMeta(id, meta.copy(commandsVersion = meta.commandsVersion + 1))
             }
+            // Nothing to store: the thread's summary (`thread/updated`) carries the new session id,
+            // and the running turn a notice. The open thread's screen says it happened.
+            is Event.NativeSessionChanged -> threadIdOfStream(stream)?.let {
+                signals += SyncSignal.NativeSessionChanged(it, e.previousNativeSessionId, e.nativeSessionId)
+            }
+            // A request for the open thread's composer: relayed, never stored (protocol.md §5).
+            is Event.ComposerInsert -> threadIdOfStream(stream)?.let { signals += SyncSignal.ComposerInsert(it, e.text, live) }
             // Raw harness events are not displayed; unknown types are ignored (protocol.md §7.6).
             is Event.Native, is Event.Unknown -> Unit
         }

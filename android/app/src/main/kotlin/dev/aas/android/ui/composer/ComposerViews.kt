@@ -32,10 +32,13 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -64,6 +67,7 @@ import dev.aas.android.domain.composer.SendAction
 import dev.aas.android.domain.composer.SendBlock
 import dev.aas.android.domain.composer.SendState
 import dev.aas.android.ui.common.asString
+import dev.aas.android.ui.components.BlobImage
 import dev.aas.android.ui.components.LocalImage
 import dev.aas.android.ui.icons.AddPhotoAlternate
 import dev.aas.android.ui.icons.AddToQueue
@@ -79,6 +83,8 @@ import dev.aas.android.ui.theme.statusColors
 
 /** Test tags of the composer (Compose UI tests). */
 object ComposerTags {
+    /** The rounded container of the input, its chips and its buttons. */
+    const val CONTAINER = "composer-container"
     const val INPUT = "composer-input"
     const val SEND = "composer-send"
     const val PALETTE = "composer-palette"
@@ -87,10 +93,12 @@ object ComposerTags {
 
 /**
  * The composer (docs/ux/codex-desktop.md §2, §8.2): the `/` palette or the `@` results right
- * above the input (so they stay above the keyboard), attached images, the multi-line input, then
- * a row of chips ([chips]: model, permission, context) with the image button and the send
- * button. The send button's long press runs [SendState.alternate]. [interruptHint] is said under
- * the composer while the button stops the turn (e.g. that background work goes on).
+ * above it (so they stay above the keyboard), then one rounded container (Material 3
+ * `surfaceContainerHigh`) holding the attached images, the multi-line input without an outline
+ * of its own, and a row of chips ([chips]: model, permission, context) with the image button and
+ * the send button (a filled icon button; 停止 in the error container colours). The send button's
+ * long press runs [SendState.alternate]. [interruptHint] is said under the composer while the
+ * button stops the turn (e.g. that background work goes on).
  */
 @Composable
 fun ComposerBar(
@@ -118,34 +126,55 @@ fun ComposerBar(
             is ComposerTrigger.Mention -> MentionPopup(state.mentionSearch, onChooseMention)
             null -> Unit
         }
-        if (state.attachments.isNotEmpty()) {
-            Row(
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                state.attachments.forEach { AttachmentThumb(it, onRemove = { onRemoveAttachment(it.id) }, onRetry = { onRetryAttachment(it.id) }) }
+        Surface(
+            shape = RoundedCornerShape(CONTAINER_CORNER),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp).testTag(ComposerTags.CONTAINER),
+        ) {
+            Column(Modifier.padding(top = 4.dp, bottom = 4.dp)) {
+                if (state.attachments.isNotEmpty()) {
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        state.attachments.forEach { AttachmentThumb(it, onRemove = { onRemoveAttachment(it.id) }, onRetry = { onRetryAttachment(it.id) }) }
+                    }
+                    state.attachments.firstNotNullOfOrNull { it.state as? Attachment.State.Failed }?.let {
+                        Text(it.message.asString(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 16.dp))
+                    }
+                }
+                // The container is the field's outline: the text field draws neither its own
+                // container nor an indicator line.
+                val transparent = Color.Transparent
+                TextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    enabled = inputEnabled,
+                    placeholder = { Text(placeholder, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                    maxLines = INPUT_MAX_LINES,
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = transparent,
+                        unfocusedContainerColor = transparent,
+                        disabledContainerColor = transparent,
+                        errorContainerColor = transparent,
+                        focusedIndicatorColor = transparent,
+                        unfocusedIndicatorColor = transparent,
+                        disabledIndicatorColor = transparent,
+                        errorIndicatorColor = transparent,
+                    ),
+                    modifier = Modifier.fillMaxWidth().testTag(ComposerTags.INPUT),
+                )
+                Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        content = chips,
+                    )
+                    if (imagesAllowed) AttachButton(inputEnabled, onPickImages, onTakePhoto)
+                    SendButton(send, onSend)
+                }
             }
-            state.attachments.firstNotNullOfOrNull { it.state as? Attachment.State.Failed }?.let {
-                Text(it.message.asString(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 16.dp))
-            }
-        }
-        OutlinedTextField(
-            value = value,
-            onValueChange = onValueChange,
-            enabled = inputEnabled,
-            placeholder = { Text(placeholder, maxLines = 2, overflow = TextOverflow.Ellipsis) },
-            maxLines = INPUT_MAX_LINES,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp).testTag(ComposerTags.INPUT),
-        )
-        Row(Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            Row(
-                Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                content = chips,
-            )
-            if (imagesAllowed) AttachButton(inputEnabled, onPickImages, onTakePhoto)
-            SendButton(send, onSend)
         }
         (sendHint(send) ?: interruptHint?.takeIf { send.primary == SendAction.Interrupt && send.enabled })?.let {
             Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 4.dp))
@@ -208,17 +237,28 @@ fun sendActionLabel(action: SendAction): String = stringResource(
     },
 )
 
+/**
+ * The send button: a Material 3 filled icon button (its colours, 40 dp, a 48 dp touch target)
+ * drawn here because the M3 `FilledIconButton` has no long press, which runs the other delivery
+ * ([SendState.alternate]). 停止 uses the error container colours; a disabled button the M3
+ * disabled colours.
+ */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SendButton(send: SendState, onSend: (SendAction) -> Unit) {
     val label = sendActionLabel(send.primary)
     val alternate = send.alternate
     val alternateLabel = alternate?.let { sendActionLabel(it) }
-    val color = when {
-        !send.enabled -> MaterialTheme.colorScheme.onSurface.copy(alpha = DISABLED_ALPHA)
-        send.primary == SendAction.Interrupt -> MaterialTheme.statusColors.error
-        else -> MaterialTheme.colorScheme.primary
+    val colors = if (send.primary == SendAction.Interrupt) {
+        IconButtonDefaults.filledIconButtonColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        )
+    } else {
+        IconButtonDefaults.filledIconButtonColors()
     }
+    val container = if (send.enabled) colors.containerColor else colors.disabledContainerColor
+    val content = if (send.enabled) colors.contentColor else colors.disabledContentColor
     val icon = when (send.primary) {
         SendAction.Start -> Icons.AutoMirrored.Filled.Send
         SendAction.Queue -> Icons.Filled.AddToQueue
@@ -227,10 +267,10 @@ private fun SendButton(send: SendState, onSend: (SendAction) -> Unit) {
     }
     Box(
         Modifier
-            .padding(4.dp)
+            .minimumInteractiveComponentSize()
             .size(SEND_BUTTON_SIZE)
             .clip(CircleShape)
-            .background(color)
+            .background(container)
             .combinedClickable(
                 enabled = send.enabled,
                 onClick = { onSend(send.primary) },
@@ -250,9 +290,9 @@ private fun SendButton(send: SendState, onSend: (SendAction) -> Unit) {
         contentAlignment = Alignment.Center,
     ) {
         if (send.blocked == SendBlock.Interrupting || send.blocked == SendBlock.Uploading) {
-            CircularProgressIndicator(Modifier.size(20.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 2.dp)
+            CircularProgressIndicator(Modifier.size(20.dp), color = content, strokeWidth = 2.dp)
         } else {
-            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimary)
+            Icon(icon, contentDescription = null, tint = content)
         }
     }
 }
@@ -284,7 +324,7 @@ private fun PalettePopup(state: ComposerUiState, onChoose: (PaletteEntry) -> Uni
                             Text("/${entry.name}", style = MaterialTheme.codeStyle, color = if (entry.runnable) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
                             entry.argumentHint?.let {
                                 Spacer(Modifier.width(6.dp))
-                                Text(it, style = MaterialTheme.codeStyle, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(it.asString(), style = MaterialTheme.codeStyle, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
                         val description = if (entry.runnable) entry.description?.asString() else stringResource(R.string.palette_unsupported)
@@ -370,7 +410,12 @@ private fun PopupNote(text: String) {
 @Composable
 private fun AttachmentThumb(attachment: Attachment, onRemove: () -> Unit, onRetry: () -> Unit) {
     Box {
-        LocalImage(attachment.localUri, THUMB_SIZE)
+        val uploaded = attachment.state as? Attachment.State.Uploaded
+        when {
+            attachment.localUri != null -> LocalImage(attachment.localUri, THUMB_SIZE)
+            // An image of a sent message put back: only the daemon has it.
+            uploaded != null -> BlobImage(uploaded.image.blobId, THUMB_EDGE_PX, THUMB_SIZE)
+        }
         when (attachment.state) {
             Attachment.State.Uploading -> Box(Modifier.size(THUMB_SIZE).background(Color.Black.copy(alpha = SCRIM_ALPHA)), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
@@ -397,7 +442,7 @@ private fun AttachmentThumb(attachment: Attachment, onRemove: () -> Unit, onRetr
 fun ComposerChip(text: String, onClick: (() -> Unit)?, modifier: Modifier = Modifier, emphasized: Boolean = false) {
     Surface(
         shape = RoundedCornerShape(50),
-        color = if (emphasized) MaterialTheme.statusColors.needsApproval.copy(alpha = CHIP_EMPHASIS_ALPHA) else MaterialTheme.colorScheme.surfaceContainerHigh,
+        color = if (emphasized) MaterialTheme.statusColors.needsApproval.copy(alpha = CHIP_EMPHASIS_ALPHA) else MaterialTheme.colorScheme.surfaceContainerHighest,
         modifier = modifier.then(if (onClick != null) Modifier.clip(RoundedCornerShape(50)).clickable(onClick = onClick) else Modifier),
     ) {
         Text(text, style = MaterialTheme.typography.labelMedium, maxLines = 1, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp))
@@ -410,8 +455,14 @@ private const val INPUT_MAX_LINES = 8
 /** Height of the palette and mention lists: about five rows, leaving the conversation visible. */
 private val POPUP_MAX_HEIGHT = 260.dp
 
-private val SEND_BUTTON_SIZE = 44.dp
+/** The Material 3 filled icon button's size. */
+private val SEND_BUTTON_SIZE = 40.dp
+
+/** Corners of the composer's container: the rounded look of a chat input (Material 3's large-to-extra-large range). */
+private val CONTAINER_CORNER = 26.dp
 private val THUMB_SIZE = 64.dp
+
+/** Decoded size of a thumbnail from a blob: 64 dp at up to 3x density. */
+private const val THUMB_EDGE_PX = 192
 private const val SCRIM_ALPHA = 0.45f
-private const val DISABLED_ALPHA = 0.25f
 private const val CHIP_EMPHASIS_ALPHA = 0.22f

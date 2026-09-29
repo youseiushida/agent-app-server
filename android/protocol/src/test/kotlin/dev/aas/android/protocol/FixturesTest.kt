@@ -180,6 +180,8 @@ class FixturesTest {
             RpcError.DATA_HARNESS_ID to { it.harnessId },
             RpcError.DATA_REASON to { it.reason },
             RpcError.DATA_CAPABILITY to { it.capability },
+            RpcError.DATA_DETAIL to { it.detail },
+            RpcError.DATA_COMMAND to { it.command },
         )
 
         private val root: File = File(

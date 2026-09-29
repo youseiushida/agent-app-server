@@ -10,6 +10,11 @@
 //   /aas-later-user <ms> [text]  after <ms>, a user message sent by the extension (a run)
 //   /aas-ask-later <ms>          after <ms>, a confirm dialog; the answer is reported by notify
 //   /aas-chain [text]            the next `agent_settled` starts another run
+//   /aas-editor <text>           puts <text> into the editor (`ctx.ui.setEditorText`)
+//   /aas-ping <text>             notifies "aas-live ping: <text>" (to be sent while pi streams)
+//   /aas-handoff                 continues in a new session (`ctx.newSession`), under a name
+//                                agent-app-server cannot know
+// A reload (`/reload`) is reported by the new instance: notify "aas-live reloaded".
 // Input:
 //   a prompt starting with `aas-race` starts a run of the extension before pi checks whether it
 //   is busy, so pi refuses the prompt because that run is going on.
@@ -50,6 +55,32 @@ export default function (pi: any) {
 				ctx.ui.notify(`aas-live answered: ${answer}`, "info");
 			}, ms);
 		},
+	});
+
+	pi.registerCommand("aas-editor", {
+		description: "aas live test: put text into the editor",
+		handler: async (args: string, ctx: any) => {
+			ctx.ui.setEditorText(args.trim() || "from aas-live");
+		},
+	});
+
+	pi.registerCommand("aas-ping", {
+		description: "aas live test: notify and return",
+		handler: async (args: string, ctx: any) => {
+			ctx.ui.notify(`aas-live ping: ${args.trim()}`, "info");
+		},
+	});
+
+	pi.registerCommand("aas-handoff", {
+		description: "aas live test: continue in a new session",
+		handler: async (_args: string, ctx: any) => {
+			// The context is stale once the session is replaced: nothing may follow.
+			await ctx.newSession();
+		},
+	});
+
+	pi.on("session_start", async (event: any, ctx: any) => {
+		if (event.reason === "reload") ctx.ui.notify("aas-live reloaded", "info");
 	});
 
 	let chain: string | undefined;

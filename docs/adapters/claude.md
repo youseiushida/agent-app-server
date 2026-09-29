@@ -1,9 +1,11 @@
 # Claude Code アダプタ（`aas-adapter-claude`）
 
-検証済み CLI: **Claude Code 2.1.283**（Windows、npm 版。`claude.cmd` は `node_modules\@anthropic-ai\claude-code\bin\claude.exe` を呼ぶ）。
-プロトコルの出典: Agent SDK（`claude-agent-sdk-python` の `_internal/transport/subprocess_cli.py` / `_internal/query.py`、TypeScript SDK の `sdk.d.ts`）、2.1.283 のバンドルに入っている SDK のスキーマ（`task_*`、`background_tasks_changed`、`command_lifecycle`、`initialize` の各フィールドの説明）、実 CLI との実際のやりとりの記録（`crates/aas-adapter-claude/tests/fixtures/`、18章）。
+検証済み CLI: **Claude Code 2.1.284**（Windows、npm 版。`claude.cmd` は `node_modules\@anthropic-ai\claude-code\bin\claude.exe` を呼ぶ）。
+プロトコルの出典: Agent SDK（`claude-agent-sdk-python` の `_internal/transport/subprocess_cli.py` / `_internal/query.py`、TypeScript SDK の `sdk.d.ts`）、バンドルに入っている SDK のスキーマ（`task_*`、`background_tasks_changed`、`command_lifecycle`、`initialize` と各制御要求の説明）、実 CLI との実際のやりとりの記録（`crates/aas-adapter-claude/tests/fixtures/`、18章）。
 
-- バックグラウンド作業、`command_lifecycle`、予約した起床、ultracode、`stop_task` の対応（15〜16章、3章、7章）は、2.1.283 の実機の記録（2026-09-28、haiku と sonnet。18章）で確かめた。これらのメッセージの一部はスキーマで `@internal` とされているので、CLI を更新したら 18章の記録を取り直して確かめる。
+- バックグラウンド作業、`command_lifecycle`、予約した起床、ultracode、`stop_task` の対応（15〜16章、3章、7章）は、2.1.283 の実機の記録（2026-09-28、haiku と sonnet）で確かめた。
+- steer、名前の変更、ハーネスの状態、会話に入らない質問、高速モード、実行中の作業のバックグラウンドへの移動、途中のターンからの fork、権限モードの報告（3章、7章、19章）は、2.1.284 の実機の記録 rec2（2026-09-29、haiku と opus。18章）で確かめた。
+- 内部用・実験的と明記された要求を使う（19章の表）。`@internal` は `get_status`・`get_plan`、実験的（「Experimental — the response shape may change」）は `get_usage`、隠しフラグは `--resume-session-at`。CLI を更新したら 18章の記録を取り直して確かめる。
 
 ## 1. 起動
 
@@ -15,9 +17,11 @@ claude -p --input-format stream-json --output-format stream-json --verbose
        [--allow-dangerously-skip-permissions]      # options.allowBypassPermissions のときだけ
        <新規>  --session-id=<アダプタが採番した UUID>
        <再開>  --resume=<id>
-       <fork>  --resume=<元 id> --fork-session --session-id=<新しい UUID>
+       <fork>  --resume=<元 id> [--resume-session-at=<uuid>] --fork-session --session-id=<新しい UUID>
        [--model <m>] [--effort <e>] [--permission-mode <p>]
 ```
+
+- 途中のターンからの fork（`StartOptions::fork_at`）は `--resume-session-at` でトランスクリプトをそのターンのアンカーまでにする（19.1）。
 
 - `--resume=` / `--session-id=` は `=` 形式で渡す（SDK と同じ。値がフラグとして解釈されるのを防ぐ）。
 - npm 版は `.cmd` シム経由（cmd.exe）で起動される。そのため、コマンドラインに載せる値（モデル名、effort、権限モード、セッション ID）は次の文字だけを許可し、それ以外はエラーにする。
@@ -36,7 +40,9 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   - `agentProgressSummaries`: オプション `agentProgressSummaries`（下）を設定したときだけ、その値を送る。設定しなければ送らず、CLI 自身の既定のままにする（D2。費用を理由に既定を変えない）。
 - 応答に含まれるもの: `models`、`commands`、`current_permission_mode`、`account` など。失敗したら stderr の末尾をエラーに含め、プロセスを停止する。
 - スレッドの effort が `ultracode` なら、`initialize` のあとに `get_settings` で本当に有効になったかを確かめる（7章）。有効でなければ起動を失敗させ、プロセスを止める。
+- スレッドのモード（`StartOptions::modes`）は `initialize` のあとに付ける（7章）。プランモードは `set_permission_mode plan`（スレッドの権限モードで起動してから入るので、プランの承認のあと CLI はその権限モードに戻る）、高速モードは `apply_flag_settings {fastMode: true}`。CLI が断れば起動を失敗させ、プロセスを止める。
 - **fork** は、`--session-id` で新しい ID をこちらから指定できることを実機で確認した。起動時点で新しいネイティブ ID が確定する。
+- **CLI が起動を断ったとき**（知らないアンカーへの fork など）: CLI は `initialize` に答えず、失敗の `result`（`subtype: error_during_execution`、`errors: ["No message found with message.uuid of: …"]`）を出して終了コード 1 で終わる（記録 g6、g3a）。この `errors` の文を起動のエラー（`Harness`）にする。stderr には同じ文が出るので付けない。そのほかの失敗では stderr の末尾（`policy.exit_message_stderr_lines` 行、エスケープシーケンスを除く）を `AdapterPolicy::with_stderr` でエラーに付ける。エラーの文に種類の接頭辞を重ねない（`AdapterError::detail`）。
 
 **オプション**（`[[harness]] options`、未知のキーはエラー）:
 
@@ -53,14 +59,21 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 | → | `control_request` `initialize` / `interrupt` / `set_model` / `set_permission_mode` / `apply_flag_settings {settings}` / `get_settings` | ハンドシェイク、中断、設定のライブ変更と確認。書き込みと `control_response` の待ち合わせを合わせて `policy.handshake_timeout` で打ち切る。`interrupt` だけは `policy.stop_grace` で打ち切る（Claude Code はすぐに応答する。応答しない CLI をエンジンの強制停止（`interrupt_grace`）より長く待たない） |
 | → | `control_request` `get_context_usage {detail: "summary"}` | `result` のたびに、コンテキストの使用量を問い合わせる（3章） |
 | → | `control_request` `stop_task {task_id}` | バックグラウンドタスクを 1 つ止める（15章） |
-| → | `control_request` `cancel_async_message {message_uuid}` | CLI が自分のターンを先に始めたときに、待たされているユーザーメッセージを取り下げる（3章） |
+| → | `control_request` `cancel_async_message {message_uuid}` | CLI が自分のターンを先に始めたときに、待たされているユーザーメッセージを取り下げる。ターンが取り込まなかった steer を取り下げる（3章） |
+| → | `control_request` `rename_session {title, source: "host", session_id}` | スレッド名をネイティブセッションに付ける（19.2） |
+| → | `control_request` `get_status`（`@internal`）/ `get_usage {skip_behaviors: true}`（実験的）/ `get_plan`（`@internal`） | ハーネスの状態（19.3） |
+| → | `control_request` `side_question {question}` | 会話に入らない質問（`/btw`。19.4） |
+| → | `control_request` `background_tasks {tool_use_id}` | 前面で動いている作業をバックグラウンドへ移す（Ctrl+B。19.5） |
 | → | `control_response`（`can_use_tool` と Stop フックへの応答） | 承認・質問への回答、期限切れの回答（5章）、Stop フックの続行（16章）。`user` メッセージと同じく、書き込みは `policy.handshake_timeout` で打ち切る（stdin を読まなくなった CLI で止まらないため） |
 | ← | `command_lifecycle {command_uuid, state}` | こちらのメッセージがターンに取り込まれたこと（`started`）など（3章） |
-| ← | `system/init` | ターンの開始（TurnStarted）、ネイティブ ID、モデル、権限モード、スラッシュコマンド名、`capabilities` |
+| ← | `system/init` | ターンの開始（TurnStarted）、ネイティブ ID、モデル、権限モード、`fast_mode_state`、スラッシュコマンド名と端末専用のコマンド名、`capabilities` |
+| ← | `system/status {permissionMode}` | 権限モードが変わったこと（7章） |
+| ← | `system/commands_changed {commands}` | コマンドの一覧が変わったこと（8章） |
+| ← | `system/notification {key, text, color}` | CLI が利用者に出す知らせ（4章） |
 | ← | `stream_event`（`--include-partial-messages`） | テキストと思考のストリーミング |
 | ← | `assistant` | 確定した内容ブロック。部分メッセージが有効な間は、1 メッセージにつき 1 ブロック |
 | ← | `user`（`tool_result` と `tool_use_result`） | ツールの結果 |
-| ← | `result` | ターン終了（状態、usage、累積コスト、`origin`） |
+| ← | `result` | ターン終了（状態、usage、累積コスト、`origin`、`fast_mode_state`） |
 | ← | `system/background_tasks_changed`、`task_started`、`task_progress`、`task_updated`、`task_notification` | バックグラウンドタスク（15章） |
 | ← | `control_request can_use_tool` | 承認・質問 |
 | ← | `control_request hook_callback`（`callback_id: "aas_stop"`） | Stop フック（16章） |
@@ -95,6 +108,23 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 - **TurnStarted**:
   - こちらのメッセージのターン: `started` の後の最初の `system/init` で出す。`init` がなくても、`stream_event` / `assistant` / `user` のどれかが来たらその時点で出す。
   - CLI が自分から始めたターン（バックグラウンドタスクの完了の通知、予約した起床、自動の続行など）: `init` を受けた時点で出す。この場合、直前の `send` はない。
+- **steer（実行中のターンへの送信、`steer_message`）**: 能力 `steer`。
+  - 送り方: 普通のユーザーメッセージ（新しい `uuid`、`origin: {kind: "human"}`、`priority` なし）をターンの途中で書く。`priority: "now"` は取り込みではなく、動いているツールを中断して新しいターンとして実行する（記録 a4: `terminal_reason: aborted_tools`）ので使わない。
+  - **取り込まれたことを示す明示的なシグナル**: その `uuid` の `command_lifecycle started` が、動いているターンの `result` より前に、新しい `system/init` なしで届く（記録 a1。`queued` はすぐに届き、`started` は次のツールの区切り（`tool_result` の直後）で届く。`completed` もその `result` より前）。stdout にメッセージのエコーはない（`--replay-user-messages` を付けない）ので、表示はエンジンが作る steer の Item のまま。
+  - Claude Code が取り込むのはツールの区切りだけ。区切りが残っていなければ、メッセージは待ち行列に残り、ターンの `result` のあとに次の実行になる（記録 a2: `result` → `started` → 新しい `init`）。
+  - ターンの `result` までに `started` が来なかった steer は、`result` を受けたときに `cancel_async_message` で取り下げる。そのターンの `TurnCompleted` は、コンテキストの問い合わせと取り下げの応答を両方受けてから出す（どちらも `policy.handshake_timeout` まで）。
+
+    | 取り下げの応答 | 扱い |
+    |---|---|
+    | `{"cancelled": true}`（CLI の待ち行列から外した。形は記録 a3。その前に `command_lifecycle cancelled` も来る） | `SteerReturned`（`TurnCompleted` の前）。エンジンが steer の Item を `declined` にしてキューに戻し、次のターンとして送る |
+    | `{"cancelled": false}` のあとに `started`（CLI がもう取り出していた。記録 a2 の順序） | CLI の次の実行がそのメッセージに答える。前のターンをその時点で完了させ、実行はこちらのメッセージのターンとして報告する（`trigger` なし）。エンジンからは CLI 起点のターンに見える |
+  - `result` のあと、`TurnCompleted` を出す前に来た steer は、書かずにすぐ `SteerReturned` を返す（エンジンのターンはまだ開いている）。`TurnCompleted` を出したあとは `Other` エラー（「ターンが終わった」）。
+  - 取り込まれる前に `refused` / `discarded`、またはこちらが頼んでいない `cancelled` が来たら、そのときに `SteerReturned`。取り下げの応答が、そのターンの `TurnCompleted` のあと（CLI が次の実行を先に始めた場合など）に `cancelled: true` で届いたら、エンジンには戻す先がないので Notice（warning、`steerNotDelivered`）で「届かなかった」と知らせる。
+  - `init` の `capabilities` に `msg_lifecycle_v1` がない CLI では、取り込まれたかが分からないので steer は `Harness` エラー。
+  - 承認を待っている間の steer は記録していない（そのツールが終わってから取り込まれると考えられる [推測]）。
+- **ターンのアンカー（`TurnAnchor`）**: ターンの最後のメインスレッドのトランスクリプトの要素の `uuid`。`{"leafUuid": <uuid>}` の形で、ターンの `TurnCompleted` の前に出す。
+  - 候補は、こちらのメッセージの `uuid`（送った `uuid` がそのままトランスクリプトのユーザーの要素の `uuid` になる。記録 g）、そのあとの `parent_tool_use_id` が null の `assistant`（内容ブロックごとに 1 つ）と `user` の `tool_result` の `uuid`。最後に来たものがアンカー。`result`・`system/*`・`stream_event` の `uuid` はトランスクリプトにないので使わない。
+  - 記録 g1 の 3 ターンのアンカーは、トランスクリプトの `last-prompt.leafUuid` と一致した。ターンや要素を数えて作ることはしない。
 - **TurnCompleted**: `result` 1 件ごとに 1 回出す。コンテキストの使用量を付けるため、`result` を受けたら `get_context_usage` を送り、その応答を受けてから出す（下の「コンテキストの使用量」）。
   - 状態の決め方（表で固定。テキストは見ない）:
 
@@ -137,7 +167,8 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 | `Task`, `Agent` | `toolCall` / `subagent`（タイトルは `<subagent_type>: <description>`） |
 | `Workflow` | `toolCall` / `subagent`。開始時のタイトルは `Workflow`、完了時に起動の結果の `workflowName` から `Workflow: <名前>` にする（名前はスクリプトの中にしかなく、スクリプトは読まない） |
 | `BashOutput`, `KillShell`, `TaskStop`, `Monitor` | `toolCall` / `execute` |
-| `EnterPlanMode`, `ExitPlanMode` | `toolCall` / `think` |
+| `EnterPlanMode` | `toolCall` / `think` |
+| `ExitPlanMode` | `proposedPlan`（本文は `input.plan`。承認されれば completed、拒否すれば declined。19.6） |
 | `AskUserQuestion` | `toolCall` / `other`（質問そのものは `question` Interaction になる） |
 | `mcp__<server>__<tool>` | `toolCall` / `mcp`（`server` を設定） |
 | その他（`CronCreate`、`CronDelete`、`CronList`、`ScheduleWakeup` を含む） | `toolCall` / `other` |
@@ -159,9 +190,12 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 
 | subtype | 扱い |
 |---|---|
-| `init` | TurnStarted（まだなら。3章）。`capabilities` に `msg_lifecycle_v1` があるかを覚える。`session_id` が変わったら `SessionIdentified`。`model` / `permissionMode` が変わったら `SessionInfo`。`slash_commands` の名前集合が変わったら `CommandsChanged`（説明は `initialize` の一覧から引き継ぐ） |
-| `background_tasks_changed`、`task_started`、`task_progress`、`task_updated`、`task_notification` | バックグラウンドタスク（15章） |
-| `status`, `thinking_tokens`, `session_state_changed` | 無視（進捗の信号にすぎない。ターンの終了は `result` で判定する。`session_state_changed` は既定では出ず、出ても Bash が動いている間に `idle` を報告する（記録 E2）ので、忙しさの判定にも使わない） |
+| `init` | TurnStarted（まだなら。3章）。`capabilities` に `msg_lifecycle_v1` があるかを覚える。`session_id` が変わったら `SessionIdentified`（CLI が自分でセッションを替えた。エンジンが `thread/nativeSessionChanged` で知らせる）。`model` が変わったら `SessionInfo { model }`。`permissionMode` は 7章の報告、`fast_mode_state` は 19.7。`slash_commands` と `terminal_slash_commands` はコマンドの一覧（8章） |
+| `status` | `permissionMode` があれば権限モードの報告（7章）。ない `status`（`requesting` など）は進捗の信号なので無視 |
+| `commands_changed` | コマンドの一覧を置き換える（8章） |
+| `notification` | Notice（`color` が `error` なら error、`warning` なら warning、ほかは info。本文は `text` のまま、code は `key`）。例: 高速モードが断られたときの `fast-mode-overage-rejected`「Fast mode disabled · usage credits exhausted」（19.7） |
+| `background_tasks_changed`、`task_started`、`task_progress`、`task_updated`、`task_notification` | バックグラウンドタスク（15章）。`task_started {is_backgrounded: false}` は、呼んだツールのアイテムをバックグラウンドへ移せるという報告にもなる（19.5） |
+| `thinking_tokens`, `session_state_changed`, `control_request_progress` | 無視（進捗の信号にすぎない。ターンの終了は `result` で判定する。`session_state_changed` は既定では出ず、出ても Bash が動いている間に `idle` を報告する（記録 E2）ので、忙しさの判定にも使わない。`control_request_progress` はこちらの要求（会話に入らない質問）に取りかかったという知らせで、終わりは応答が示す） |
 | `compact_boundary` | Notice（info, `compacted`） |
 | その他 | `Native` |
 
@@ -175,7 +209,7 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 - 件名（Subject）:
   - Bash / PowerShell → `command`
   - ファイル系ツール → `fileChange`（入力から作った差分付き）
-  - `ExitPlanMode` → `plan`（`input.plan`）
+  - `ExitPlanMode` → `plan`（`input.plan`）。このツールの Item は `proposedPlan`（19.6）
   - その他 → `tool`
 - タイトル: CLI が `title` を送ってきたらそれを使う。なければ `Run command?` / `Write <path>?` / `Edit <path>?` / `Approve the plan?` / `Use <tool>?`。
 - 詳細: `description`、`decision_reason`、`blocked_path`。ANSI エスケープは除去する。
@@ -231,13 +265,31 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 | モデル | `--model` | `control_request set_model {model}` → Live |
 | 推論量（effort） | `--effort`（low / medium / high / xhigh / max / ultracode） | `apply_flag_settings {settings:{effortLevel}}` → Live（ultracode は下） |
 | 権限モード | `--permission-mode` | `set_permission_mode {mode}` → Live |
+| プランモード（`modes.plan`） | 起動後に `set_permission_mode plan` | `set_permission_mode plan` / 権限モード（`apply_modes`）→ Live |
+| 高速モード（`modes.fast`） | 起動後に `apply_flag_settings {fastMode: true}` | `apply_flag_settings {fastMode}`（`apply_modes`）→ Live（19.7） |
 
 - モデル一覧は `initialize` 応答の `models`（`value` / `displayName` / `description` / `supportedEffortLevels`）から作る。
   - `default` は CLI 自身の既定モデル（`isDefault`）。
   - モデルごとの effort の対応は `supportedEffortLevels` による。
-- 権限モードは固定の表: `default`（Ask）、`acceptEdits`、`plan`、`auto`、`dontAsk`、`bypassPermissions`。
+- 権限モードは固定の表: `default`（Ask）、`acceptEdits`、`auto`、`dontAsk`、`bypassPermissions`。
   - `bypassPermissions` はオプション `allowBypassPermissions: true` のときだけ提示する（既定は off）。
-  - 既定のモードは `initialize.current_permission_mode`（ユーザー設定の `defaultMode`）。
+  - 既定のモードは `initialize.current_permission_mode`（ユーザー設定の `defaultMode`。それが `plan` なら `default`）。
+  - Claude Code の権限モード `plan` は権限モードとしては出さない。スレッドのプランモード（`modes.plan`、アプリの `/plan`）として扱う（19.6）。
+  - 以前の版では `plan` を権限モードとして選べたので、スレッドとプロジェクトの既定値に残っている（`mapping::upgrade_settings`）。スレッドを作るときはエンジンが `HarnessAdapter::upgrade_settings` で権限モードを既定にして `modes.plan` をオンにする。保存済みのスレッドは、起動のときにアダプタが同じようにする: `--permission-mode plan` を渡さずに起動し（CLI の既定の権限モードになる）、起動後に `set_permission_mode plan` でプランモードに入る。`initialize` の今の権限モード（`SessionInfo`）とプランモードの報告（`ModesReported`）でスレッドの設定が直る（design.md 5.5）。`apply_settings` に `plan` が権限モードとして来ても、プランモードに戻る先の権限モードは変えない。
+
+### CLI が報告する権限モード（スレッドの設定への反映）
+
+Claude Code は自分で権限モードを変える。承認で「このセッションは許可」を選ぶと CLI の提案 `{type: "setMode", mode: "acceptEdits", destination: "session"}` を返すので acceptEdits に替わり（記録 h1）、プランの承認（ExitPlanMode）のあとはプランモードに入る前のモードに戻る（記録 h1: `default`、h2: `acceptEdits`）。変わるたびに CLI は `system/status {status: null, permissionMode}` を出す（`set_permission_mode` への応答のあとにも。記録 h1）。実行ごとの `system/init.permissionMode`、`initialize.current_permission_mode` も同じ値を持つ。
+
+| 報告された値 | 出すもの |
+|---|---|
+| `plan` | `ModesReported { plan: true }`（前回と違うときだけ） |
+| それ以外 | `SessionInfo { permission_mode }`（前回と違うときだけ）と、プランモードだったなら `ModesReported { plan: false }` |
+
+- エンジンがスレッドの設定（`settings.permissionMode`、`modes.plan`）に反映する（design.md 5.5）。アダプタも CLI の今の権限モードとして覚え、次の `apply_settings` はそれと比べる（同じなら何も送らない）。
+- `initialize` の値は、その応答より先に届いた `system/status` がなければ使う（ハンドシェイクの直後の報告のほうが新しい）。
+- 推論量は、`get_settings` で確かめたとき（ultracode。下）だけ報告する。スレッドの推論量が CLI の既定（なし）のときは、既定が何に解決されたかを報告しない（利用者の「既定」を具体的な段階で置き換えないため）。モデルは報告してもスレッドには反映されない（ターンに記録される）。
+- プランモードの間にスレッドの権限モードが変わったら、`set_permission_mode <新しいモード>` のあとに `set_permission_mode plan` を送る。CLI はプランモードに入ったときのモードを覚えていてプランの承認のあとにそこへ戻るので、新しいモードから入り直す。その間の CLI の報告（新しいモード、plan）はそのまま出す。
 
 ### ultracode（D6）
 
@@ -259,17 +311,32 @@ ultracode は「xhigh の推論量 + 常にワークフローで作業を組み�
 
 ## 8. コマンド（`/` メニュー）
 
-- `initialize.commands`（`name` / `description` / `argumentHint`）を、`InsertText "/<name> "` として返す。
-- 作業ディレクトリごとにキャッシュする。キャッシュを更新するのは次の 3 つのとき:
+- 一覧の元は次の 3 つ（どれも CLI の明示的な欄。説明文は読まない）:
+  - `initialize.commands` と `system/commands_changed.commands`: 全体の一覧（`name`、`description`、`argumentHint`、`aliases`、`builtin`）。`commands_changed` を受けたら一覧を置き換える（スキルや MCP のプロンプトが増えたとき）。
+  - `system/init.slash_commands`: そのターンのコマンドの正式名（別名は入らない）。全体の一覧にない名前は、説明なしで加える。
+  - `system/init.terminal_slash_commands`: 端末でしか使えないコマンド（2.1.284: `doctor`、`color`、`focus`、`reload-plugins`）。一覧から外す。`initialize` にはこの欄がないので、最後の `init` の値を作業ディレクトリごとに覚えておき、そのディレクトリで最初のターンより前の一覧（プローブ）にも使う（そのディレクトリの値がなければ、ほかのディレクトリで最後に見た値）。
+- 各コマンドを `InsertText "/<name> "` として返す。別名（`aliases`）もそれぞれ 1 つのコマンドとして加える（説明と引数のヒントは元のコマンドのもの。CLI が別名を解決する）。例: `code-review` の別名 `review` で、`/review` が Claude Code 自身のコードレビューになる。
+- 名前のリストで外すもの（CLI はこれらを一覧で区別しない。版ごとに確かめる。2.1.284）:
+
+  | 名前 | 理由 |
+  |---|---|
+  | `__remote-workflow` | サーバが起動したセッション専用（「server-launched sessions only」） |
+  | `workflow-launch-exec` | `workflow_launch` のイベントで始まったセッション専用 |
+  | `extra-usage` | 中身のないもの（「Renamed to /usage-credits」） |
+  | `agents` | 中身のないもの（「(removed) …」） |
+  | `heapdump` | CLI のプロセスの JS ヒープを PC のデスクトップに書き出す診断で、会話とは関係がない |
+  | `design-consent`、`design-revoke` | 一覧にある `/design consent`・`/design revoke` と同じ操作 |
+
+- 作業ディレクトリごとにキャッシュする。キャッシュを更新するのは次のとき:
   - その cwd でセッションを開始したとき
-  - `init.slash_commands` が変化したとき
+  - `init` や `commands_changed` で一覧が変わったとき（変わったときだけ `CommandsChanged` を出す）
   - キャッシュがなく、`--no-session-persistence` 付きのプローブプロセスで取得したとき
-- stream-json モードではスラッシュコマンドをプロンプト本文として送る（CLI が解釈する）。`/compact`、`/review`、`/init`、`/loop` など CLI がこのモードで扱えるコマンドは、すべてこの一覧に入っている。アダプタが別に実装するコマンドはない。
-- `terminal_slash_commands`（端末でしか使えないもの）は含めない。
-- セッションを切り替えるコマンド（`session_switching_commands`）: `clear` と `resume`。エンジンが `command/list` から除く（design.md 9.5）。
-  - `clear`: Claude Code 2.1.283 の `initialize.commands` にあり、説明は「Start a new session with empty context; previous session stays on disk (resumable with /resume)」。stream-json モードでも動き、CLI は新しい `session_id` を報告する。スレッドの履歴とエージェントの文脈が食い違うので出さない。
-  - `resume`: セッションの選択。今は端末専用で一覧に出ないが、出るようになっても除く。
-  - 入力欄に `/clear` と打って送れば CLI に届く（利用者の明示的な操作）。CLI が報告した新しい `session_id` は `SessionIdentified` でスレッドに記録される。
+- stream-json モードではスラッシュコマンドをプロンプト本文として送る（CLI が解釈する）。`/compact`、`/init`、`/loop` など CLI がこのモードで扱えるコマンドは、すべてこの一覧に入っている。アダプタが別に実装するコマンドはない（アプリの `/plan` はスレッドのプランモード。19.6）。
+- **セッションを切り替えるコマンド**（`session_switching_commands` と `session_switching_names`）: `clear`（別名 `reset`、`new`）と `resume`（別名 `continue`）。エンジンが `command/list` から除き、手で打った入力も型付きのエラー（`sessionSwitchingCommand`）で断る（design.md 9.5）。アプリは `/clear`・`/reset` を自分の `/new` として扱う。
+  - `clear`: `initialize.commands` にあり、説明は「Start a new session with empty context; previous session stays on disk (resumable with /resume)」。stream-json モードでも動き（`supportsNonInteractive`）、CLI は新しい `session_id` を報告する。スレッドの履歴とエージェントの文脈が食い違う。別名は一覧の `aliases` から読む（2.1.284 では `reset`、`new`）。
+  - `resume`: セッションの選択。端末専用で一覧に出ない。別名 `continue` は CLI のコマンドの定義による（2.1.284）。
+  - 別名は、2.1.284 のものを固定で持ち、CLI が一覧で挙げたものを足す（`clear` や `resume` に新しい別名が付いても断れる）。
+  - それでも CLI がセッションを替えたら（`init.session_id` が変わった）、`SessionIdentified` を出し、エンジンが `thread/nativeSessionChanged` と Notice で知らせる。
 
 ## 9. 画像とメンション
 
@@ -285,10 +352,13 @@ ultracode は「xhigh の推論量 + 常にワークフローで作業を組み�
   - 比較は、区切り文字を統一し、末尾の区切りを除き、Windows では大文字小文字を区別しない。
   - ディレクトリ名はデコードしない。
   - ユーザーのプロンプトが 1 つもないもの（プローブなど）は除く。
-- **タイトルの優先順**: 最後の `custom-title.customTitle` → 最後の `ai-title.aiTitle` → `summary`（ここまでは `policy.harness_title_chars` で切る）→ 最初のプロンプトの 1 行目（`policy.first_message_title_chars` で切り、`…` を付ける。エンジンの規則と同じ）。
+- **タイトルの優先順**（ほかのプロセスで付けた名前も `custom-title` に残る。19.2）: 最後の `custom-title.customTitle` → 最後の `ai-title.aiTitle` → `summary`（ここまでは `policy.harness_title_chars` で切る）→ 最初のプロンプトの 1 行目（`policy.first_message_title_chars` で切り、`…` を付ける。エンジンの規則と同じ）。
 - `updated_at` はエントリの `timestamp` の最大値。
 - **履歴の読み取り**:
-  - ユーザーエントリの `promptId` が変わったらターンの区切りとする（同じ `promptId` のツール結果や中断マーカーは同じターンに属する）。
+  - ターンの区切りは、プロンプトのユーザーエントリの `turnPosition.turnIndex`（2.1.284 がプロンプトごとに書く）が変わったところ。`turnPosition` のないトランスクリプトでは `promptId` が変わったところ（同じ `promptId` のツール結果や中断マーカーは同じターンに属する）。
+    - fork したトランスクリプトでは、コピーされたプロンプトの `promptId` がすべて fork の最初のプロンプトのものに書き換わる（記録 g2）ので、`promptId` だけでは全体が 1 つのターンになる。`turnPosition` はコピーでも保たれる。
+  - ターンに取り込まれた steer は、ユーザーのエントリではなく `attachment {type: "queued_command", commandMode: "prompt", origin: {kind: "human"}, prompt}` として残る（記録 a1）。これを、そのターンの steer のユーザーメッセージ（`delivery: steer`）にする。ほかの `queued_command`（タスクの通知など）は表示しない。
+  - 各ターンのアンカー（`read_native_history_anchored`）: そのターンのプロンプト、`assistant` エントリ、`tool_result` のユーザーエントリのうち最後のものの `uuid`（`isSidechain` のものは除く）。ライブのターンのアンカー（3章）と同じ要素になる（記録 g1 で確かめた）。
   - `isMeta` / `isCompactSummary` / `isSidechain` のエントリは除く。
   - `tool_use` と `tool_result` は、ライブのときと同じ対応表でアイテムにする。
   - `compact_boundary` は Notice にする。
@@ -301,11 +371,12 @@ ultracode は「xhigh の推論量 + 常にワークフローで作業を組み�
 
 ## 11. プローブ
 
-1. `claude --version` を `run_tool` で実行する（出力は例えば `2.1.283 (Claude Code)`）。
+1. `claude --version` を `run_tool` で実行する（出力は例えば `2.1.284 (Claude Code)`）。
 2. `--no-session-persistence` を付けてプロセスを起動し、`initialize` を送る（API 呼び出しは発生しない）。
 3. モデル、コマンド、既定の権限モードを取得したら、stdin を閉じて終了させる。
 
-能力: `interrupt`、`approvals`、`questions`、`resume`、`fork`、`images`、`modelSwitchLive`、`nativeSessions`、`backgroundTasks`、`backgroundStop`。`steer` はない。
+能力: `interrupt`、`steer`（3章）、`approvals`、`questions`、`resume`、`fork`、`images`、`modelSwitchLive`、`nativeSessions`、`backgroundTasks`、`backgroundStop`。
+機能（`features`）は 19章。高速モードのモデル（`fastModeModels`）はプローブの `initialize.models` から作る。
 
 ## 12. 停止
 
@@ -320,20 +391,22 @@ ultracode は「xhigh の推論量 + 常にワークフローで作業を組み�
 ## 13. ヒューリスティック
 
 使っていない。状態の判定はすべて、明示的なフィールドと、こちらが送った要求の記録だけで行う。
-- 使うフィールド: `result.is_error` / `terminal_reason` / `subtype` / `origin`、`tool_result.is_error`、`tool_use_result`（`status`、`agentId`、`taskId`、`taskType`、`backgroundTaskId`、`workflowName`、`id`、`jobs`）、`command_lifecycle`、`system/init.capabilities`、`task_*` と `background_tasks_changed` の各フィールド、`can_use_tool.agent_id`、Stop フックの `session_crons`、`get_settings.applied`、`promptId`、`control_cancel_request` など。
-- こちらの要求の記録: 中断を送ったか、拒否したか、どの `uuid` のメッセージを送ったか。
+- 使うフィールド: `result.is_error` / `terminal_reason` / `subtype` / `origin` / `errors` / `fast_mode_state`、`tool_result.is_error`、`tool_use_result`（`status`、`agentId`、`taskId`、`taskType`、`backgroundTaskId`、`workflowName`、`id`、`jobs`）、`command_lifecycle`、`system/init.capabilities` / `permissionMode` / `slash_commands` / `terminal_slash_commands`、`system/status.permissionMode`、`system/commands_changed.commands`（`aliases`）、`task_*` と `background_tasks_changed` の各フィールド（`task_started.is_backgrounded`）、`can_use_tool.agent_id`、Stop フックの `session_crons`、`get_settings.applied`、`cancel_async_message` と `background_tasks` の応答、`models[].supportsFastMode`、メッセージの `uuid`、トランスクリプトの `promptId` / `turnPosition` / `uuid` / `attachment.type`、`control_cancel_request` など。
+- こちらの要求の記録: 中断を送ったか、拒否したか、どの `uuid` のメッセージ（steer を含む）を送ったか、どれを取り下げたか。
+- 名前のリスト（8章の外すコマンド、セッションを切り替えるコマンドの別名）は CLI の版ごとの固定の表で、推定ではない。
 - 読まないもの: タスクの `summary` や `description`（表示するだけ）、ツールの結果の本文（「Command running in background with ID: …」など）、`output_file` の中身、`result.result`。時間や無出力からも何も推定しない。
 
 ## 14. 制限事項
 
-- steer はない（CLI にはキュー機能があるが、エンジン側のキューを使う）。
+- steer はツールの区切りでしか取り込まれない（3章）。区切りがないターンの steer はキューに戻る。
 - コマンドの終了コードは CLI が出さないので未設定。バックグラウンドの Bash の終了コードも、CLI は人向けの要約（「…completed (exit code 0)」）にしか書かないので設定しない。
 - サブエージェント内部の経過は表示しない（進み具合はタスクの `progress` に出る。15章）。
 - バックグラウンドのシェルの出力は、CLI がファイル（`output_file`）に書くだけでストリームがないので、動いている間は見えない。終わったときも要約（`summary`）だけを表示する。
 - 履歴の取り込みでは、画像を添付として復元できない（blob がないため）。
 - 秘匿された思考（空の thinking と signature）は表示できない。
 - コンテキストの使用量はターンの終わりにだけ分かる（3章）。`get_context_usage` の値は CLI の見積もりを含む（`detail: "summary"`）。
-- 予約した起床の制限は 16章。範囲外にしたもの（design.md 1章）: フォアグラウンドのタスクをスマホからバックグラウンドに移すこと、予約した起床を 1 つずつ止めること。
+- 予約した起床の制限は 16章。範囲外にしたもの（design.md 1章）: 予約した起床を 1 つずつ止めること、ほかのプロセスで付けた名前を動いているスレッドに反映すること、エージェントが動いていないときの `get_status` の節、ツールの区切りを待たない取り込み。
+- 高速モードの状態（`fast_mode_state`）は CLI の意図で、実際に速く処理されたか（`usage.speed`）ではない（19.7）。
 
 ## 15. バックグラウンド作業
 
@@ -437,10 +510,13 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
 ## 18. テスト
 
 - 単体テスト:
-  - `src/mapping.rs`: 対応表、承認と質問、使用量とコンテキストの応答の解釈、起動の結果の形（E1 / E2 / E3a / w4 の記録の形）、`Workflow` のタイトル、`origin` からの `trigger`、期限切れの応答、ultracode の effort の一覧と `apply_flag_settings` の形。
+  - `src/mapping.rs`: 対応表、承認と質問（エスケープシーケンスの除去を含む）、使用量とコンテキストの応答の解釈、起動の結果の形（E1 / E2 / E3a / w4 の記録の形）、`Workflow` のタイトル、`origin` からの `trigger`、期限切れの応答、ultracode の effort の一覧と `apply_flag_settings` の形、権限モードの表（`plan` を出さない）、高速モードのモデル、`ExitPlanMode` の `proposedPlan`、`get_status` / `get_usage` / `get_plan` の節（b1 の形）、起動を断った `result` の文（g6 / g3a の形）。
   - `src/background.rs`: ライブセットと開始の順序、表示しないフォアグラウンドのタスク、同じ ID の再開、終わりの対応、サブエージェントのタスクの親（両方の順序）、ワークフローのエージェントの統合と承認の持ち主、予約した起床の一覧・作成・削除、一覧なしで終わったターンのあとの一度だけの起床（16章）。
-  - `src/lib.rs`: ネイティブセッションのタイトル（ポリシー値の長さ）、セッションを切り替えるコマンドの名前（2.1.283 の `initialize.commands` の形で `clear` と `resume` が除かれること）、オプション。
-- 再生テスト（`src/replay_tests.rs`）: 実 CLI との記録を、偽の CLI がパイプの上で再生する。偽の CLI は、アダプタが書いたもの（制御要求の種類と主な欄、`initialize` の `hooks` と `perTaskStopAffordance`、メッセージの内容と `origin`、回答の本文）を記録と照らし合わせ、アダプタが選ぶ ID（制御要求の ID、メッセージの `uuid`）を記録の ID に対応させる。操作（送信、回答、中断、停止、設定）は、偽の CLI がその入力を待っている時点で公開 API から行う。
+  - `src/commands.rs`: 別名の展開、端末専用と名前のリストのコマンドを外すこと、`init` で足される名前、セッションを切り替えるコマンドの別名（固定のものと一覧から読んだもの）、最後の `init` の端末専用の一覧をプローブの一覧に使うこと。
+  - `src/native.rs`: fork したトランスクリプト（同じ `promptId`、違う `turnPosition`）のターン、取り込まれた steer（`queued_command`）、ターンのアンカー。
+  - `src/lib.rs`: fork の引数（g2 / g3b のコマンドライン、前のターンのアンカーがないとき、形の違うアンカー、コマンドラインに載せられない値）と、同じ判断を起動の前にする `check_fork_point`、機能、セッションを切り替える名前、オプション。
+  - `src/mapping.rs` の `upgrade_settings`: 以前の版の権限モード `plan` がプランモードになり、ほかの設定は変わらないこと。
+- 再生テスト（`src/replay_tests.rs`）: 実 CLI との記録を、偽の CLI がパイプの上で再生する。偽の CLI は、アダプタが書いたもの（制御要求の種類と主な欄、`initialize` の `hooks` と `perTaskStopAffordance`、メッセージの内容と `origin`、回答の本文）を記録と照らし合わせ、アダプタが選ぶ ID（制御要求の ID、メッセージの `uuid`）を記録の ID に対応させる。操作（送信、steer、回答、中断、停止、設定、モード、状態、名前の変更、質問、バックグラウンドへの移動）は、偽の CLI がその入力を待っている時点で公開 API から行う。ターンの途中で記録係が送ったメッセージは、fixture の行に `"act":"steer"` を付けて steer として再生する。
 
   | fixture | 元の記録 | 確かめること |
   |---|---|---|
@@ -451,6 +527,15 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
   | `scheduled_crons.jsonl` | rec-claude w4 | `CronCreate`（一度だけと繰り返し）、起床で始まるターン、Stop フックの一覧、`CronList`、`CronDelete` |
   | `race_notification_turn.jsonl` | rec-claude r1a（下の変更あり） | CLI が自分のターンを先に始めたときの `TurnInProgress`、取り下げ、送り直したメッセージのターン |
   | `ultracode_turn.jsonl` | rec-claude u4 | ultracode の反映と `get_settings` での確認、`origin` 付きのメッセージ |
+  | `steer_absorbed.jsonl` | rec2 a1 | ツールの区切りで取り込まれた steer（`SteerReturned` なし、1 ターン、答えに反映）、アンカー、Bash の `ItemBackgroundable` |
+  | `steer_next_run.jsonl` | rec2 a2 | 区切りのない steer: 取り下げが間に合わず（`cancelled: false`）CLI の次の実行になる。前のターンがその前に完了すること |
+  | `steer_returned.jsonl` | rec2 a2（下の変更あり） | 取り下げた steer の `SteerReturned` が `TurnCompleted` より前に出ること、送り直しのターン |
+  | `rename_status_btw.jsonl` | rec2 b1 | `get_status` と `get_usage` の節、`rename_session`、待機中と実行中の `side_question`、`control_request_progress` |
+  | `fast_mode.jsonl` | rec2 e1 | `apply_flag_settings {fastMode}`、`fast_mode_state` の報告、`fast-mode-overage-rejected` の Notice |
+  | `background_bash.jsonl` | rec2 f1b | 前面の Bash の `ItemBackgroundable`、`background_tasks`、`backgrounded` の Item とシェルのタスク |
+  | `background_agent.jsonl` | rec2 f2 | 前面の Agent のバックグラウンドへの移動、その終わりで CLI が始める実行の `trigger` |
+  | `plan_mode.jsonl` | rec2 h1 | 権限モードの報告（`system/status`、承認の `setMode`）、プランモードの出入り、`proposedPlan` |
+  | `three_turns.jsonl` | rec2 g1 | 3 ターンのアンカーが、fork の記録（g2 / g3b / g4）で使った uuid と一致すること |
 
   記録から fixture を作るときの変更（どれも、アダプタが読まない部分か、アダプタが記録係と違うことをする部分）:
   - 利用者のパス、アカウント（メールアドレス、組織）、セッション ID を置き換えた。`initialize` の応答はコマンド・モデル・権限モードだけに、`get_context_usage` の応答は 4 つの数値だけに、`system/init` は使う欄だけに縮めた。`rate_limit_event` と `commands_changed`（利用者のスキル一覧）は除いた。思考の `signature` は短くした。
@@ -459,11 +544,97 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
   - `stop_hook` という記録係のフックの ID は、アダプタの `aas_stop` にした。
   - claude-live の記録と以前の fixture は `uuid` なしで記録したので、各メッセージに `uuid` を付け、2.1.283 がそのとき出す `command_lifecycle`（`init` の前に `queued` と `started`、`result` のあとに `completed` か `cancelled`）を加えた。
   - `race_notification_turn.jsonl`: 記録では 2 通目のメッセージが CLI のターンの後ろで待ち、そのあとで実行された。アダプタはそれを取り下げるので、CLI のターンの `init` のあとに `cancel_async_message` のやりとり（応答 `{"cancelled": true}` と `command_lifecycle cancelled`。形は 2.1.283 のスキーマ）を入れ、待っていたメッセージのターンを、CLI のターンが終わってから送り直したメッセージ（別の `uuid`）のターンにした。
+  - `session_approvals.jsonl`: 記録係が 4 ターン目のあとに送った `set_permission_mode acceptEdits` を除いた。その前の承認（「このセッションは許可」）で CLI はすでに acceptEdits になっていて（`system/status`）、アダプタはそれを知っているので何も送らない。
+  - rec2 の記録（2.1.284）から作った fixture:
+    - 利用者のパスは `C:\Users\user\proj` と `C--Users-user-proj`、利用者名は `user`、メールアドレスは `user@example.com` に置き換えた。`initialize` の応答は `current_permission_mode`、`fast_mode_state`、`fast_mode_disabled_reason`、コマンド 9 個（`clear`、`compact`、`code-review`、`color`、`context`、`rename`、`fast`、`heapdump`、`init`）、モデル 4 個に、`system/init` は使う欄とその 9 個のコマンド名に縮めた。`rate_limit_event` と記録係の `meta` / `ps` の行は除いた。思考の `signature` は `sig` にした。
+    - 記録係は `get_context_usage` を送らなかったので、各 `result` の直後にそのやりとりを加えた（`totalTokens` は 30000 + ターンの番号 × 1000）。
+    - 記録係だけが送った確認用の要求とその応答を除いた: b1 の別のセッション ID と `source` なしでの `rename_session`、最後の `get_usage`、e1 の `get_settings` と送り直した `initialize`、f1b の知らない `tool_use_id` と `tool_use_id` なしの `background_tasks`、h1 の送り直した `initialize`。b1 の 2 回目の `get_usage` には、アダプタと同じく `skip_behaviors: true` を付けた。除いた 2 回目の名前の変更でセッション名が変わっていたので、`get_status` の応答のセッション名を最初の名前（`Rec2 host title`）にした。
+    - `steer_next_run.jsonl`: `result` の直後に `cancel_async_message` の要求を、steer の `started` の直後にその応答 `{"cancelled": false}` を加えた（アダプタが送る取り下げ。記録係は送らなかった）。
+    - `steer_returned.jsonl`: 取り下げが先に届いた形にした。`result` の直後に `cancel_async_message` の要求、`command_lifecycle cancelled`、応答 `{"cancelled": true}` を加え（形は記録 a3）、steer の実行を、エンジンが送り直したメッセージ（別の `uuid`、`queued` / `started` / `completed` 付き）の実行にした。
   - 元の記録とその変換のスクリプトは、利用者のアカウント情報を含むのでリポジトリに入れない。変換の手順は、この一覧がすべて。
-- 手書きの台本で確かめること: エラーの `result`（`get_context_usage` の error 応答で context なし）、CLI が自分で始めたターン（次のターンが先に始まったら、遅れて届いた応答を別のターンに付けない。`origin` の `trigger`）、CLI のターン中の `send`（何も書かずに `TurnInProgress`）、取り下げが間に合わず CLI のターンに取り込まれたメッセージ（そのターンが利用者のターン）、CLI が断ったメッセージ、ultracode の確認（有効・モデル変更で無効・戻して有効・既定に戻す。応答は u1 / u5 の形）と ultracode での起動の失敗、期限切れの回答、予約した起床を止められないこと、起床で始まったターンが一覧なしで終わったときの一度だけの起床（ライブから外れ、利用者のターンの中断では外れず、次の一覧で戻るか終わる。16章）、ターン途中のプロセス終了、画像とメンション、詰まった書き込みがあっても止まれる shutdown、応答しない中断。
+- 手書きの台本で確かめること: 断られた steer の `SteerReturned`、`result` のあと・`TurnCompleted` のあとの steer、`msg_lifecycle_v1` のない CLI での steer、ターンの完了のあとに届いた取り下げ（`steerNotDelivered`）、プランモードと高速モード（プランモード中の権限モードの変更）、以前の版の権限モード `plan` を持つスレッドでプランモードを出ると `default` を送り、そのあと CLI がプランモードだと報告したらエンジンに出すこと、プランモードの状態の `get_plan` と失敗した `get_usage` の節、バックグラウンドへ移せない作業と `backgrounded: false`、`commands_changed` と `init` のコマンドの一覧、起動を断った `result`、断られた名前の変更と答えのない質問、エラーの `result`（`get_context_usage` の error 応答で context なし）、CLI が自分で始めたターン（次のターンが先に始まったら、遅れて届いた応答を別のターンに付けない。`origin` の `trigger`）、CLI のターン中の `send`（何も書かずに `TurnInProgress`）、取り下げが間に合わず CLI のターンに取り込まれたメッセージ（そのターンが利用者のターン）、CLI が断ったメッセージ、ultracode の確認（有効・モデル変更で無効・戻して有効・既定に戻す。応答は u1 / u5 の形）と ultracode での起動の失敗、期限切れの回答、予約した起床を止められないこと、起床で始まったターンが一覧なしで終わったときの一度だけの起床（ライブから外れ、利用者のターンの中断では外れず、次の一覧で戻るか終わる。16章）、ターン途中のプロセス終了、画像とメンション、詰まった書き込みがあっても止まれる shutdown、応答しない中断。
 - `crates/aas-testkit/tests/adapter_start_cancel.rs`: ハンドシェイクの途中で `start` を捨てると段階停止されること。
 - 実物のテスト（`tests/live.rs`、`AAS_LIVE_TESTS=1 cargo test -p aas-adapter-claude --test live -- --ignored`。トークンを使う）:
   - 1ターン目の `TurnCompleted` にコンテキストの使用量が付くこと、承認、履歴、再開、中断。
   - `live_background_bash_stop_scheduled_wakeup_and_ultracode`: バックグラウンドの Bash（ライブ、起動したアイテムが `backgrounded`）を `stop_background` で止めて `stopped` が届くこと、`CronCreate` の起床（ライブ、止められない）と `CronDelete` での `stopped`、ultracode が sonnet で有効になり haiku ではエラーになること（モデル呼び出しなし）、プロセスが残らないこと。
   - `live_background_agent_completion_starts_a_marked_run`: バックグラウンドのエージェントの承認がそのエージェントに属すること、その完了のあとに CLI が始めるターンに `trigger: backgroundTask` が付くこと。
-  - テストが作ったセッションのトランスクリプト、`session-env`、バックグラウンドタスクの出力フォルダ（`%TEMP%\claude\<プロジェクト>\<セッション ID>`）は、テストの終わりに消す。
+  - `live_steer_side_question_rename_status_and_background`: プロセスなしとありの状態、ツールの区切りで取り込まれる steer（答えに反映、`SteerReturned` なし）、実行中の `side_question`、名前の変更が CLI の状態に出ること、前面のコマンドのバックグラウンドへの移動（`backgrounded` の Item とタスク）。
+  - `live_plan_mode_anchors_and_forks_at_a_turn`: 起動時のプランモード、`proposedPlan`、プランの承認のあとにプランモードが切れること、ライブのアンカーと履歴のアンカーが一致すること、あるターンでの fork とその直前での fork（覚えている単語で確かめる）、知らないアンカーへの fork が CLI の文で断られること。
+  - `live_fast_mode`: opus の高速モード（`fastModeModels`、`fast_mode_state: on`）と、切ること。
+  - `live_a_legacy_plan_permission_mode_is_plan_mode`: 以前の版の権限モード `plan` を持つスレッドの起動で、CLI が自分の既定の権限モードで起動してからプランモードに入り（`ModesReported { plan: true }`）、プランモードを出ると `plan` 以外の権限モードが報告されること（モデルは呼ばない。2.1.284 で確かめた）。
+  - テストが作ったセッションのトランスクリプト、`session-env`、バックグラウンドタスクの出力フォルダ（`%TEMP%\claude\<プロジェクト>\<セッション ID>`）、プランモードで CLI が書いたプランのファイル（`~/.claude/plans`）は、テストの終わりに消す（途中で失敗しても消す）。
+
+## 19. ハーネスの拡張機能（`features`）
+
+`HarnessAdapter::features`（design.md 9.6）で Claude Code が出すもの。
+
+| 機能 | Claude Code の仕組み | 種類（2.1.284 のスキーマ） |
+|---|---|---|
+| `forkAtTurn`、`forkWhileHeld` | `--resume=<id> --resume-session-at=<uuid> --fork-session` | 隠しフラグ（SDK の `resumeSessionAt`） |
+| `rename` | `rename_session {title, source, session_id}` | 公開（SDK の `renameSession`） |
+| `status` | `get_status` / `get_usage {skip_behaviors}` / `get_plan` | `@internal` / 実験的 / `@internal` |
+| `sideQuestion` | `side_question {question}` | 公開 |
+| `moveToBackground` | `background_tasks {tool_use_id}` | 公開 |
+| `planMode` | 権限モード `plan`（`set_permission_mode`）、`ExitPlanMode` | 公開 |
+| `fastModeModels` | `apply_flag_settings {fastMode}`、`models[].supportsFastMode`、`fast_mode_state` | 公開 |
+
+`projectTrust` は出さない（Claude Code のプロジェクトの信頼は CLI 自身の設定で、`-p` では確認を出さない）。
+
+### 19.1 途中のターンからの fork
+
+- アンカー: 3章（ライブ）と 10章（履歴）。形は `{"leafUuid": <uuid>}`。
+- 「ここから分岐」（そのターンを含む）: `--resume-session-at=<そのターンのアンカー>`。記録 g2: 3 ターンのセッションを 2 ターン目で fork すると、答えは「1. APPLE 2. BANANA」。
+- 「このプロンプトを編集」（そのターンの前まで、`before`）: `--resume-session-at=<前のターンのアンカー>`（`ForkPoint::previous`。エンジンが、エージェントに届いたいちばん近い前のターンの、同じセッションのアンカーを渡す。design.md 9.6）。それがなければ、`check_fork_point` が断るので `thread/fork` が `invalidState` で答え、スレッドは作られない。エージェントに届いたターンがその前にないときは、エンジンが新しいセッションにする。記録 g3b: 2 ターン目の前で fork すると「1. APPLE」。
+- `--resume-drops-turn=<プロンプトの uuid>` は使わない。落とすターンのあとに別のターンがあると CLI が断る（記録 g3a: 「Resume rejected by --resume-drops-turn: … range contains a user entry not attributable to the declared turn」、終了コード 1）。最後のターンなら受け付ける（g4）が、`--resume-session-at` だけで同じ結果になる。
+- fork のトランスクリプトはコピーした要素の `uuid` を保つので、元のセッションで記録したアンカーは fork の fork でも使える。コピーしたプロンプトの `promptId` は書き換わる（10章）。
+- 知らないアンカー: 起動を断る（1章。「No message found with message.uuid of: …」）。
+- 別のプロセスが持っているセッション（`forkWhileHeld`）: `-p` のプロセスは `~/.claude/sessions` に `kind: "interactive"` として登録され、そのセッションの再開も fork も受け付けられた（記録 g7）。CLI が再開を断るのはバックグラウンドのセッションが持っているときだけで、その文は `--fork-session` を勧める（コードによる [推測]）。
+
+### 19.2 名前の変更
+
+- `rename_session {title, source: "host", session_id: <今のセッション>}`。`source: "host"` は「ホストのアプリで利用者が付けた名前」で、CLI は利用者の名前の変更として扱う。`session_id` を付けると、プロセスが別のセッションに移っていたら CLI が断る（「session_id is not the current session」。記録 b1）。
+- 応答は本文なしの success。stdout には何も出ない。名前はトランスクリプトの `custom-title` と `agent-name`（プロセスの終わりにも書き足される）と、`<projects>\<cwd>\<セッション ID>\custom-title.json` に残り、`get_status` の「Session name」に出る。
+- ほかのプロセスでの名前の変更は stdout に出ないので、動いているスレッドには反映しない（design.md 1章の範囲外）。取り込みでは `custom-title` をタイトルにする。`-p` の CLI は `ai-title` を書かなかった（rec2 のどのトランスクリプトにもない）。
+
+### 19.3 ハーネスの状態（`/status`）
+
+| 要求 | 節 |
+|---|---|
+| `get_status`（`@internal`。「the rows of the terminal's /status screen …, every value already rendered as text」） | CLI の節と行をそのまま（2.1.284: 「Session」（Version、Session name、Session ID、Session kind、Peer address、cwd、Login method、Organization、Email）、「Environment」（Model、MCP servers、Setting sources、Auto mode server））。値が null の行は空の文字列 |
+| `get_usage {skip_behaviors: true}`（実験的。「Experimental — the response shape may change」） | 「Plan usage」: `subscription_type`（Plan）、`rate_limits.limits[]` の各行（`kind` の表: `session` → Current session、`weekly_all` → Current week (all models)、`weekly_scoped` → Current week (<`scope.model.display_name`>)、ほかは `kind` のまま。値は `<percent>% used, resets <resets_at>`、`severity` が normal 以外なら括弧で付ける）、`rate_limits.spend`（Usage credits: 有効なら使用率、無効なら `disabled_reason`）、`rate_limits_available: false` なら「Rate limits: not available」。「Session usage」: `session` の費用、時間、変更した行数、モデルごとのトークン |
+| `get_plan`（`@internal`。`{exists, content?, path?}`） | プランモードの間だけ聞く。`exists` なら「Plan」（File、Plan の本文）。アプリの `/plan` の「今のプランを見る」はこの節で見られる |
+
+- `skip_behaviors: true` にするのは、`behaviors` を作るために 7 日分のトランスクリプトを走査するから（記録 b1: 付けると 0.36 秒、付けないと 24.5 秒と 5.9 秒）。`behaviors` は出さない。
+- `get_status` が失敗すれば `status` はエラー。`get_usage` と `get_plan` の失敗は、その節の代わりに「Error」の行（エラーの文）を出す。
+- プロセスが動いていないとき（`HarnessAdapter::status`）は、`--no-session-persistence` のプロセスを起動して `get_usage` だけを聞き、「Plan usage」を出す（`get_status` はそのプロセスのセッションを説明するので出さない。design.md 1章の範囲外）。モデルの呼び出しは起きない。
+- `get_status` にはアカウントのメールアドレスと組織が入る（利用者自身のスマホにだけ出る）。
+
+### 19.4 会話に入らない質問（`/btw`）
+
+- `side_question {question}` → `{response, synthetic}`（SDK では `response: null` は答えなし、`refusal_fallback` が付くことがある）。応答の前に `system/control_request_progress {request_id, status: "started"}` が届く（無視する）。
+- ターンの実行中にも答える（記録 b1: Bash の実行中に 2.2 秒で答え、ターンに影響しなかった）。トランスクリプトには何も残らず、次のターンでもモデルはその質問を知らなかった（b1 の L109、L188）。
+- `history`（前の質問と答え）は送らない。
+
+### 19.5 実行中の作業のバックグラウンドへの移動（Ctrl+B）
+
+- 移せる印: 動いているターンのツール（Bash、PowerShell、Agent など）の `tool_use_id` を持つ `task_started {is_backgrounded: false}`。これを受けたら、そのツールの Item に `ItemBackgroundable { backgroundable: true }` を出す。Bash は開始の約 5.6〜6.6 秒後に、Agent はツールの直後に届く（記録 a1、b1、f1b、f2、f3）。それより前の `background_tasks` には CLI が `{backgrounded: false}` を返す（記録 f3）ので、時間ではなくこの印で決める。
+- `move_to_background`: `background_tasks {tool_use_id}`。応答 `{backgrounded: true}` で `Ok`、それ以外は `Harness` エラー。
+- そのあと CLI は `background_tasks_changed`、`task_updated {patch: {is_backgrounded: true}}`、応答の順に出し、ツールの結果が作業のバックグラウンド化を示す（Bash: `tool_use_result.backgroundTaskId`、`backgroundedByUser: true`。Agent: `status: "async_launched"`）。15章の「起動したアイテム」の規則で Item が `backgrounded` になり、タスクが続く。Bash のターンは続き、Agent のターンは終わる（記録 f1b、f2）。
+- サブエージェントの中のツール（`owned_by_subagent`）は Item がないので出さない。
+
+### 19.6 プランモード（アプリの `/plan`）
+
+- `features.planMode`: `implementPrompt` と `newThreadPreamble` はなし。Claude Code はプランの承認（ExitPlanMode）で自分で実装に進むので、実装のために送る文がない。
+- オン: `set_permission_mode plan`（スレッドの権限モードから入るので、CLI はプランの承認のあとそこへ戻る）。オフ: `set_permission_mode <スレッドの権限モード>`（ないときは `default`）。`plan` は戻る先にしない: CLI が `plan` のときに `set_permission_mode plan` を送っても何も変わらず、`system/status` も来ないので、アプリの表示だけがプランモードを出て CLI はプランモードのままになる（以前の版の権限モード `plan` を持つスレッドで起きた）。
+- アダプタがプランモードを変えたあとは、CLI の次のプランモードの報告を必ずエンジンに出す（`reported_plan` を空にする）。CLI が結局プランモードのまま、または出たと報告したときに、アプリの表示がそれに追従する。
+- プランは `ExitPlanMode` のツールの入力 `plan` で届く。その Item を `proposedPlan` にし、承認の要求（件名 `plan`）で利用者が決める。承認の要求には `permission_suggestions` がない（記録 h1）。プランモードの間、CLI はプランのファイル（`~/.claude/plans/<slug>.md`）を承認なしで書く。
+- 承認されると CLI はプランモードを出て元の権限モードを報告し（`system/status`）、`modes.plan` が切れる（7章）。
+- 今のプランは `get_plan` で状態に出す（19.3）。
+
+### 19.7 高速モード
+
+- `features.fastModeModels`: プローブの `initialize.models` のうち `supportsFastMode: true` のもの（2.1.284: `opus`、`claude-opus-5`、`claude-opus-4-8`）。
+- オン・オフ: `apply_flag_settings {settings: {fastMode: true | false}}`。SDK では高速モードに opt-in が要り（最初の `fast_mode_disabled_reason: "sdk_opt_in_required"`）、この `fastMode` が opt-in と切り替えを兼ねる（記録 e1: `true` で次の `init` と `result` が `on`、`false` で `off` と `sdk_opt_in_required` に戻る）。対応しないモデルでは `true` でも `off`（e2）。
+- 状態: `initialize`、`system/init`、`result` の `fast_mode_state`（`off` / `cooldown` / `on`）を、変わったときに `ModesReported { fast_state }` で出す（`Thread.fastModeState`、表示だけ）。
+- `fast_mode_state` は CLI の意図で、実際に速く処理されたかではない。記録 e1 では、サーバが断って（`system/notification` `fast-mode-overage-rejected`「Fast mode disabled · usage credits exhausted」。4章で Notice になる）標準の速さで処理され（`usage.speed: "standard"`）、それでも `fast_mode_state` は `on` のままだった。利用上限の理由（`out_of_credits`）では CLI は高速モードを入れたままにし、ターンごとに知らせを繰り返す。
+

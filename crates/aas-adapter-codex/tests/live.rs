@@ -3,23 +3,31 @@
 //! Run with: `AAS_LIVE_TESTS=1 cargo test -p aas-adapter-codex --test live -- --ignored`
 //!
 //! * `live_codex_round_trip` spends one small turn of the configured model.
-//! * `live_codex_background_work` runs the installed app-server against a scripted model
-//!   (`mock_model`, a local Responses API endpoint) in a temporary `CODEX_HOME`: no tokens, and
-//!   nothing of the user's Codex configuration or sessions is read or written.
+//! * `live_codex_background_work` and `live_codex_features` run the installed app-server
+//!   against a scripted model (`mock_model`, a local Responses API endpoint) in a temporary
+//!   `CODEX_HOME`: no tokens, and nothing of the user's Codex configuration or sessions is read
+//!   or written.
+//! * `live_codex_texts_match_the_installed_binary` reads the installed Codex binary (no
+//!   process).
 
 mod mock_model;
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use aas_adapter_codex::CodexAdapter;
 use aas_harness::protocol::{BackgroundTaskKind, HarnessKind, ItemBody, ItemStatus};
 use aas_harness::{
-    AdapterContext, AdapterEvent, AdapterPolicy, BackgroundState, BackgroundTaskInfo,
-    CommandContext, HarnessAdapter, HarnessConfig, SessionHandle, StartMode, StartRequest,
-    ThreadId, ThreadSettings, TurnInput, TurnStatus,
+    AdapterContext, AdapterError, AdapterEvent, AdapterPolicy, BackgroundState, BackgroundTaskInfo,
+    CommandContext, ForkPoint, HarnessAdapter, HarnessConfig, SessionControl, SessionHandle,
+    StartMode, StartOptions, StartRequest, ThreadId, ThreadModes, ThreadSettings, TurnInput,
+    TurnStatus,
 };
 use aas_supervisor::{StopReason, Supervisor, SupervisorPolicy};
-use mock_model::{LONG, MockModel, SHORT, WORKER_CMD, background_script};
+use mock_model::{
+    LONG, MockModel, PLAN_BODY, SHORT, WORKER_CMD, background_script, features_script,
+};
 use serde_json::Value;
 
 fn live_enabled() -> bool {
@@ -123,6 +131,7 @@ async fn live_codex_round_trip() {
         .commands(CommandContext {
             cwd: ws.clone(),
             native_session_id: Some(native.clone()),
+            project_trusted: None,
         })
         .await
         .unwrap();
@@ -423,4 +432,481 @@ async fn live_codex_background_work() {
         0,
         "no supervised process may outlive the test"
     );
+}
+
+// ----- the port's features against a scripted model -------------------------------------------
+
+/// An adapter of the installed CLI whose `CODEX_HOME` is `home` (the scripted model's).
+fn scripted_adapter(
+    home: &std::path::Path,
+    supervisor: &Supervisor,
+    state: &std::path::Path,
+) -> CodexAdapter {
+    CodexAdapter::new(
+        HarnessConfig {
+            id: "codex".into(),
+            kind: HarnessKind::Codex,
+            display_name: None,
+            command: "codex".into(),
+            args: Vec::new(),
+            env: [("CODEX_HOME".to_owned(), home.to_string_lossy().into_owned())].into(),
+            options: Value::Null,
+        },
+        AdapterContext {
+            supervisor: supervisor.clone(),
+            state_dir: state.join("codex"),
+            policy: AdapterPolicy::default(),
+        },
+    )
+}
+
+fn anchor_of(events: &[AdapterEvent]) -> Value {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AdapterEvent::TurnAnchor { anchor } => Some(anchor.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no anchor: {events:#?}"))
+}
+
+/// Sends `text` and returns the events up to its turn's end.
+async fn run_turn(
+    ev: &mut Events<'_>,
+    control: &Arc<dyn SessionControl>,
+    text: &str,
+) -> Vec<AdapterEvent> {
+    let from = ev.seen.len();
+    control.send(TurnInput::text(text)).await.unwrap();
+    let done = ev
+        .until(&format!("the turn of {text:?}"), |e| {
+            matches!(e, AdapterEvent::TurnCompleted { .. })
+        })
+        .await;
+    assert!(
+        matches!(
+            done,
+            AdapterEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            }
+        ),
+        "{done:?}"
+    );
+    ev.seen[from..].to_vec()
+}
+
+/// Plan mode, fast mode, rename, `/init`, the inline review, goals, the status, a thread another
+/// app-server holds (resume refused, forks at a turn accepted) and anchored history, with the
+/// installed app-server and a scripted model.
+#[tokio::test]
+#[ignore = "runs the installed codex CLI; set AAS_LIVE_TESTS=1 and pass --ignored"]
+async fn live_codex_features() {
+    if !live_enabled() {
+        eprintln!("AAS_LIVE_TESTS not set; skipping");
+        return;
+    }
+    let model = MockModel::start(features_script).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("hello.txt"), "Hello world\n").unwrap();
+    let home = mock_model::codex_home(dir.path(), &model.base_url);
+    let state = dir.path().join("state");
+    let supervisor = Supervisor::new(
+        &state,
+        SupervisorPolicy {
+            prevent_sleep: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let adapter = scripted_adapter(&home, &supervisor, &state);
+
+    // The probe learns the fast mode of Codex's bundled GPT models.
+    let info = adapter.probe().await;
+    assert!(info.available, "{:?}", info.unavailable_reason);
+    let features = adapter.features();
+    let fast_model = features
+        .fast_mode_models
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("no fast mode model: {features:?}"));
+    let plan = features.plan_mode.clone().expect("plan mode");
+    assert_eq!(
+        plan.implement_prompt.as_deref(),
+        Some(aas_adapter_codex::IMPLEMENT_PLAN_PROMPT)
+    );
+    assert!(
+        features.fork_at_turn && features.fork_while_held && features.rename && features.status
+    );
+
+    // A thread that starts in plan mode and fast mode.
+    let settings = ThreadSettings {
+        model: Some(fast_model.clone()),
+        permission_mode: Some("fullAccess".into()),
+        ..Default::default()
+    };
+    let mut session = adapter
+        .start_with(
+            StartRequest {
+                thread_id: ThreadId::generate(),
+                cwd: ws.clone(),
+                settings: settings.clone(),
+                mode: StartMode::New,
+            },
+            StartOptions {
+                modes: ThreadModes {
+                    plan: true,
+                    fast: true,
+                },
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let native = session.native_session_id.clone().expect("thread id");
+    let control = session.control.clone();
+    let mut ev = Events {
+        session: &mut session,
+        seen: Vec::new(),
+    };
+    ev.until(
+        "the fast mode state",
+        |e| matches!(e, AdapterEvent::ModesReported { fast_state: Some(s), .. } if s == "Fast"),
+    )
+    .await;
+
+    // 1. Plan mode: the proposed plan is an item.
+    let events = run_turn(
+        &mut ev,
+        &control,
+        "ROLE=PLAN# Plan how to make hello.txt say \"Hello, world\".",
+    )
+    .await;
+    let plan_anchor = anchor_of(&events);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::ModesReported {
+                plan: Some(true),
+                ..
+            }
+        )),
+        "{events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e,
+            AdapterEvent::ItemCompleted { body: Some(ItemBody::ProposedPlan { text }), .. }
+                if text.trim_end() == PLAN_BODY)),
+        "{events:#?}"
+    );
+
+    // 2. Implement: plan mode and fast mode off, Codex's own text.
+    control
+        .apply_modes(&ThreadModes {
+            plan: false,
+            fast: false,
+        })
+        .await
+        .unwrap();
+    let events = run_turn(&mut ev, &control, aas_adapter_codex::IMPLEMENT_PLAN_PROMPT).await;
+    let implement_anchor = anchor_of(&events);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::ModesReported {
+                plan: Some(false),
+                ..
+            }
+        )),
+        "{events:#?}"
+    );
+
+    // 3. Rename: Codex echoes the name.
+    control.rename("Live features").await.unwrap();
+    ev.until(
+        "the rename's echo",
+        |e| matches!(e, AdapterEvent::SessionTitle { title } if title == "Live features"),
+    )
+    .await;
+
+    // 4. `/init` sends Codex's own prompt.
+    run_turn(&mut ev, &control, "/init").await;
+
+    // 5. The inline review: the rendered findings, not the reviewer's JSON.
+    let events = run_turn(
+        &mut ev,
+        &control,
+        "/review ROLE=REVIEW# Review hello.txt for wording problems.",
+    )
+    .await;
+    let texts: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ItemCompleted {
+                body: Some(ItemBody::AgentMessage { text }),
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("[P2] Greeting is missing a comma")),
+        "{events:#?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("\"findings\"")),
+        "{texts:#?}"
+    );
+    assert!(events.iter().any(|e| matches!(e,
+        AdapterEvent::ItemCompleted { body: Some(ItemBody::Notice { message, .. }), .. }
+            if message == "Review finished")));
+
+    // 6. The status: the thread, the account (no sign-in with this provider), the rate limits
+    // (Codex refuses to read them without an OpenAI sign-in).
+    let sections = control.status().await.unwrap();
+    let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        ["Codex thread", "Account", "Rate limits"],
+        "{sections:#?}"
+    );
+    let harness_sections = adapter.status(&ws).await.unwrap();
+    assert_eq!(harness_sections.len(), 2, "{harness_sections:#?}");
+
+    // 7. A goal: its command turn, then Codex's continuation, which the model completes.
+    let from = ev.seen.len();
+    control
+        .send(TurnInput::text("/goal ROLE=GOAL# Finish the goal."))
+        .await
+        .unwrap();
+    ev.until("the goal's completion notice", |e| {
+        matches!(e, AdapterEvent::Notice { message, .. }
+            if message == "Goal complete: ROLE=GOAL# Finish the goal.")
+    })
+    .await;
+    ev.until("the continuation's end", |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    let goal_events = ev.seen[from..].to_vec();
+    assert!(goal_events.iter().any(|e| matches!(e,
+        AdapterEvent::Notice { message, .. } if message == "Goal active: ROLE=GOAL# Finish the goal.")));
+    let sections = control.status().await.unwrap();
+    assert!(
+        sections
+            .iter()
+            .any(|s| s.title == "Goal" && s.rows.iter().any(|r| r.value == "complete")),
+        "{sections:#?}"
+    );
+
+    // 7b. Stopping a continuation of an active goal pauses the goal, as Codex's TUI does: the
+    // interrupted turn says so, and Codex reports the goal paused.
+    control
+        .send(TurnInput::text(
+            "/goal ROLE=GOALSTOP# Wait for the command.",
+        ))
+        .await
+        .unwrap();
+    ev.until("the waiting continuation's command", |e| {
+        matches!(e, AdapterEvent::ItemStarted { body: ItemBody::CommandExecution { command, .. }, .. }
+            if command.contains("GOAL_WAITED"))
+    })
+    .await;
+    let from = ev.seen.len();
+    control.interrupt().await.unwrap();
+    ev.until("the interrupted continuation's end", |e| {
+        matches!(
+            e,
+            AdapterEvent::TurnCompleted {
+                status: TurnStatus::Interrupted,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(
+        ev.seen[from..].iter().any(|e| matches!(e,
+            AdapterEvent::Notice { message, .. }
+                if message == "Goal paused: ROLE=GOALSTOP# Wait for the command.")),
+        "{:#?}",
+        &ev.seen[from..]
+    );
+    let sections = control.status().await.unwrap();
+    assert!(
+        sections
+            .iter()
+            .any(|s| s.title == "Goal" && s.rows.iter().any(|r| r.value == "paused")),
+        "{sections:#?}"
+    );
+
+    // 8. Another app-server cannot resume the thread this one holds, but forks it at a turn.
+    let adapter_b = scripted_adapter(&home, &supervisor, &dir.path().join("state-b"));
+    assert!(adapter_b.probe().await.available);
+    let resumed = adapter_b
+        .start(StartRequest {
+            thread_id: ThreadId::generate(),
+            cwd: ws.clone(),
+            settings: settings.clone(),
+            mode: StartMode::Resume {
+                native_session_id: native.clone(),
+            },
+        })
+        .await;
+    match resumed {
+        Err(error @ AdapterError::Harness(_)) => {
+            assert!(
+                error.detail().contains("already has an active writer"),
+                "{error}"
+            );
+        }
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("a thread another app-server holds was resumed"),
+    }
+    for (anchor, before, role) in [
+        (&plan_anchor, false, "FORKED"),
+        (&implement_anchor, true, "BEFORE"),
+    ] {
+        let mut fork = adapter_b
+            .start_with(
+                StartRequest {
+                    thread_id: ThreadId::generate(),
+                    cwd: ws.clone(),
+                    settings: settings.clone(),
+                    mode: StartMode::Fork {
+                        native_session_id: native.clone(),
+                    },
+                },
+                StartOptions {
+                    fork_at: Some(ForkPoint {
+                        anchor: anchor.clone(),
+                        before,
+                        previous: None,
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("fork at {anchor} (before: {before}): {e}"));
+        assert_ne!(fork.native_session_id.as_deref(), Some(native.as_str()));
+        let fork_control = fork.control.clone();
+        let mut fork_ev = Events {
+            session: &mut fork,
+            seen: Vec::new(),
+        };
+        run_turn(
+            &mut fork_ev,
+            &fork_control,
+            &format!("ROLE={role}# prompt on the fork"),
+        )
+        .await;
+        fork_control.shutdown(StopReason::Shutdown).await;
+        while fork.events.recv().await.is_some() {}
+    }
+
+    // 9. The history carries the turns' anchors, the ones the live turns reported.
+    let (history, anchors) = adapter
+        .read_native_history_anchored(&ws, &native)
+        .await
+        .unwrap();
+    assert_eq!(history.turns.len(), anchors.len());
+    assert!(anchors.contains(&Some(plan_anchor.clone())), "{anchors:?}");
+    assert!(
+        anchors.contains(&Some(implement_anchor.clone())),
+        "{anchors:?}"
+    );
+
+    assert!(
+        ev.seen
+            .iter()
+            .all(|e| !matches!(e, AdapterEvent::Native { .. })),
+        "native events: {:#?}",
+        ev.seen
+    );
+    let sampled = model.sampled.lock().clone();
+    eprintln!("scripted model answered: {sampled:#?}");
+    let find = |role: &str| {
+        sampled
+            .iter()
+            .find(|s| s.role.as_deref() == Some(role))
+            .unwrap_or_else(|| panic!("no {role} request: {sampled:#?}"))
+            .clone()
+    };
+    let planned = find("PLAN");
+    assert_eq!(planned.mode.as_deref(), Some("plan"), "{planned:?}");
+    assert_eq!(
+        planned.service_tier.as_deref(),
+        Some("priority"),
+        "{planned:?}"
+    );
+    let implemented = find("IMPL");
+    assert_eq!(
+        implemented.mode.as_deref(),
+        Some("default"),
+        "{implemented:?}"
+    );
+    assert_eq!(implemented.service_tier, None, "{implemented:?}");
+    assert_eq!(
+        implemented.user_text,
+        aas_adapter_codex::IMPLEMENT_PLAN_PROMPT
+    );
+    assert_eq!(find("INIT").user_text, aas_adapter_codex::INIT_PROMPT);
+    // The first turn on each fork states the mode Codex does not carry over.
+    assert_eq!(find("FORKED").mode.as_deref(), Some("default"));
+    assert_eq!(find("BEFORE").mode.as_deref(), Some("default"));
+    assert!(
+        sampled.iter().all(|s| !s.reply.contains("MOCK_")),
+        "{sampled:#?}"
+    );
+    assert!(model.errors.lock().is_empty(), "{:?}", model.errors.lock());
+
+    control.shutdown(StopReason::Shutdown).await;
+    while session.events.recv().await.is_some() {}
+    assert_eq!(
+        supervisor.running_count(),
+        0,
+        "no supervised process may outlive the test"
+    );
+}
+
+/// The texts the adapter sends in Codex's place (`/init`, plan mode's implement texts) appear in
+/// the installed Codex binary word for word (its Windows build embeds them with CRLF). Reads the
+/// binary of the npm package next to the resolved `codex` launcher; no process runs.
+#[test]
+#[ignore = "reads the installed codex CLI; set AAS_LIVE_TESTS=1 and pass --ignored"]
+fn live_codex_texts_match_the_installed_binary() {
+    if !live_enabled() {
+        eprintln!("AAS_LIVE_TESTS not set; skipping");
+        return;
+    }
+    let launcher = aas_supervisor::resolve_program("codex").expect("codex on PATH");
+    // The npm package layout (test-only knowledge; the adapter never looks inside the package).
+    let binary = launcher
+        .parent()
+        .expect("launcher directory")
+        .join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .join("node_modules")
+        .join("@openai")
+        .join("codex-win32-x64")
+        .join("vendor")
+        .join("x86_64-pc-windows-msvc")
+        .join("bin")
+        .join("codex.exe");
+    let bytes = std::fs::read(&binary).unwrap_or_else(|e| panic!("{}: {e}", binary.display()));
+    let find = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    for (name, text) in aas_adapter_codex::testing::CODEX_TEXTS {
+        let crlf = text.replace('\n', "\r\n");
+        assert!(
+            find(text.as_bytes()) || find(crlf.as_bytes()),
+            "the {name} of codex-cli {} is not in {}",
+            aas_adapter_codex::CODEX_TEXTS_VERSION,
+            binary.display()
+        );
+    }
 }

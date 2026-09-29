@@ -1,5 +1,9 @@
+@file:OptIn(ExperimentalSerializationApi::class)
+
 package dev.aas.android.protocol
 
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 
@@ -122,6 +126,11 @@ data class ProjectUpdateParams(
     val projectId: ProjectId,
     val name: String? = null,
     val defaults: ProjectDefaults? = null,
+    /**
+     * The user's trust decisions for harnesses with the feature `projectTrust`, merged into
+     * `Project.harnessTrust` (only the harnesses named here change).
+     */
+    val harnessTrust: Map<String, Boolean>? = null,
 )
 
 @Serializable
@@ -216,10 +225,26 @@ data class ThreadUpdateParams(
     val settings: ThreadSettings? = null,
     /** Pins (`true`) or unpins (`false`) the thread. */
     val pinned: Boolean? = null,
+    /** Plan mode and fast mode (only the fields present change). */
+    val modes: ThreadModesUpdate? = null,
 )
 
 @Serializable
-data class ThreadUpdateResult(val thread: Thread, val settingsOutcome: SettingsOutcome? = null)
+data class ThreadUpdateResult(
+    val thread: Thread,
+    /** How `settings` and `modes` reach the agent (present when either was given). */
+    val settingsOutcome: SettingsOutcome? = null,
+    /** What happened to the native session's name (a `title` on a harness with the feature `rename`). */
+    val nativeRename: NativeRename? = null,
+)
+
+/** The native session's side of a rename (`thread/update { title }`). */
+@Serializable
+data class NativeRename(
+    val status: NativeRenameStatus,
+    /** The harness's reason, verbatim (`failed` only). */
+    val message: String? = null,
+)
 
 @Serializable
 data class ThreadArchiveParams(
@@ -230,8 +255,17 @@ data class ThreadArchiveParams(
     val force: Boolean = false,
 )
 
+/**
+ * `thread/fork`: the whole session, or (with [atTurnId]) up to and including that turn, or with
+ * [before] up to right before it (「このプロンプトを編集」).
+ */
 @Serializable
-data class ThreadForkParams(val clientRequestId: String, val threadId: ThreadId, val atTurnId: TurnId? = null)
+data class ThreadForkParams(
+    val clientRequestId: String,
+    val threadId: ThreadId,
+    val atTurnId: TurnId? = null,
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val before: Boolean = false,
+)
 
 @Serializable
 data class ThreadStopParams(val clientRequestId: String, val threadId: ThreadId)
@@ -357,6 +391,30 @@ data class BackgroundTaskStopParams(val clientRequestId: String, val threadId: T
 @Serializable
 data class BackgroundTaskResult(val task: BackgroundTask)
 
+// ----- harness status, side questions, items ----------------------------------------------------
+
+@Serializable
+data class ThreadHarnessStatusParams(val threadId: ThreadId)
+
+/**
+ * The harness's own status in its sections and words (display only). [live]: from the thread's
+ * running agent; otherwise from the harness without a session.
+ */
+@Serializable
+data class ThreadHarnessStatusResult(val sections: List<StatusSection>, val live: Boolean)
+
+/** A question beside the conversation (Claude Code's `/btw`): answered by the running agent, not stored. */
+@Serializable
+data class ThreadSideQuestionParams(val threadId: ThreadId, val question: String)
+
+/** [answer] verbatim (absent: the harness gave none); [synthetic]: not the model's answer. */
+@Serializable
+data class ThreadSideQuestionResult(val answer: String? = null, val synthetic: Boolean = false)
+
+/** Asks the harness to move a running item's work to the background (Claude Code's Ctrl+B). */
+@Serializable
+data class ItemMoveToBackgroundParams(val clientRequestId: String, val threadId: ThreadId, val itemId: ItemId)
+
 /** Every method of protocol v1, typed. */
 object Methods {
     val Initialize = RpcMethod("initialize", false, InitializeParams.serializer(), InitializeResult.serializer())
@@ -404,6 +462,11 @@ object Methods {
     val OperationCancel = RpcMethod("operation/cancel", true, OperationCancelParams.serializer(), OperationResult.serializer())
     val BackgroundTaskStop =
         RpcMethod("backgroundTask/stop", true, BackgroundTaskStopParams.serializer(), BackgroundTaskResult.serializer())
+    val ThreadHarnessStatus =
+        RpcMethod("thread/harnessStatus", false, ThreadHarnessStatusParams.serializer(), ThreadHarnessStatusResult.serializer())
+    val ThreadSideQuestion =
+        RpcMethod("thread/sideQuestion", false, ThreadSideQuestionParams.serializer(), ThreadSideQuestionResult.serializer())
+    val ItemMoveToBackground = RpcMethod("item/moveToBackground", true, ItemMoveToBackgroundParams.serializer(), Empty.serializer())
 
     val all: List<RpcMethod<*, *>> = listOf(
         Initialize, Subscribe, Unsubscribe, WorkspaceSnapshot, ServerStatus, DeviceList, DeviceRevoke, HarnessList,
@@ -411,7 +474,7 @@ object Methods {
         FsRoots, FsList, FsMkdir, FsSearch, ThreadList, ThreadGet, ThreadCreate, ThreadRead, ThreadUpdate, ThreadArchive,
         ThreadFork, ThreadStop, ThreadDiff, TurnStart, TurnInterrupt, QueueRemove, QueueResume, QueueUpdate, QueueSteer,
         InteractionRespond, InteractionList, CommandList, NativeList, NativeImport, OperationList, OperationCancel,
-        BackgroundTaskStop,
+        BackgroundTaskStop, ThreadHarnessStatus, ThreadSideQuestion, ItemMoveToBackground,
     )
 
     private val byName = all.associateBy { it.name }

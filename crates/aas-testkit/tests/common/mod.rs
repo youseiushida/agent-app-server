@@ -244,8 +244,11 @@ pub async fn http_post(addr: SocketAddr, path: &str, body: &[u8]) -> (u16, Vec<u
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
-    stream.write_all(head.as_bytes()).await.expect("write head");
-    stream.write_all(body).await.expect("write body");
+    // One write for the head and the body: a server that answers from the head alone and
+    // closes the connection would make a second write fail.
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request).await.expect("write request");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.expect("read response");
     let split = buf

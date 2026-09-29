@@ -9,8 +9,12 @@ import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 
-/** An uploaded image of a draft, with the picked content URI for its thumbnail. */
-data class DraftImage(val localUri: String, val image: UploadedImage)
+/**
+ * An uploaded image of a draft, with the picked content URI for its thumbnail. [localUri] is
+ * `null` for an image only the daemon has: an attachment of a sent message put back into a
+ * composer (「このプロンプトを編集」), whose thumbnail comes from its blob.
+ */
+data class DraftImage(val localUri: String?, val image: UploadedImage)
 
 /** A composer's unsent content. */
 data class Draft(val text: String = "", val mentions: Set<String> = emptySet(), val images: List<DraftImage> = emptyList()) {

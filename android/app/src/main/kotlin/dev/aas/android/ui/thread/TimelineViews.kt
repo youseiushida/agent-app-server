@@ -12,17 +12,25 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalResources
@@ -30,7 +38,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.aas.android.R
+import dev.aas.android.domain.ErrorTexts
+import dev.aas.android.domain.ForkChoices
 import dev.aas.android.domain.InteractionTexts
+import dev.aas.android.domain.ResumeFailedChoices
 import dev.aas.android.domain.timeline.PendingInput
 import dev.aas.android.protocol.Delivery
 import dev.aas.android.protocol.ExpireReason
@@ -45,11 +56,13 @@ import dev.aas.android.protocol.TurnStatus
 import dev.aas.android.protocol.TurnTrigger
 import dev.aas.android.protocol.Usage
 import dev.aas.android.ui.common.LocalAppPolicy
+import dev.aas.android.ui.common.asString
 import dev.aas.android.ui.components.rememberNow
 import dev.aas.android.ui.icons.ExpandLess
 import dev.aas.android.ui.icons.ExpandMore
 import dev.aas.android.ui.icons.HelpOutline
 import dev.aas.android.ui.icons.HourglassEmpty
+import dev.aas.android.ui.icons.MoreHoriz
 import dev.aas.android.ui.icons.Schedule
 import dev.aas.android.ui.icons.Timer
 import dev.aas.android.ui.icons.Unarchive
@@ -60,10 +73,16 @@ import java.util.Locale
 /**
  * The start of a turn: a divider with its number and the model the CLI reported. A turn the
  * agent started by itself says why when the harness told (`Turn.trigger`): "バックグラウンド
- * 作業の完了を受けて" / "予約した時刻に再開".
+ * 作業の完了を受けて" / "予約した時刻に再開". When the thread can be forked at it ([fork]), a
+ * menu offers 「ここから分岐」 and 「このプロンプトを編集」.
  */
 @Composable
-fun TurnStartRow(turn: Turn) {
+fun TurnStartRow(
+    turn: Turn,
+    fork: ForkChoices = ForkChoices.None,
+    onForkHere: () -> Unit = {},
+    onEditPrompt: () -> Unit = {},
+) {
     val reason = when (turn.trigger) {
         null -> null
         TurnTrigger.BackgroundTask -> stringResource(R.string.turn_trigger_background)
@@ -81,16 +100,50 @@ fun TurnStartRow(turn: Turn) {
             overflow = TextOverflow.Ellipsis,
         )
         HorizontalDivider(Modifier.weight(1f))
+        if (fork.any) TurnMenu(turn, fork, onForkHere, onEditPrompt)
+    }
+}
+
+/** The turn's actions: forks at it (protocol.md §4 `thread/fork` with `atTurnId` / `before`). */
+@Composable
+private fun TurnMenu(turn: Turn, fork: ForkChoices, onForkHere: () -> Unit, onEditPrompt: () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { open = true }, modifier = Modifier.size(TURN_MENU_SIZE)) {
+            Icon(Icons.Outlined.MoreHoriz, contentDescription = stringResource(R.string.turn_menu, turn.index + 1), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            if (fork.here) {
+                DropdownMenuItem(text = { Text(stringResource(R.string.fork_here)) }, onClick = {
+                    open = false
+                    onForkHere()
+                })
+            }
+            if (fork.editPrompt) {
+                DropdownMenuItem(text = { Text(stringResource(R.string.fork_edit_prompt)) }, onClick = {
+                    open = false
+                    onEditPrompt()
+                })
+            }
+        }
     }
 }
 
 /**
  * The end of a turn (docs/ux/codex-desktop.md §3.1 ターン末尾のまとめ): how it ended and after how
- * long ("{time}間作業しました" / "{time}後に停止しました"), its token usage, its error, and the
- * files it changed with the way into its diff.
+ * long ("{time}間作業しました" / "{time}後に停止しました"), its token usage, its error (a Japanese
+ * lead-in for its kind, then the harness's words), and the files it changed with the way into its
+ * diff. After a failed resume ([resumeFailed]) it offers 再試行 and, where the harness can fork a
+ * session another process holds, 新しいスレッドに分岐.
  */
 @Composable
-fun TurnEndRow(turn: Turn, onOpenDiff: () -> Unit) {
+fun TurnEndRow(
+    turn: Turn,
+    onOpenDiff: () -> Unit,
+    resumeFailed: ResumeFailedChoices? = null,
+    onRetry: () -> Unit = {},
+    onForkNew: () -> Unit = {},
+) {
     val res = LocalResources.current
     val duration = turn.completedAt?.let { InteractionTexts.duration(res, it - turn.startedAt) }
     val (text, color) = when (turn.status) {
@@ -105,7 +158,23 @@ fun TurnEndRow(turn: Turn, onOpenDiff: () -> Unit) {
             Spacer(Modifier.width(6.dp))
             Text(text, style = MaterialTheme.typography.labelMedium, color = color)
         }
-        turn.error?.let { Text(it.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.statusColors.error) }
+        turn.error?.let { error ->
+            SelectionContainer {
+                Text(ErrorTexts.turnError(error.kind, error.message).asString(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.statusColors.error)
+            }
+        }
+        if (resumeFailed != null) {
+            Text(
+                stringResource(if (resumeFailed.fork) R.string.resume_failed_note_fork else R.string.resume_failed_note),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (resumeFailed.retry) OutlinedButton(onClick = onRetry) { Text(stringResource(R.string.resume_failed_retry)) }
+                if (resumeFailed.fork) OutlinedButton(onClick = onForkNew) { Text(stringResource(R.string.resume_failed_fork)) }
+            }
+        }
         turn.usage?.let { usage -> Text(usageText(usage), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         val diff = turn.diff
         if (diff != null && diff.files > 0) {
@@ -321,6 +390,9 @@ fun ArchivedBanner(onUnarchive: () -> Unit) {
         }
     }
 }
+
+/** The turn menu's button: small, so the divider line stays a line. */
+private val TURN_MENU_SIZE = 32.dp
 
 private const val THOUSAND = 1_000L
 private const val MILLION = 1_000_000L

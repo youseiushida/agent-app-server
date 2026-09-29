@@ -140,7 +140,7 @@ class SyncEngineOutboxTest {
             setOf(
                 "parseError", "invalidRequest", "methodNotFound", "invalidParams", "notFound", "invalidState",
                 "capabilityUnsupported", "idempotencyKeyReused", "pathNotAllowed", "protocolVersionUnsupported",
-                "alreadyExists", "payloadTooLarge",
+                "alreadyExists", "payloadTooLarge", "sessionSwitchingCommand",
             ),
             definitive,
         )

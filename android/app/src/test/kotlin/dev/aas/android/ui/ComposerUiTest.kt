@@ -6,8 +6,13 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.test.assertHeightIsEqualTo
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertTouchHeightIsEqualTo
+import androidx.compose.ui.test.assertTouchWidthIsEqualTo
+import androidx.compose.ui.test.assertWidthIsEqualTo
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -20,6 +25,7 @@ import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.unit.dp
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.aas.android.AppPolicy
@@ -243,6 +249,46 @@ class ComposerUiTest {
         idle()
         compose.onNode(hasTestTag(ComposerTags.SEND) and hasContentDescription("停止")).performClick()
         assertEquals(SendAction.Interrupt, sent.last())
+    }
+
+    /**
+     * The composer is one rounded container (Material 3 `surfaceContainerHigh`) holding the input
+     * (no outline of its own), the chips, the image button and the send button: a filled icon
+     * button of 40 dp with a 48 dp touch target.
+     */
+    @Test
+    fun theComposerIsOneRoundedContainerWithItsInputChipsAndButtons() {
+        send.value = SendState(SendAction.Start, null, null)
+        show()
+        val inContainer = hasAnyAncestor(hasTestTag(ComposerTags.CONTAINER))
+        compose.onNode(hasTestTag(ComposerTags.INPUT) and inContainer).assertIsDisplayed()
+        compose.onNode(hasTestTag(ComposerTags.SEND) and inContainer).assertIsDisplayed()
+        compose.onNode(hasContentDescription("画像を添付") and inContainer).assertIsDisplayed()
+        compose.onNodeWithTag(ComposerTags.SEND)
+            .assertWidthIsEqualTo(40.dp)
+            .assertHeightIsEqualTo(40.dp)
+            .assertTouchWidthIsEqualTo(48.dp)
+            .assertTouchHeightIsEqualTo(48.dp)
+    }
+
+    /** `/plan` and `/btw` from the palette go into the composer: their argument follows, sending runs them. */
+    @Test
+    fun planAndBtwFromThePaletteWaitForTheirArgument() {
+        controller.setPaletteContext(PaletteContext(inThread = true, planMode = true, sideQuestion = true))
+        controller.setCommands(CommandsState.Loaded(Fixtures.result("command_list", CommandListResult.serializer()).commands))
+        show()
+        input.performTextInput("/pl")
+        idle()
+        compose.onNodeWithText("[依頼]").assertIsDisplayed()
+        compose.onNodeWithText("/plan").performClick()
+        idle()
+        assertEquals("/plan ", controller.textValue.text)
+        assertEquals(PaletteChoice.Inserted, choices.last())
+        input.performTextReplacement("/bt")
+        idle()
+        compose.onNodeWithText("/btw").performClick()
+        idle()
+        assertEquals("/btw ", controller.textValue.text)
     }
 
     private companion object {

@@ -10,7 +10,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::error::{CoreError, CoreResult};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 7;
 
 /// SQLite's `auto_vacuum` value for incremental vacuuming (free pages are kept until
 /// `PRAGMA incremental_vacuum` returns them).
@@ -241,6 +241,39 @@ CREATE TABLE background_last_ended (
     task_id TEXT NOT NULL,
     ended TEXT NOT NULL
 ) STRICT;
+"#;
+
+/// v6: what the harnesses' extended features need (design.md §5.5, §9.6). Threads keep their
+/// plan and fast modes (`modes`, JSON; `NULL`: both off) and the harness's last word on fast
+/// mode (`fast_mode_state`), where a fork at a turn branches its source (`fork_at`, JSON, while
+/// `fork_source` waits for the first process), and whether the user's title still has to reach
+/// the native session (`native_rename_pending`). Turns keep the harness's anchor to fork at
+/// (`native_anchor`, JSON). Items say whether their work can be moved to the background now
+/// (`backgroundable`). Projects keep the user's trust decisions per harness (`harness_trust`,
+/// JSON; `NULL`: none). Existing rows get none of these.
+const SCHEMA_V6: &str = r#"
+ALTER TABLE threads ADD COLUMN modes TEXT;
+ALTER TABLE threads ADD COLUMN fast_mode_state TEXT;
+ALTER TABLE threads ADD COLUMN fork_at TEXT;
+ALTER TABLE threads ADD COLUMN native_rename_pending INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turns ADD COLUMN native_anchor TEXT;
+ALTER TABLE items ADD COLUMN backgroundable INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE projects ADD COLUMN harness_trust TEXT;
+"#;
+
+/// v7: where a turn's anchor holds (design.md §9.6). Turns keep the native session their anchor
+/// belongs to once the thread has moved to another one (`anchor_session`; `NULL`: the thread's
+/// current session), and whether their input reached the agent (`delivered`; a turn the agent
+/// started itself did). Rows written before are taken as delivered, except those whose error is
+/// one the engine gives only to turns it never sent: a failed start (`spawnFailed`,
+/// `resumeFailed`, `harnessUnavailable`), a fork refused before its start (`forkOutdated`) and
+/// an interrupt before the agent started (`interrupted`).
+const SCHEMA_V7: &str = r#"
+ALTER TABLE turns ADD COLUMN anchor_session TEXT;
+ALTER TABLE turns ADD COLUMN delivered INTEGER NOT NULL DEFAULT 1;
+UPDATE turns SET delivered = 0
+    WHERE error IS NOT NULL
+      AND json_extract(error, '$.kind') IN ('spawnFailed', 'resumeFailed', 'harnessUnavailable', 'forkOutdated', 'interrupted');
 "#;
 
 /// Connection settings (from [`crate::Policy`]).
@@ -608,6 +641,18 @@ fn migrate(conn: &mut Connection) -> CoreResult<()> {
         tx.pragma_update(None, "user_version", 5)?;
         tx.commit()?;
     }
+    if version < 6 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V6)?;
+        tx.pragma_update(None, "user_version", 6)?;
+        tx.commit()?;
+    }
+    if version < 7 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V7)?;
+        tx.pragma_update(None, "user_version", 7)?;
+        tx.commit()?;
+    }
     // A file created before incremental vacuuming was enabled is rebuilt with it once.
     let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
     if auto_vacuum != AUTO_VACUUM_INCREMENTAL {
@@ -915,6 +960,171 @@ mod tests {
                 (last.task_id, last.ended_at),
                 (task_ended(2, None, false).id, 7)
             );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A version 5 database gains what the extended harness features keep (v6): rows written
+    /// before read back with no modes, no fork point, no pending rename, no turn anchor, no
+    /// backgroundable item and no trust decision; the new columns round-trip.
+    #[tokio::test]
+    async fn a_version_5_database_gains_modes_anchors_and_trust() {
+        use aas_protocol::{ThreadId, TurnId};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        {
+            let mut conn = open_connection(&path, &opts()).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(SCHEMA_V1).unwrap();
+            aas_eventlog::migrate(&tx).unwrap();
+            for schema in [SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5] {
+                tx.execute_batch(schema).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 5).unwrap();
+            tx.execute(
+                "INSERT INTO threads (id, project_id, harness_id, title, title_source, cwd, workspace, settings, status,
+                    usage, created_at, updated_at, last_activity_at)
+                 VALUES ('thr_1', 'prj_1', 'fake', 't', 'user', 'C:\\x', '{\"kind\":\"local\"}', '{}', 'idle',
+                    '{\"inputTokens\":0,\"outputTokens\":0,\"cachedInputTokens\":0,\"reasoningTokens\":0}', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO turns (id, thread_id, idx, status, started_at) VALUES ('trn_1', 'thr_1', 0, 'completed', 1)",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO projects (id, name, path, path_key, created_at, updated_at, defaults)
+                 VALUES ('prj_1', 'p', 'C:\\x', 'c:/x', 1, 1, '{}')",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path, opts()).unwrap();
+        db.write(|tx| {
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(version, SCHEMA_VERSION);
+            let mut thread = crate::store::get_thread(tx, &ThreadId::from("thr_1"))?.unwrap();
+            assert_eq!(thread.modes, aas_protocol::ThreadModes::default());
+            assert_eq!(
+                (
+                    &thread.fast_mode_state,
+                    &thread.fork_at,
+                    thread.native_rename_pending
+                ),
+                (&None, &None, false)
+            );
+            let mut turn = crate::store::get_turn(tx, &TurnId::from("trn_1"))?.unwrap();
+            assert_eq!(
+                (turn.native_anchor.clone(), turn.turn.forkable),
+                (None, false)
+            );
+            let project =
+                crate::store::get_project(tx, &aas_protocol::ProjectId::from("prj_1"))?.unwrap();
+            assert!(project.project.harness_trust.is_empty());
+
+            thread.modes.plan = true;
+            thread.fast_mode_state = Some("on".into());
+            thread.fork_at = Some(aas_harness::ForkPoint {
+                anchor: serde_json::json!({"turn": 3}),
+                before: true,
+                previous: Some(serde_json::json!({"turn": 2})),
+            });
+            thread.native_rename_pending = true;
+            crate::store::update_thread(tx, &thread)?;
+            assert_eq!(crate::store::get_thread(tx, &thread.id)?.unwrap(), thread);
+            turn.native_anchor = Some(serde_json::json!("turn-id"));
+            crate::store::update_turn(tx, &turn)?;
+            let read = crate::store::get_turn(tx, &turn.turn.id)?.unwrap();
+            assert!(read.turn.forkable);
+            assert_eq!(read.native_anchor, turn.native_anchor);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A version 6 database gains where turn anchors hold (v7): turns the engine never sent
+    /// (their error says so) are not delivered, every other turn is; no anchor names another
+    /// native session. Replacing an anchor and moving to another session touch only the anchors
+    /// of the thread's current session.
+    #[tokio::test]
+    async fn a_version_6_database_gains_anchor_sessions_and_delivery() {
+        use aas_protocol::{ThreadId, TurnId};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v6.db");
+        {
+            let mut conn = open_connection(&path, &opts()).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(SCHEMA_V1).unwrap();
+            aas_eventlog::migrate(&tx).unwrap();
+            for schema in [SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6] {
+                tx.execute_batch(schema).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 6).unwrap();
+            let rows = [
+                ("trn_0", 0, "completed", None, Some("{\"turn\":0}")),
+                ("trn_1", 1, "failed", Some("resumeFailed"), None),
+                ("trn_2", 2, "interrupted", Some("interrupted"), None),
+                ("trn_3", 3, "failed", Some("adapterError"), None),
+                ("trn_4", 4, "interrupted", None, Some("{\"turn\":1}")),
+                ("trn_5", 5, "failed", Some("spawnFailed"), None),
+                ("trn_6", 6, "failed", Some("forkOutdated"), None),
+                ("trn_7", 7, "failed", Some("harnessUnavailable"), None),
+            ];
+            for (id, idx, status, kind, anchor) in rows {
+                let error = kind.map(|k| format!("{{\"message\":\"m\",\"kind\":\"{k}\"}}"));
+                tx.execute(
+                    "INSERT INTO turns (id, thread_id, idx, status, started_at, error, native_anchor)
+                     VALUES (?1, 'thr_1', ?2, ?3, 1, ?4, ?5)",
+                    rusqlite::params![id, idx, status, error, anchor],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path, opts()).unwrap();
+        db.write(|tx| {
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(version, SCHEMA_VERSION);
+            let thread = ThreadId::from("thr_1");
+            let turns = crate::store::all_turns(tx, &thread)?;
+            assert_eq!(
+                turns.iter().map(|t| t.delivered).collect::<Vec<_>>(),
+                [true, false, false, true, true, false, false, false]
+            );
+            assert!(turns.iter().all(|t| t.anchor_session.is_none()));
+
+            // A switch keeps the anchors so far with the earlier session; a later anchor of
+            // the same value belongs to the current one and is the only one replaced.
+            crate::store::keep_anchors_with_session(tx, &thread, "ses-1")?;
+            let mut later = crate::store::get_turn(tx, &TurnId::from("trn_3"))?.unwrap();
+            later.native_anchor = Some(serde_json::json!({"turn": 0}));
+            crate::store::update_turn(tx, &later)?;
+            assert!(crate::store::replace_turn_anchor(
+                tx,
+                &thread,
+                &serde_json::json!({"turn": 0}),
+                &serde_json::json!({"turn": 9}),
+            )?);
+            let anchors: Vec<_> = crate::store::all_turns(tx, &thread)?
+                .into_iter()
+                .map(|t| (t.native_anchor, t.anchor_session))
+                .collect();
+            assert_eq!(
+                anchors[0],
+                (Some(serde_json::json!({"turn": 0})), Some("ses-1".into()))
+            );
+            assert_eq!(anchors[3], (Some(serde_json::json!({"turn": 9})), None));
+            assert_eq!(
+                anchors[4],
+                (Some(serde_json::json!({"turn": 1})), Some("ses-1".into()))
+            );
+            assert_eq!(anchors[1], (None, None));
             Ok(())
         })
         .await

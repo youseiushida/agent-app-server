@@ -8,7 +8,8 @@
 //!
 //! A request's *role* is the last `ROLE=<name>#` token in a message item of its input (tool
 //! call arguments and outputs are not messages, so a parent's `spawn_agent` arguments do not
-//! count); its *step* is the number of the script's own calls of that role (call ids
+//! count), or the role of one of Codex's own fixed texts a user message starts with (see
+//! [`FIXED_ROLES`]); its *step* is the number of the script's own calls of that role (call ids
 //! `mock_<role>_<n>`) after that message that already have an output.
 
 // Each test crate that includes this module uses a different subset of it.
@@ -83,6 +84,64 @@ pub fn codex_home(dir: &Path, base_url: &str) -> PathBuf {
     home
 }
 
+/// The command of the `GOALSTOP` continuation: it outlasts the moment the test interrupts.
+pub const GOAL_WAIT: &str = "Start-Sleep -Seconds 60; Write-Output GOAL_WAITED";
+
+/// Roles of user messages that are Codex's own fixed texts (they carry no role token).
+pub const FIXED_ROLES: [(&str, &str); 3] = [
+    ("Implement the plan.", "IMPL"),
+    ("A previous agent produced the plan below", "IMPL_FRESH"),
+    ("Generate a file named AGENTS.md", "INIT"),
+];
+
+/// The plan the `PLAN` role proposes (inside the reply's `<proposed_plan>` block).
+pub const PLAN_BODY: &str = "# Rename greeting
+
+1. Change `hello.txt` so it says `Hello, world`.
+2. Verify the file content.";
+const PLAN_REPLY: &str = "I read the task and prepared a plan.
+
+<proposed_plan>
+# Rename greeting
+
+1. Change `hello.txt` so it says `Hello, world`.
+2. Verify the file content.
+</proposed_plan>
+
+Switch to Default mode to implement it.";
+/// The review the `REVIEW` role returns (Codex's review output schema).
+const REVIEW_REPLY: &str = r#"{"findings":[{"title":"[P2] Greeting is missing a comma","body":"`hello.txt` says `Hello world`; the requested text is `Hello, world`.","confidence_score":0.8,"priority":2,"code_location":{"absolute_file_path":"hello.txt","line_range":{"start":1,"end":1}}}],"overall_correctness":"patch is incorrect","overall_explanation":"One wording problem in hello.txt.","overall_confidence_score":0.7}"#;
+
+/// The features scenarios: plan mode (`PLAN`, then Codex's implement text), `/init`, the
+/// inline review (`REVIEW`), a goal the model completes with `update_goal` (`GOAL`), a goal
+/// whose continuation waits until it is interrupted (`GOALSTOP`), and plain answers (`FORKED`,
+/// `BEFORE`).
+pub fn features_script(role: &str, step: usize) -> Reply {
+    match (role, step) {
+        ("PLAN", _) => Reply::Message(PLAN_REPLY),
+        ("IMPL", _) => Reply::Message("IMPLEMENTED"),
+        ("IMPL_FRESH", _) => Reply::Message("IMPLEMENTED_FRESH"),
+        ("INIT", _) => Reply::Message("INIT_DONE"),
+        ("REVIEW", _) => Reply::Message(REVIEW_REPLY),
+        ("GOAL", 0) => Reply::Call {
+            name: "update_goal",
+            namespace: None,
+            arguments: json!({ "status": "complete" }),
+        },
+        ("GOAL", _) => Reply::Message("GOAL_DONE"),
+        // A goal whose continuation waits on a long command until it is interrupted.
+        ("GOALSTOP", 0) => Reply::Call {
+            name: "exec_command",
+            namespace: None,
+            arguments: json!({ "cmd": GOAL_WAIT, "yield_time_ms": 30000 }),
+        },
+        ("GOALSTOP", _) => Reply::Message("GOALSTOP_DONE"),
+        ("FORKED", _) => Reply::Message("FORKED"),
+        ("BEFORE", _) => Reply::Message("BEFORE"),
+        _ => Reply::Message("MOCK_UNHANDLED"),
+    }
+}
+
 /// What the model answers.
 #[derive(Debug, Clone)]
 pub enum Reply {
@@ -105,6 +164,15 @@ pub struct Sampled {
     pub role: Option<String>,
     pub step: usize,
     pub reply: String,
+    /// The request's `service_tier` (`None`: not sent).
+    pub service_tier: Option<String>,
+    /// The request's `reasoning.effort`.
+    pub effort: Option<String>,
+    /// The collaboration mode of the last developer message that states one: `plan`,
+    /// `default`, or `none` for Codex's empty block (`None`: no block at all).
+    pub mode: Option<String>,
+    /// The text of the input's last user message.
+    pub user_text: String,
 }
 
 pub struct MockModel {
@@ -228,6 +296,15 @@ async fn serve(
     }
     let request: Value = serde_json::from_slice(&body).map_err(|e| format!("request body: {e}"))?;
     let input = request["input"].as_array().cloned().unwrap_or_default();
+    let service_tier = request["service_tier"].as_str().map(str::to_owned);
+    let effort = request["reasoning"]["effort"].as_str().map(str::to_owned);
+    let mode = collaboration_mode(&input);
+    let user_text = input
+        .iter()
+        .rev()
+        .find(|i| i["type"] == "message" && i["role"] == "user")
+        .map(text_of)
+        .unwrap_or_default();
     let (role, at) = role_of(&input);
     let step = match &role {
         Some(role) => calls_done(&input, role, at),
@@ -247,6 +324,10 @@ async fn serve(
         role: role.clone(),
         step,
         reply: described,
+        service_tier,
+        effort,
+        mode,
+        user_text,
     });
     respond(&mut stream, "200 OK", "text/event-stream", &events).await
 }
@@ -288,6 +369,30 @@ fn text_of(item: &Value) -> String {
     }
 }
 
+/// The collaboration mode the input's developer messages state last (see
+/// [`Sampled::mode`]).
+fn collaboration_mode(input: &[Value]) -> Option<String> {
+    input
+        .iter()
+        .rev()
+        .filter(|i| i["type"] == "message" && i["role"] == "developer")
+        .find_map(|i| {
+            let text = text_of(i);
+            // The block opens the message; its text may quote the tag itself.
+            let at = text.find("<collaboration_mode>")?;
+            let block = &text[at + "<collaboration_mode>".len()..];
+            Some(if block.starts_with("</collaboration_mode>") {
+                "none".to_owned()
+            } else if block.contains("# Plan Mode") {
+                "plan".to_owned()
+            } else if block.contains("Collaboration Mode: Default") {
+                "default".to_owned()
+            } else {
+                format!("other: {}", block.chars().take(160).collect::<String>())
+            })
+        })
+}
+
 /// The last role token of the input's messages and the index of its message.
 fn role_of(input: &[Value]) -> (Option<String>, usize) {
     let mut found = (None, 0);
@@ -297,6 +402,12 @@ fn role_of(input: &[Value]) -> (Option<String>, usize) {
             continue;
         }
         let text = text_of(item);
+        if item["role"] == "user"
+            && let Some((_, role)) = FIXED_ROLES.iter().find(|(t, _)| text.starts_with(t))
+        {
+            found = (Some((*role).to_owned()), i);
+            continue;
+        }
         let mut rest = text.as_str();
         while let Some(at) = rest.find("ROLE=") {
             let after = &rest[at + 5..];

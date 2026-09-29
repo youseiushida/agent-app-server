@@ -13,7 +13,11 @@
 //! * The first line is the header: the session id, the working directory the session was
 //!   created in, and, for a fork, `forkedFrom` (the id of the session it was branched off).
 //! * Every finished turn is appended as one `turn` line holding its items in order (the user's
-//!   message first). Item bodies are the protocol's own [`ItemBody`].
+//!   message first). Item bodies are the protocol's own [`ItemBody`]. A turn's index among the
+//!   turns of its transcript is the agent's anchor of that turn (a fork keeps the indices).
+//! * A `name` line names the session (the latest wins); it is the session's title.
+//! * `<session id>.held` beside a transcript says that another process holds the session: a
+//!   resume is refused, a fork still works (like Codex's writer lock).
 //!
 //! Sessions are matched to a folder by the `cwd` of their header (never by file names), the way
 //! the Claude and pi adapters read their CLIs' transcripts. Ids are the file names, so only
@@ -51,6 +55,8 @@ pub enum Entry {
     },
     /// A finished turn.
     Turn(RecordedTurn),
+    /// The session's name.
+    Name { name: String },
 }
 
 /// A finished turn as the agent recorded it.
@@ -98,6 +104,8 @@ pub enum StoreError {
         line: usize,
         message: String,
     },
+    #[error("session {id} has {turns} turns; it cannot be branched at turn {at}")]
+    NoSuchTurn { id: String, turns: usize, at: usize },
 }
 
 /// A parsed transcript.
@@ -108,13 +116,18 @@ pub struct Transcript {
     pub created_at: Millis,
     pub forked_from: Option<String>,
     pub turns: Vec<RecordedTurn>,
+    /// The session's name (its latest `name` line).
+    pub name: Option<String>,
 }
 
 impl Transcript {
-    /// The session's title: the first line of its first user message, cut to
+    /// The session's title: its name, else the first line of its first user message, cut to
     /// `policy.first_message_title_chars` (the engine's rule for titles made from a first
     /// message, which the other adapters apply to sessions without a name).
     pub fn title(&self, policy: &AdapterPolicy) -> Option<String> {
+        if let Some(name) = &self.name {
+            return policy.harness_title(name);
+        }
         let prompt = self
             .turns
             .iter()
@@ -227,7 +240,7 @@ impl SessionStore {
         &self,
         id: &str,
         cwd: &Path,
-        forked_from: Option<(&str, &[RecordedTurn])>,
+        forked_from: Option<(&str, &[RecordedTurn], Option<&str>)>,
     ) -> Result<(), StoreError> {
         let path = self.path_of(id)?;
         std::fs::create_dir_all(&self.dir).map_err(|e| Self::io(&self.dir, e))?;
@@ -246,10 +259,15 @@ impl SessionStore {
             id: id.to_owned(),
             cwd: cwd.display().to_string(),
             created_at: now_ms(),
-            forked_from: forked_from.map(|(source, _)| source.to_owned()),
+            forked_from: forked_from.map(|(source, _, _)| source.to_owned()),
         });
-        for turn in forked_from.map_or(&[][..], |(_, turns)| turns) {
+        for turn in forked_from.map_or(&[][..], |(_, turns, _)| turns) {
             text.push_str(&line(&Entry::Turn(turn.clone())));
+        }
+        if let Some((_, _, Some(name))) = forked_from {
+            text.push_str(&line(&Entry::Name {
+                name: name.to_owned(),
+            }));
         }
         file.write_all(text.as_bytes())
             .and_then(|_| file.sync_all())
@@ -262,14 +280,71 @@ impl SessionStore {
     }
 
     /// Branches `new_id` (started in `cwd`) off `source`: a new session holding every turn of
-    /// `source` so far.
-    pub fn fork(&self, source: &str, new_id: &str, cwd: &Path) -> Result<(), StoreError> {
+    /// `source` so far, or its first `upto` turns. The name comes along.
+    pub fn fork(
+        &self,
+        source: &str,
+        new_id: &str,
+        cwd: &Path,
+        upto: Option<usize>,
+    ) -> Result<(), StoreError> {
         let parent = self.read(source)?;
-        self.create_file(new_id, cwd, Some((source, &parent.turns)))
+        let turns = match upto {
+            None => &parent.turns[..],
+            Some(n) if n <= parent.turns.len() => &parent.turns[..n],
+            Some(n) => {
+                return Err(StoreError::NoSuchTurn {
+                    id: source.to_owned(),
+                    turns: parent.turns.len(),
+                    at: n,
+                });
+            }
+        };
+        self.create_file(new_id, cwd, Some((source, turns, parent.name.as_deref())))
+    }
+
+    /// Names session `id` (a `name` line; the latest one is its title).
+    pub fn rename(&self, id: &str, name: &str) -> Result<(), StoreError> {
+        self.append(
+            id,
+            &Entry::Name {
+                name: name.to_owned(),
+            },
+        )
+    }
+
+    fn held_path(&self, id: &str) -> Result<PathBuf, StoreError> {
+        Ok(self.path_of(id)?.with_extension("held"))
+    }
+
+    /// Marks session `id` as held by another process (see the module docs).
+    pub fn hold(&self, id: &str) -> Result<(), StoreError> {
+        self.read(id)?;
+        let path = self.held_path(id)?;
+        std::fs::write(&path, b"").map_err(|e| Self::io(&path, e))
+    }
+
+    /// Ends the hold of session `id` (nothing to do when it was not held).
+    pub fn release(&self, id: &str) -> Result<(), StoreError> {
+        let path = self.held_path(id)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Self::io(&path, e)),
+        }
+    }
+
+    /// Whether another process holds session `id`.
+    pub fn is_held(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.held_path(id)?.exists())
     }
 
     /// Appends a finished turn to the transcript of `id`.
     pub fn append_turn(&self, id: &str, turn: &RecordedTurn) -> Result<(), StoreError> {
+        self.append(id, &Entry::Turn(turn.clone()))
+    }
+
+    fn append(&self, id: &str, entry: &Entry) -> Result<(), StoreError> {
         let path = self.path_of(id)?;
         let mut file = match std::fs::OpenOptions::new().append(true).open(&path) {
             Ok(file) => file,
@@ -278,7 +353,7 @@ impl SessionStore {
             }
             Err(e) => return Err(Self::io(&path, e)),
         };
-        file.write_all(line(&Entry::Turn(turn.clone())).as_bytes())
+        file.write_all(line(entry).as_bytes())
             .and_then(|_| file.sync_all())
             .map_err(|e| Self::io(&path, e))
     }
@@ -407,13 +482,17 @@ fn read_transcript(path: &Path) -> Result<Transcript, StoreError> {
                     created_at,
                     forked_from,
                     turns: Vec::new(),
+                    name: None,
                 })
             }
             (Entry::Turn(turn), Some(t)) => t.turns.push(turn),
+            (Entry::Name { name }, Some(t)) => t.name = Some(name),
             (Entry::Session { .. }, Some(_)) => {
                 return Err(corrupt("a second session header".into()));
             }
-            (Entry::Turn(_), None) => return Err(corrupt("a turn before the header".into())),
+            (Entry::Turn(_) | Entry::Name { .. }, None) => {
+                return Err(corrupt("an entry before the header".into()));
+            }
         }
     }
     header.ok_or_else(|| StoreError::Corrupt {
@@ -510,7 +589,7 @@ mod tests {
         let work = dir.path().join("w");
         store.create("src", &work).unwrap();
         store.append_turn("src", &turn("one", "1", 10)).unwrap();
-        store.fork("src", "copy", &work).unwrap();
+        store.fork("src", "copy", &work, None).unwrap();
         store.append_turn("src", &turn("two", "2", 20)).unwrap();
         store.append_turn("copy", &turn("branch", "b", 30)).unwrap();
         let copy = store.read("copy").unwrap();
@@ -530,12 +609,57 @@ mod tests {
             "later turns of the source stay there"
         );
         assert!(matches!(
-            store.fork("missing", "x", &work),
+            store.fork("missing", "x", &work, None),
             Err(StoreError::NotFound(_))
         ));
         assert!(matches!(
-            store.fork("src", "copy", &work),
+            store.fork("src", "copy", &work, None),
             Err(StoreError::Exists(_))
+        ));
+    }
+
+    /// A fork at a turn keeps the first turns (their indices are the anchors), and the name;
+    /// a session another process holds can be forked but is reported held.
+    #[test]
+    fn forks_at_a_turn_names_and_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let work = dir.path().join("w");
+        store.create("src", &work).unwrap();
+        for (n, text) in ["one", "two", "three"].iter().enumerate() {
+            store
+                .append_turn("src", &turn(text, text, 10 * n as i64))
+                .unwrap();
+        }
+        store.rename("src", "Named").unwrap();
+        store.hold("src").unwrap();
+        assert!(store.is_held("src").unwrap());
+        store.fork("src", "upto2", &work, Some(2)).unwrap();
+        store.fork("src", "none", &work, Some(0)).unwrap();
+        assert!(matches!(
+            store.fork("src", "toofar", &work, Some(4)),
+            Err(StoreError::NoSuchTurn {
+                turns: 3,
+                at: 4,
+                ..
+            })
+        ));
+        let upto2 = store.read("upto2").unwrap();
+        assert_eq!(upto2.turns.len(), 2);
+        assert_eq!(upto2.name.as_deref(), Some("Named"));
+        assert!(!store.is_held("upto2").unwrap());
+        assert_eq!(store.read("none").unwrap().turns.len(), 0);
+        let policy = AdapterPolicy::default();
+        assert_eq!(
+            store.read("src").unwrap().title(&policy).as_deref(),
+            Some("Named")
+        );
+        store.release("src").unwrap();
+        store.release("src").unwrap();
+        assert!(!store.is_held("src").unwrap());
+        assert!(matches!(
+            store.hold("missing"),
+            Err(StoreError::NotFound(_))
         ));
     }
 

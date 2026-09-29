@@ -90,7 +90,8 @@ import kotlin.random.Random
  *    showing the server's reason, until the synced workspace lists its harness as available
  *    (`harness/updated`), and is then sent at once ([OutboxEntry.waitingForHarness]).
  *    `turn/interrupt` and `thread/stop` do not wait behind an entry of their thread that only
- *    waits for its retry.
+ *    waits for its retry. Requests that only make sense together are committed as a chain
+ *    ([submitChain]): each is sent after the one before it succeeded, never after a failure.
  * 4. **Liveness.** A watchdog closes the socket when no frame arrived within the server's
  *    `clientTimeoutMs`, measured with [Clock.monotonicMs] (which counts deep sleep). Its timer
  *    does not count deep sleep, so [onAppForeground] and [onNetworkAvailable] measure again at
@@ -478,6 +479,7 @@ class SyncEngine(
             // what it delivers has no base.
             val wasLive = s.liveThreads.remove(threadId)
             if (wasLive) s.suspendedStreams += stream
+            s.subscribedHeads.remove(stream)
             s to wasLive
         }
         s.scope.launch {
@@ -575,6 +577,35 @@ class SyncEngine(
         return PendingMutation(crid, waiter) { AasJson.decodeFromJsonElement(method.result, it) }
     }
 
+    /**
+     * Commits the requests [build] adds ([OutboxChain.add]) as one chain, in one transaction, so
+     * none of it is sent before all of it is committed (leaving a screen, or the process ending,
+     * right after cannot lose its end). Each request after the first waits for the one before it
+     * ([OutboxEntry.after]): it is sent only once that one succeeded. When one fails definitively
+     * or is discarded, the rest of the chain is dropped without being sent
+     * ([OutboxResult.Dropped]; callers waiting for them get [OutboxChainBrokenException]). A chain
+     * that starts with `thread/create` is for the created thread: its other requests get the new
+     * thread's id when the creation succeeds. Returns what [build] returned (its handles).
+     *
+     * For requests whose meaning depends on the one before (plan mode, then the request to plan;
+     * a thread, then its first requests).
+     */
+    suspend fun <T> submitChain(build: OutboxChain.() -> T): T {
+        val chain = OutboxChain(newRequestId, clock.nowMs())
+        val handles = chain.build()
+        require(chain.entries.isNotEmpty()) { "an empty chain" }
+        // Registered before the entries exist, so even an immediate answer finds its caller.
+        waiters.putAll(chain.waiters)
+        try {
+            write { tx, _ -> chain.entries.forEach { tx.addOutbox(it) } }
+        } catch (e: Throwable) {
+            chain.waiters.keys.forEach { waiters.remove(it) }
+            throw e
+        }
+        outboxKick.trySend(Unit)
+        return handles
+    }
+
     /** [enqueue] for a method named at runtime; `clientRequestId` is added to [params]. */
     suspend fun enqueueRaw(method: String, params: JsonObject): String =
         enqueueInternal(method, { crid -> withRequestId(params, crid) }, null)
@@ -590,7 +621,8 @@ class SyncEngine(
      * Drops one outbox entry without an answer, e.g. a message whose harness keeps failing, or a
      * request the user no longer wants sent. An entry whose frame is on the wire right now stays
      * ([OutboxDiscard.InFlight]): the server may be running it. A caller waiting for it fails
-     * with [OutboxClearedException] and [results] reports [OutboxResult.Discarded].
+     * with [OutboxClearedException] and [results] reports [OutboxResult.Discarded]. The entries
+     * chained after it ([submitChain]) are dropped with it.
      */
     suspend fun discardOutbox(clientRequestId: String): OutboxDiscard {
         synchronized(outboxGuard) {
@@ -794,6 +826,12 @@ class SyncEngine(
 
         /** Threads loaded and subscribed on this connection. */
         val liveThreads: MutableSet<ThreadId> = ConcurrentHashMap.newKeySet()
+
+        /**
+         * Each stream's head when this connection subscribed to it (the `subscribe` answer): its
+         * events up to it are the catch-up, later ones happen now ([SyncSignal.ComposerInsert]).
+         */
+        val subscribedHeads: MutableMap<String, Long> = ConcurrentHashMap()
 
         /** Stall bookkeeping (reader coroutine only): stream → cursor and since when. */
         val stallMarks = HashMap<String, StallMark>()
@@ -1064,6 +1102,7 @@ class SyncEngine(
         val requested = subscriptions.associate { it.stream to it.after }
         val result = subscribe(s, subscriptions)
         for (st in result.subscriptions) {
+            s.subscribedHeads[st.stream] = st.head
             val after = requested[st.stream] ?: continue
             if (st.stream == WORKSPACE_STREAM) {
                 // A head behind the cursor means the server lost events we applied (a restored
@@ -1112,7 +1151,10 @@ class SyncEngine(
             if (!openCounts.containsKey(threadId)) return
             write { tx, signals -> EventApplier.applyThreadRead(tx, read, signals, ::warnData) }
             s.suspendedStreams -= stream
+            // Until this subscription answers, what the stream delivers counts as catch-up.
+            s.subscribedHeads.remove(stream)
             val result = subscribe(s, listOf(Subscription(stream, read.head)))
+            result.subscriptions.firstOrNull { it.stream == stream }?.let { s.subscribedHeads[stream] = it.head }
             if (result.subscriptions.any { it.stream == stream && it.status == SubscriptionState.NotFound }) {
                 threadGone(s, threadId)
                 return
@@ -1222,7 +1264,7 @@ class SyncEngine(
         val now = clock.nowMs()
         val outcome = write { tx, signals ->
             // An empty batch moves the cursor to the head (protocol.md §2.1): see EventApplier.
-            val o = EventApplier.applyBatch(tx, batch, signals, ::warnData)
+            val o = EventApplier.applyBatch(tx, batch, signals, ::warnData, liveAfter = s.subscribedHeads[batch.stream])
             if (o.cursorMoved) tx.setLastSyncAtMs(now)
             o
         }
@@ -1311,6 +1353,8 @@ class SyncEngine(
      * * An entry waiting for a harness ([OutboxEntry.waitingForHarness]) is not sent while the
      *   synced workspace does not list that harness as available, whatever its `nextAttemptAtMs`
      *   says; it holds its lane like an entry waiting for its retry.
+     * * An entry of a chain waits for the entry before it ([OutboxEntry.after], [submitChain]):
+     *   it holds its lane the same way, and one for a thread not created yet holds none.
      */
     private suspend fun runOutbox(s: Session) {
         val inFlight = HashMap<String, Job>()
@@ -1328,6 +1372,13 @@ class SyncEngine(
             var wakeAt: Long? = null
             val lanes = HashMap<String, LaneState>()
             for (entry in entries) {
+                if (entry.after != null) {
+                    // Waits for the entry before it in its chain ([settleChain] releases it). It
+                    // holds its own lane like an entry waiting for its retry; one for a thread
+                    // not created yet has no lane (it must not hold the global one).
+                    if (hasOwnLane(entry)) lanes.putIfAbsent(laneOf(entry), LaneState.RetryWaiting)
+                    continue
+                }
                 val lane = laneOf(entry)
                 val before = lanes[lane]
                 when (before) {
@@ -1388,6 +1439,10 @@ class SyncEngine(
      */
     private fun bypassesRetryWait(entry: OutboxEntry): Boolean = entry.method in STOP_METHODS
 
+    /** Whether [entry] names what its lane is ordered by ([laneOf] is not the global lane). */
+    private fun hasOwnLane(entry: OutboxEntry): Boolean =
+        entry.threadId != null || entry.projectId != null || entry.params[JsonKeys.INTERACTION_ID] is JsonPrimitive
+
     /** Requests that must keep their order share a lane: same thread, same project, same interaction. */
     private fun laneOf(entry: OutboxEntry): String {
         entry.threadId?.let { return "thread:$it" }
@@ -1438,12 +1493,23 @@ class SyncEngine(
 
     /**
      * Removes an answered (or discarded) entry, once, and reports the outcome to its caller and
-     * [results]. Returns whether the entry was still there.
+     * [results]. The entries chained after it are settled in the same transaction
+     * ([settleChain]). Returns whether the entry was still there.
      */
     private suspend fun finishOutbox(result: OutboxResult): Boolean {
         val crid = result.entry.clientRequestId
-        val removed = write { tx, _ -> tx.removeOutbox(crid) }
-        if (!removed) return false
+        val dropped = write { tx, _ -> if (tx.removeOutbox(crid)) settleChain(tx, result) else null } ?: return false
+        report(result)
+        for (consequence in dropped) {
+            log(SyncLogger.Level.Info, "${consequence.entry.method} (${consequence.entry.clientRequestId}) dropped: ${consequence.after} before it did not succeed")
+            report(consequence)
+        }
+        return true
+    }
+
+    /** Completes the caller waiting for [result]'s entry and publishes the result. */
+    private fun report(result: OutboxResult) {
+        val crid = result.entry.clientRequestId
         val waiter = waiters.remove(crid)
         when (result) {
             is OutboxResult.Succeeded -> waiter?.complete(result.result)
@@ -1452,9 +1518,65 @@ class SyncEngine(
                 waiter?.completeExceptionally(RpcException(result.error))
             }
             is OutboxResult.Discarded -> waiter?.completeExceptionally(OutboxClearedException())
+            is OutboxResult.Dropped -> waiter?.completeExceptionally(OutboxChainBrokenException(result.after, result.error))
         }
         emitResult(result)
-        return true
+    }
+
+    /**
+     * Settles the entries chained after [result]'s entry ([OutboxEntry.after]) in the transaction
+     * that removed it, and returns the ones dropped:
+     *
+     * * It succeeded: the entry after it may be sent now. After a `thread/create`, the rest of its
+     *   chain is for the created thread and gets its id (all of it at once, so the thread shows
+     *   its waiting requests while the first of them is sent).
+     * * It failed definitively, was discarded or was dropped: the rest of its chain is dropped,
+     *   never sent. So is it when a `thread/create`'s answer names no thread this client can read.
+     */
+    private suspend fun settleChain(tx: SyncTx, result: OutboxResult): List<OutboxResult.Dropped> {
+        val crid = result.entry.clientRequestId
+        val outbox = tx.outbox()
+        val rest = chainAfter(outbox, crid)
+        if (rest.isEmpty()) return emptyList()
+        if (result is OutboxResult.Succeeded) {
+            if (result.entry.method != Methods.ThreadCreate.name) {
+                rest.filter { it.after == crid }.forEach { tx.updateOutbox(it.copy(after = null)) }
+                return emptyList()
+            }
+            val created = createdThreadId(result)
+            if (created != null) {
+                for (entry in rest) {
+                    val params = JsonObject(entry.params + (JsonKeys.THREAD_ID to JsonPrimitive(created)))
+                    tx.updateOutbox(entry.copy(params = params, after = entry.after.takeUnless { it == crid }))
+                }
+                return emptyList()
+            }
+            warnData("thread/create ($crid) answered without a readable thread: dropping the requests chained after it")
+        }
+        val error = when (result) {
+            is OutboxResult.Failed -> result.error
+            is OutboxResult.Dropped -> result.error
+            is OutboxResult.Succeeded, is OutboxResult.Discarded -> null
+        }
+        return rest.map { entry ->
+            tx.removeOutbox(entry.clientRequestId)
+            OutboxResult.Dropped(entry, after = entry.after ?: crid, error = error)
+        }
+    }
+
+    /** The entries chained after [crid], directly or through others, in outbox order. */
+    private fun chainAfter(outbox: List<OutboxEntry>, crid: String): List<OutboxEntry> {
+        val chain = hashSetOf(crid)
+        // Chained entries come after the ones they wait for (committed together, in order).
+        return outbox.filter { entry -> entry.after != null && entry.after in chain && chain.add(entry.clientRequestId) }
+    }
+
+    /** The id of the thread a `thread/create` answered with, `null` when the answer has none this client can read. */
+    private fun createdThreadId(result: OutboxResult.Succeeded): ThreadId? = try {
+        AasJson.decodeFromJsonElement(Methods.ThreadCreate.result, result.result).thread.id
+    } catch (e: IllegalArgumentException) {
+        // SerializationException is one: an answer of another shape than protocol.md's.
+        null
     }
 
     private suspend fun retryOutbox(entry: OutboxEntry, message: String) {

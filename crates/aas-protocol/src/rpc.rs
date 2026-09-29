@@ -134,10 +134,13 @@ pub enum ErrorKind {
     AdapterError,
     PayloadTooLarge,
     Draining,
+    /// The input starts with a command of the harness that would switch the thread's agent to
+    /// another native session (`data.command`, `data.harnessId`).
+    SessionSwitchingCommand,
 }
 
 impl ErrorKind {
-    pub const ALL: [ErrorKind; 19] = [
+    pub const ALL: [ErrorKind; 20] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -157,6 +160,7 @@ impl ErrorKind {
         ErrorKind::AdapterError,
         ErrorKind::PayloadTooLarge,
         ErrorKind::Draining,
+        ErrorKind::SessionSwitchingCommand,
     ];
 
     pub fn code(self) -> i32 {
@@ -180,6 +184,7 @@ impl ErrorKind {
             ErrorKind::AdapterError => -32011,
             ErrorKind::PayloadTooLarge => -32012,
             ErrorKind::Draining => -32013,
+            ErrorKind::SessionSwitchingCommand => -32014,
         }
     }
 
@@ -208,6 +213,7 @@ impl ErrorKind {
             ErrorKind::AdapterError => "adapterError",
             ErrorKind::PayloadTooLarge => "payloadTooLarge",
             ErrorKind::Draining => "draining",
+            ErrorKind::SessionSwitchingCommand => "sessionSwitchingCommand",
         }
     }
 
@@ -229,7 +235,8 @@ impl ErrorKind {
             | ErrorKind::PathNotAllowed
             | ErrorKind::ProtocolVersionUnsupported
             | ErrorKind::AlreadyExists
-            | ErrorKind::PayloadTooLarge => true,
+            | ErrorKind::PayloadTooLarge
+            | ErrorKind::SessionSwitchingCommand => true,
             ErrorKind::Internal
             | ErrorKind::NotInitialized
             | ErrorKind::Unauthorized

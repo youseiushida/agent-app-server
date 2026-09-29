@@ -22,8 +22,42 @@
 //! | `@context <used> <window>` | reports the turn's usage so far with a context-window occupancy of `used` of `window` tokens (also carried by the final usage) |
 //! | `@hang [ms]` | keeps the turn running for `ms` (default 60 s) without reacting to interrupts or to its input ending: only terminating the process ends it early |
 //! | `@bg <key> [options…] [title…]` | starts a background task that goes on after the turn (see below) |
+//! | `@switch-session` | the agent moves to a new session of its own (reported like a new session id; a stored session gets a new transcript) |
+//! | `@permission <mode>` | the agent changes its permission mode by itself (reported as current) |
+//! | `@effort <level>` | the agent changes its reasoning effort by itself (reported as current) |
+//! | `@plan-mode on\|off` | the agent enters or leaves plan mode by itself (reported) |
+//! | `@proposed-plan <text…>` | a proposed plan (`proposedPlan` item, streamed); `\n` in the text is a line break |
+//! | `@fast-state <word>` | reports what fast mode does (`on`, `off`, `cooldown`, …) |
+//! | `@rename <title…>` | the agent names its session by itself (a stored session keeps the name) |
+//! | `@editor <text…>` | asks to put `text` into the composer |
+//! | `@tool [ms] [title…]` | a command that runs `ms` (default 5000) in the foreground and can be moved to the background while it runs (it then goes on as a shell task) |
+//! | `@refuse-steers` | steered messages of this turn are not taken: the agent returns them |
+//! | `@trust` | answers whether the project was trusted (`project trusted: yes`, `no` or `undecided`) |
+//! | `@stderr <text…>` | writes `text` to the agent's stderr; `\e` in the text is the escape character (for terminal colours) |
+//! | `@late-anchor` | the turn's anchor is provisional (reported right away, not usable for forking) and settles only at the start of the agent's next turn in the same session, like CLIs that settle what a turn is branched at later |
+//! | `@settle-anchor` | settles this turn's provisional anchor now |
 //!
 //! Attached images are acknowledged with an extra message `received <n> image(s) (<bytes> bytes)`.
+//!
+//! A prompt that starts with `/fake-clear` (or its alias `/fake-reset`) makes the agent start a
+//! new session, like `@switch-session`: the harness's session-switching command (the engine
+//! refuses it before it gets here).
+//!
+//! # Modes, anchors, names
+//!
+//! In plan mode (`setModes`, or `@plan-mode on`) a prompt without directives is answered with a
+//! proposed plan for it instead of an echo. Fast mode is `on` with the model `fake-fast` and
+//! `off` otherwise (reported with every `setModes`). Each finished turn of a stored session
+//! reports its anchor, its index in the session's transcript (`anchor`), before its completion;
+//! a fork at a turn (`hello` with `forkAt`) keeps the turns up to it. Under `@late-anchor` the
+//! turn reports a provisional anchor instead (`provisionalAnchor`, the adapter's
+//! `{"pending": <index>}`), which a fork cannot use, and the agent settles it
+//! (`anchorSettled`) when its next turn in the same session starts; an agent that exits first
+//! leaves it provisional. `rename` names the session
+//! (answered with `title`). `query` answers the agent's status and side questions (`side answer:
+//! <question>`) right away, also while a turn runs. A resume of a session another process holds
+//! (see [`crate::store`]) is rejected with a coloured message on stderr, as a CLI would; a fork
+//! of it works.
 //!
 //! # Background tasks (`@bg`)
 //!
@@ -73,9 +107,9 @@ use aas_stdio::{JsonLinesReader, JsonLinesWriter, ReadLine};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, watch};
 
-use crate::background::{BackgroundGuard, BackgroundRuntime, BackgroundSpec, Wake};
+use crate::background::{BackgroundEnd, BackgroundGuard, BackgroundRuntime, BackgroundSpec, Wake};
 use crate::store::{RecordedItem, RecordedTurn, SessionStore};
-use crate::wire::{Ev, Op};
+use crate::wire::{Ev, ForkAt, Modes, Op, Query};
 
 /// Characters per delta when streaming text, unless the options say otherwise.
 pub const DEFAULT_CHUNK_SIZE: usize = 4;
@@ -100,6 +134,14 @@ pub const REJECTED_EXIT_CODE: i32 = 1;
 /// How long a turn the agent starts by itself runs after its message, like a short model
 /// answer: a prompt sent right after that turn started finds it running (and is refused).
 const OWN_RUN_MS: u64 = 200;
+/// Default duration of `@tool`: long enough for a client to move it to the background.
+const DEFAULT_TOOL_MS: u64 = 5000;
+/// The fake harness's session-switching command, and its aliases (listed as commands of their
+/// own, like an adapter that expands a CLI's aliases).
+pub const SWITCH_COMMAND: &str = "fake-clear";
+pub const SWITCH_COMMAND_ALIASES: &[&str] = &["fake-reset"];
+/// The model that has fast mode.
+pub const FAST_MODEL: &str = "fake-fast";
 
 /// Options of the fake agent.
 #[derive(Debug, Clone)]
@@ -146,6 +188,23 @@ pub enum Step {
     },
     Hang(u64),
     Background(BackgroundSpec),
+    SwitchSession,
+    Permission(String),
+    Effort(String),
+    PlanMode(bool),
+    ProposedPlan(String),
+    FastState(String),
+    Rename(String),
+    Editor(String),
+    Tool {
+        ms: u64,
+        title: String,
+    },
+    RefuseSteers,
+    Trust,
+    Stderr(String),
+    LateAnchor,
+    SettleAnchor,
     Unknown(String),
     /// A directive whose arguments are wrong (reported as a warning notice).
     Invalid(String),
@@ -177,26 +236,7 @@ pub fn parse_script(prompt: &str) -> Vec<Step> {
         let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         let args = args.trim();
         // Mentions such as "@src/main.rs" are not directives.
-        let known = matches!(
-            name,
-            "text"
-                | "reason"
-                | "stream"
-                | "exec"
-                | "approve"
-                | "question"
-                | "plan"
-                | "write"
-                | "sleep"
-                | "fail"
-                | "crash"
-                | "withdraw"
-                | "bigoutput"
-                | "context"
-                | "hang"
-                | "bg"
-        );
-        if !known {
+        if !is_directive(name) {
             if !text.is_empty() {
                 text.push('\n');
             }
@@ -265,6 +305,45 @@ pub fn parse_script(prompt: &str) -> Vec<Step> {
                 Ok(spec) => Step::Background(spec),
                 Err(message) => Step::Invalid(message),
             },
+            "switch-session" => Step::SwitchSession,
+            "permission" if !args.is_empty() => Step::Permission(args.to_owned()),
+            "effort" if !args.is_empty() => Step::Effort(args.to_owned()),
+            "plan-mode" => match args {
+                "on" => Step::PlanMode(true),
+                "off" => Step::PlanMode(false),
+                _ => Step::Invalid(format!("@plan-mode needs on or off, not `{args}`")),
+            },
+            "proposed-plan" => Step::ProposedPlan(args.replace("\\n", "\n")),
+            "fast-state" if !args.is_empty() => Step::FastState(args.to_owned()),
+            "rename" if !args.is_empty() => Step::Rename(args.to_owned()),
+            "editor" if !args.is_empty() => Step::Editor(args.to_owned()),
+            "tool" => {
+                let (ms, title) = match args.split_once(char::is_whitespace) {
+                    Some((n, rest)) if n.parse::<u64>().is_ok() => {
+                        (n.parse().unwrap_or(DEFAULT_TOOL_MS), rest.trim().to_owned())
+                    }
+                    _ => match args.parse::<u64>() {
+                        Ok(n) => (n, String::new()),
+                        Err(_) => (DEFAULT_TOOL_MS, args.to_owned()),
+                    },
+                };
+                Step::Tool {
+                    ms,
+                    title: if title.is_empty() {
+                        "long command".to_owned()
+                    } else {
+                        title
+                    },
+                }
+            }
+            "refuse-steers" => Step::RefuseSteers,
+            "trust" => Step::Trust,
+            "stderr" => Step::Stderr(args.replace("\\e", "\u{1b}")),
+            "late-anchor" => Step::LateAnchor,
+            "settle-anchor" => Step::SettleAnchor,
+            "permission" | "effort" | "fast-state" | "rename" | "editor" => {
+                Step::Invalid(format!("@{name} needs an argument"))
+            }
             other => Step::Unknown(other.to_owned()),
         });
     }
@@ -274,6 +353,72 @@ pub fn parse_script(prompt: &str) -> Vec<Step> {
         return vec![Step::Text(echo)];
     }
     steps
+}
+
+/// Whether `name` is a directive (`@name`); anything else starting with `@` is text (a mention).
+fn is_directive(name: &str) -> bool {
+    matches!(
+        name,
+        "text"
+            | "reason"
+            | "stream"
+            | "exec"
+            | "approve"
+            | "question"
+            | "plan"
+            | "write"
+            | "sleep"
+            | "fail"
+            | "crash"
+            | "withdraw"
+            | "bigoutput"
+            | "context"
+            | "hang"
+            | "bg"
+            | "switch-session"
+            | "permission"
+            | "effort"
+            | "plan-mode"
+            | "proposed-plan"
+            | "fast-state"
+            | "rename"
+            | "editor"
+            | "tool"
+            | "refuse-steers"
+            | "trust"
+            | "stderr"
+            | "late-anchor"
+            | "settle-anchor"
+    )
+}
+
+/// Whether a prompt holds any directive (without one, it is answered as a whole).
+pub fn has_directives(prompt: &str) -> bool {
+    prompt.lines().any(|line| {
+        line.trim()
+            .strip_prefix('@')
+            .map(|rest| rest.split_whitespace().next().unwrap_or(""))
+            .is_some_and(is_directive)
+    })
+}
+
+/// The scenario of a prompt in plan mode: a prompt without directives gets a proposed plan for
+/// it (the agent plans instead of acting); one with directives runs as written.
+pub fn plan_mode_script(prompt: &str) -> Vec<Step> {
+    if has_directives(prompt) {
+        return parse_script(prompt);
+    }
+    let task = prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    vec![
+        Step::ProposedPlan(format!(
+            "1. Look into: {task}\n2. Make the change\n3. Verify it\n"
+        )),
+        Step::Text("The plan is ready.".into()),
+    ]
 }
 
 /// Where the agent's events go: to the adapter and, during a turn of a stored session, into
@@ -399,14 +544,23 @@ impl TurnRecord {
             Ev::Ready { .. }
             | Ev::Rejected { .. }
             | Ev::SessionInfo { .. }
+            | Ev::Modes { .. }
+            | Ev::Title { .. }
             | Ev::Commands { .. }
             | Ev::PromptAck { .. }
             | Ev::TurnStarted
+            | Ev::Anchor { .. }
+            | Ev::ProvisionalAnchor { .. }
+            | Ev::AnchorSettled { .. }
+            | Ev::Backgroundable { .. }
             | Ev::Request { .. }
             | Ev::Withdraw { .. }
+            | Ev::SteerReturned { .. }
+            | Ev::EditorText { .. }
             | Ev::Usage { .. }
             | Ev::TurnCompleted { .. }
-            | Ev::Background { .. } => {}
+            | Ev::Background { .. }
+            | Ev::QueryResult { .. } => {}
         }
     }
 
@@ -434,12 +588,48 @@ struct Session {
     id: String,
 }
 
+/// The session the agent works in, shared by its main loop and its turns (a turn may move the
+/// agent to a new session, `@switch-session`). `None`: nothing is stored.
+type CurrentSession = Arc<parking_lot::Mutex<Option<Session>>>;
+
+/// What the agent runs with besides its session: the model and the modes (shared by the main
+/// loop, which applies `setModel` and `setModes`, and the turns, which report and use them).
+#[derive(Debug, Clone)]
+struct AgentState {
+    model: Option<String>,
+    modes: Modes,
+    /// The user's decision about the project (from `hello`).
+    project_trusted: Option<bool>,
+    /// Turns of finished runs whose provisional anchors settle when the next turn starts: the
+    /// session and the turn's index there (`@late-anchor`).
+    unsettled: Vec<(String, usize)>,
+}
+
+impl AgentState {
+    /// Fast mode as the agent runs it: on with the model that has it.
+    fn fast_state(&self) -> &'static str {
+        if self.modes.fast && self.model.as_deref() == Some(FAST_MODEL) {
+            "on"
+        } else {
+            "off"
+        }
+    }
+}
+
+type SharedState = Arc<parking_lot::Mutex<AgentState>>;
+
+/// The message of a session another process holds, coloured like a CLI's error output.
+fn held_message(id: &str) -> String {
+    format!("\u{1b}[1;31merror\u{1b}[0m: session {id} is held by another process")
+}
+
 /// Opens the session a `hello` names (see the module docs); the error is the rejection message.
 fn open_session(
     cwd: &std::path::Path,
     id: &str,
     resume: bool,
     fork_from: Option<&str>,
+    fork_at: Option<ForkAt>,
     sessions_dir: Option<&str>,
 ) -> Result<Option<Session>, String> {
     let Some(dir) = sessions_dir else {
@@ -450,8 +640,16 @@ fn open_session(
     };
     let store = SessionStore::new(dir);
     let opened = match (fork_from, resume) {
-        (Some(source), _) => store.fork(source, id, cwd),
-        (None, true) => store.read(id).map(|_| ()),
+        (Some(source), _) => {
+            let upto = fork_at.map(|at| if at.before { at.turn } else { at.turn + 1 });
+            store.fork(source, id, cwd, upto)
+        }
+        (None, true) => {
+            if store.is_held(id).map_err(|e| e.to_string())? {
+                return Err(held_message(id));
+            }
+            store.read(id).map(|_| ())
+        }
         (None, false) => store.create(id, cwd),
     };
     opened.map_err(|e| e.to_string())?;
@@ -461,10 +659,32 @@ fn open_session(
     }))
 }
 
+/// Starts a new session in place of the current one (the harness's session switch): a stored
+/// agent creates its transcript. Returns the new id.
+fn switch_session(current: &CurrentSession, cwd: &std::path::Path) -> Result<String, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut session = current.lock();
+    if let Some(old) = session.as_ref() {
+        old.store.create(&id, cwd).map_err(|e| e.to_string())?;
+        *session = Some(Session {
+            store: old.store.clone(),
+            id: id.clone(),
+        });
+    }
+    Ok(id)
+}
+
 struct TurnChannels {
     interrupt_tx: watch::Sender<bool>,
     respond_tx: mpsc::UnboundedSender<(String, InteractionResolution)>,
-    steer_tx: mpsc::UnboundedSender<String>,
+    steer_tx: mpsc::UnboundedSender<Steered>,
+    background_tx: mpsc::UnboundedSender<String>,
+}
+
+/// A steered message and the engine's id of it.
+struct Steered {
+    text: String,
+    message_id: Option<String>,
 }
 
 /// The task running the current turn, aborted when dropped: a turn never outlives its agent
@@ -486,6 +706,13 @@ impl Drop for TurnTask {
     }
 }
 
+/// How the foreground command of `@tool` ended.
+enum ToolEnd {
+    Done,
+    Background,
+    Interrupted,
+}
+
 /// How a turn ended, as the agent's main loop learns it.
 enum TurnEnd {
     /// The turn is over (sent before its completion is reported, see [`TurnCtx::finish`]).
@@ -505,7 +732,7 @@ where
         record: None,
     };
     let mut reader = JsonLinesReader::new(reader, MAX_OP_LINE_BYTES);
-    let mut session: Option<Session> = None;
+    let session: CurrentSession = Arc::new(parking_lot::Mutex::new(None));
     let (end_tx, mut end_rx) = mpsc::unbounded_channel::<TurnEnd>();
     let mut turn: Option<TurnChannels> = None;
     let mut turn_task = TurnTask(None);
@@ -519,7 +746,12 @@ where
     let mut own_run = false;
     // Set while a `@hang` step runs: the agent then outlives the end of its input.
     let hanging = Arc::new(AtomicBool::new(false));
-    let mut model: Option<String> = Some("fake-fast".into());
+    let state: SharedState = Arc::new(parking_lot::Mutex::new(AgentState {
+        model: Some(FAST_MODEL.into()),
+        modes: Modes::default(),
+        project_trusted: None,
+        unsettled: Vec::new(),
+    }));
     let mut item_counter = 0u64;
 
     // Starts the next turn of the agent's own when none runs.
@@ -531,6 +763,7 @@ where
                 let (channels, ctx) = turn_ctx(
                     &writer,
                     &session,
+                    &state,
                     None,
                     &options,
                     &mut item_counter,
@@ -610,22 +843,71 @@ where
                 }
                 start_own_run!();
                 match op {
-                    Op::Hello { session_id, resume, fork_from, sessions_dir } => {
-                        match open_session(&options.cwd, &session_id, resume, fork_from.as_deref(), sessions_dir.as_deref()) {
-                            Ok(opened) => session = opened,
+                    Op::Hello { session_id, resume, fork_from, fork_at, sessions_dir, modes, project_trusted } => {
+                        match open_session(&options.cwd, &session_id, resume, fork_from.as_deref(), fork_at, sessions_dir.as_deref()) {
+                            Ok(opened) => *session.lock() = opened,
                             Err(message) => {
+                                // Like a CLI: on stderr (coloured), and in the answer.
+                                eprintln!("{message}");
                                 emit(&writer, Ev::Rejected { message }).await;
                                 return REJECTED_EXIT_CODE;
                             }
                         }
+                        let (model, fast_state) = {
+                            let mut state = state.lock();
+                            state.modes = modes;
+                            state.project_trusted = project_trusted;
+                            (state.model.clone(), state.fast_state())
+                        };
                         emit(&writer, Ev::Ready { session_id }).await;
-                        emit(&writer, Ev::SessionInfo { model: model.clone() }).await;
-                        emit(&writer, Ev::Commands { commands: fake_commands() }).await;
+                        emit(&writer, Ev::SessionInfo { model, permission_mode: None, effort: None }).await;
+                        if modes != Modes::default() {
+                            emit(&writer, Ev::Modes { plan: Some(modes.plan), fast_state: Some(fast_state.into()) }).await;
+                        }
+                        emit(&writer, Ev::Commands { commands: fake_commands(project_trusted) }).await;
                     }
                     Op::SetModel { model: m } => {
-                        model = m;
-                        emit(&writer, Ev::SessionInfo { model: model.clone() }).await;
+                        let (model, fast_state, fast) = {
+                            let mut state = state.lock();
+                            state.model = m;
+                            (state.model.clone(), state.fast_state(), state.modes.fast)
+                        };
+                        emit(&writer, Ev::SessionInfo { model, permission_mode: None, effort: None }).await;
+                        if fast {
+                            emit(&writer, Ev::Modes { plan: None, fast_state: Some(fast_state.into()) }).await;
+                        }
                     }
+                    Op::SetModes { modes } => {
+                        let fast_state = {
+                            let mut state = state.lock();
+                            state.modes = modes;
+                            state.fast_state()
+                        };
+                        emit(&writer, Ev::Modes { plan: Some(modes.plan), fast_state: Some(fast_state.into()) }).await;
+                    }
+                    Op::Rename { title } => {
+                        let stored = session.lock().clone();
+                        if let Some(s) = stored
+                            && let Err(e) = s.store.rename(&s.id, &title)
+                        {
+                            emit(&writer, Ev::Notice { level: NoticeLevel::Error, message: format!("the session could not be named: {e}") }).await;
+                            continue;
+                        }
+                        emit(&writer, Ev::Title { title }).await;
+                    }
+                    Op::Query { id, query } => {
+                        let (sections, answer) = match query {
+                            Query::Status => (status_sections(&session, &state), None),
+                            Query::SideQuestion { question } => (Vec::new(), Some(format!("side answer: {question}"))),
+                        };
+                        emit(&writer, Ev::QueryResult { id, sections, answer }).await;
+                    }
+                    Op::Background { key } => match &turn {
+                        Some(t) => {
+                            let _ = t.background_tx.send(key);
+                        }
+                        None => { emit(&writer, Ev::Notice { level: NoticeLevel::Warning, message: format!("no running item {key} to move to the background") }).await; }
+                    },
                     Op::Prompt { text, images } => {
                         if turn.is_some() {
                             emit(&writer, Ev::PromptAck { accepted: false, own_run }).await;
@@ -635,6 +917,7 @@ where
                         let (channels, ctx) = turn_ctx(
                             &writer,
                             &session,
+                            &state,
                             Some(&text),
                             &options,
                             &mut item_counter,
@@ -645,7 +928,17 @@ where
                         );
                         turn = Some(channels);
                         let end_tx = end_tx.clone();
-                        let mut steps = parse_script(&text);
+                        let plan_mode = state.lock().modes.plan;
+                        let first_word = text.split_whitespace().next().and_then(|w| w.strip_prefix('/'));
+                        let mut steps = match first_word {
+                            // The harness's own session switch (the engine refuses it; an agent
+                            // that gets it does what the CLI would).
+                            Some(w) if w == SWITCH_COMMAND || SWITCH_COMMAND_ALIASES.contains(&w) => {
+                                vec![Step::SwitchSession, Step::Text("Started a new session.".into())]
+                            }
+                            _ if plan_mode => plan_mode_script(&text),
+                            _ => parse_script(&text),
+                        };
                         if !images.is_empty() {
                             steps.push(Step::Text(describe_images(&images)));
                         }
@@ -657,10 +950,10 @@ where
                         });
                         turn_task.track(task.abort_handle());
                     }
-                    Op::Steer { text, images } => match &turn {
+                    Op::Steer { text, images, message_id } => match &turn {
                         Some(t) => {
                             let text = if images.is_empty() { text } else { format!("{text} ({})", describe_images(&images)) };
-                            let _ = t.steer_tx.send(text);
+                            let _ = t.steer_tx.send(Steered { text, message_id });
                         }
                         None => { emit(&writer, Ev::Notice { level: NoticeLevel::Warning, message: "nothing to steer".into() }).await; }
                     },
@@ -712,25 +1005,101 @@ fn describe_images(paths: &[String]) -> String {
     out
 }
 
-fn fake_commands() -> Vec<Command> {
-    vec![Command {
-        name: "fake-help".into(),
-        description: Some("Show the fake agent's scenario directives".into()),
+/// The fake harness's commands: its help, and its session switch with each alias listed as a
+/// command of its own (the engine never offers the switch).
+///
+/// `fake-project` stands for a command the project itself defines (like pi's prompts in
+/// `.pi/prompts`): it is listed only when the user trusted the project (`trusted`, the decision
+/// the engine passes to a start and to a listing without an agent).
+pub fn fake_commands(trusted: Option<bool>) -> Vec<Command> {
+    let command = |name: &str, description: &str| Command {
+        name: name.into(),
+        description: Some(description.into()),
         source: CommandSource::Harness,
         argument_hint: None,
         action: CommandAction::InsertText {
-            text: "/fake-help ".into(),
+            text: format!("/{name} "),
         },
+    };
+    let mut commands = vec![
+        command("fake-help", "Show the fake agent's scenario directives"),
+        command(SWITCH_COMMAND, "Start a new session"),
+    ];
+    for alias in SWITCH_COMMAND_ALIASES {
+        commands.push(command(alias, &format!("Alias of /{SWITCH_COMMAND}")));
+    }
+    if trusted == Some(true) {
+        commands.push(command(
+            PROJECT_COMMAND,
+            "A command of the project (listed when the project is trusted)",
+        ));
+    }
+    commands
+}
+
+/// The command the project defines (see [`fake_commands`]).
+pub const PROJECT_COMMAND: &str = "fake-project";
+
+/// The agent's status (`query` `status`): its session and what it runs with.
+fn status_sections(session: &CurrentSession, state: &SharedState) -> Vec<StatusSection> {
+    let row = |label: &str, value: String| StatusRow {
+        label: label.into(),
+        value,
+    };
+    let session = session
+        .lock()
+        .as_ref()
+        .map_or_else(|| "not stored".to_owned(), |s| s.id.clone());
+    let state = state.lock().clone();
+    vec![StatusSection {
+        title: "Fake agent".into(),
+        rows: vec![
+            row("Session", session),
+            row("Model", state.model.clone().unwrap_or_default()),
+            row(
+                "Plan mode",
+                if state.modes.plan { "on" } else { "off" }.into(),
+            ),
+            row("Fast mode", state.fast_state().into()),
+            row("Project trusted", trust_word(state.project_trusted).into()),
+        ],
     }]
+}
+
+fn trust_word(trusted: Option<bool>) -> &'static str {
+    match trusted {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "undecided",
+    }
+}
+
+/// How a turn reports its anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorReport {
+    /// Once the turn is saved, before its completion (the default).
+    AtTheEnd,
+    /// Provisional, reported for this index of the session's transcript (`@late-anchor`).
+    Provisional(usize),
+    /// Settled during the turn (`@settle-anchor`): nothing more to report.
+    Settled,
 }
 
 struct TurnCtx<W> {
     writer: Emitter<W>,
     /// The stored session the turn belongs to (its transcript gets the finished turn).
-    session: Option<Session>,
+    session: CurrentSession,
+    /// The agent's model and modes.
+    state: SharedState,
     interrupt: watch::Receiver<bool>,
     responses: mpsc::UnboundedReceiver<(String, InteractionResolution)>,
-    steers: mpsc::UnboundedReceiver<String>,
+    steers: mpsc::UnboundedReceiver<Steered>,
+    /// Keys of running items the adapter asks to move to the background (`@tool`).
+    backgrounds: mpsc::UnboundedReceiver<String>,
+    /// Steered messages are returned instead of taken (`@refuse-steers`).
+    refuse_steers: bool,
+    /// How the turn's anchor has been reported so far (`@late-anchor`, `@settle-anchor`).
+    anchor: AnchorReport,
     options: AgentOptions,
     first_item: u64,
     hanging: Arc<AtomicBool>,
@@ -748,7 +1117,8 @@ struct TurnCtx<W> {
 #[allow(clippy::too_many_arguments)]
 fn turn_ctx<W>(
     writer: &Emitter<W>,
-    session: &Option<Session>,
+    session: &CurrentSession,
+    state: &SharedState,
     prompt: Option<&str>,
     options: &AgentOptions,
     item_counter: &mut u64,
@@ -760,7 +1130,8 @@ fn turn_ctx<W>(
     let (interrupt_tx, interrupt_rx) = watch::channel(false);
     let (respond_tx, respond_rx) = mpsc::unbounded_channel();
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
-    let record = session.as_ref().map(|_| {
+    let (background_tx, background_rx) = mpsc::unbounded_channel();
+    let record = session.lock().as_ref().map(|_| {
         Arc::new(parking_lot::Mutex::new(match prompt {
             Some(text) => TurnRecord::new(text),
             None => TurnRecord::own(),
@@ -772,9 +1143,13 @@ fn turn_ctx<W>(
             record,
         },
         session: session.clone(),
+        state: state.clone(),
         interrupt: interrupt_rx,
         responses: respond_rx,
         steers: steer_rx,
+        backgrounds: background_rx,
+        refuse_steers: false,
+        anchor: AnchorReport::AtTheEnd,
         options: options.clone(),
         first_item: *item_counter,
         hanging: hanging.clone(),
@@ -788,6 +1163,7 @@ fn turn_ctx<W>(
             interrupt_tx,
             respond_tx,
             steer_tx,
+            background_tx,
         },
         ctx,
     )
@@ -799,7 +1175,15 @@ impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
     }
 
     /// Takes in steered input: recorded as the user's message and acknowledged with a notice.
-    async fn steered(&self, text: String) {
+    /// Under `@refuse-steers` the message is returned instead (when it has an id).
+    async fn steered(&self, steered: Steered) {
+        let Steered { text, message_id } = steered;
+        if self.refuse_steers
+            && let Some(message_id) = message_id
+        {
+            emit(&self.writer, Ev::SteerReturned { message_id }).await;
+            return;
+        }
         if let Some(record) = &self.writer.record {
             record
                 .lock()
@@ -815,33 +1199,62 @@ impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
         .await;
     }
 
-    /// Appends the finished turn to the session transcript (when the session is stored). A
-    /// transcript that cannot be written is reported to the adapter, within the turn.
-    async fn save(&self, status: TurnStatus) {
-        let (Some(session), Some(record)) = (&self.session, &self.writer.record) else {
-            return;
+    /// Appends the finished turn to the session transcript (when the session is stored) and
+    /// returns its index there (its anchor). A transcript that cannot be written is reported to
+    /// the adapter, within the turn.
+    async fn save(&self, status: TurnStatus) -> Option<usize> {
+        let session = self.session.lock().clone();
+        let (Some(session), Some(record)) = (session, &self.writer.record) else {
+            return None;
         };
         let turn = record.lock().finish(status);
-        if let Err(e) = session.store.append_turn(&session.id, &turn) {
-            emit(
-                &self.writer,
-                Ev::Notice {
-                    level: NoticeLevel::Error,
-                    message: format!("the session transcript could not be written: {e}"),
-                },
-            )
-            .await;
+        let saved = session
+            .store
+            .read(&session.id)
+            .map(|t| t.turns.len())
+            .and_then(|index| {
+                session
+                    .store
+                    .append_turn(&session.id, &turn)
+                    .map(|()| index)
+            });
+        match saved {
+            Ok(index) => Some(index),
+            Err(e) => {
+                emit(
+                    &self.writer,
+                    Ev::Notice {
+                        level: NoticeLevel::Error,
+                        message: format!("the session transcript could not be written: {e}"),
+                    },
+                )
+                .await;
+                None
+            }
         }
     }
 
-    /// Ends the turn: saves it, then reports its completion.
+    /// Ends the turn: saves it, reports its anchor, then its completion.
     async fn finish(&self, status: TurnStatus, usage: Option<Usage>, error: Option<TurnError>) {
         if let (Some(record), Some(error)) = (&self.writer.record, &error) {
             record
                 .lock()
                 .notice(NoticeLevel::Error, &error.message, Some(&error.kind));
         }
-        self.save(status).await;
+        if let Some(turn) = self.save(status).await {
+            match self.anchor {
+                AnchorReport::AtTheEnd => {
+                    emit(&self.writer, Ev::Anchor { turn }).await;
+                }
+                AnchorReport::Provisional(index) => {
+                    let session = self.session.lock().as_ref().map(|s| s.id.clone());
+                    if let Some(session) = session {
+                        self.state.lock().unsettled.push((session, index));
+                    }
+                }
+                AnchorReport::Settled => {}
+            }
+        }
         // Before the completion is reported: a prompt sent in response to it must find the turn
         // over. The main loop owns the receiver for the agent's whole life.
         let _ = self.end.send(TurnEnd::Done);
@@ -870,7 +1283,38 @@ impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
                         return false;
                     }
                 }
-                Some(text) = self.steers.recv() => self.steered(text).await,
+                Some(steered) = self.steers.recv() => self.steered(steered).await,
+            }
+        }
+    }
+
+    /// Runs the foreground command of `@tool` (item `key`) for `ms`, taking in steers
+    /// meanwhile, unless it is moved to the background or the turn is interrupted first.
+    async fn run_tool(&mut self, key: &str, ms: u64) -> ToolEnd {
+        let sleep = tokio::time::sleep(Duration::from_millis(ms));
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => return ToolEnd::Done,
+                changed = self.interrupt.changed() => {
+                    if changed.is_err() || *self.interrupt.borrow() {
+                        return ToolEnd::Interrupted;
+                    }
+                }
+                Some(steered) = self.steers.recv() => self.steered(steered).await,
+                Some(asked) = self.backgrounds.recv() => {
+                    if asked == key {
+                        return ToolEnd::Background;
+                    }
+                    emit(
+                        &self.writer,
+                        Ev::Notice {
+                            level: NoticeLevel::Warning,
+                            message: format!("no running item {asked} to move to the background"),
+                        },
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -883,7 +1327,7 @@ impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
                         return None;
                     }
                 }
-                Some(text) = self.steers.recv() => self.steered(text).await,
+                Some(steered) = self.steers.recv() => self.steered(steered).await,
                 resp = self.responses.recv() => match resp {
                     Some((id, res)) if id == request_id => return Some(res),
                     Some(_) => continue,
@@ -900,6 +1344,14 @@ async fn run_turn<W: AsyncWrite + Unpin + Send + 'static>(
 ) -> TurnEnd {
     let w = ctx.writer.clone();
     emit(&w, Ev::TurnStarted).await;
+    // What the previous turns left provisional settles now (in the session they ran in).
+    let current = ctx.session.lock().as_ref().map(|s| s.id.clone());
+    let unsettled = std::mem::take(&mut ctx.state.lock().unsettled);
+    for (session, turn) in unsettled {
+        if current.as_deref() == Some(session.as_str()) {
+            emit(&w, Ev::AnchorSettled { turn }).await;
+        }
+    }
     let mut next_key = ctx.first_item;
     let mut key = || {
         next_key += 1;
@@ -1461,6 +1913,252 @@ async fn run_turn<W: AsyncWrite + Unpin + Send + 'static>(
                         .await;
                     }
                 }
+                Step::SwitchSession => match switch_session(&ctx.session, &ctx.options.cwd) {
+                    Ok(id) => {
+                        emit(&w, Ev::Ready { session_id: id }).await;
+                    }
+                    Err(message) => {
+                        emit(
+                            &w,
+                            Ev::Notice {
+                                level: NoticeLevel::Error,
+                                message: format!("the new session could not be created: {message}"),
+                            },
+                        )
+                        .await;
+                    }
+                },
+                Step::Permission(mode) => {
+                    let model = ctx.state.lock().model.clone();
+                    emit(
+                        &w,
+                        Ev::SessionInfo {
+                            model,
+                            permission_mode: Some(mode),
+                            effort: None,
+                        },
+                    )
+                    .await;
+                }
+                Step::Effort(effort) => {
+                    let model = ctx.state.lock().model.clone();
+                    emit(
+                        &w,
+                        Ev::SessionInfo {
+                            model,
+                            permission_mode: None,
+                            effort: Some(effort),
+                        },
+                    )
+                    .await;
+                }
+                Step::PlanMode(on) => {
+                    ctx.state.lock().modes.plan = on;
+                    emit(
+                        &w,
+                        Ev::Modes {
+                            plan: Some(on),
+                            fast_state: None,
+                        },
+                    )
+                    .await;
+                }
+                Step::ProposedPlan(text) => {
+                    let k = key();
+                    emit(
+                        &w,
+                        Ev::ItemStarted {
+                            key: k.clone(),
+                            body: ItemBody::ProposedPlan {
+                                text: String::new(),
+                            },
+                        },
+                    )
+                    .await;
+                    open_items.push(k.clone());
+                    for line in text.split_inclusive('\n') {
+                        emit(
+                            &w,
+                            Ev::Delta {
+                                key: k.clone(),
+                                field: DeltaField::Text,
+                                text: line.to_owned(),
+                            },
+                        )
+                        .await;
+                        if !ctx.pause(0).await {
+                            break 'steps TurnStatus::Interrupted;
+                        }
+                    }
+                    emit(
+                        &w,
+                        Ev::ItemCompleted {
+                            key: k.clone(),
+                            status: ItemStatus::Completed,
+                            body: None,
+                        },
+                    )
+                    .await;
+                    open_items.retain(|x| x != &k);
+                }
+                Step::FastState(state) => {
+                    emit(
+                        &w,
+                        Ev::Modes {
+                            plan: None,
+                            fast_state: Some(state),
+                        },
+                    )
+                    .await;
+                }
+                Step::Rename(title) => {
+                    let stored = ctx.session.lock().clone();
+                    match stored.map(|s| s.store.rename(&s.id, &title)) {
+                        Some(Err(e)) => {
+                            emit(
+                                &w,
+                                Ev::Notice {
+                                    level: NoticeLevel::Error,
+                                    message: format!("the session could not be named: {e}"),
+                                },
+                            )
+                            .await;
+                        }
+                        _ => {
+                            emit(&w, Ev::Title { title }).await;
+                        }
+                    }
+                }
+                Step::Editor(text) => {
+                    emit(&w, Ev::EditorText { text }).await;
+                }
+                Step::Tool { ms, title } => {
+                    let k = key();
+                    emit(
+                        &w,
+                        Ev::ItemStarted {
+                            key: k.clone(),
+                            body: command_body(&title, &ctx.options, "", None),
+                        },
+                    )
+                    .await;
+                    open_items.push(k.clone());
+                    // Like Claude Code's task_started for a foreground command: from now on it
+                    // can be moved.
+                    emit(
+                        &w,
+                        Ev::Backgroundable {
+                            key: k.clone(),
+                            backgroundable: true,
+                        },
+                    )
+                    .await;
+                    let started = std::time::Instant::now();
+                    match ctx.run_tool(&k, ms).await {
+                        ToolEnd::Done => {
+                            let out = format!("ran {title}\n");
+                            emit(
+                                &w,
+                                Ev::ItemCompleted {
+                                    key: k.clone(),
+                                    status: ItemStatus::Completed,
+                                    body: Some(command_body(&title, &ctx.options, &out, Some(0))),
+                                },
+                            )
+                            .await;
+                        }
+                        ToolEnd::Background => {
+                            // The rest of the command goes on as a shell task, reported before
+                            // the item closes as backgrounded.
+                            let left = ms.saturating_sub(started.elapsed().as_millis() as u64);
+                            let spec = BackgroundSpec {
+                                key: format!("bg-{k}"),
+                                kind: BackgroundTaskKind::Shell,
+                                title: title.clone(),
+                                ms: left.max(1),
+                                end: BackgroundEnd::Completed,
+                                exit: None,
+                                progress: 0,
+                                parent: None,
+                                restart: 0,
+                                ambient: false,
+                                wake: false,
+                                approve: false,
+                                stoppable: true,
+                                stubborn: false,
+                                launch_item: true,
+                            };
+                            ctx.background.start(&w, spec, Some(k.clone())).await;
+                            emit(
+                                &w,
+                                Ev::ItemCompleted {
+                                    key: k.clone(),
+                                    status: ItemStatus::Backgrounded,
+                                    body: None,
+                                },
+                            )
+                            .await;
+                        }
+                        ToolEnd::Interrupted => break 'steps TurnStatus::Interrupted,
+                    }
+                    open_items.retain(|x| x != &k);
+                }
+                Step::RefuseSteers => ctx.refuse_steers = true,
+                Step::Trust => {
+                    let trusted = ctx.state.lock().project_trusted;
+                    let k = key();
+                    emit(
+                        &w,
+                        Ev::ItemStarted {
+                            key: k.clone(),
+                            body: ItemBody::AgentMessage {
+                                text: format!("project trusted: {}", trust_word(trusted)),
+                            },
+                        },
+                    )
+                    .await;
+                    emit(
+                        &w,
+                        Ev::ItemCompleted {
+                            key: k,
+                            status: ItemStatus::Completed,
+                            body: None,
+                        },
+                    )
+                    .await;
+                }
+                Step::Stderr(text) => eprintln!("{text}"),
+                Step::LateAnchor => {
+                    // The index the turn gets once it is saved: it follows the stored turns.
+                    let session = ctx.session.lock().clone();
+                    let index = session.map(|s| s.store.read(&s.id).map(|t| t.turns.len()));
+                    match index {
+                        Some(Ok(index)) => {
+                            ctx.anchor = AnchorReport::Provisional(index);
+                            emit(&w, Ev::ProvisionalAnchor { turn: index }).await;
+                        }
+                        Some(Err(e)) => {
+                            emit(
+                                &w,
+                                Ev::Notice {
+                                    level: NoticeLevel::Error,
+                                    message: format!(
+                                        "the session transcript could not be read: {e}"
+                                    ),
+                                },
+                            )
+                            .await;
+                        }
+                        // Nothing is stored: there is no anchor.
+                        None => {}
+                    }
+                }
+                Step::SettleAnchor => {
+                    if let AnchorReport::Provisional(turn) = ctx.anchor {
+                        ctx.anchor = AnchorReport::Settled;
+                        emit(&w, Ev::AnchorSettled { turn }).await;
+                    }
+                }
                 Step::Unknown(name) => {
                     emit(
                         &w,
@@ -1592,7 +2290,10 @@ pub async fn record_session(
         session_id: id.clone(),
         resume: false,
         fork_from: None,
+        fork_at: None,
         sessions_dir: Some(sessions_dir.display().to_string()),
+        modes: Modes::default(),
+        project_trusted: None,
     })
     .await?;
     loop {
@@ -1837,7 +2538,10 @@ mod tests {
                 session_id: "missing".into(),
                 resume: true,
                 fork_from: None,
+                fork_at: None,
                 sessions_dir: Some(dir.path().display().to_string()),
+                modes: Modes::default(),
+                project_trusted: None,
             },
         )
         .await;
@@ -1860,7 +2564,10 @@ mod tests {
                 session_id: "new".into(),
                 resume: false,
                 fork_from: Some("source".into()),
+                fork_at: None,
                 sessions_dir: None,
+                modes: Modes::default(),
+                project_trusted: None,
             },
         )
         .await;

@@ -67,9 +67,13 @@ pub struct ProjectRow {
     pub removed: bool,
 }
 
-const PROJECT_COLS: &str = "id, name, path, created_at, updated_at, archived, removed, defaults";
+const PROJECT_COLS: &str =
+    "id, name, path, created_at, updated_at, archived, removed, defaults, harness_trust";
 
-fn project_row(r: &Row<'_>) -> rusqlite::Result<(ProjectRow, String)> {
+/// A project row as stored: the row without its JSON columns, `defaults` and `harness_trust`.
+type RawProject = (ProjectRow, String, Option<String>);
+
+fn project_row(r: &Row<'_>) -> rusqlite::Result<RawProject> {
     Ok((
         ProjectRow {
             project: Project {
@@ -81,15 +85,18 @@ fn project_row(r: &Row<'_>) -> rusqlite::Result<(ProjectRow, String)> {
                 archived: b(r.get(5)?),
                 defaults: ProjectDefaults::default(),
                 git: GitInfo::default(),
+                harness_trust: Default::default(),
             },
             removed: b(r.get(6)?),
         },
         r.get::<_, String>(7)?,
+        r.get(8)?,
     ))
 }
 
-fn finish_project((mut row, defaults): (ProjectRow, String)) -> CoreResult<ProjectRow> {
+fn finish_project((mut row, defaults, trust): RawProject) -> CoreResult<ProjectRow> {
     row.project.defaults = from_json(&defaults)?;
+    row.project.harness_trust = opt_json(trust)?.unwrap_or_default();
     Ok(row)
 }
 
@@ -127,19 +134,24 @@ pub fn list_projects(conn: &Connection, include_archived: bool) -> CoreResult<Ve
     Ok(out)
 }
 
+/// `projects.harness_trust`: `NULL` while no decision was recorded.
+fn trust_json(p: &Project) -> Option<String> {
+    (!p.harness_trust.is_empty()).then(|| to_json(&p.harness_trust))
+}
+
 pub fn insert_project(conn: &Connection, p: &Project, key: &str) -> CoreResult<()> {
     conn.execute(
-        "INSERT INTO projects (id, name, path, path_key, created_at, updated_at, archived, removed, defaults)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
-        params![p.id.as_str(), p.name, p.path, key, p.created_at, p.updated_at, p.archived, to_json(&p.defaults)],
+        "INSERT INTO projects (id, name, path, path_key, created_at, updated_at, archived, removed, defaults, harness_trust)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9)",
+        params![p.id.as_str(), p.name, p.path, key, p.created_at, p.updated_at, p.archived, to_json(&p.defaults), trust_json(p)],
     )?;
     Ok(())
 }
 
 pub fn update_project(conn: &Connection, p: &Project, removed: bool) -> CoreResult<()> {
     conn.execute(
-        "UPDATE projects SET name = ?2, updated_at = ?3, archived = ?4, removed = ?5, defaults = ?6 WHERE id = ?1",
-        params![p.id.as_str(), p.name, p.updated_at, p.archived, removed, to_json(&p.defaults)],
+        "UPDATE projects SET name = ?2, updated_at = ?3, archived = ?4, removed = ?5, defaults = ?6, harness_trust = ?7 WHERE id = ?1",
+        params![p.id.as_str(), p.name, p.updated_at, p.archived, removed, to_json(&p.defaults), trust_json(p)],
     )?;
     Ok(())
 }
@@ -176,13 +188,24 @@ pub struct ThreadRow {
     pub archived: bool,
     pub removed: bool,
     pub pinned: bool,
+    /// Plan mode and fast mode (`Thread.modes`).
+    pub modes: ThreadModes,
+    /// What the harness last reported about fast mode (`Thread.fastModeState`).
+    pub fast_mode_state: Option<String>,
+    /// With `fork_source`: where the fork branches the source (a fork at a turn); `None`: the
+    /// whole source session.
+    pub fork_at: Option<aas_harness::ForkPoint>,
+    /// The user's title has not reached the native session yet: it is given when the next
+    /// agent process starts (harnesses with the feature `rename`).
+    pub native_rename_pending: bool,
 }
 
 const THREAD_COLS: &str = "id, project_id, harness_id, title, title_source, cwd, workspace, settings, status, \
     native_session_id, fork_source, forked_from, last_error, usage, base_tree, diff_available, queue_paused, head, \
-    created_at, updated_at, last_activity_at, archived, removed, pinned";
+    created_at, updated_at, last_activity_at, archived, removed, pinned, modes, fast_mode_state, fork_at, \
+    native_rename_pending";
 
-const THREAD_COL_COUNT: usize = 24;
+const THREAD_COL_COUNT: usize = 28;
 
 fn thread_row(r: &Row<'_>) -> rusqlite::Result<[Value; THREAD_COL_COUNT]> {
     // Read raw values first; JSON decoding happens outside the rusqlite callback.
@@ -238,6 +261,10 @@ fn decode_thread(v: [Value; THREAD_COL_COUNT]) -> CoreResult<ThreadRow> {
         archived: i(&v[21]) != 0,
         removed: i(&v[22]) != 0,
         pinned: i(&v[23]) != 0,
+        modes: opt_json(os(&v[24]))?.unwrap_or_default(),
+        fast_mode_state: os(&v[25]),
+        fork_at: opt_json(os(&v[26]))?,
+        native_rename_pending: i(&v[27]) != 0,
     })
 }
 
@@ -254,7 +281,7 @@ pub fn get_thread(conn: &Connection, id: &ThreadId) -> CoreResult<Option<ThreadR
 
 pub fn insert_thread(conn: &Connection, t: &ThreadRow) -> CoreResult<()> {
     conn.execute(
-        &format!("INSERT INTO threads ({THREAD_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)"),
+        &format!("INSERT INTO threads ({THREAD_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)"),
         params![
             t.id.as_str(),
             t.project_id.as_str(),
@@ -280,6 +307,10 @@ pub fn insert_thread(conn: &Connection, t: &ThreadRow) -> CoreResult<()> {
             t.archived,
             t.removed,
             t.pinned,
+            to_json(&t.modes),
+            t.fast_mode_state,
+            t.fork_at.as_ref().map(to_json),
+            t.native_rename_pending,
         ],
     )?;
     Ok(())
@@ -290,7 +321,8 @@ pub fn update_thread(conn: &Connection, t: &ThreadRow) -> CoreResult<()> {
         "UPDATE threads SET title = ?2, title_source = ?3, cwd = ?4, workspace = ?5, settings = ?6, status = ?7,
             native_session_id = ?8, fork_source = ?9, forked_from = ?10, last_error = ?11, usage = ?12, base_tree = ?13,
             diff_available = ?14, queue_paused = ?15, head = ?16, updated_at = ?17, last_activity_at = ?18,
-            archived = ?19, removed = ?20, pinned = ?21
+            archived = ?19, removed = ?20, pinned = ?21, modes = ?22, fast_mode_state = ?23, fork_at = ?24,
+            native_rename_pending = ?25
          WHERE id = ?1",
         params![
             t.id.as_str(),
@@ -314,6 +346,10 @@ pub fn update_thread(conn: &Connection, t: &ThreadRow) -> CoreResult<()> {
             t.archived,
             t.removed,
             t.pinned,
+            to_json(&t.modes),
+            t.fast_mode_state,
+            t.fork_at.as_ref().map(to_json),
+            t.native_rename_pending,
         ],
     )?;
     Ok(())
@@ -357,6 +393,8 @@ pub fn thread_view(conn: &Connection, t: &ThreadRow) -> CoreResult<Thread> {
         archived: t.archived,
         pinned: t.pinned,
         background,
+        modes: t.modes,
+        fast_mode_state: t.fast_mode_state.clone(),
         head: t.head,
     })
 }
@@ -478,13 +516,40 @@ pub struct TurnRow {
     pub base_tree: Option<String>,
     /// Working-tree snapshot when the turn ended.
     pub end_tree: Option<String>,
+    /// The harness's own anchor of the turn (`AdapterEvent::TurnAnchor`), kept to fork at it.
+    /// `Turn.forkable` says whether it is set.
+    pub native_anchor: Option<Value>,
+    /// The native session `native_anchor` belongs to, once the thread has moved to another
+    /// native session; `None`: the thread's current one (design.md §9.6).
+    pub anchor_session: Option<String>,
+    /// The turn's input reached the agent, or the agent started the turn itself: the turn is
+    /// part of the native session. `false` for a turn whose start failed or that was
+    /// interrupted before it was sent.
+    pub delivered: bool,
 }
 
-const TURN_COLS: &str = "id, thread_id, idx, status, started_at, completed_at, model, error, usage, diff, base_tree, end_tree, start_trigger";
+impl TurnRow {
+    /// A row without snapshots or anchor (`turn.forkable` follows the anchor), not delivered.
+    pub fn new(turn: Turn) -> Self {
+        Self {
+            turn: Turn {
+                forkable: false,
+                ..turn
+            },
+            base_tree: None,
+            end_tree: None,
+            native_anchor: None,
+            anchor_session: None,
+            delivered: false,
+        }
+    }
+}
+
+const TURN_COLS: &str = "id, thread_id, idx, status, started_at, completed_at, model, error, usage, diff, base_tree, end_tree, start_trigger, native_anchor, anchor_session, delivered";
 
 /// A turn row as stored: the row without its JSON and enum columns, those columns (error,
-/// usage, diff), the status and the trigger.
-type RawTurn = (TurnRow, [Option<String>; 3], String, Option<String>);
+/// usage, diff, anchor), the status and the trigger.
+type RawTurn = (TurnRow, [Option<String>; 4], String, Option<String>);
 
 fn turn_row(r: &Row<'_>) -> rusqlite::Result<RawTurn> {
     Ok((
@@ -501,17 +566,23 @@ fn turn_row(r: &Row<'_>) -> rusqlite::Result<RawTurn> {
                 usage: None,
                 diff: None,
                 trigger: None,
+                forkable: false,
             },
             base_tree: r.get(10)?,
             end_tree: r.get(11)?,
+            native_anchor: None,
+            anchor_session: r.get(14)?,
+            delivered: r.get(15)?,
         },
-        [r.get(7)?, r.get(8)?, r.get(9)?],
+        [r.get(7)?, r.get(8)?, r.get(9)?, r.get(13)?],
         r.get(3)?,
         r.get(12)?,
     ))
 }
 
-fn finish_turn((mut row, [error, usage, diff], status, trigger): RawTurn) -> CoreResult<TurnRow> {
+fn finish_turn(
+    (mut row, [error, usage, diff, anchor], status, trigger): RawTurn,
+) -> CoreResult<TurnRow> {
     row.turn.status = TurnStatus::parse(&status)
         .ok_or_else(|| CoreError::Corrupt(format!("turn status {status}")))?;
     row.turn.error = opt_json(error)?;
@@ -522,13 +593,15 @@ fn finish_turn((mut row, [error, usage, diff], status, trigger): RawTurn) -> Cor
             TurnTrigger::parse(&t).ok_or_else(|| CoreError::Corrupt(format!("turn trigger {t}")))
         })
         .transpose()?;
+    row.native_anchor = opt_json(anchor)?;
+    row.turn.forkable = row.native_anchor.is_some();
     Ok(row)
 }
 
 pub fn insert_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
     conn.execute(
         &format!(
-            "INSERT INTO turns ({TURN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+            "INSERT INTO turns ({TURN_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
         ),
         params![
             t.turn.id.as_str(),
@@ -544,6 +617,9 @@ pub fn insert_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
             t.base_tree,
             t.end_tree,
             t.turn.trigger.map(TurnTrigger::as_str),
+            t.native_anchor.as_ref().map(to_json),
+            t.anchor_session,
+            t.delivered,
         ],
     )?;
     Ok(())
@@ -552,7 +628,7 @@ pub fn insert_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
 pub fn update_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
     conn.execute(
         "UPDATE turns SET status = ?2, completed_at = ?3, model = ?4, error = ?5, usage = ?6, diff = ?7, base_tree = ?8,
-            end_tree = ?9, start_trigger = ?10
+            end_tree = ?9, start_trigger = ?10, native_anchor = ?11, anchor_session = ?12, delivered = ?13
          WHERE id = ?1",
         params![
             t.turn.id.as_str(),
@@ -565,6 +641,9 @@ pub fn update_turn(conn: &Connection, t: &TurnRow) -> CoreResult<()> {
             t.base_tree,
             t.end_tree,
             t.turn.trigger.map(TurnTrigger::as_str),
+            t.native_anchor.as_ref().map(to_json),
+            t.anchor_session,
+            t.delivered,
         ],
     )?;
     Ok(())
@@ -633,6 +712,52 @@ pub fn all_turns(conn: &Connection, thread: &ThreadId) -> CoreResult<Vec<TurnRow
     Ok(out)
 }
 
+/// Gives the turn of `thread` whose recorded anchor is exactly `previous` the anchor `anchor`
+/// (see `AdapterEvent::TurnAnchorReplaced`). Only anchors of the thread's current native session
+/// are candidates: the harness names the anchors of the session it runs. Returns whether a turn
+/// had it.
+pub fn replace_turn_anchor(
+    conn: &Connection,
+    thread: &ThreadId,
+    previous: &Value,
+    anchor: &Value,
+) -> CoreResult<bool> {
+    let rows: Vec<(String, String)> = conn
+        .prepare_cached(
+            "SELECT id, native_anchor FROM turns
+             WHERE thread_id = ?1 AND native_anchor IS NOT NULL AND anchor_session IS NULL",
+        )?
+        .query_map([thread.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut replaced = false;
+    for (id, stored) in rows {
+        let stored: Value = from_json(&stored)?;
+        if stored == *previous {
+            conn.execute(
+                "UPDATE turns SET native_anchor = ?2 WHERE id = ?1",
+                params![id, to_json(anchor)],
+            )?;
+            replaced = true;
+        }
+    }
+    Ok(replaced)
+}
+
+/// The thread moved from native session `previous` to another one: the anchors recorded so far
+/// (those of its current session, `anchor_session IS NULL`) are kept as anchors of `previous`.
+pub fn keep_anchors_with_session(
+    conn: &Connection,
+    thread: &ThreadId,
+    previous: &str,
+) -> CoreResult<()> {
+    conn.execute(
+        "UPDATE turns SET anchor_session = ?2
+         WHERE thread_id = ?1 AND native_anchor IS NOT NULL AND anchor_session IS NULL",
+        params![thread.as_str(), previous],
+    )?;
+    Ok(())
+}
+
 pub fn turns_with_status(conn: &Connection, status: TurnStatus) -> CoreResult<Vec<TurnRow>> {
     let mut stmt =
         conn.prepare_cached(&format!("SELECT {TURN_COLS} FROM turns WHERE status = ?1"))?;
@@ -655,10 +780,10 @@ pub fn next_turn_index(conn: &Connection, thread: &ThreadId) -> CoreResult<u32> 
 
 // ----- items ------------------------------------------------------------------------------------
 
-const ITEM_COLS: &str =
-    "id, thread_id, turn_id, status, started_at, completed_at, body, background_task_id";
+const ITEM_COLS: &str = "id, thread_id, turn_id, status, started_at, completed_at, body, background_task_id, backgroundable";
 
-/// An item row as stored (id, thread, turn, status, started, completed, body, background task).
+/// An item row as stored (id, thread, turn, status, started, completed, body, background task,
+/// backgroundable).
 type RawItem = (
     String,
     String,
@@ -668,6 +793,7 @@ type RawItem = (
     Option<i64>,
     String,
     Option<String>,
+    i64,
 );
 
 fn item_row(r: &Row<'_>) -> rusqlite::Result<RawItem> {
@@ -680,11 +806,12 @@ fn item_row(r: &Row<'_>) -> rusqlite::Result<RawItem> {
         r.get(5)?,
         r.get(6)?,
         r.get(7)?,
+        r.get(8)?,
     ))
 }
 
 fn finish_item(
-    (id, thread, turn, status, started, completed, body, task): RawItem,
+    (id, thread, turn, status, started, completed, body, task, backgroundable): RawItem,
 ) -> CoreResult<Item> {
     Ok(Item {
         id: ItemId::from(id),
@@ -695,6 +822,7 @@ fn finish_item(
         started_at: started,
         completed_at: completed,
         background_task_id: task.map(BackgroundTaskId::from),
+        backgroundable: b(backgroundable),
         body: from_json(&body)?,
     })
 }
@@ -707,7 +835,7 @@ pub fn insert_item(conn: &Connection, item: &Item) -> CoreResult<()> {
         |r| r.get(0),
     )?;
     conn.execute(
-        &format!("INSERT INTO items ({ITEM_COLS}, ord) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"),
+        &format!("INSERT INTO items ({ITEM_COLS}, ord) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"),
         params![
             item.id.as_str(),
             item.thread_id.as_str(),
@@ -717,6 +845,7 @@ pub fn insert_item(conn: &Connection, item: &Item) -> CoreResult<()> {
             item.completed_at,
             to_json(&item.body),
             item.background_task_id.as_ref().map(|t| t.as_str()),
+            item.backgroundable,
             ord,
         ],
     )?;
@@ -726,16 +855,28 @@ pub fn insert_item(conn: &Connection, item: &Item) -> CoreResult<()> {
 pub fn update_item(conn: &Connection, item: &Item) -> CoreResult<()> {
     sync_item_blob_refs(conn, item)?;
     conn.execute(
-        "UPDATE items SET status = ?2, completed_at = ?3, body = ?4, background_task_id = ?5 WHERE id = ?1",
+        "UPDATE items SET status = ?2, completed_at = ?3, body = ?4, background_task_id = ?5, backgroundable = ?6 WHERE id = ?1",
         params![
             item.id.as_str(),
             item.status.as_str(),
             item.completed_at,
             to_json(&item.body),
             item.background_task_id.as_ref().map(|t| t.as_str()),
+            item.backgroundable,
         ],
     )?;
     Ok(())
+}
+
+pub fn get_item(conn: &Connection, id: &ItemId) -> CoreResult<Option<Item>> {
+    conn.query_row(
+        &format!("SELECT {ITEM_COLS} FROM items WHERE id = ?1"),
+        [id.as_str()],
+        item_row,
+    )
+    .optional()?
+    .map(finish_item)
+    .transpose()
 }
 
 pub fn items_of_turns(conn: &Connection, turns: &[TurnId]) -> CoreResult<Vec<Item>> {
@@ -1393,7 +1534,8 @@ pub fn item_blob_ids(body: &ItemBody) -> Vec<BlobId> {
         | ItemBody::Reasoning { .. }
         | ItemBody::FileChange { .. }
         | ItemBody::Plan { .. }
-        | ItemBody::Notice { .. } => Vec::new(),
+        | ItemBody::Notice { .. }
+        | ItemBody::ProposedPlan { .. } => Vec::new(),
     }
 }
 

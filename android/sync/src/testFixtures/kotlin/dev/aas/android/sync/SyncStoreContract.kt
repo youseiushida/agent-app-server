@@ -303,6 +303,28 @@ abstract class SyncStoreContract {
         }
     }
 
+    /** A chained entry keeps the entry it waits for, and its params change when it is released (6.3). */
+    @Test
+    fun aChainedEntryKeepsWhatItWaitsFor() = test { store ->
+        store.transaction { tx ->
+            tx.addOutbox(entry("c1").copy(method = "thread/create"))
+            tx.addOutbox(entry("c2").copy(method = "thread/update", after = "c1"))
+            tx.addOutbox(entry("c3").copy(after = "c2"))
+        }
+        store.transaction { tx ->
+            assertEquals(listOf(null, "c1", "c2"), tx.outbox().map { it.after })
+            // Released with the created thread's id, in place.
+            tx.updateOutbox(entry("c2", threadId = "thr_new").copy(method = "thread/update", after = null))
+            tx.updateOutbox(entry("c3", threadId = "thr_new").copy(after = "c2"))
+        }
+        store.transaction { tx ->
+            val entries = tx.outbox()
+            assertEquals(listOf("c1", "c2", "c3"), entries.map { it.clientRequestId })
+            assertEquals(listOf(null, null, "c2"), entries.map { it.after })
+            assertEquals(listOf(null, "thr_new", "thr_new"), entries.map { it.threadId })
+        }
+    }
+
     @Test
     fun theQueueIsReplacedAsAWhole() = test { store ->
         store.transaction { tx ->

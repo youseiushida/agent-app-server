@@ -12,17 +12,44 @@
 //!
 //! Extension commands (`source: "extension"`) are also told apart from other prompts: pi runs
 //! them as soon as the prompt arrives, even while a run goes on, and answers the prompt only
-//! once the command's handler has returned (see [`is_extension_command`]).
+//! once the command's handler has returned (see [`is_extension_command`]). While a run goes on,
+//! pi's `steer` refuses them ("cannot be queued"), so a steer that is an extension command is
+//! sent as a `prompt` (see `PiSession::steer`).
+//!
+//! Left out of the listing:
+//! * the approval gate's internal command ([`crate::gate::FORK_COMMAND`], sent by the adapter
+//!   itself to fork at a turn); its `/reload` is offered like any extension command;
+//! * [`TUI_ONLY_COMMANDS`]: commands of extensions pi bundles that only work in pi's
+//!   interactive mode, by name and source, per pi version.
 
 use std::collections::HashSet;
 
 use aas_harness::{Command, TurnInput, TurnInputPart};
 use aas_protocol::{CommandAction, CommandSource};
 
+use crate::gate;
 use crate::wire::PiCommand;
 
 /// Name of the built-in compaction command.
 pub const COMPACT: &str = "compact";
+
+/// Commands of extensions bundled with pi that do nothing over RPC, as `(name, sourceInfo.path)`
+/// (both must match, so a user's own extension of the same name stays). Checked against pi
+/// 0.85.1:
+/// * `llama` from the bundled llama.cpp extension (`<inline:llama.cpp>`): its handler returns
+///   right away with the notice "/llama is available in interactive mode" when `ctx.mode` is
+///   not `tui` (the extension's `registerCommand("llama")`), so offering it on the phone only
+///   produces that notice. pi marks the command in no other way (no hidden flag; `inline` only
+///   says the extension was loaded from a factory), hence the list.
+pub const TUI_ONLY_COMMANDS: &[(&str, &str)] = &[("llama", "<inline:llama.cpp>")];
+
+/// Whether the command is one pi lists but the phone never gets (see the module docs).
+fn hidden(c: &PiCommand) -> bool {
+    (c.name == gate::FORK_COMMAND && c.source.as_deref() == Some("extension"))
+        || TUI_ONLY_COMMANDS
+            .iter()
+            .any(|(name, path)| c.name == *name && c.source_path() == Some(path))
+}
 
 fn to_command(c: PiCommand) -> Command {
     Command {
@@ -53,10 +80,15 @@ pub fn builtin_compact(pi_commands: &[PiCommand]) -> bool {
     !pi_commands.iter().any(|c| c.name == COMPACT)
 }
 
-/// The commands shown for a session: pi's own, then the built-in ones pi does not shadow.
+/// The commands shown for a session: pi's own (without the hidden ones), then the built-in ones
+/// pi does not shadow.
 pub fn commands(pi_commands: Vec<PiCommand>) -> Vec<Command> {
     let add_compact = builtin_compact(&pi_commands);
-    let mut out: Vec<Command> = pi_commands.into_iter().map(to_command).collect();
+    let mut out: Vec<Command> = pi_commands
+        .into_iter()
+        .filter(|c| !hidden(c))
+        .map(to_command)
+        .collect();
     if add_compact {
         out.push(compact_command());
     }
@@ -108,7 +140,44 @@ mod tests {
             name: name.into(),
             description: Some("d".into()),
             source: Some("extension".into()),
+            source_info: None,
         }
+    }
+
+    fn from(name: &str, path: &str) -> PiCommand {
+        PiCommand {
+            source_info: Some(crate::wire::PiSourceInfo {
+                path: Some(path.into()),
+                source: Some("inline".into()),
+            }),
+            ..pi(name)
+        }
+    }
+
+    #[test]
+    fn tui_only_and_internal_commands_are_not_offered() {
+        let names = |c: Vec<Command>| c.into_iter().map(|c| c.name).collect::<Vec<_>>();
+        let listed = vec![
+            // pi 0.85.1's bundled llama.cpp extension: interactive mode only.
+            from("llama", "<inline:llama.cpp>"),
+            // A user's own extension of that name stays.
+            from("llama", "C:/Users/me/.pi/agent/extensions/llama.ts"),
+            // The gate's internal fork command is the adapter's; its `/reload` is offered.
+            from("aas-gate-fork", "C:/state/aas-gate-v3.ts"),
+            from("reload", "C:/state/aas-gate-v3.ts"),
+            pi("skill:x"),
+        ];
+        assert_eq!(
+            names(commands(listed)),
+            ["llama", "reload", "skill:x", "compact"]
+        );
+        // A skill or template of the internal command's name is not the gate's.
+        let mut template = pi("aas-gate-fork");
+        template.source = Some("prompt".into());
+        assert_eq!(
+            names(commands(vec![template])),
+            ["aas-gate-fork", "compact"]
+        );
     }
 
     #[test]
@@ -161,6 +230,7 @@ mod tests {
             name: "skill:x".into(),
             description: None,
             source: Some("skill".into()),
+            source_info: None,
         });
         let names = extension_command_names(&listed);
         assert_eq!(names.len(), 2, "skills and templates are expanded, not run");

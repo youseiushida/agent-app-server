@@ -192,6 +192,7 @@ async fn codex_listing_dropped_during_initialize_stops_its_short_lived_server() 
     let ctx = aas_harness::CommandContext {
         cwd: s.cwd.clone(),
         native_session_id: None,
+        project_trusted: None,
     };
     dropped_future_stops_the_process(adapter.commands(ctx), &s).await;
 }

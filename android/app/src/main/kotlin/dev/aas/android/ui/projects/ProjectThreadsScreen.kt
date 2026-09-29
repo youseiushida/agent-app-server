@@ -59,6 +59,7 @@ import dev.aas.android.data.ThreadRepository
 import dev.aas.android.data.WorkspaceRepository
 import dev.aas.android.domain.NativeSessionHarnesses
 import dev.aas.android.domain.ProjectLists
+import dev.aas.android.domain.ResultMessages
 import dev.aas.android.domain.ThreadActivity
 import dev.aas.android.domain.ThreadRow
 import dev.aas.android.protocol.Harness
@@ -72,7 +73,6 @@ import dev.aas.android.ui.components.EmptyState
 import dev.aas.android.ui.components.LabeledExtendedFab
 import dev.aas.android.ui.components.TextInputDialog
 import dev.aas.android.ui.components.ThreadActivityChip
-import dev.aas.android.ui.thread.RunningBackgroundNote
 import dev.aas.android.ui.components.UnreadDot
 import dev.aas.android.ui.components.relativeTime
 import dev.aas.android.ui.icons.Archive
@@ -82,6 +82,7 @@ import dev.aas.android.ui.icons.MarkEmailUnread
 import dev.aas.android.ui.icons.PushPin
 import dev.aas.android.ui.navigation.AppNavigator
 import dev.aas.android.ui.theme.statusColors
+import dev.aas.android.ui.thread.RunningBackgroundNote
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -121,7 +122,10 @@ class ProjectThreadsViewModel(
     fun rename(row: ThreadRow, title: String) {
         val trimmed = title.trim()
         if (trimmed.isEmpty()) return
-        launch { threads.rename(row.id, trimmed) }
+        launch {
+            val pending = threads.rename(row.id, trimmed)
+            ResultMessages.awaitNativeRename(pending)?.let { messages.show(it) }
+        }
     }
 
     /** Archives; the snackbar offers to undo (`thread/archive` with `archived: false`). */

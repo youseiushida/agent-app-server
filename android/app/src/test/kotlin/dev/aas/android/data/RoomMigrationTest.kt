@@ -134,6 +134,37 @@ class RoomMigrationTest {
         }
     }
 
+    @Test
+    fun version3UpgradesWithUnchainedRequests() = runBlocking<Unit> {
+        val params = """{"clientRequestId":"c1","threadId":"thr_1","input":[{"type":"text","text":"日本語"}]}"""
+        createExported(3) { db ->
+            db.execSQL("INSERT INTO meta (`key`, value) VALUES ('epoch', 'e3')")
+            db.execSQL(
+                "INSERT INTO outbox (client_request_id, method, params, created_at, failures, last_error, next_attempt_at, waiting_for_harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                arrayOf<Any?>("c1", "turn/start", params, 5L, 1, "draining", 9L, "codex"),
+            )
+        }
+        val db = AasDatabase.open(context)
+        try {
+            val store = RoomSyncStore(db)
+            store.transaction { tx ->
+                assertEquals("e3", tx.epoch())
+                assertEquals(
+                    listOf(OutboxEntry("c1", "turn/start", Json.parseToJsonElement(params).jsonObject, 5, 1, "draining", 9, waitingForHarness = "codex", after = null)),
+                    tx.outbox(),
+                )
+            }
+            // The new column works like the others.
+            store.transaction { tx ->
+                tx.addOutbox(OutboxEntry("c2", "thread/update", JsonObject(mapOf("clientRequestId" to JsonPrimitive("c2"))), 7, after = "c1"))
+                tx.updateOutbox(tx.outbox()[0].copy(failures = 2))
+            }
+            store.transaction { tx -> assertEquals(listOf(null, "c1"), tx.outbox().map { it.after }) }
+        } finally {
+            db.close()
+        }
+    }
+
     private companion object {
         /** Room's placeholder for the table name in the exported `createSql`. */
         const val TABLE_NAME_PLACEHOLDER = "\${TABLE_NAME}"

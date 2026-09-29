@@ -14,7 +14,7 @@ use aas_harness::protocol::{
 };
 use aas_harness::{
     AdapterError, AdapterEvent, AdapterPolicy, BackgroundTaskInfo, SessionControl, SessionHandle,
-    SettingsApplied, StartMode, TurnInput,
+    SettingsApplied, StartMode, StartOptions, StatusSection, ThreadModes, TurnInput,
 };
 use aas_stdio::{Incoming, IncomingRequest, RpcCallError, RpcPeer, RpcWireError};
 use aas_supervisor::{ExitInfo, StopReason};
@@ -25,21 +25,20 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, OnceCell, mpsc};
 
 use crate::background::{Background, CommandEnd, Route, TurnEnd};
-use crate::commands::{self, Intercept, SkillInfo};
+use crate::commands::{self, GoalCommand, Intercept, SkillInfo};
 use crate::link::ProcessLink;
 use crate::mapping::{
     self, DecisionTable, ElicitationTable, MappedItem, ReasoningStream, UsageTracker,
     UserInputTable,
 };
 use crate::rpc_err;
-use crate::settings;
+use crate::settings::{self, FastTiers};
+use crate::status::{self, RateLimits, ThreadFacts};
+use crate::texts;
 use crate::wire::*;
 
 /// Notifications that are understood and deliberately not forwarded (see the adapter doc).
 const IGNORED_NOTIFICATIONS: &[&str] = &[
-    "thread/goal/updated",
-    "thread/goal/cleared",
-    "thread/settings/updated",
     "thread/queue/changed",
     "thread/archived",
     "thread/unarchived",
@@ -55,7 +54,6 @@ const IGNORED_NOTIFICATIONS: &[&str] = &[
     "hook/started",
     "hook/completed",
     "account/updated",
-    "account/rateLimits/updated",
     "account/login/completed",
     "remoteControl/status/changed",
     "app/list/updated",
@@ -82,15 +80,50 @@ pub struct EstablishArgs {
     pub cwd: PathBuf,
     pub settings: ThreadSettings,
     pub policy: AdapterPolicy,
+    /// Modes and the fork point (`HarnessAdapter::start_with`).
+    pub options: StartOptions,
+    /// The fast mode of each model, from the last probe's `model/list`.
+    pub fast_tiers: FastTiers,
+    /// Codex's default model (the last probe's), which a thread without a model runs.
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum TurnPhase {
     #[default]
     Idle,
-    /// `turn/start` (or an intercepted command) was sent; the turn id is not known yet.
-    Starting,
+    /// `turn/start` (or an intercepted command that runs as a Codex turn) was sent; the turn
+    /// id is not known yet. `named`: the answer names the turn (`turn/start`, `review/start`),
+    /// so its anchor comes from the answer; `thread/compact/start` answers `{}` and the
+    /// compaction's turn is known from `turn/started` only.
+    Starting {
+        named: bool,
+    },
+    /// A command that is not a Codex turn (`/goal`) waits for its answer. The adapter reports
+    /// it as a turn of its own and ends that turn with the answer; a turn Codex starts
+    /// meanwhile (a goal's continuation) is reported after it.
+    Command,
     Running(String),
+}
+
+/// An inline review (`review/start`) between its `enteredReviewMode` and `exitedReviewMode`
+/// items. The reviewer's agent messages there are its structured findings (the JSON Codex's
+/// review contract asks for; the one of codex-cli 0.148.0 is never completed), which Codex
+/// renders itself into the agent message that follows `exitedReviewMode`: they are not shown.
+#[derive(Debug, Default)]
+struct ReviewTrack {
+    active: bool,
+    /// Items of the reviewer's messages, whose later deltas are not shown either.
+    hidden: HashSet<String>,
+}
+
+/// The `turn/start` parameters that bring Codex to the thread's modes.
+#[derive(Debug, Default)]
+struct ModeParams {
+    /// `collaborationMode`, and whether it is plan mode.
+    collaboration: Option<(bool, Value)>,
+    /// `serviceTier`: `Some(None)` clears the fast mode's tier.
+    service_tier: Option<Option<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -138,6 +171,14 @@ struct State {
     applied_mode: Option<String>,
     turn: TurnPhase,
     completed_turns: HashSet<String>,
+    /// Turns Codex reported started on this thread while another turn of it ran: the reviewer's
+    /// turn of an inline review (codex-cli 0.148.0 starts it under an id of its own and never
+    /// completes it). They are not the session's turns.
+    foreign_turns: HashSet<String>,
+    /// The turn whose anchor was reported last. A turn is anchored once, before its
+    /// `TurnCompleted`: from `turn/started`, from the answer that names it, or at the latest
+    /// from its own `turn/completed` (when the answer is handled after the turn ended).
+    anchored: Option<String>,
     usage: UsageTracker,
     /// Items of the session's thread (reasoning streams, file changes).
     items: HashMap<String, ItemTrack>,
@@ -157,32 +198,127 @@ struct State {
     closing: bool,
     /// The notice that Codex's terminal list is unavailable was shown (once per session).
     terminal_list_noticed: bool,
+    /// The modes the thread asks for (the start options, then `apply_modes`). They reach Codex
+    /// with the next `turn/start` when Codex's differ.
+    desired: ThreadModes,
+    /// Codex's collaboration mode as last known: `Some(false)` for a new thread; `None` after
+    /// a resume or a fork, because Codex does not restore the mode then (its history may end
+    /// with an earlier mode's instructions, recorded with codex-cli 0.148.0), so the next turn
+    /// states it; then what `thread/settings/updated` reports.
+    known_plan: Option<bool>,
+    /// The thread's service tier as Codex last reported it (open response,
+    /// `thread/settings/updated`).
+    known_tier: Option<String>,
+    /// The model and the effort Codex reports for the thread.
+    codex_model: Option<String>,
+    codex_effort: Option<String>,
+    fast_tiers: FastTiers,
+    /// The thread's goal as Codex last reported it (`thread/goal/*` answers and notifications).
+    goal: Option<WireGoal>,
+    /// Rate limits from Codex's rolling updates, merged.
+    rate_limits: Option<RateLimitSnapshot>,
+    /// The thread's last token usage (for the status).
+    token_usage: Option<ThreadTokenUsage>,
+    review: ReviewTrack,
+    /// A `/goal` steered into the running turn waits for its answer, whose notice belongs to
+    /// that turn: the pump reports the turn's end after it.
+    steered_command: bool,
+}
+
+/// What a session starts with.
+struct StateInit {
+    thread_id: String,
+    settings: ThreadSettings,
+    applied_mode: Option<String>,
+    skills: Vec<SkillInfo>,
+    desired: ThreadModes,
+    known_plan: Option<bool>,
+    known_tier: Option<String>,
+    codex_model: Option<String>,
+    codex_effort: Option<String>,
+    fast_tiers: FastTiers,
 }
 
 impl State {
-    fn new(
-        thread_id: String,
-        settings: ThreadSettings,
-        applied_mode: Option<String>,
-        skills: Vec<SkillInfo>,
-    ) -> Self {
+    fn new(init: StateInit) -> Self {
         Self {
-            background: Background::new(thread_id.clone()),
-            thread_id,
-            settings,
-            applied_mode,
+            background: Background::new(init.thread_id.clone()),
+            thread_id: init.thread_id,
+            settings: init.settings,
+            applied_mode: init.applied_mode,
             turn: TurnPhase::Idle,
             completed_turns: HashSet::new(),
+            foreign_turns: HashSet::new(),
+            anchored: None,
             usage: UsageTracker::default(),
             items: HashMap::new(),
             child_changes: HashMap::new(),
             pending: HashMap::new(),
             seen_notices: HashSet::new(),
             plan_key: None,
-            skills,
+            skills: init.skills,
             closing: false,
             terminal_list_noticed: false,
+            desired: init.desired,
+            known_plan: init.known_plan,
+            known_tier: init.known_tier,
+            codex_model: init.codex_model,
+            codex_effort: init.codex_effort,
+            fast_tiers: init.fast_tiers,
+            goal: None,
+            rate_limits: None,
+            token_usage: None,
+            review: ReviewTrack::default(),
+            steered_command: false,
         }
+    }
+
+    /// A command waits for its answer (see [`wait_for_command`]).
+    fn command_in_flight(&self) -> bool {
+        self.turn == TurnPhase::Command || self.steered_command
+    }
+
+    /// The model the thread uses: the user's choice, else what Codex reports.
+    fn model(&self) -> Option<String> {
+        self.settings.model.clone().or(self.codex_model.clone())
+    }
+
+    /// The `turn/start` parameters for the desired modes, given what Codex runs with.
+    fn mode_params(&self) -> Result<ModeParams, String> {
+        let mut params = ModeParams::default();
+        let model = self.model();
+        if self.known_plan != Some(self.desired.plan) {
+            let model = model.as_deref().ok_or_else(|| {
+                "Codex did not report the thread's model, which its collaboration mode needs"
+                    .to_owned()
+            })?;
+            let effort = self.settings.effort.clone().or(self.codex_effort.clone());
+            params.collaboration = Some((
+                self.desired.plan,
+                settings::collaboration_mode(self.desired.plan, model, effort.as_deref()),
+            ));
+        }
+        let fast = model.as_deref().and_then(|m| self.fast_tiers.get(m));
+        params.service_tier = match (self.desired.fast, fast) {
+            (true, Some(tier)) if self.known_tier.as_deref() != Some(tier.id.as_str()) => {
+                Some(Some(tier.id.clone()))
+            }
+            (true, Some(_)) => None,
+            (true, None) => return Err(no_fast_mode(model.as_deref())),
+            // Only a tier fast mode sets is cleared (a tier from `config.toml` stays).
+            (false, _) => match &self.known_tier {
+                Some(tier) if self.fast_tiers.values().any(|t| &t.id == tier) => Some(None),
+                _ => None,
+            },
+        };
+        Ok(params)
+    }
+}
+
+fn no_fast_mode(model: Option<&str>) -> String {
+    match model {
+        Some(model) => format!("Codex lists no fast mode for model {model}"),
+        None => "Codex did not report the thread's model, so fast mode cannot be set".into(),
     }
 }
 
@@ -254,8 +390,32 @@ pub(crate) async fn establish(
     link: Arc<dyn ProcessLink>,
     args: EstablishArgs,
 ) -> Result<(SessionHandle, Arc<Shared>), AdapterError> {
-    let mut params = settings::open_overrides(&args.settings).map_err(AdapterError::Other)?;
+    let desired = args.options.modes;
+    // Fast mode at the start: the tier of the model the thread asks for, else of Codex's
+    // default model (the one a thread without a model runs).
+    let start_tier = if desired.fast {
+        let model = args
+            .settings
+            .model
+            .clone()
+            .or_else(|| args.default_model.clone());
+        let tier = model.as_deref().and_then(|m| args.fast_tiers.get(m));
+        Some(
+            tier.ok_or_else(|| AdapterError::Other(no_fast_mode(model.as_deref())))?
+                .id
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let mut params = settings::open_overrides(&args.settings, start_tier.as_deref())
+        .map_err(AdapterError::Other)?;
     params.insert("cwd".into(), json!(args.cwd.to_string_lossy()));
+    if args.options.fork_at.is_some() && !matches!(args.mode, StartMode::Fork { .. }) {
+        return Err(AdapterError::Other(
+            "a fork point was given for a start that is not a fork".into(),
+        ));
+    }
     let method = match &args.mode {
         StartMode::New => "thread/start",
         StartMode::Resume { native_session_id } => {
@@ -264,6 +424,17 @@ pub(crate) async fn establish(
         }
         StartMode::Fork { native_session_id } => {
             params.insert("threadId".into(), json!(native_session_id));
+            if let Some(point) = &args.options.fork_at {
+                // The turn's own id; `beforeTurnId` is experimental (sent with the experimental
+                // API on, like every request of this adapter).
+                let turn = anchor_turn_id(&point.anchor).map_err(AdapterError::Other)?;
+                let key = if point.before {
+                    "beforeTurnId"
+                } else {
+                    "lastTurnId"
+                };
+                params.insert(key.into(), json!(turn));
+            }
             "thread/fork"
         }
     };
@@ -283,17 +454,30 @@ pub(crate) async fn establish(
     });
 
     let (tx, rx) = mpsc::unbounded_channel();
+    let fast_state = opened
+        .service_tier
+        .as_deref()
+        .map(|tier| settings::tier_word(tier, &args.fast_tiers));
     let shared = Arc::new(Shared {
         peer,
         link,
         policy: args.policy,
         cwd: args.cwd,
-        state: Mutex::new(State::new(
-            opened.thread.id.clone(),
-            args.settings,
-            applied_mode.clone(),
+        state: Mutex::new(State::new(StateInit {
+            thread_id: opened.thread.id.clone(),
+            settings: args.settings,
+            applied_mode: applied_mode.clone(),
             skills,
-        )),
+            desired,
+            known_plan: match args.mode {
+                StartMode::New => Some(false),
+                StartMode::Resume { .. } | StartMode::Fork { .. } => None,
+            },
+            known_tier: opened.service_tier.clone(),
+            codex_model: opened.model.clone(),
+            codex_effort: opened.reasoning_effort.clone(),
+            fast_tiers: args.fast_tiers,
+        })),
         events: Mutex::new(Some(tx)),
         turn_changed: Notify::new(),
         shutdown: OnceCell::new(),
@@ -303,6 +487,26 @@ pub(crate) async fn establish(
         permission_mode: applied_mode,
         effort: opened.reasoning_effort.clone(),
     });
+    if fast_state.is_some() {
+        // The plan mode is not reported here: Codex does not say it (the next turn states it).
+        shared.emit(AdapterEvent::ModesReported {
+            plan: None,
+            fast_state,
+        });
+    }
+    // A name the thread got elsewhere (Codex desktop, another client) is only seen here: Codex
+    // notifies renames within one process only.
+    if let Some(name) = opened
+        .thread
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        shared.emit(AdapterEvent::SessionTitle {
+            title: name.to_owned(),
+        });
+    }
     tokio::spawn(pump(shared.clone(), incoming));
     let control = Arc::new(CodexSession {
         shared: shared.clone(),
@@ -315,6 +519,21 @@ pub(crate) async fn establish(
         },
         shared,
     ))
+}
+
+/// The anchor of a turn this adapter reports (`TurnAnchor`): the turn's own id, which Codex
+/// keeps in forks (recorded with codex-cli 0.148.0).
+pub(crate) fn turn_anchor(turn_id: &str) -> Value {
+    json!({ "turnId": turn_id })
+}
+
+/// The turn id of an anchor this adapter reported.
+pub(crate) fn anchor_turn_id(anchor: &Value) -> Result<&str, String> {
+    anchor
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| format!("{anchor} is not the anchor of a Codex turn"))
 }
 
 pub(crate) async fn fetch_skills(
@@ -480,6 +699,17 @@ fn on_session_notification(shared: &Arc<Shared>, method: &str, params: &Value) -
                 shared.emit(AdapterEvent::InteractionWithdrawn { request_id: id });
             }
         }
+        "account/rateLimits/updated" => {
+            // Sparse: values an update leaves out keep what an earlier one said.
+            if let Some(n) = parse::<RateLimitsUpdated>(shared, method, params) {
+                shared
+                    .state
+                    .lock()
+                    .rate_limits
+                    .get_or_insert_with(RateLimitSnapshot::default)
+                    .merge(n.rate_limits);
+            }
+        }
         "skills/changed" => {
             let shared = shared.clone();
             tokio::spawn(async move {
@@ -634,19 +864,47 @@ async fn on_main_notification(shared: &Arc<Shared>, method: &str, params: Value)
             let Some(n) = parse::<TurnNotification>(shared, method, &params) else {
                 return;
             };
+            // A turn Codex starts while a command of ours waits for its answer (a goal's
+            // continuation right after `/goal`) follows that command's turn.
+            wait_for_command(shared).await;
             {
                 let mut st = shared.state.lock();
-                if st.turn == TurnPhase::Idle {
-                    // A turn the agent started by itself: Codex's goal continuation starts turns
-                    // without `turn/start` whenever the thread becomes idle with a goal set.
-                    st.usage.start_turn();
+                let id = n.turn.id.clone();
+                match st.turn.clone() {
+                    _ if st.completed_turns.contains(&id) => {
+                        tracing::debug!(turn = %id, "turn/started of a turn that already completed");
+                    }
+                    _ if st.foreign_turns.contains(&id) => {}
+                    TurnPhase::Running(current) if current != id => {
+                        // codex-cli 0.148.0's inline review starts its reviewer's turn on this
+                        // thread under another id, and never completes it; the review turn
+                        // (`review/start`'s) stays the running one.
+                        tracing::debug!(running = %current, other = %id, "turn/started of another turn while a turn runs; not the session's");
+                        st.foreign_turns.insert(id);
+                    }
+                    phase => {
+                        if matches!(phase, TurnPhase::Idle | TurnPhase::Command) {
+                            // A turn the agent started by itself: Codex's goal continuation
+                            // starts turns without `turn/start` whenever the thread becomes
+                            // idle with an active goal.
+                            st.usage.start_turn();
+                        }
+                        st.turn = TurnPhase::Running(id.clone());
+                        // Emitted under the state lock: `send` refuses with
+                        // `TurnInProgress` only once this turn's `TurnStarted` is out. The
+                        // anchor follows (the turn a fork at it keeps), unless the answer of
+                        // the request that started it names the turn (`started`): an inline
+                        // review's reviewer turn may come before that answer.
+                        shared.emit(AdapterEvent::TurnStarted);
+                        let named = matches!(phase, TurnPhase::Starting { named: true });
+                        if !named && st.anchored.as_deref() != Some(id.as_str()) {
+                            shared.emit(AdapterEvent::TurnAnchor {
+                                anchor: turn_anchor(&id),
+                            });
+                            st.anchored = Some(id);
+                        }
+                    }
                 }
-                if !st.completed_turns.contains(&n.turn.id) {
-                    st.turn = TurnPhase::Running(n.turn.id.clone());
-                }
-                // Emitted under the state lock: `send` refuses with `TurnInProgress` only once
-                // this turn's `TurnStarted` is out.
-                shared.emit(AdapterEvent::TurnStarted);
             }
             shared.turn_changed.notify_waiters();
         }
@@ -654,11 +912,28 @@ async fn on_main_notification(shared: &Arc<Shared>, method: &str, params: Value)
             let Some(n) = parse::<TurnNotification>(shared, method, &params) else {
                 return;
             };
+            // The answer of a `/goal` steered into this turn is a notice of it.
+            wait_for_command(shared).await;
             let (thread, plan_key, usage) = {
                 let mut st = shared.state.lock();
+                if st.foreign_turns.contains(&n.turn.id) {
+                    // The inline review's reviewer turn never completes on 0.148.0; should a
+                    // later version complete it, it does not end the review turn.
+                    tracing::debug!(turn = %n.turn.id, "turn/completed of a turn that is not the session's; ignored");
+                    return;
+                }
                 st.completed_turns.insert(n.turn.id.clone());
                 st.turn = TurnPhase::Idle;
                 st.items.clear();
+                st.review = ReviewTrack::default();
+                if st.anchored.as_deref() != Some(n.turn.id.as_str()) {
+                    // The answer that names the turn is handled after its end: the turn's own
+                    // id anchors it, before its `TurnCompleted`.
+                    shared.emit(AdapterEvent::TurnAnchor {
+                        anchor: turn_anchor(&n.turn.id),
+                    });
+                    st.anchored = Some(n.turn.id.clone());
+                }
                 (
                     st.thread_id.clone(),
                     st.plan_key.take(),
@@ -709,6 +984,9 @@ async fn on_main_notification(shared: &Arc<Shared>, method: &str, params: Value)
             let Some(d) = parse::<DeltaNotification>(shared, method, &params) else {
                 return;
             };
+            if shared.state.lock().review.hidden.contains(&d.item_id) {
+                return;
+            }
             shared.emit(AdapterEvent::ItemDelta {
                 key: d.item_id,
                 field: aas_harness::DeltaField::Text,
@@ -797,11 +1075,39 @@ async fn on_main_notification(shared: &Arc<Shared>, method: &str, params: Value)
                 let mut st = shared.state.lock();
                 let current =
                     matches!(&st.turn, TurnPhase::Running(id) if Some(id) == n.turn_id.as_ref());
+                st.token_usage = Some(n.token_usage.clone());
                 st.usage.observe(&n.token_usage, current)
             };
             if let Some(usage) = usage {
                 shared.emit(AdapterEvent::TurnUsage { usage });
             }
+        }
+        "thread/settings/updated" => {
+            if let Some(n) = parse::<ThreadSettingsUpdated>(shared, method, &params) {
+                on_settings_updated(shared, n.thread_settings);
+            }
+        }
+        "thread/goal/updated" => {
+            let Some(n) = parse::<GoalUpdated>(shared, method, &params) else {
+                return;
+            };
+            let changed = {
+                let mut st = shared.state.lock();
+                let before = st.goal.replace(n.goal.clone());
+                // A change within a turn (the model's `update_goal`, Codex stopping it at a
+                // limit) is shown; the accounting update at every turn's end keeps the status,
+                // and changes without a turn are answers to requests (`/goal`) or the
+                // snapshot a resume sends.
+                n.turn_id.is_some()
+                    && before.as_ref().map(|g| g.status.as_str()) != Some(n.goal.status.as_str())
+            };
+            if changed {
+                let (level, message) = goal_notice(&n.goal);
+                shared.notice(level, message, "goalUpdated");
+            }
+        }
+        "thread/goal/cleared" => {
+            shared.state.lock().goal = None;
         }
         "error" => {
             let Some(n) = parse::<ErrorNotification>(shared, method, &params) else {
@@ -850,6 +1156,81 @@ async fn on_main_notification(shared: &Arc<Shared>, method: &str, params: Value)
     }
 }
 
+/// `thread/settings/updated`: what Codex runs the thread with from now on. The collaboration
+/// mode is the explicit signal of plan mode (`ModesReported`), the service tier is the fast
+/// mode's state; model, effort and permission preset are reported as `SessionInfo`.
+fn on_settings_updated(shared: &Shared, ts: WireThreadSettings) {
+    let (plan, fast_state, permission_mode) = {
+        let mut st = shared.state.lock();
+        if let Some(model) = &ts.model {
+            st.codex_model = Some(model.clone());
+        }
+        st.codex_effort = ts.effort.clone();
+        st.known_tier = ts.service_tier.clone();
+        let plan = ts.collaboration_mode.as_ref().map(|c| c.mode == "plan");
+        if plan.is_some() {
+            st.known_plan = plan;
+        }
+        let preset = settings::preset_from_response(
+            ts.approval_policy.as_ref(),
+            ts.approvals_reviewer.as_deref(),
+            ts.sandbox_policy.as_ref(),
+        );
+        if let Some(preset) = preset {
+            st.applied_mode = Some(preset.to_owned());
+        }
+        let fast_state = ts
+            .service_tier
+            .as_deref()
+            .map(|tier| settings::tier_word(tier, &st.fast_tiers));
+        (plan, fast_state, preset.map(str::to_owned))
+    };
+    shared.emit(AdapterEvent::SessionInfo {
+        model: ts.model,
+        permission_mode,
+        effort: ts.effort,
+    });
+    if plan.is_some() || fast_state.is_some() {
+        shared.emit(AdapterEvent::ModesReported { plan, fast_state });
+    }
+}
+
+/// The notice of a goal's new status, in the words of `status::goal_status_words`.
+fn goal_notice(goal: &WireGoal) -> (NoticeLevel, String) {
+    let level = match goal.status.as_str() {
+        "blocked" | "usageLimited" | "budgetLimited" => NoticeLevel::Warning,
+        _ => NoticeLevel::Info,
+    };
+    (
+        level,
+        format!(
+            "Goal {}: {}",
+            status::goal_status_words(&goal.status),
+            goal.objective
+        ),
+    )
+}
+
+/// Waits (up to `handshake_timeout`, the bound of the command itself) while a command that is
+/// not a Codex turn waits for its answer: a `/goal` sent as a turn of its own (a continuation
+/// Codex starts meanwhile follows that turn) or steered into the running turn (whose end
+/// follows the answer's notice).
+async fn wait_for_command(shared: &Shared) {
+    let deadline = tokio::time::Instant::now() + shared.policy.handshake_timeout;
+    loop {
+        let notified = shared.turn_changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !shared.state.lock().command_in_flight() {
+            return;
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            tracing::warn!("a command's answer did not arrive in time; Codex's turn is reported");
+            return;
+        }
+    }
+}
+
 async fn on_main_item(shared: &Arc<Shared>, method: &str, params: Value) {
     let Some(n) = parse::<ItemNotification>(shared, method, &params) else {
         return;
@@ -863,6 +1244,45 @@ async fn on_main_item(shared: &Arc<Shared>, method: &str, params: Value) {
     };
     let started = method == "item/started";
     let thread = shared.thread_id();
+    // An inline review: its markers, and the reviewer's own messages in between.
+    {
+        let mut st = shared.state.lock();
+        match &item {
+            WireItem::EnteredReviewMode { .. } => st.review.active = true,
+            WireItem::ExitedReviewMode { .. } => st.review.active = false,
+            WireItem::AgentMessage { id, .. } if st.review.hidden.contains(id) => {
+                if !started {
+                    st.review.hidden.remove(id);
+                }
+                return;
+            }
+            WireItem::AgentMessage { id, .. } if st.review.active => {
+                if started {
+                    st.review.hidden.insert(id.clone());
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+    if let WireItem::ExitedReviewMode { id, .. } = &item {
+        // The review's text follows as an agent message of its own; the marker closes the
+        // review started by `enteredReviewMode`.
+        let body = mapping::review_finished_notice();
+        shared.emit(if started {
+            AdapterEvent::ItemStarted {
+                key: id.clone(),
+                body,
+            }
+        } else {
+            AdapterEvent::ItemCompleted {
+                key: id.clone(),
+                body: Some(body),
+                status: ItemStatus::Completed,
+            }
+        });
+        return;
+    }
     // Commands are tracked from their start: one still open when the turn ends may run on.
     if let (
         true,
@@ -1575,8 +1995,9 @@ impl CodexSession {
             notified.as_mut().enable();
             match self.shared.state.lock().turn.clone() {
                 TurnPhase::Running(id) => return Some(id),
-                TurnPhase::Idle => return None,
-                TurnPhase::Starting => {}
+                // A command that is not a Codex turn has nothing to interrupt or steer.
+                TurnPhase::Idle | TurnPhase::Command => return None,
+                TurnPhase::Starting { .. } => {}
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return None;
@@ -1584,9 +2005,9 @@ impl CodexSession {
         }
     }
 
-    fn begin_turn(
-        &self,
-    ) -> Result<(String, ThreadSettings, Option<String>, Vec<SkillInfo>), AdapterError> {
+    /// Begins what the engine sends: a Codex turn (`Starting`) or a command that is not one
+    /// (`Command`).
+    fn begin_turn(&self, phase: TurnPhase) -> Result<TurnContext, AdapterError> {
         let mut st = self.shared.state.lock();
         match st.turn {
             TurnPhase::Idle => {}
@@ -1594,38 +2015,209 @@ impl CodexSession {
             // agent started by itself (goal continuation), whose `TurnStarted` is out (it is
             // emitted under this lock).
             TurnPhase::Running(_) => return Err(AdapterError::TurnInProgress),
-            TurnPhase::Starting => {
+            TurnPhase::Starting { .. } | TurnPhase::Command => {
                 return Err(AdapterError::Other("a turn is being started".into()));
             }
         }
-        st.turn = TurnPhase::Starting;
+        st.turn = phase;
         st.usage.start_turn();
-        Ok((
-            st.thread_id.clone(),
-            st.settings.clone(),
-            st.applied_mode.clone(),
-            st.skills.clone(),
-        ))
+        Ok(TurnContext {
+            thread_id: st.thread_id.clone(),
+            settings: st.settings.clone(),
+            applied_mode: st.applied_mode.clone(),
+            skills: st.skills.clone(),
+        })
     }
 
     fn abort_start(&self) {
         let mut st = self.shared.state.lock();
-        if st.turn == TurnPhase::Starting {
+        if matches!(st.turn, TurnPhase::Starting { .. } | TurnPhase::Command) {
             st.turn = TurnPhase::Idle;
         }
         drop(st);
         self.shared.turn_changed.notify_waiters();
     }
 
-    fn started(&self, turn_id: String, applied_mode: Option<String>) {
+    /// Codex took the turn `turn_id` (`turn/start` or `review/start` answered). Its anchor is
+    /// reported now: an inline review gets no `turn/started` of its own.
+    fn started(&self, turn_id: String, applied: Applied) {
         let mut st = self.shared.state.lock();
-        if applied_mode.is_some() {
-            st.applied_mode = applied_mode;
+        if applied.mode.is_some() {
+            st.applied_mode = applied.mode;
         }
-        if st.turn == TurnPhase::Starting && !st.completed_turns.contains(&turn_id) {
-            st.turn = TurnPhase::Running(turn_id);
+        if let Some(plan) = applied.plan {
+            st.known_plan = Some(plan);
+        }
+        if let Some(tier) = applied.tier {
+            st.known_tier = tier;
+        }
+        if !st.completed_turns.contains(&turn_id) {
+            match st.turn.clone() {
+                TurnPhase::Starting { .. } => {
+                    st.turn = TurnPhase::Running(turn_id.clone());
+                    if applied.announce {
+                        // Under the state lock, like the pump's `TurnStarted`.
+                        self.shared.emit(AdapterEvent::TurnStarted);
+                    }
+                }
+                // The answer names the turn: one the pump took for it before the answer
+                // arrived (an inline review's reviewer turn) is not the session's.
+                TurnPhase::Running(other) if other != turn_id => {
+                    st.foreign_turns.insert(other);
+                    st.turn = TurnPhase::Running(turn_id.clone());
+                }
+                _ => {}
+            }
+            if st.anchored.as_deref() != Some(turn_id.as_str()) {
+                self.shared.emit(AdapterEvent::TurnAnchor {
+                    anchor: turn_anchor(&turn_id),
+                });
+                st.anchored = Some(turn_id);
+            }
         }
         drop(st);
+        self.shared.turn_changed.notify_waiters();
+    }
+
+    /// Ends a command that is not a Codex turn with its answer: reported as a turn of its own
+    /// (started, the answer as a notice, completed), under the state lock so that a turn Codex
+    /// starts meanwhile is reported after it.
+    fn finish_command(&self, level: NoticeLevel, message: String, code: &str) {
+        let mut st = self.shared.state.lock();
+        if st.turn == TurnPhase::Command {
+            st.turn = TurnPhase::Idle;
+        }
+        self.shared.emit(AdapterEvent::TurnStarted);
+        self.shared.notice(level, message, code);
+        self.shared.emit(AdapterEvent::TurnCompleted {
+            status: aas_harness::TurnStatus::Completed,
+            usage: None,
+            error: None,
+            trigger: None,
+        });
+        drop(st);
+        self.shared.turn_changed.notify_waiters();
+    }
+
+    /// Runs `/goal` (the `thread/goal/*` requests) and returns its answer as a notice.
+    async fn goal_command(
+        &self,
+        thread_id: &str,
+        command: &GoalCommand,
+    ) -> Result<(NoticeLevel, String), AdapterError> {
+        let peer = &self.shared.peer;
+        let timeout = self.shared.policy.handshake_timeout;
+        let set = |params: Value| async move {
+            const METHOD: &str = "thread/goal/set";
+            peer.request_timeout::<_, GoalSetResponse>(METHOD, params, timeout)
+                .await
+                .map_err(|e| rpc_err(METHOD, e))
+                .map(|r| r.goal)
+        };
+        let goal = match command {
+            GoalCommand::Show => {
+                const METHOD: &str = "thread/goal/get";
+                let resp: GoalGetResponse = peer
+                    .request_timeout(METHOD, json!({ "threadId": thread_id }), timeout)
+                    .await
+                    .map_err(|e| rpc_err(METHOD, e))?;
+                self.shared.state.lock().goal = resp.goal.clone();
+                return Ok(match resp.goal {
+                    Some(goal) => (NoticeLevel::Info, goal_summary(&goal)),
+                    // The TUI's words.
+                    None => (NoticeLevel::Info, "No goal is currently set.".into()),
+                });
+            }
+            GoalCommand::Clear => {
+                const METHOD: &str = "thread/goal/clear";
+                let resp: GoalClearResponse = peer
+                    .request_timeout(METHOD, json!({ "threadId": thread_id }), timeout)
+                    .await
+                    .map_err(|e| rpc_err(METHOD, e))?;
+                self.shared.state.lock().goal = None;
+                return Ok(if resp.cleared {
+                    (NoticeLevel::Info, "Goal cleared".into())
+                } else {
+                    // The TUI's words.
+                    (
+                        NoticeLevel::Info,
+                        "This thread does not currently have a goal.".into(),
+                    )
+                });
+            }
+            GoalCommand::Set { objective } => {
+                set(json!({ "threadId": thread_id, "objective": objective, "status": "active" }))
+                    .await?
+            }
+            GoalCommand::Edit { objective } => {
+                set(json!({ "threadId": thread_id, "objective": objective })).await?
+            }
+            GoalCommand::Pause => set(json!({ "threadId": thread_id, "status": "paused" })).await?,
+            GoalCommand::Resume => {
+                set(json!({ "threadId": thread_id, "status": "active" })).await?
+            }
+        };
+        self.shared.state.lock().goal = Some(goal.clone());
+        Ok(goal_notice(&goal))
+    }
+
+    /// Pauses the thread's goal when Codex last reported it active (see `interrupt`), by
+    /// `deadline`. Codex's answer is the goal's new state, told as a notice of the running turn
+    /// (`goalUpdated`; like a steered `/goal`, the pump reports the turn's end after it); a
+    /// pause that fails is told too, since the goal then goes on.
+    async fn pause_goal_for_interrupt(&self, thread_id: &str, deadline: tokio::time::Instant) {
+        let flagged = {
+            let mut st = self.shared.state.lock();
+            if !st.goal.as_ref().is_some_and(|g| g.status == "active") {
+                return;
+            }
+            // A `/goal` steered meanwhile holds the turn's end already, and releases it.
+            let flagged = !st.command_in_flight();
+            if flagged {
+                st.steered_command = true;
+            }
+            flagged
+        };
+        const METHOD: &str = "thread/goal/set";
+        let params = json!({ "threadId": thread_id, "status": "paused" });
+        let answer = tokio::time::timeout_at(
+            deadline,
+            self.shared
+                .peer
+                .request::<_, GoalSetResponse>(METHOD, params),
+        )
+        .await;
+        {
+            // Under the state lock: the pump reports the turn's end after the notice.
+            let mut st = self.shared.state.lock();
+            let error = match answer {
+                Ok(Ok(resp)) => {
+                    let (level, message) = goal_notice(&resp.goal);
+                    st.goal = Some(resp.goal);
+                    self.shared.notice(level, message, "goalUpdated");
+                    None
+                }
+                Ok(Err(e)) => Some(rpc_err(METHOD, e)),
+                Err(_) => Some(rpc_err(
+                    METHOD,
+                    RpcCallError::Timeout(self.shared.policy.stop_grace),
+                )),
+            };
+            if let Some(error) = error {
+                tracing::warn!(thread = %thread_id, error = %error, "could not pause the goal of the interrupted turn");
+                self.shared.notice(
+                    NoticeLevel::Warning,
+                    format!(
+                        "The goal could not be paused with the turn, so Codex continues it after the next turn (send /goal pause to pause it): {}",
+                        error.detail()
+                    ),
+                    "goalNotPaused",
+                );
+            }
+            if flagged {
+                st.steered_command = false;
+            }
+        }
         self.shared.turn_changed.notify_waiters();
     }
 
@@ -1655,17 +2247,93 @@ impl CodexSession {
     }
 }
 
+/// What the engine sends that runs as a Codex turn.
+enum CodexTurn {
+    /// `thread/compact/start`.
+    Compact,
+    /// `review/start` (inline).
+    Review { instructions: Option<String> },
+    /// `turn/start` with this input.
+    Message(TurnInput),
+}
+
+/// What `begin_turn` hands the request that starts a turn.
+struct TurnContext {
+    thread_id: String,
+    settings: ThreadSettings,
+    applied_mode: Option<String>,
+    skills: Vec<SkillInfo>,
+}
+
+/// What Codex runs with once it took a turn.
+#[derive(Debug, Default)]
+struct Applied {
+    /// The permission preset sent with the turn.
+    mode: Option<String>,
+    /// The collaboration mode sent with the turn.
+    plan: Option<bool>,
+    /// The service tier sent with the turn.
+    tier: Option<Option<String>>,
+    /// Codex sends no `turn/started` for this turn (an inline review): the answer is its
+    /// start.
+    announce: bool,
+}
+
+/// `/goal`'s answer about a goal.
+fn goal_summary(goal: &WireGoal) -> String {
+    let mut text = format!(
+        "Goal {}: {} ({} tokens, {} used",
+        status::goal_status_words(&goal.status),
+        goal.objective,
+        status::thousands(goal.tokens_used),
+        status::duration_words(goal.time_used_seconds)
+    );
+    if let Some(budget) = goal.token_budget {
+        text.push_str(&format!(", budget {}", status::thousands(budget)));
+    }
+    text.push(')');
+    text
+}
+
 #[async_trait]
 impl SessionControl for CodexSession {
     // Every request below is bounded: the engine waits for these calls, and an app-server
     // that stops answering must not keep the thread waiting (`handshake_timeout` for requests,
     // `stop_grace` for the interrupt, like `shutdown`).
     async fn send(&self, input: TurnInput) -> Result<(), AdapterError> {
-        let (thread_id, settings, applied_mode, skills) = self.begin_turn()?;
+        let turn = match commands::parse_intercept(&input) {
+            Some(Err(usage)) => return Err(AdapterError::Other(usage)),
+            Some(Ok(Intercept::Goal(command))) => {
+                let ctx = self.begin_turn(TurnPhase::Command)?;
+                return match self.goal_command(&ctx.thread_id, &command).await {
+                    Ok((level, message)) => {
+                        self.finish_command(level, message, "goal");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.abort_start();
+                        Err(e)
+                    }
+                };
+            }
+            Some(Ok(Intercept::Compact)) => CodexTurn::Compact,
+            Some(Ok(Intercept::Review { instructions })) => CodexTurn::Review { instructions },
+            // `/init` is a turn with Codex's own prompt as its input.
+            Some(Ok(Intercept::Init)) => CodexTurn::Message(TurnInput::text(texts::INIT_PROMPT)),
+            None => CodexTurn::Message(input),
+        };
+        let TurnContext {
+            thread_id,
+            settings,
+            applied_mode,
+            skills,
+        } = self.begin_turn(TurnPhase::Starting {
+            named: !matches!(turn, CodexTurn::Compact),
+        })?;
         let peer = &self.shared.peer;
         let timeout = self.shared.policy.handshake_timeout;
-        match commands::parse_intercept(&input) {
-            Some(Intercept::Compact) => {
+        match turn {
+            CodexTurn::Compact => {
                 // The compaction runs as a turn; its id arrives with `turn/started`.
                 if let Err(e) = peer
                     .request_timeout::<_, Value>(
@@ -1680,24 +2348,24 @@ impl SessionControl for CodexSession {
                 }
                 Ok(())
             }
-            Some(Intercept::Review { instructions }) => {
+            CodexTurn::Review { instructions } => {
                 let params = json!({
                     "threadId": thread_id,
                     "target": commands::review_target(instructions.as_deref()),
                     "delivery": "inline",
                 });
                 match peer
-                    .request_timeout::<_, Value>("review/start", params, timeout)
+                    .request_timeout::<_, ReviewStartResponse>("review/start", params, timeout)
                     .await
                 {
                     Ok(resp) => {
-                        if let Some(id) = resp
-                            .get("turn")
-                            .and_then(|t| t.get("id"))
-                            .and_then(Value::as_str)
-                        {
-                            self.started(id.to_owned(), None);
-                        }
+                        self.started(
+                            resp.turn.id,
+                            Applied {
+                                announce: true,
+                                ..Applied::default()
+                            },
+                        );
                         Ok(())
                     }
                     Err(e) => {
@@ -1706,9 +2374,14 @@ impl SessionControl for CodexSession {
                     }
                 }
             }
-            None => {
-                let overrides = match settings::turn_overrides(&settings, applied_mode.as_deref()) {
-                    Ok(o) => o,
+            CodexTurn::Message(input) => {
+                let (overrides, modes) = {
+                    let st = self.shared.state.lock();
+                    let overrides = settings::turn_overrides(&settings, applied_mode.as_deref());
+                    (overrides, st.mode_params())
+                };
+                let (mut overrides, modes) = match overrides.and_then(|o| Ok((o, modes?))) {
+                    Ok(both) => both,
                     Err(e) => {
                         self.abort_start();
                         return Err(AdapterError::Other(e));
@@ -1720,6 +2393,14 @@ impl SessionControl for CodexSession {
                     "input".into(),
                     Value::Array(commands::user_inputs(&input, &skills)),
                 );
+                if let Some((_, mode)) = &modes.collaboration {
+                    // Codex ignores a top-level effort sent with a mode: it is in the mode.
+                    overrides.remove("effort");
+                    params.insert("collaborationMode".into(), mode.clone());
+                }
+                if let Some(tier) = &modes.service_tier {
+                    params.insert("serviceTier".into(), json!(tier));
+                }
                 params.extend(overrides);
                 match peer
                     .request_timeout::<_, TurnStartResponse>(
@@ -1730,7 +2411,15 @@ impl SessionControl for CodexSession {
                     .await
                 {
                     Ok(resp) => {
-                        self.started(resp.turn.id, settings.permission_mode.clone());
+                        self.started(
+                            resp.turn.id,
+                            Applied {
+                                mode: settings.permission_mode.clone(),
+                                plan: modes.collaboration.map(|(plan, _)| plan),
+                                tier: modes.service_tier,
+                                announce: false,
+                            },
+                        );
                         Ok(())
                     }
                     Err(e) => {
@@ -1742,7 +2431,43 @@ impl SessionControl for CodexSession {
         }
     }
 
+    /// `turn/steer`. `/goal` also works while a turn runs (a paused or cleared goal lets the
+    /// running continuation finish and starts no other): its answer is a notice of the running
+    /// turn. The other commands run as turns of their own and are refused while one runs (as
+    /// Codex's TUI disables them during a task); typed text is never sent to the model in their
+    /// place.
     async fn steer(&self, input: TurnInput) -> Result<(), AdapterError> {
+        match commands::parse_intercept(&input) {
+            Some(Err(usage)) => return Err(AdapterError::Other(usage)),
+            Some(Ok(Intercept::Goal(command))) => {
+                let thread_id = {
+                    let mut st = self.shared.state.lock();
+                    if st.command_in_flight() {
+                        return Err(AdapterError::Other("a command is being run".into()));
+                    }
+                    st.steered_command = true;
+                    st.thread_id.clone()
+                };
+                let answer = self.goal_command(&thread_id, &command).await;
+                {
+                    // Under the state lock: the pump reports the turn's end after the notice.
+                    let mut st = self.shared.state.lock();
+                    if let Ok((level, message)) = &answer {
+                        self.shared.notice(*level, message.clone(), "goal");
+                    }
+                    st.steered_command = false;
+                }
+                self.shared.turn_changed.notify_waiters();
+                return answer.map(|_| ());
+            }
+            Some(Ok(other)) => {
+                return Err(AdapterError::Other(format!(
+                    "{} runs as a turn of its own: send it when no turn runs",
+                    other.command()
+                )));
+            }
+            None => {}
+        }
         let timeout = self.shared.policy.handshake_timeout;
         let steer = async {
             let Some(turn_id) = self.current_turn_id().await else {
@@ -1773,23 +2498,37 @@ impl SessionControl for CodexSession {
     /// once the turn has been aborted; an app-server that does not within `stop_grace` gets an
     /// error back, so the engine's forced stop (`interrupt_grace`) is never held up here.
     /// Background terminals and sub-agents go on (Codex does not stop them with the turn).
+    ///
+    /// While the thread's goal is active, stopping the turn also pauses the goal, as Codex's
+    /// own TUI does (`pause_active_goal_for_interrupt`, whenever a turn runs while the goal is
+    /// active): otherwise Codex would continue the goal by itself after the next turn (docs/
+    /// adapters/codex.md §14.6). The pause is written before the interrupt and both run within
+    /// the same `stop_grace`; the outcome of the interrupt is what this returns.
     async fn interrupt(&self) -> Result<(), AdapterError> {
         let grace = self.shared.policy.stop_grace;
-        let interrupt = async {
-            let Some(turn_id) = self.current_turn_id().await else {
-                return Ok(());
-            };
-            let params = json!({ "threadId": self.shared.thread_id(), "turnId": turn_id });
-            self.shared
-                .peer
-                .request_value("turn/interrupt", params)
-                .await
-                .map(|_| ())
-                .map_err(|e| rpc_err("turn/interrupt", e))
+        let deadline = tokio::time::Instant::now() + grace;
+        let late = || Err(rpc_err("turn/interrupt", RpcCallError::Timeout(grace)));
+        let turn_id = match tokio::time::timeout_at(deadline, self.current_turn_id()).await {
+            Ok(Some(turn_id)) => turn_id,
+            Ok(None) => return Ok(()),
+            Err(_) => return late(),
         };
-        tokio::time::timeout(grace, interrupt)
+        let thread_id = self.shared.thread_id();
+        let pause = self.pause_goal_for_interrupt(&thread_id, deadline);
+        let params = json!({ "threadId": thread_id, "turnId": turn_id });
+        let interrupt = async {
+            match tokio::time::timeout_at(
+                deadline,
+                self.shared.peer.request_value("turn/interrupt", params),
+            )
             .await
-            .unwrap_or_else(|_| Err(rpc_err("turn/interrupt", RpcCallError::Timeout(grace))))
+            {
+                Ok(answer) => answer.map(|_| ()).map_err(|e| rpc_err("turn/interrupt", e)),
+                Err(_) => late(),
+            }
+        };
+        let ((), interrupted) = tokio::join!(pause, interrupt);
+        interrupted
     }
 
     async fn respond(
@@ -1849,6 +2588,82 @@ impl SessionControl for CodexSession {
         // in this same process uses them.
         self.shared.state.lock().settings = settings.clone();
         Ok(SettingsApplied::Live)
+    }
+
+    /// Plan mode (`collaborationMode`) and fast mode (`serviceTier`) are `turn/start`
+    /// parameters: the next turn of this process takes them.
+    async fn apply_modes(&self, modes: &ThreadModes) -> Result<SettingsApplied, AdapterError> {
+        let mut st = self.shared.state.lock();
+        if modes.fast {
+            let model = st.model();
+            if model
+                .as_deref()
+                .and_then(|m| st.fast_tiers.get(m))
+                .is_none()
+            {
+                return Err(AdapterError::Other(no_fast_mode(model.as_deref())));
+            }
+        }
+        st.desired = *modes;
+        Ok(SettingsApplied::Live)
+    }
+
+    /// `thread/name/set`. Codex echoes the name with `thread/name/updated` (a `SessionTitle`
+    /// that changes nothing).
+    async fn rename(&self, title: &str) -> Result<(), AdapterError> {
+        const METHOD: &str = "thread/name/set";
+        let params = json!({ "threadId": self.shared.thread_id(), "name": title });
+        self.shared
+            .peer
+            .request_timeout::<_, Value>(METHOD, params, self.shared.policy.handshake_timeout)
+            .await
+            .map(|_| ())
+            .map_err(|e| rpc_err(METHOD, e))
+    }
+
+    /// The thread (model, effort, modes, token usage), its goal, the account and its rate
+    /// limits. `account/read` and `account/rateLimits/read` are asked now (in that order);
+    /// the rest is what Codex last reported. When the rate limits cannot be read (a provider
+    /// other than OpenAI's needs no sign-in, and then Codex refuses the read), the rolling
+    /// updates Codex sent after model calls are shown.
+    async fn status(&self) -> Result<Vec<StatusSection>, AdapterError> {
+        let peer = &self.shared.peer;
+        let timeout = self.shared.policy.handshake_timeout;
+        let account = read_account(peer, timeout).await;
+        let limits = read_rate_limits(peer, timeout).await;
+        let st = self.shared.state.lock();
+        let facts = ThreadFacts {
+            thread_id: st.thread_id.clone(),
+            model: st.model(),
+            effort: st.settings.effort.clone().or(st.codex_effort.clone()),
+            permissions: st
+                .applied_mode
+                .as_deref()
+                .and_then(settings::preset)
+                .map(|p| p.label.to_owned()),
+            plan: st.known_plan,
+            service_tier: st
+                .known_tier
+                .as_deref()
+                .map(|t| settings::tier_word(t, &st.fast_tiers)),
+            usage: st.token_usage.clone(),
+        };
+        let mut sections = vec![status::thread_section(&facts)];
+        if let Some(goal) = &st.goal {
+            sections.push(status::goal_section(goal));
+        }
+        sections.push(status::account_section(
+            account.as_ref().map_err(String::as_str),
+        ));
+        let limits = match &limits {
+            Ok(snapshot) => RateLimits::Read(snapshot),
+            Err(error) => RateLimits::Rolling {
+                snapshot: st.rate_limits.as_ref(),
+                read_error: error,
+            },
+        };
+        sections.push(status::rate_limit_section(limits, unix_now()));
+        Ok(sections)
     }
 
     /// Stops background task `key`: a terminal with `thread/backgroundTerminals/terminate`
@@ -1933,4 +2748,47 @@ impl SessionControl for CodexSession {
             .await
             .clone()
     }
+}
+
+/// `account/read`; the error is Codex's (or the transport's) text.
+pub(crate) async fn read_account(
+    peer: &RpcPeer,
+    timeout: std::time::Duration,
+) -> Result<AccountReadResponse, String> {
+    const METHOD: &str = "account/read";
+    peer.request_timeout::<_, AccountReadResponse>(
+        METHOD,
+        json!({ "refreshToken": false }),
+        timeout,
+    )
+    .await
+    .map_err(|e| match e {
+        RpcCallError::Rpc(e) => e.message,
+        other => rpc_err(METHOD, other).detail(),
+    })
+}
+
+/// `account/rateLimits/read` (it takes no parameters); the error is Codex's text (codex-cli
+/// 0.148.0: "codex account authentication required to read rate limits" without an OpenAI
+/// sign-in).
+pub(crate) async fn read_rate_limits(
+    peer: &RpcPeer,
+    timeout: std::time::Duration,
+) -> Result<RateLimitSnapshot, String> {
+    const METHOD: &str = "account/rateLimits/read";
+    peer.request_timeout::<_, RateLimitsReadResponse>(METHOD, Value::Null, timeout)
+        .await
+        .map(|r| r.rate_limits)
+        .map_err(|e| match e {
+            RpcCallError::Rpc(e) => e.message,
+            other => rpc_err(METHOD, other).detail(),
+        })
+}
+
+/// The current Unix time in seconds (for "resets in" of the rate limits).
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

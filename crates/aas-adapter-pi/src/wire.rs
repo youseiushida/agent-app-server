@@ -113,21 +113,143 @@ pub struct PiState {
     #[serde(default)]
     pub is_streaming: bool,
     #[serde(default)]
+    pub is_compacting: bool,
+    #[serde(default)]
+    pub steering_mode: Option<String>,
+    #[serde(default)]
+    pub follow_up_mode: Option<String>,
+    #[serde(default)]
     pub session_file: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
     pub session_name: Option<String>,
+    #[serde(default)]
+    pub auto_compaction_enabled: Option<bool>,
+    #[serde(default)]
+    pub message_count: Option<u64>,
+    #[serde(default)]
+    pub pending_message_count: Option<u64>,
 }
 
 /// One entry of `get_commands`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PiCommand {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
+    /// Where the command comes from (`sourceInfo`: the extension's file, or `<inline:…>` for an
+    /// extension pi bundles).
+    #[serde(default)]
+    pub source_info: Option<PiSourceInfo>,
+}
+
+/// `sourceInfo` of a command.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PiSourceInfo {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl PiCommand {
+    /// `sourceInfo.path`, when pi gave one.
+    pub fn source_path(&self) -> Option<&str> {
+        self.source_info.as_ref()?.path.as_deref()
+    }
+}
+
+/// `get_session_stats` data (pi 0.85.1 `AgentSession.getSessionStats`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiSessionStats {
+    #[serde(default)]
+    pub session_file: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub user_messages: u64,
+    #[serde(default)]
+    pub assistant_messages: u64,
+    #[serde(default)]
+    pub tool_calls: u64,
+    #[serde(default)]
+    pub tool_results: u64,
+    #[serde(default)]
+    pub total_messages: u64,
+    #[serde(default)]
+    pub tokens: PiStatsTokens,
+    #[serde(default)]
+    pub cost: f64,
+    #[serde(default)]
+    pub context_usage: Option<PiContextUsage>,
+}
+
+/// `tokens` of the session stats.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiStatsTokens {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
+    #[serde(default)]
+    pub total: u64,
+}
+
+/// `contextUsage` of the session stats: `tokens` and `percent` are `null` right after a
+/// compaction, until the next response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiContextUsage {
+    #[serde(default)]
+    pub tokens: Option<u64>,
+    #[serde(default)]
+    pub context_window: u64,
+    #[serde(default)]
+    pub percent: Option<f64>,
+}
+
+/// `get_entries` data: the session's entries in file order (after `since` when it was given)
+/// and the current leaf (`null` for a session without entries).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiEntries {
+    #[serde(default)]
+    pub entries: Vec<Value>,
+    #[serde(default)]
+    pub leaf_id: Option<String>,
+}
+
+impl PiEntries {
+    /// The id of the first user message among the entries (file order).
+    pub fn first_user_message(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| {
+                e.get("type").and_then(Value::as_str) == Some("message")
+                    && e.pointer("/message/role").and_then(Value::as_str) == Some("user")
+            })
+            .and_then(|e| e.get("id"))
+            .and_then(Value::as_str)
+    }
+}
+
+/// One user message of `get_fork_messages`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiForkMessage {
+    pub entry_id: String,
+    #[serde(default)]
+    pub text: String,
 }
 
 /// pi's `Usage` object.

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aas_harness::{
     AdapterError, AdapterEvent, BackgroundTaskInfo, SessionControl, SessionHandle, SettingsApplied,
-    StartMode, StartRequest, TurnInput, TurnInputPart,
+    StartMode, StartOptions, StartRequest, TurnInput, TurnInputPart,
 };
 use aas_protocol::events::Event;
 use aas_protocol::methods::*;
@@ -73,6 +73,7 @@ pub enum Msg {
         title: Option<String>,
         settings: Option<ThreadSettings>,
         pinned: Option<bool>,
+        modes: Option<ThreadModesUpdate>,
         idem: Option<Idem>,
         reply: Reply<ThreadUpdateResult>,
     },
@@ -119,6 +120,21 @@ pub enum Msg {
         idem: Option<Idem>,
         reply: Reply<BackgroundTaskResult>,
     },
+    /// `item/moveToBackground`: asks the harness to move a running item to the background.
+    MoveToBackground {
+        item_id: ItemId,
+        idem: Option<Idem>,
+        reply: Reply<Empty>,
+    },
+    /// The control of the running agent, for the read-only requests the engine makes outside
+    /// the actor (`thread/harnessStatus`, `thread/sideQuestion`); `None` while no agent runs
+    /// (or it is being stopped).
+    LiveControl {
+        reply: oneshot::Sender<Option<Arc<dyn SessionControl>>>,
+    },
+    /// The user's trust decision for the thread's harness in its project changed: a running
+    /// agent is replaced before the next turn, so that it starts with the decision.
+    TrustChanged,
     /// Daemon shutdown: stop the process (if any) and exit the actor.
     Shutdown { reply: oneshot::Sender<()> },
 }
@@ -200,6 +216,8 @@ struct Live {
     /// applied live. They differ from the thread's settings while a change waits for the next
     /// turn (a running turn is never affected, design.md §5.4).
     settings: ThreadSettings,
+    /// Modes the process runs with, like `settings`.
+    modes: ThreadModes,
 }
 
 struct OpenItem {
@@ -246,6 +264,14 @@ struct ActiveTurn {
     trigger: Option<TurnTrigger>,
     /// The notice that the turn waits for background work has been added.
     background_notice: bool,
+    /// The harness's anchor of the turn (`AdapterEvent::TurnAnchor`).
+    anchor: Option<Value>,
+    /// The native session `anchor` belongs to when the harness moved the thread to another
+    /// one after reporting it; `None`: the thread's current session.
+    anchor_session: Option<String>,
+    /// Steered messages of the turn by their item id: the item, and the input as it was sent
+    /// (a steer the harness returns goes back to the queue as it was).
+    steers: HashMap<ItemId, (Item, Vec<InputPart>)>,
 }
 
 enum Phase {
@@ -272,6 +298,8 @@ struct Launch {
     /// Settings a new process is started with (compared with the thread's settings once it
     /// runs: they may have changed meanwhile).
     settings: ThreadSettings,
+    /// Modes a new process is started with (like `settings`).
+    modes: ThreadModes,
     /// Set when no turn needs the process any more: the start is skipped if it has not begun
     /// yet. A start in progress is never dropped (see `Actor::cancel_launch`).
     abort: Arc<AtomicBool>,
@@ -280,6 +308,8 @@ struct Launch {
 struct LaunchResult {
     base_tree: Option<String>,
     session: Option<Result<(SessionHandle, Permit), AdapterError>>,
+    /// The native session the start resumed (`StartMode::Resume`), when it did.
+    resumed: Option<String>,
     /// The start was refused before any process was started: the fork's parent has moved on
     /// (see [`fork_point_passed`]).
     refused: Option<TurnError>,
@@ -287,21 +317,29 @@ struct LaunchResult {
 
 /// Why a launch produced no process for its turn.
 enum StartFailure {
-    Adapter(AdapterError),
+    /// The adapter's start failed; `resuming` when it was to resume the thread's native
+    /// session.
+    Adapter {
+        error: AdapterError,
+        resuming: bool,
+    },
     Refused(TurnError),
 }
 
 impl StartFailure {
-    /// The error the turn ends with.
+    /// The error the turn ends with. Its message is the adapter's own text
+    /// ([`AdapterError::detail`]): the kind says what failed, and clients put a lead-in of
+    /// their own in front of it.
     fn turn_error(&self) -> TurnError {
         match self {
-            StartFailure::Adapter(e) => {
-                let kind = match e {
-                    AdapterError::Unavailable(_) => "harnessUnavailable",
-                    _ => "spawnFailed",
+            StartFailure::Adapter { error, resuming } => {
+                let kind = match (error, resuming) {
+                    (AdapterError::Unavailable(_), _) => "harnessUnavailable",
+                    (_, true) => "resumeFailed",
+                    (_, false) => "spawnFailed",
                 };
                 TurnError {
-                    message: e.to_string(),
+                    message: error.detail(),
                     kind: kind.into(),
                 }
             }
@@ -313,7 +351,7 @@ impl StartFailure {
 impl std::fmt::Display for StartFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StartFailure::Adapter(e) => write!(f, "{e}"),
+            StartFailure::Adapter { error, .. } => write!(f, "{error}"),
             StartFailure::Refused(error) => write!(f, "{} ({})", error.message, error.kind),
         }
     }
@@ -367,6 +405,21 @@ struct Uow {
     /// Requests of the agent that expire in this commit while its process lives: the adapter
     /// answers each once the commit is stored (design.md §8).
     answers: Vec<(String, ExpireReason)>,
+    /// Anchors of stored turns to replace (`AdapterEvent::TurnAnchorReplaced`): the turn whose
+    /// anchor is the first value gets the second.
+    anchor_replacements: Vec<(Value, Value)>,
+    /// The harness moved the thread to other native sessions, in order (see
+    /// `Actor::native_session_changed`).
+    session_switches: Vec<SessionSwitch>,
+}
+
+/// A move of the thread to another native session, as one commit applies it to the stored
+/// turns (before the turn rows of the commit, which the actor updated itself): first the
+/// replacements of anchors reported before it, then the anchors recorded so far are kept as
+/// anchors of `previous`.
+struct SessionSwitch {
+    previous: String,
+    replacements: Vec<(Value, Value)>,
 }
 
 impl Uow {
@@ -392,6 +445,8 @@ impl Uow {
             && self.idem_thread.is_empty()
             && self.idem_create.is_none()
             && self.answers.is_empty()
+            && self.anchor_replacements.is_empty()
+            && self.session_switches.is_empty()
     }
 
     fn update_item(&mut self, item: Item) {
@@ -471,6 +526,16 @@ pub(crate) struct ConvertedInput {
     mentions: Vec<Mention>,
     text: String,
     pins: Vec<BlobPin>,
+}
+
+/// A message to steer into the running turn: converted for the adapter, as recorded, and as it
+/// was sent (to queue it again when the harness returns it).
+struct SteeredInput {
+    input: TurnInput,
+    text: String,
+    attachments: Vec<Attachment>,
+    mentions: Vec<Mention>,
+    original: Vec<InputPart>,
 }
 
 async fn recv_live(live: &mut Option<Live>) -> Option<AdapterEvent> {
@@ -733,6 +798,11 @@ impl Actor {
                 Msg::Commands { reply } => {
                     let _ = reply.send(None);
                 }
+                Msg::LiveControl { reply } => {
+                    // Nothing runs while retired.
+                    let _ = reply.send(None);
+                }
+                Msg::TrustChanged => {}
                 Msg::Shutdown { reply } => {
                     // Nothing runs and nothing may be written.
                     self.shutting_down = true;
@@ -783,10 +853,11 @@ impl Actor {
                 title,
                 settings,
                 pinned,
+                modes,
                 idem,
                 reply,
             } => {
-                let r = self.update(title, settings, pinned, idem).await;
+                let r = self.update(title, settings, pinned, modes, idem).await;
                 send_reply(reply, r);
             }
             Msg::UpdateQueued {
@@ -839,6 +910,35 @@ impl Actor {
             } => {
                 let r = self.stop_background(task_id, idem).await;
                 send_reply(reply, r);
+            }
+            Msg::MoveToBackground {
+                item_id,
+                idem,
+                reply,
+            } => {
+                let r = self.move_to_background(item_id, idem).await;
+                send_reply(reply, r);
+            }
+            Msg::LiveControl { reply } => {
+                let control = self
+                    .live
+                    .as_ref()
+                    .filter(|_| self.stopping.is_none())
+                    .map(|l| l.control.clone());
+                let _ = reply.send(control);
+            }
+            Msg::TrustChanged => {
+                // A process that runs, or one being started (it read the decision before this
+                // change), is replaced before the next turn is sent, like settings that need a
+                // new process (never while background work keeps it busy, see `begin_launch`).
+                let starting = self
+                    .launch
+                    .as_ref()
+                    .is_some_and(|l| l.kind != LaunchKind::Reuse);
+                if self.live.is_some() || starting {
+                    tracing::info!(thread = %self.row.id, "the project's trust decision changed; the agent is replaced before the next turn");
+                    self.restart_pending = true;
+                }
             }
             Msg::Shutdown { reply } => self.on_shutdown(Some(reply)).await,
         }
@@ -894,6 +994,13 @@ impl Actor {
             Msg::StopBackground { reply, .. } => {
                 let _ = reply.send(Err(gone()));
             }
+            Msg::MoveToBackground { reply, .. } => {
+                let _ = reply.send(Err(gone()));
+            }
+            Msg::LiveControl { reply } => {
+                let _ = reply.send(None);
+            }
+            Msg::TrustChanged => {}
             Msg::Stop { reply, .. } | Msg::Archive { reply, .. } => {
                 let _ = reply.send(Err(gone()));
             }
@@ -959,14 +1066,42 @@ impl Actor {
         Instant::now() + self.sh.config.policy.handshake_timeout
     }
 
-    /// Fails with `invalidState` when this thread is a fork whose native session is still to
-    /// be branched off and its parent has run turns since the fork was made (see
-    /// [`fork_point_passed`]).
+    /// Refuses input that starts with a command of the harness that switches the native
+    /// session (`sessionSwitchingCommand`, design.md §9.5): a thread is one native session.
+    fn refuse_session_switch(&self, input: &[InputPart]) -> CoreResult<()> {
+        let Some(adapter) = self.sh.registry.get(&self.row.harness_id) else {
+            return Ok(());
+        };
+        let names = crate::commands::session_switching_names(adapter.as_ref());
+        crate::commands::refuse_session_switch(input, &names, &self.row.harness_id)
+    }
+
+    /// A queued entry about to start a turn: converted like at `turn/start` (entries queued
+    /// before a check existed are checked again).
+    fn checked_queued_input(
+        &self,
+        input: &[InputPart],
+    ) -> impl Future<Output = CoreResult<ConvertedInput>> + Send + 'static {
+        let refused = self.refuse_session_switch(input);
+        let convert = self.convert_input(input);
+        async move {
+            refused?;
+            convert.await
+        }
+    }
+
+    /// The thread's harness's features (as of its last probe).
+    fn features(&self) -> HarnessFeatures {
+        self.sh.registry.features(&self.row.harness_id)
+    }
+
+    /// Fails with `invalidState` when this thread is a fork of a whole session whose native
+    /// session is still to be branched off and its parent has run turns since the fork was
+    /// made (see [`fork_point_passed`]).
     fn check_fork_point(&self) -> impl Future<Output = CoreResult<()>> + Send + 'static {
-        let pending = self
-            .row
-            .fork_source
-            .is_some()
+        // A fork at a turn branches at that turn's anchor: later turns of the parent do not
+        // change what it gets.
+        let pending = (self.row.fork_source.is_some() && self.row.fork_at.is_none())
             .then(|| self.row.forked_from.clone())
             .flatten();
         let db = self.sh.db.clone();
@@ -1114,6 +1249,20 @@ async fn convert_input(
     })
 }
 
+/// Applies the anchor replacements the harness reported (`AdapterEvent::TurnAnchorReplaced`).
+fn replace_anchors(
+    tx: &rusqlite::Transaction<'_>,
+    thread_id: &ThreadId,
+    replacements: &[(Value, Value)],
+) -> CoreResult<()> {
+    for (previous, anchor) in replacements {
+        if !store::replace_turn_anchor(tx, thread_id, previous, anchor)? {
+            tracing::warn!(thread = %thread_id, anchor = %previous, "no turn of the thread's current native session has the anchor the harness replaces; ignored");
+        }
+    }
+    Ok(())
+}
+
 /// Writes the changes of one commit of a thread actor (called again for every attempt, so
 /// it only reads `uow`). `preview_chars` is `policy.queued_preview_chars`.
 fn apply_uow(
@@ -1127,6 +1276,12 @@ fn apply_uow(
     let now = now_ms();
     if uow.thread_insert {
         store::insert_thread(tx, &row)?;
+    }
+    // Before the turn rows of this commit: those recorded before a switch already name its
+    // session, those recorded after it belong to the current one.
+    for switch in &uow.session_switches {
+        replace_anchors(tx, &thread_id, &switch.replacements)?;
+        store::keep_anchors_with_session(tx, &thread_id, &switch.previous)?;
     }
     for t in &uow.turn_inserts {
         store::insert_turn(tx, t)?;
@@ -1163,6 +1318,7 @@ fn apply_uow(
     for task in &uow.background {
         store::upsert_background_task(tx, task)?;
     }
+    replace_anchors(tx, &thread_id, &uow.anchor_replacements)?;
     for e in &uow.events {
         em.thread(&thread_id, e.clone());
     }
@@ -1245,6 +1401,7 @@ impl Actor {
         }
         self.sh.registry.wait_ready().await;
         let info = self.harness_info()?;
+        self.refuse_session_switch(&input)?;
         let converted = self.check_input(&input, &info).await?;
         if self.turn.is_none() {
             // The turn would start a fork's native session: refused while that would copy
@@ -1266,8 +1423,14 @@ impl Actor {
             };
             return match delivery {
                 Delivery::Steer => {
-                    self.steer(turn_input, text, attachments, mentions, &info, idem, uow)
-                        .await
+                    let steered = SteeredInput {
+                        input: turn_input,
+                        text,
+                        attachments,
+                        mentions,
+                        original: input,
+                    };
+                    self.steer(steered, &info, idem, uow).await
                 }
                 Delivery::Auto | Delivery::Queue => self.enqueue(input, idem, uow).await,
             };
@@ -1326,6 +1489,7 @@ impl Actor {
             usage: None,
             diff: None,
             trigger: None,
+            forkable: false,
         };
         let user_item = Item {
             id: ItemId::generate(),
@@ -1335,6 +1499,7 @@ impl Actor {
             started_at: now,
             completed_at: Some(now),
             background_task_id: None,
+            backgroundable: false,
             body: ItemBody::UserMessage {
                 text: text.clone(),
                 attachments,
@@ -1352,11 +1517,7 @@ impl Actor {
         self.row.last_activity_at = now;
         self.row.last_error = None;
         uow.thread_changed = true;
-        uow.turn_inserts.push(TurnRow {
-            turn: turn.clone(),
-            base_tree: None,
-            end_tree: None,
-        });
+        uow.turn_inserts.push(TurnRow::new(turn.clone()));
         uow.events.push(Event::TurnStarted { turn: turn.clone() });
         uow.items_insert.push(user_item.clone());
         uow.events.push(Event::ItemStarted { item: user_item });
@@ -1384,6 +1545,9 @@ impl Actor {
             forced: false,
             trigger: None,
             background_notice: false,
+            anchor: None,
+            anchor_session: None,
+            steers: HashMap::new(),
         });
         TurnStartResult {
             disposition: Disposition::Started,
@@ -1412,13 +1576,14 @@ impl Actor {
             usage: None,
             diff: None,
             trigger: None,
+            forkable: false,
         };
         self.row.last_activity_at = now;
         uow.thread_changed = true;
+        // The agent runs it already: it is part of the native session.
         uow.turn_inserts.push(TurnRow {
-            turn: turn.clone(),
-            base_tree: None,
-            end_tree: None,
+            delivered: true,
+            ..TurnRow::new(turn.clone())
         });
         uow.events.push(Event::TurnStarted { turn: turn.clone() });
         let lease = self
@@ -1445,21 +1610,20 @@ impl Actor {
             forced: false,
             trigger: None,
             background_notice: false,
+            anchor: None,
+            anchor_session: None,
+            steers: HashMap::new(),
         });
         tracing::info!(thread = %self.row.id, "agent started a turn by itself");
     }
 
     /// Injects input into the running turn. `uow` may already hold changes that commit with the
-    /// steer (a queued entry that is sent now).
-    // The caller has already split the request into these parts (and holds the unit of work);
-    // a one-off struct for this private method would only move the same list elsewhere.
-    #[allow(clippy::too_many_arguments)]
+    /// steer (a queued entry that is sent now). The message's item id goes to the adapter
+    /// ([`SessionControl::steer_message`]): a harness that does not take the steer returns it
+    /// by that id ([`AdapterEvent::SteerReturned`]), and it goes back to the queue.
     async fn steer(
         &mut self,
-        input: TurnInput,
-        text: String,
-        attachments: Vec<Attachment>,
-        mentions: Vec<Mention>,
+        steered: SteeredInput,
         info: &aas_harness::HarnessInfo,
         idem: Option<Idem>,
         mut uow: Uow,
@@ -1471,6 +1635,14 @@ impl Actor {
             )
             .with("capability", "steer"));
         }
+        let SteeredInput {
+            input,
+            text,
+            attachments,
+            mentions,
+            original,
+        } = steered;
+        let item_id = ItemId::generate();
         let deadline = self.request_deadline();
         let turn = self.turn.as_mut().expect("steer requires a turn");
         if turn.sent {
@@ -1479,9 +1651,13 @@ impl Actor {
                 .as_ref()
                 .map(|l| l.control.clone())
                 .ok_or_else(|| invalid_state("the agent is not running"))?;
-            bounded(deadline, "the steer", control.steer(input))
-                .await
-                .map_err(adapter_err(&self.row.harness_id))?;
+            bounded(
+                deadline,
+                "the steer",
+                control.steer_message(item_id.as_str(), input),
+            )
+            .await
+            .map_err(adapter_err(&self.row.harness_id))?;
         } else {
             // Not sent yet: the steer becomes part of the turn's first message.
             turn.input.parts.push(TurnInputPart::Text("\n\n".into()));
@@ -1490,13 +1666,14 @@ impl Actor {
         let turn = self.turn.as_ref().expect("turn");
         let now = now_ms();
         let item = Item {
-            id: ItemId::generate(),
+            id: item_id,
             thread_id: self.row.id.clone(),
             turn_id: turn.id.clone(),
             status: ItemStatus::Completed,
             started_at: now,
             completed_at: Some(now),
             background_task_id: None,
+            backgroundable: false,
             body: ItemBody::UserMessage {
                 text,
                 attachments,
@@ -1510,6 +1687,10 @@ impl Actor {
             queued_id: None,
         };
         uow.items_insert.push(item.clone());
+        if let Some(turn) = self.turn.as_mut().filter(|t| t.sent) {
+            turn.steers
+                .insert(item.id.clone(), (item.clone(), original));
+        }
         uow.events.push(Event::ItemStarted { item });
         if let Some(idem) = idem {
             uow.idem_values.push((idem, serde_json::to_value(&result)?));
@@ -1642,6 +1823,7 @@ impl Actor {
         // Validated like a `turn/start` input: the entry must be sendable as it is.
         self.sh.registry.wait_ready().await;
         let info = self.harness_info()?;
+        self.refuse_session_switch(&input)?;
         let converted = self.check_input(&input, &info).await?;
         let thread_id = self.row.id.clone();
         let preview_chars = self.sh.config.policy.queued_preview_chars;
@@ -1701,6 +1883,7 @@ impl Actor {
         }
         self.sh.registry.wait_ready().await;
         let info = self.harness_info()?;
+        self.refuse_session_switch(&entry.input)?;
         let converted = self.check_input(&entry.input, &info).await?;
         if self.turn.is_none() {
             self.check_fork_point().await?;
@@ -1732,10 +1915,14 @@ impl Actor {
             if remaining == 0 {
                 self.row.queue_paused = false;
             }
-            if let Err(e) = self
-                .steer(input, text, attachments, mentions, &info, None, uow)
-                .await
-            {
+            let steered = SteeredInput {
+                input,
+                text,
+                attachments,
+                mentions,
+                original: entry.input.clone(),
+            };
+            if let Err(e) = self.steer(steered, &info, None, uow).await {
                 self.row.queue_paused = queue_paused_before;
                 return Err(e);
             }
@@ -1935,6 +2122,7 @@ impl Actor {
         title: Option<String>,
         settings: Option<ThreadSettings>,
         pinned: Option<bool>,
+        modes: Option<ThreadModesUpdate>,
         idem: Option<Idem>,
     ) -> CoreResult<ThreadUpdateResult> {
         // Everything that can refuse the request (validation, the process refusing the
@@ -1950,38 +2138,87 @@ impl Actor {
             }
             None => None,
         };
-        let mut outcome = None;
-        let mut new_settings = None;
-        if let Some(s) = settings {
-            // Only the values this request sets are checked, and only against the lists of an
-            // available harness (design.md §5.4): the thread's other values were accepted when
-            // they were set, and the placeholder information of an unavailable harness lists
-            // nothing, which says nothing about which values are valid. The request must not
-            // be refused for good (`invalidParams` is stored) for either reason.
-            if let Some(info) = self.sh.registry.info(&self.row.harness_id)
-                && info.available
-            {
-                validate_settings(&info, &s)?;
+        // Only the values this request sets are checked, and only against the lists of an
+        // available harness (design.md §5.4): the thread's other values were accepted when
+        // they were set, and the placeholder information of an unavailable harness lists
+        // nothing, which says nothing about which values are valid. The request must not be
+        // refused for good (`invalidParams` is stored) for either reason.
+        let info = self
+            .sh
+            .registry
+            .info(&self.row.harness_id)
+            .filter(|info| info.available);
+        let features = self.features();
+        let new_settings = match settings {
+            Some(s) => {
+                if let Some(info) = &info {
+                    validate_settings(info, &s)?;
+                }
+                Some(ThreadSettings {
+                    model: s.model.or_else(|| self.row.settings.model.clone()),
+                    effort: s.effort.or_else(|| self.row.settings.effort.clone()),
+                    permission_mode: s
+                        .permission_mode
+                        .or_else(|| self.row.settings.permission_mode.clone()),
+                })
             }
-            let merged = ThreadSettings {
-                model: s.model.or_else(|| self.row.settings.model.clone()),
-                effort: s.effort.or_else(|| self.row.settings.effort.clone()),
-                permission_mode: s
-                    .permission_mode
-                    .or_else(|| self.row.settings.permission_mode.clone()),
-            };
-            outcome = Some(self.settings_outcome(&merged).await?);
-            new_settings = Some(merged);
-        }
+            None => None,
+        };
+        let target_settings = new_settings
+            .clone()
+            .unwrap_or_else(|| self.row.settings.clone());
+        let new_modes = match (modes, &info) {
+            (Some(m), Some(info)) => Some(merged_modes(
+                self.row.modes,
+                m,
+                &target_settings,
+                info,
+                &features,
+            )?),
+            (Some(m), None) => Some(ThreadModes {
+                plan: m.plan.unwrap_or(self.row.modes.plan),
+                fast: m.fast.unwrap_or(self.row.modes.fast),
+            }),
+            // A model without fast mode ends the fast mode the thread asked for (the harness
+            // lists the models that have it).
+            (None, Some(info)) if new_settings.is_some() && self.row.modes.fast => {
+                let fast = fast_mode_model(&target_settings, info, &features);
+                (!fast).then_some(ThreadModes {
+                    fast: false,
+                    ..self.row.modes
+                })
+            }
+            (None, _) => None,
+        };
+        let outcome = if new_settings.is_some() || new_modes.is_some() {
+            let target_modes = new_modes.unwrap_or(self.row.modes);
+            Some(
+                self.settings_outcome(&target_settings, &target_modes)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let renamed = title.is_some() && features.rename;
         if let Some(title) = title {
             self.row.title = title;
             self.row.title_source = "user".into();
+            // Given to the native session as well: now when an agent runs, else when the next
+            // one starts.
+            self.row.native_rename_pending = renamed;
         }
         if let Some(pinned) = pinned {
             self.row.pinned = pinned;
         }
         if let Some(settings) = new_settings {
             self.row.settings = settings;
+        }
+        if let Some(modes) = new_modes {
+            self.row.modes = modes;
+        }
+        let mut native_rename = None;
+        if renamed {
+            native_rename = Some(self.rename_native_now().await);
         }
         let mut uow = Uow {
             thread_changed: true,
@@ -1998,6 +2235,7 @@ impl Actor {
         let result = ThreadUpdateResult {
             thread: view,
             settings_outcome: outcome,
+            native_rename,
         };
         if let Some(idem) = idem2 {
             let value = serde_json::to_value(&result)?;
@@ -2008,8 +2246,44 @@ impl Actor {
         Ok(result)
     }
 
-    /// How the settings `merged` reach the agent (`thread/update`, design.md §5.4). Called
-    /// before the thread's settings change; an idle process is asked to apply them now.
+    /// Gives the user's title (`native_rename_pending`) to the running agent now, when one
+    /// runs and is not being stopped; otherwise it stays pending for the next start
+    /// (`on_launched`). A refusal by the harness is reported, not retried: the thread keeps its
+    /// title either way.
+    async fn rename_native_now(&mut self) -> NativeRename {
+        let Some(control) = self
+            .live
+            .as_ref()
+            .filter(|_| self.stopping.is_none())
+            .map(|l| l.control.clone())
+        else {
+            return NativeRename {
+                status: NativeRenameStatus::Pending,
+                message: None,
+            };
+        };
+        let deadline = self.request_deadline();
+        let title = self.row.title.clone();
+        let result = bounded(deadline, "the rename", control.rename(&title)).await;
+        self.row.native_rename_pending = false;
+        match result {
+            Ok(()) => NativeRename {
+                status: NativeRenameStatus::Applied,
+                message: None,
+            },
+            Err(e) => {
+                tracing::warn!(thread = %self.row.id, error = %e, "the native session did not take the thread's title");
+                NativeRename {
+                    status: NativeRenameStatus::Failed,
+                    message: Some(e.detail()),
+                }
+            }
+        }
+    }
+
+    /// How the settings `merged` and the modes `modes` reach the agent (`thread/update`,
+    /// design.md §5.4). Called before the thread's settings change; an idle process is asked to
+    /// apply them now.
     ///
     /// * No process: the next one starts with them (a start in progress applies them before
     ///   its turn is sent, see `on_launched`): `appliesNextTurn`, or `appliedLive` when they
@@ -2021,38 +2295,65 @@ impl Actor {
     /// * Otherwise the process applies them now (`appliedLive`), or needs a restart, which the
     ///   next turn does (`appliesNextTurn`). When it fails, the request fails and the process
     ///   is replaced before the next turn: it may have applied a part of them.
-    async fn settings_outcome(&mut self, merged: &ThreadSettings) -> CoreResult<SettingsOutcome> {
+    async fn settings_outcome(
+        &mut self,
+        merged: &ThreadSettings,
+        modes: &ThreadModes,
+    ) -> CoreResult<SettingsOutcome> {
         let Some(live) = &self.live else {
-            return Ok(if *merged == self.row.settings {
-                SettingsOutcome::AppliedLive
-            } else {
-                SettingsOutcome::AppliesNextTurn
-            });
+            return Ok(
+                if *merged == self.row.settings && *modes == self.row.modes {
+                    SettingsOutcome::AppliedLive
+                } else {
+                    SettingsOutcome::AppliesNextTurn
+                },
+            );
         };
-        if live.settings == *merged {
+        if live.settings == *merged && live.modes == *modes {
             return Ok(SettingsOutcome::AppliedLive);
         }
         if self.turn.as_ref().is_some_and(|t| t.sent) || self.stopping.is_some() {
             return Ok(SettingsOutcome::AppliesNextTurn);
         }
         let control = live.control.clone();
-        let deadline = self.request_deadline();
-        match bounded(deadline, "the settings", control.apply_settings(merged)).await {
-            Ok(SettingsApplied::Live) => {
-                if let Some(live) = self.live.as_mut() {
-                    live.settings = merged.clone();
+        let (settings_differ, modes_differ) = (live.settings != *merged, live.modes != *modes);
+        if settings_differ {
+            let deadline = self.request_deadline();
+            match bounded(deadline, "the settings", control.apply_settings(merged)).await {
+                Ok(SettingsApplied::Live) => {
+                    if let Some(live) = self.live.as_mut() {
+                        live.settings = merged.clone();
+                    }
                 }
-                Ok(SettingsOutcome::AppliedLive)
-            }
-            Ok(SettingsApplied::RequiresRestart) => {
-                self.restart_pending = true;
-                Ok(SettingsOutcome::AppliesNextTurn)
-            }
-            Err(e) => {
-                self.restart_pending = true;
-                Err(adapter_err(&self.row.harness_id)(e))
+                Ok(SettingsApplied::RequiresRestart) => {
+                    self.restart_pending = true;
+                    return Ok(SettingsOutcome::AppliesNextTurn);
+                }
+                Err(e) => {
+                    self.restart_pending = true;
+                    return Err(adapter_err(&self.row.harness_id)(e));
+                }
             }
         }
+        if modes_differ {
+            let deadline = self.request_deadline();
+            match bounded(deadline, "the modes", control.apply_modes(modes)).await {
+                Ok(SettingsApplied::Live) => {
+                    if let Some(live) = self.live.as_mut() {
+                        live.modes = *modes;
+                    }
+                }
+                Ok(SettingsApplied::RequiresRestart) => {
+                    self.restart_pending = true;
+                    return Ok(SettingsOutcome::AppliesNextTurn);
+                }
+                Err(e) => {
+                    self.restart_pending = true;
+                    return Err(adapter_err(&self.row.harness_id)(e));
+                }
+            }
+        }
+        Ok(SettingsOutcome::AppliedLive)
     }
 
     async fn stop(&mut self, idem: Option<Idem>, reply: Reply<ThreadResult>) {
@@ -2395,6 +2696,7 @@ impl Actor {
             return;
         }
         let settings = self.row.settings.clone();
+        let modes = self.start_modes();
         let abort = Arc::new(AtomicBool::new(false));
         let restart = self.restart_pending && self.live.is_some();
         let mut uow = Uow::default();
@@ -2420,7 +2722,7 @@ impl Actor {
                 Some(old.permit),
                 Some(old.control),
                 base,
-                settings.clone(),
+                (settings.clone(), modes),
                 abort.clone(),
             );
             (LaunchKind::Restart, Phase::Launching(fut))
@@ -2431,7 +2733,7 @@ impl Actor {
                         Some(permit),
                         None,
                         base,
-                        settings.clone(),
+                        (settings.clone(), modes),
                         abort.clone(),
                     );
                     (LaunchKind::Fresh, Phase::Launching(fut))
@@ -2445,7 +2747,8 @@ impl Actor {
                 }
             }
         } else {
-            let fut = self.launching_future(None, None, base, settings.clone(), abort.clone());
+            let fut =
+                self.launching_future(None, None, base, (settings.clone(), modes), abort.clone());
             (LaunchKind::Reuse, Phase::Launching(fut))
         };
         self.launch = Some(Launch {
@@ -2453,6 +2756,7 @@ impl Actor {
             turn: turn_id,
             kind,
             settings,
+            modes,
             abort,
         });
         self.commit_logged(uow).await;
@@ -2498,6 +2802,7 @@ impl Actor {
             started_at: now,
             completed_at: Some(now),
             background_task_id: None,
+            backgroundable: false,
             body: ItemBody::Notice {
                 level,
                 message: message.into(),
@@ -2523,18 +2828,34 @@ impl Actor {
         }
     }
 
+    /// The modes a new process starts in: the thread's, as far as its harness offers them
+    /// (fast mode only with a model that has it).
+    fn start_modes(&self) -> ThreadModes {
+        let features = self.features();
+        let fast_model = self
+            .sh
+            .registry
+            .info(&self.row.harness_id)
+            .is_some_and(|info| fast_mode_model(&self.row.settings, &info, &features));
+        ThreadModes {
+            plan: self.row.modes.plan && features.plan_mode.is_some(),
+            fast: self.row.modes.fast && fast_model,
+        }
+    }
+
     fn launching_future(
         &mut self,
         permit: Option<Permit>,
         old: Option<Arc<dyn SessionControl>>,
         base: Option<String>,
-        settings: ThreadSettings,
+        (settings, modes): (ThreadSettings, ThreadModes),
         abort: Arc<AtomicBool>,
     ) -> Pin<Box<dyn Future<Output = LaunchResult> + Send>> {
         let git = self.sh.git.clone();
         let cwd = PathBuf::from(&self.row.cwd);
         let thread = self.row.id.to_string();
         let adapter = self.sh.registry.get(&self.row.harness_id);
+        let features = self.features();
         let mode = match (&self.row.fork_source, &self.row.native_session_id) {
             (Some(src), _) => StartMode::Fork {
                 native_session_id: src.clone(),
@@ -2544,16 +2865,29 @@ impl Actor {
             },
             (None, None) => StartMode::New,
         };
+        let resumed = match &mode {
+            StartMode::Resume { native_session_id } => Some(native_session_id.clone()),
+            _ => None,
+        };
         // A fork's parent may run turns while this start waits for capacity: checked again
-        // right before the native session is branched off.
+        // right before the native session is branched off. A fork at a turn branches at that
+        // turn's anchor, which later turns of the parent do not move.
+        let fork_at = match &mode {
+            StartMode::Fork { .. } => self.row.fork_at.clone(),
+            _ => None,
+        };
         let fork_check = match &mode {
-            StartMode::Fork { .. } => self
+            StartMode::Fork { .. } if fork_at.is_none() => self
                 .row
                 .forked_from
                 .clone()
                 .map(|origin| (self.sh.db.clone(), origin)),
             _ => None,
         };
+        let project = features
+            .project_trust
+            .then(|| (self.sh.db.clone(), self.row.project_id.clone()));
+        let harness_id = self.row.harness_id.clone();
         let req = StartRequest {
             thread_id: self.row.id.clone(),
             cwd: cwd.clone(),
@@ -2569,6 +2903,7 @@ impl Actor {
                 return LaunchResult {
                     base_tree: None,
                     session: None,
+                    resumed: None,
                     refused: None,
                 };
             }
@@ -2596,6 +2931,7 @@ impl Actor {
                         return LaunchResult {
                             base_tree,
                             session: None,
+                            resumed: None,
                             refused: Some(refused),
                         };
                     }
@@ -2605,17 +2941,45 @@ impl Actor {
                         return LaunchResult {
                             base_tree,
                             session: Some(Err(AdapterError::Other(message))),
+                            resumed: None,
                             refused: None,
                         };
                     }
                 }
             }
+            // The user's decision for the project, read when the process starts (a change
+            // replaces a running process before its next turn, `Msg::TrustChanged`).
+            let project_trusted = match project {
+                Some((db, project_id)) if permit.is_some() => {
+                    match db.read(move |tx| store::get_project(tx, &project_id)).await {
+                        Ok(row) => {
+                            row.and_then(|r| r.project.harness_trust.get(&harness_id).copied())
+                        }
+                        Err(e) => {
+                            let message =
+                                format!("could not read the project's trust decision: {e}");
+                            return LaunchResult {
+                                base_tree,
+                                session: Some(Err(AdapterError::Other(message))),
+                                resumed: None,
+                                refused: None,
+                            };
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let options = StartOptions {
+                modes,
+                fork_at,
+                project_trusted,
+            };
             let session = match (permit, adapter) {
                 (Some(_), _) if abort.load(Ordering::SeqCst) => None,
                 // Awaited to the end even when the turn is cancelled meanwhile: the process
                 // exists as soon as the adapter spawned it.
                 (Some(permit), Some(adapter)) => {
-                    Some(adapter.start(req).await.map(|h| (h, permit)))
+                    Some(adapter.start_with(req, options).await.map(|h| (h, permit)))
                 }
                 (Some(_), None) => Some(Err(AdapterError::Unavailable(
                     "harness is not configured".into(),
@@ -2625,6 +2989,7 @@ impl Actor {
             LaunchResult {
                 base_tree,
                 session,
+                resumed,
                 refused: None,
             }
         })
@@ -2637,16 +3002,18 @@ impl Actor {
                     return;
                 };
                 let settings = self.row.settings.clone();
+                let modes = self.start_modes();
                 let fut = self.launching_future(
                     Some(permit),
                     None,
                     None,
-                    settings.clone(),
+                    (settings.clone(), modes),
                     launch.abort.clone(),
                 );
                 self.launch = Some(Launch {
                     phase: Phase::Launching(fut),
                     settings,
+                    modes,
                     ..launch
                 });
                 self.commit_logged(Uow::default()).await;
@@ -2655,7 +3022,8 @@ impl Actor {
                 let Some(launch) = self.launch.take() else {
                     return;
                 };
-                self.on_launched(launch.turn, launch.settings, result).await;
+                self.on_launched(launch.turn, (launch.settings, launch.modes), result)
+                    .await;
             }
         }
     }
@@ -2663,7 +3031,7 @@ impl Actor {
     async fn on_launched(
         &mut self,
         launched_for: TurnId,
-        settings: ThreadSettings,
+        (settings, modes): (ThreadSettings, ThreadModes),
         result: LaunchResult,
     ) {
         let mut uow = Uow::default();
@@ -2682,18 +3050,29 @@ impl Actor {
                         Publish::IfChanged,
                     ));
                 }
-                start_error = Some(StartFailure::Adapter(e));
+                start_error = Some(StartFailure::Adapter {
+                    error: e,
+                    resuming: result.resumed.is_some(),
+                });
             }
             Some(Ok((handle, permit))) => {
                 if let Some(native) = handle.native_session_id.clone() {
-                    self.row.native_session_id = Some(native);
+                    // A resumed session the CLI opened under another id: it switched sessions.
+                    match &result.resumed {
+                        Some(resumed) if *resumed != native => {
+                            self.native_session_changed(resumed.clone(), native, &mut uow);
+                        }
+                        _ => self.row.native_session_id = Some(native),
+                    }
                 }
                 self.row.fork_source = None;
+                self.row.fork_at = None;
                 self.live = Some(Live {
                     control: handle.control,
                     events: handle.events,
                     permit,
                     settings,
+                    modes,
                 });
                 uow.thread_changed = true;
             }
@@ -2756,6 +3135,8 @@ impl Actor {
             self.begin_launch(result.base_tree).await;
             return;
         }
+        // A title the user gave while no agent ran reaches the native session now.
+        self.apply_pending_rename(&mut uow).await;
         let turn = self.turn.as_mut().expect("unsent turn");
         turn.base_tree = result.base_tree.clone();
         if self.row.base_tree.is_none() && result.base_tree.is_some() {
@@ -2780,6 +3161,11 @@ impl Actor {
                 if let Some(t) = self.turn.as_mut() {
                     t.sent = true;
                 }
+                // The turn is part of the native session now (`delivered`).
+                if let Some(t) = self.turn.as_ref() {
+                    uow.turn_updates
+                        .push(self.turn_row_of(t, TurnStatus::Running));
+                }
                 self.commit_logged(uow).await;
             }
             Err(AdapterError::Closed) if reused && self.live.is_some() => {
@@ -2797,7 +3183,9 @@ impl Actor {
                 self.commit_logged(uow).await;
             }
             Err(e) => {
-                let message = e.to_string();
+                // The adapter's own text: the kind says what failed, and clients put a lead-in
+                // of their own in front of it.
+                let message = e.detail();
                 self.finish_turn(
                     TurnStatus::Failed,
                     None,
@@ -2822,26 +3210,76 @@ impl Actor {
         if self.restart_pending {
             return;
         }
-        let Some(live) = self
+        if let Some(live) = self
             .live
             .as_ref()
             .filter(|l| l.settings != self.row.settings)
-        else {
-            return;
-        };
-        let (control, target) = (live.control.clone(), self.row.settings.clone());
-        let deadline = self.request_deadline();
-        match bounded(deadline, "the settings", control.apply_settings(&target)).await {
-            Ok(SettingsApplied::Live) => {
-                if let Some(live) = self.live.as_mut() {
-                    live.settings = target;
+        {
+            let (control, target) = (live.control.clone(), self.row.settings.clone());
+            let deadline = self.request_deadline();
+            match bounded(deadline, "the settings", control.apply_settings(&target)).await {
+                Ok(SettingsApplied::Live) => {
+                    if let Some(live) = self.live.as_mut() {
+                        live.settings = target;
+                    }
+                }
+                Ok(SettingsApplied::RequiresRestart) => self.restart_pending = true,
+                Err(e) => {
+                    tracing::warn!(thread = %self.row.id, error = %e, "applying the thread's settings failed; restarting the process");
+                    self.restart_pending = true;
                 }
             }
-            Ok(SettingsApplied::RequiresRestart) => self.restart_pending = true,
-            Err(e) => {
-                tracing::warn!(thread = %self.row.id, error = %e, "applying the thread's settings failed; restarting the process");
-                self.restart_pending = true;
+        }
+        if self.restart_pending {
+            return;
+        }
+        let target = self.start_modes();
+        if let Some(live) = self.live.as_ref().filter(|l| l.modes != target) {
+            let control = live.control.clone();
+            let deadline = self.request_deadline();
+            match bounded(deadline, "the modes", control.apply_modes(&target)).await {
+                Ok(SettingsApplied::Live) => {
+                    if let Some(live) = self.live.as_mut() {
+                        live.modes = target;
+                    }
+                }
+                Ok(SettingsApplied::RequiresRestart) => self.restart_pending = true,
+                Err(e) => {
+                    tracing::warn!(thread = %self.row.id, error = %e, "applying the thread's modes failed; restarting the process");
+                    self.restart_pending = true;
+                }
             }
+        }
+    }
+
+    /// Gives a title that waits for an agent (`native_rename_pending`) to the one that just
+    /// started, before the turn's input. A refusal is shown as a notice of the turn, not
+    /// retried (the thread keeps its title).
+    async fn apply_pending_rename(&mut self, uow: &mut Uow) {
+        if !self.row.native_rename_pending {
+            return;
+        }
+        if !self.features().rename {
+            self.row.native_rename_pending = false;
+            uow.thread_changed = true;
+            return;
+        }
+        let outcome = self.rename_native_now().await;
+        uow.thread_changed = true;
+        if outcome.status == NativeRenameStatus::Failed
+            && let Some(turn_id) = self.turn.as_ref().map(|t| t.id.clone())
+        {
+            let message = format!(
+                "The agent's session did not take the thread's name: {}",
+                outcome.message.unwrap_or_default()
+            );
+            self.core_notice(
+                &turn_id,
+                NoticeLevel::Warning,
+                &message,
+                "nativeRenameFailed",
+                uow,
+            );
         }
     }
 
@@ -2893,14 +3331,100 @@ impl Actor {
     fn apply_event(&mut self, ev: AdapterEvent, uow: &mut Uow, after: &mut Vec<After>) {
         match ev {
             AdapterEvent::SessionIdentified { native_session_id } => {
-                if self.row.native_session_id.as_deref() != Some(native_session_id.as_str()) {
-                    self.row.native_session_id = Some(native_session_id);
+                match self.row.native_session_id.clone() {
+                    Some(previous) if previous != native_session_id => {
+                        self.native_session_changed(previous, native_session_id, uow);
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.row.native_session_id = Some(native_session_id);
+                        uow.thread_changed = true;
+                    }
+                }
+            }
+            AdapterEvent::SessionInfo {
+                model,
+                permission_mode,
+                effort,
+            } => {
+                if model.is_some() {
+                    self.reported_model = model;
+                }
+                if let Some(mode) = permission_mode {
+                    self.reflect_setting(Reported::PermissionMode(mode), uow);
+                }
+                if let Some(effort) = effort {
+                    self.reflect_setting(Reported::Effort(effort), uow);
+                }
+            }
+            AdapterEvent::ModesReported { plan, fast_state } => {
+                if let Some(plan) = plan {
+                    self.reflect_setting(Reported::Plan(plan), uow);
+                }
+                if let Some(state) = fast_state
+                    && self.row.fast_mode_state.as_deref() != Some(state.as_str())
+                {
+                    self.row.fast_mode_state = Some(state);
                     uow.thread_changed = true;
                 }
             }
-            AdapterEvent::SessionInfo { model, .. } => {
-                if model.is_some() {
-                    self.reported_model = model;
+            AdapterEvent::TurnAnchor { anchor } => match self.turn.as_mut().filter(|t| t.sent) {
+                Some(turn)
+                    if turn.anchor.as_ref() != Some(&anchor) || turn.anchor_session.is_some() =>
+                {
+                    turn.anchor = Some(anchor);
+                    turn.anchor_session = None;
+                    let turn = self.turn.as_ref().expect("the sent turn just anchored");
+                    uow.turn_updates
+                        .push(self.turn_row_of(turn, TurnStatus::Running));
+                }
+                Some(_) => {}
+                None => {
+                    tracing::warn!(thread = %self.row.id, "a turn anchor without a running turn; ignored")
+                }
+            },
+            AdapterEvent::TurnAnchorReplaced { previous, anchor } => {
+                // The running turn (its anchor is not stored yet), else a stored turn; only
+                // anchors of the session the thread runs now.
+                match self
+                    .turn
+                    .as_mut()
+                    .filter(|t| t.anchor.as_ref() == Some(&previous) && t.anchor_session.is_none())
+                {
+                    Some(turn) => {
+                        turn.anchor = Some(anchor);
+                        let turn = self.turn.as_ref().expect("the running turn");
+                        uow.turn_updates
+                            .push(self.turn_row_of(turn, TurnStatus::Running));
+                    }
+                    None => uow.anchor_replacements.push((previous, anchor)),
+                }
+            }
+            AdapterEvent::SteerReturned { message_id } => self.steer_returned(message_id, uow),
+            AdapterEvent::ComposerText { text } => {
+                uow.events.push(Event::ComposerInsert { text });
+            }
+            AdapterEvent::ItemBackgroundable {
+                key,
+                backgroundable,
+            } => {
+                match self
+                    .turn
+                    .as_mut()
+                    .filter(|t| t.sent)
+                    .and_then(|t| t.items.get_mut(&key))
+                {
+                    Some(open) if open.item.backgroundable != backgroundable => {
+                        open.item.backgroundable = backgroundable;
+                        uow.update_item(open.item.clone());
+                        uow.events.push(Event::ItemUpdated {
+                            item: open.item.clone(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        tracing::warn!(thread = %self.row.id, key, "backgroundable report for an item that does not run; ignored")
+                    }
                 }
             }
             AdapterEvent::CommandsChanged { commands } => {
@@ -3058,6 +3582,7 @@ impl Actor {
             started_at: now,
             completed_at: None,
             background_task_id: None,
+            backgroundable: false,
             body,
         };
         uow.items_insert.push(item.clone());
@@ -3274,6 +3799,8 @@ impl Actor {
         }
         open.item.status = status;
         open.item.completed_at = Some(now_ms());
+        // Only a running item can move to the background.
+        open.item.backgroundable = false;
         open.item
     }
 
@@ -3345,6 +3872,134 @@ impl Actor {
         self.row.last_activity_at = now_ms();
     }
 
+    /// The harness moved the thread's agent to another native session by itself (a command,
+    /// an extension): the thread follows it, and the user is told (`thread/nativeSessionChanged`,
+    /// and a notice in the turn that runs).
+    ///
+    /// The anchors recorded so far belong to `previous` and stay with it (design.md §9.6): a
+    /// fork at one of those turns branches `previous`. That holds for the stored turns, for the
+    /// rows this commit writes and for the running turn's anchor; replacements the harness
+    /// reported before the switch are for anchors of `previous`, so they are applied first.
+    fn native_session_changed(&mut self, previous: String, current: String, uow: &mut Uow) {
+        tracing::warn!(thread = %self.row.id, previous = %previous, current = %current, "the harness switched the thread's agent to another native session");
+        self.row.native_session_id = Some(current.clone());
+        uow.thread_changed = true;
+        let replacements = std::mem::take(&mut uow.anchor_replacements);
+        for row in uow
+            .turn_inserts
+            .iter_mut()
+            .chain(uow.turn_updates.iter_mut())
+        {
+            if row.anchor_session.is_some() {
+                continue;
+            }
+            for (replaced, anchor) in &replacements {
+                if row.native_anchor.as_ref() == Some(replaced) {
+                    row.native_anchor = Some(anchor.clone());
+                }
+            }
+            if row.native_anchor.is_some() {
+                row.anchor_session = Some(previous.clone());
+            }
+        }
+        uow.session_switches.push(SessionSwitch {
+            previous: previous.clone(),
+            replacements,
+        });
+        if let Some(turn) = self
+            .turn
+            .as_mut()
+            .filter(|t| t.anchor.is_some() && t.anchor_session.is_none())
+        {
+            turn.anchor_session = Some(previous.clone());
+        }
+        uow.events.push(Event::NativeSessionChanged {
+            previous_native_session_id: previous,
+            native_session_id: current.clone(),
+        });
+        if let Some(turn_id) = self.turn.as_ref().map(|t| t.id.clone()) {
+            let message = format!(
+                "The agent switched to another session ({current}) by itself. The thread follows it; the agent no longer has the earlier turns of this thread in its context."
+            );
+            self.core_notice(
+                &turn_id,
+                NoticeLevel::Warning,
+                &message,
+                "nativeSessionChanged",
+                uow,
+            );
+        }
+    }
+
+    /// Takes over a value the harness reports as current (design.md §5.5): the thread's
+    /// setting follows it, unless the user changed the same setting and the change waits for
+    /// the next turn (it is applied then, over the reported value). Values the harness does not
+    /// list are not taken over.
+    fn reflect_setting(&mut self, reported: Reported, uow: &mut Uow) {
+        let info = self.sh.registry.info(&self.row.harness_id);
+        let listed = match (&reported, &info) {
+            (Reported::PermissionMode(mode), Some(info)) => {
+                info.permission_modes.is_empty()
+                    || info.permission_modes.iter().any(|m| &m.id == mode)
+            }
+            (Reported::Effort(effort), Some(info)) => {
+                info.effort_levels.iter().any(|e| &e.id == effort)
+            }
+            (Reported::Plan(_), _) => self.features().plan_mode.is_some(),
+            (_, None) => false,
+        };
+        if !listed {
+            tracing::info!(thread = %self.row.id, reported = ?reported, "the harness reports a value it does not offer; the thread's setting stays");
+            return;
+        }
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let changed = match reported {
+            Reported::PermissionMode(mode) => reflect(
+                &mut live.settings.permission_mode,
+                &mut self.row.settings.permission_mode,
+                Some(mode),
+            ),
+            Reported::Effort(effort) => reflect(
+                &mut live.settings.effort,
+                &mut self.row.settings.effort,
+                Some(effort),
+            ),
+            Reported::Plan(plan) => reflect(&mut live.modes.plan, &mut self.row.modes.plan, plan),
+        };
+        if changed {
+            tracing::info!(thread = %self.row.id, "the thread's settings follow what the harness reports");
+            uow.thread_changed = true;
+        }
+    }
+
+    /// The harness did not take a steered message into the running turn and withdrew it: the
+    /// message is shown as not delivered (`declined`) and goes back to the queue, at its place
+    /// in time (when it was sent).
+    fn steer_returned(&mut self, message_id: String, uow: &mut Uow) {
+        let id = ItemId::from(message_id);
+        let Some((mut item, input)) = self.turn.as_mut().and_then(|t| t.steers.remove(&id)) else {
+            tracing::warn!(thread = %self.row.id, item = %id, "the harness returned a steer this turn does not have; ignored");
+            return;
+        };
+        item.status = ItemStatus::Declined;
+        uow.update_item(item.clone());
+        uow.events.push(Event::ItemUpdated { item: item.clone() });
+        let queued = QueuedInput {
+            id: QueuedInputId::generate(),
+            thread_id: self.row.id.clone(),
+            created_at: item.started_at,
+            preview: store::input_preview(&input, self.sh.config.policy.queued_preview_chars),
+            input,
+        };
+        uow.queued_insert.push(queued);
+        uow.queue_changed = true;
+        uow.thread_changed = true;
+        self.queue_len += 1;
+        tracing::info!(thread = %self.row.id, item = %id, "the harness did not take a steered message; it is queued again");
+    }
+
     fn turn_row_of(&self, t: &ActiveTurn, status: TurnStatus) -> TurnRow {
         TurnRow {
             turn: Turn {
@@ -3362,9 +4017,13 @@ impl Actor {
                 usage: t.usage,
                 diff: None,
                 trigger: t.trigger,
+                forkable: t.anchor.is_some(),
             },
             base_tree: t.base_tree.clone(),
             end_tree: None,
+            native_anchor: t.anchor.clone(),
+            anchor_session: t.anchor_session.clone(),
+            delivered: t.sent,
         }
     }
 
@@ -3513,7 +4172,7 @@ impl Actor {
                         continue;
                     }
                     match self.pop_queued().await {
-                        Ok(Some(next)) => match self.convert_input(&next.input).await {
+                        Ok(Some(next)) => match self.checked_queued_input(&next.input).await {
                             Ok(c) => {
                                 let mut uow = Uow {
                                     queue_changed: true,
@@ -4163,9 +4822,89 @@ impl Actor {
         self.commit(uow).await?;
         Ok(result)
     }
+
+    /// `item/moveToBackground`: asks the harness to move the running item `item_id` to the
+    /// background (feature `moveToBackground`). Only an item the harness reported
+    /// backgroundable qualifies. The request only asks: the item closes as `backgrounded`
+    /// with its task when the harness has moved it (design.md §5.6).
+    async fn move_to_background(
+        &mut self,
+        item_id: ItemId,
+        idem: Option<Idem>,
+    ) -> CoreResult<Empty> {
+        let running = self.turn.as_ref().filter(|t| t.sent).and_then(|t| {
+            t.items
+                .iter()
+                .find(|(_, open)| open.item.id == item_id)
+                .map(|(key, open)| (key.clone(), open.item.backgroundable))
+        });
+        let Some((key, backgroundable)) = running else {
+            // Not a running item: one of this thread that is over, or none of it.
+            let (id, thread) = (item_id.clone(), self.row.id.clone());
+            let stored = self.sh.db.read(move |tx| store::get_item(tx, &id)).await?;
+            return Err(match stored {
+                Some(item) if item.thread_id == thread => invalid_state("the item is not running"),
+                _ => not_found("item", &item_id),
+            });
+        };
+        if !self.features().move_to_background {
+            return Err(rpc(
+                ErrorKind::CapabilityUnsupported,
+                "this harness cannot move running work to the background",
+            )
+            .with("capability", "moveToBackground"));
+        }
+        if !backgroundable {
+            return Err(invalid_state(
+                "the harness has not said that this item can move to the background",
+            ));
+        }
+        let control = self
+            .live
+            .as_ref()
+            .filter(|_| self.stopping.is_none())
+            .map(|l| l.control.clone())
+            .ok_or_else(|| invalid_state("the agent is not running"))?;
+        let deadline = self.request_deadline();
+        bounded(
+            deadline,
+            "the move to the background",
+            control.move_to_background(&key),
+        )
+        .await
+        .map_err(adapter_err(&self.row.harness_id))?;
+        let result = Empty {};
+        let mut uow = Uow::default();
+        if let Some(idem) = idem {
+            uow.idem_values.push((idem, serde_json::to_value(&result)?));
+        }
+        self.commit(uow).await?;
+        Ok(result)
+    }
 }
 
 /// How background work ends with its process.
+/// A value the harness reports as current (see [`Actor::reflect_setting`]).
+#[derive(Debug)]
+enum Reported {
+    PermissionMode(String),
+    Effort(String),
+    Plan(bool),
+}
+
+/// Takes `reported` into the process's value `live` and, unless the thread's value `thread`
+/// holds a change the user made that waits for the next turn (it differs from `live`), into
+/// the thread's value. Returns whether the thread's value changed.
+fn reflect<T: PartialEq + Clone>(live: &mut T, thread: &mut T, reported: T) -> bool {
+    let user_change_waits = *thread != *live;
+    *live = reported.clone();
+    if user_change_waits || *thread == reported {
+        return false;
+    }
+    *thread = reported;
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessEnd {
     /// We stopped the process, for this reason.
@@ -4228,19 +4967,13 @@ fn stop_error(reason: StopReason, sh: &Shared) -> TurnError {
 /// What a turn's error says about an unexpected exit, quoting the last `stderr_lines` lines of
 /// the agent's stderr (`policy.exit_message_stderr_lines`).
 fn exit_message(info: &ExitInfo, stderr_lines: usize) -> String {
-    let tail = info.stderr_tail.trim();
-    let last_lines: Vec<&str> = tail
-        .lines()
-        .rev()
-        .take(stderr_lines)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if last_lines.is_empty() {
+    // Without terminal control ([`aas_harness::stderr_excerpt`], the rule adapters apply to
+    // the stderr they quote).
+    let excerpt = aas_harness::stderr_excerpt(&info.stderr_tail, stderr_lines);
+    if excerpt.is_empty() {
         format!("the agent {}", info.describe())
     } else {
-        format!("the agent {}: {}", info.describe(), last_lines.join("\n"))
+        format!("the agent {}: {excerpt}", info.describe())
     }
 }
 
@@ -4258,10 +4991,13 @@ fn adapter_err(harness: &str) -> impl Fn(AdapterError) -> CoreError + '_ {
             format!("not supported by {harness}: {cap}"),
         )
         .with("capability", cap),
-        AdapterError::Unavailable(r) => rpc(ErrorKind::HarnessUnavailable, r),
+        AdapterError::Unavailable(_) => rpc(ErrorKind::HarnessUnavailable, e.to_string())
+            .with("harnessId", harness)
+            .with("reason", e.detail()),
+        // `detail`: the adapter's own text, which clients show after a lead-in of their own.
         other => rpc(ErrorKind::AdapterError, other.to_string())
             .with("harnessId", harness)
-            .with("detail", other.to_string()),
+            .with("detail", other.detail()),
     }
 }
 
@@ -4399,6 +5135,52 @@ pub fn validate_settings(info: &aas_harness::HarnessInfo, s: &ThreadSettings) ->
     Ok(())
 }
 
+/// Whether the model `settings` run with (their own, else the harness's default) supports fast
+/// mode: the harness lists it in `fastModeModels`.
+fn fast_mode_model(
+    settings: &ThreadSettings,
+    info: &aas_harness::HarnessInfo,
+    features: &HarnessFeatures,
+) -> bool {
+    settings
+        .model
+        .as_deref()
+        .or(info.default_model.as_deref())
+        .is_some_and(|model| features.fast_mode_models.iter().any(|m| m == model))
+}
+
+/// The modes `current` with `update` applied, checked against an available harness: plan mode
+/// needs the feature `planMode`, fast mode a model the harness lists in `fastModeModels` (with
+/// the settings the request leaves the thread with). Fast mode ends with a model that does not
+/// have it.
+fn merged_modes(
+    current: ThreadModes,
+    update: ThreadModesUpdate,
+    settings: &ThreadSettings,
+    info: &aas_harness::HarnessInfo,
+    features: &HarnessFeatures,
+) -> CoreResult<ThreadModes> {
+    if update.plan == Some(true) && features.plan_mode.is_none() {
+        return Err(rpc(
+            ErrorKind::CapabilityUnsupported,
+            "this harness has no plan mode the app switches",
+        )
+        .with("capability", "planMode"));
+    }
+    let fast_model = fast_mode_model(settings, info, features);
+    if update.fast == Some(true) && !fast_model {
+        return Err(rpc(
+            ErrorKind::CapabilityUnsupported,
+            "the thread's model has no fast mode",
+        )
+        .with("capability", "fastMode"));
+    }
+    Ok(ThreadModes {
+        plan: update.plan.unwrap_or(current.plan),
+        fast: update.fast.unwrap_or(current.fast) && fast_model,
+    })
+}
+
 trait CoreErrorWith {
     fn with(self, key: &str, value: impl Into<Value>) -> Self;
 }
@@ -4432,5 +5214,37 @@ mod tests {
             "the agent exited with code 1: two\nthree"
         );
         assert_eq!(exit_message(&info, 0), "the agent exited with code 1");
+        // Terminal colours and cursor movement of the CLI's stderr do not reach the message.
+        let colored = ExitInfo {
+            stderr_tail: "\u{1b}[2Kstarting\r\n\u{1b}[1;31mError:\u{1b}[0m out of memory\n".into(),
+            ..info
+        };
+        assert_eq!(
+            exit_message(&colored, 5),
+            "the agent exited with code 1: starting\nError: out of memory"
+        );
+    }
+
+    #[test]
+    fn reported_values_follow_unless_a_user_change_waits() {
+        // Nothing pending: the thread follows the report.
+        let (mut live, mut thread) = (Some("ask".to_owned()), Some("ask".to_owned()));
+        assert!(reflect(&mut live, &mut thread, Some("auto".to_owned())));
+        assert_eq!(
+            (live.as_deref(), thread.as_deref()),
+            (Some("auto"), Some("auto"))
+        );
+        // The same value again changes nothing.
+        assert!(!reflect(&mut live, &mut thread, Some("auto".to_owned())));
+        // The user's change waits for the next turn: only the process's value follows.
+        let (mut live, mut thread) = (Some("auto".to_owned()), Some("ask".to_owned()));
+        assert!(!reflect(&mut live, &mut thread, Some("plan".to_owned())));
+        assert_eq!(
+            (live.as_deref(), thread.as_deref()),
+            (Some("plan"), Some("ask"))
+        );
+        let (mut live, mut thread) = (true, true);
+        assert!(reflect(&mut live, &mut thread, false));
+        assert!(!thread);
     }
 }

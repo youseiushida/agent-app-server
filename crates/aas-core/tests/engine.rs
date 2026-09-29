@@ -1003,6 +1003,7 @@ async fn commands_merge_app_and_harness_entries() {
             client_request_id: crid(),
             thread_id: thread.id.clone(),
             at_turn_id: None,
+            before: false,
         })
         .await
         .unwrap_err();
@@ -1229,6 +1230,7 @@ async fn threads_can_be_pinned_and_unpinned() {
             title: None,
             settings: None,
             pinned: Some(true),
+            modes: None,
         })
         .await
         .unwrap();
@@ -1259,6 +1261,7 @@ async fn threads_can_be_pinned_and_unpinned() {
             title: Some("Renamed".into()),
             settings: None,
             pinned: Some(false),
+            modes: None,
         })
         .await
         .unwrap();
@@ -2602,6 +2605,7 @@ async fn compaction_keeps_the_latest_state_of_every_entity() {
             title: Some(title.into()),
             settings: None,
             pinned: None,
+            modes: None,
         })
         .await
         .unwrap();
@@ -2847,6 +2851,7 @@ async fn project_settings_archiving_and_the_workspace_snapshot() {
         project_id: project.id.clone(),
         name: Some("  Renamed  ".into()),
         defaults: Some(defaults),
+        harness_trust: None,
     };
     let bad = env
         .call::<spec::ProjectUpdate>(update(ProjectDefaults {

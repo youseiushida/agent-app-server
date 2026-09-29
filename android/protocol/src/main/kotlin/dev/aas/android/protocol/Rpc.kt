@@ -58,6 +58,15 @@ data class RpcError(val code: Int, val message: String, val data: JsonElement? =
     /** The missing capability (`data.capability` of `capabilityUnsupported`). */
     val capability: String? get() = dataString(DATA_CAPABILITY)
 
+    /**
+     * The harness's own text of an `adapterError` (`data.detail`): without the daemon's English
+     * lead-in and terminal escape sequences, shown verbatim after the app's own lead-in.
+     */
+    val detail: String? get() = dataString(DATA_DETAIL)
+
+    /** The session-switching command a `sessionSwitchingCommand` refused (`data.command`, without the `/`). */
+    val command: String? get() = dataString(DATA_COMMAND)
+
     /** A string field of `data`, or `null` when absent or not a string. */
     fun dataString(key: String): String? =
         ((data as? JsonObject)?.get(key) as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
@@ -66,6 +75,8 @@ data class RpcError(val code: Int, val message: String, val data: JsonElement? =
         const val DATA_HARNESS_ID = "harnessId"
         const val DATA_REASON = "reason"
         const val DATA_CAPABILITY = "capability"
+        const val DATA_DETAIL = "detail"
+        const val DATA_COMMAND = "command"
     }
 }
 
@@ -102,6 +113,12 @@ enum class ErrorKind(val wire: String, val code: Int, val definitive: Boolean) {
     Draining("draining", -32013, false),
 
     /**
+     * The input starts with a harness command that would move the thread's agent to another
+     * native session ([RpcError.command], [RpcError.harnessId]): one thread is one native session.
+     */
+    SessionSwitchingCommand("sessionSwitchingCommand", -32014, true),
+
+    /**
      * A kind this client does not know (a newer server). Treated as definitive: the client
      * cannot tell whether the server stored it for this `clientRequestId`, and if it did, every
      * resend would get the same answer while the request blocks the requests behind it in its
@@ -130,4 +147,5 @@ object JsonKeys {
     const val INTERACTION_ID = "interactionId"
     const val HARNESS_ID = "harnessId"
     const val TASK_ID = "taskId"
+    const val ITEM_ID = "itemId"
 }

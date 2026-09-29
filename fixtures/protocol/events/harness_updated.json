@@ -33,6 +33,18 @@
         }
       ],
       "executable": "C:\\nvm4w\\nodejs\\claude.cmd",
+      "features": {
+        "fastModeModels": [
+          "opus"
+        ],
+        "forkAtTurn": true,
+        "forkWhileHeld": true,
+        "moveToBackground": true,
+        "planMode": {},
+        "rename": true,
+        "sideQuestion": true,
+        "status": true
+      },
       "id": "claude",
       "kind": "claude",
       "models": [

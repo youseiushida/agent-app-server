@@ -1,8 +1,8 @@
 //! Retention: what is deleted, when, and how the space comes back (design.md §6.1).
 //!
 //! * Event log: deltas of completed items (`delta_retention`), events a later event of the
-//!   same entity carries in full (`superseded_event_retention`), `native` events
-//!   (`native_event_retention`). Everything is deleted in batches of
+//!   same entity carries in full (`superseded_event_retention`), `native` and
+//!   `composer/insert` events (`native_event_retention`). Everything is deleted in batches of
 //!   `maintenance_batch_size`, one short transaction each.
 //! * Blobs: references are recorded explicitly when a blob is attached, spilled or produced
 //!   (`blob_refs`, see `store`); a blob without references is deleted once it has been
@@ -110,12 +110,14 @@ pub(crate) async fn run(sh: &Arc<Shared>) -> CoreResult<MaintenanceReport> {
     note("superseded events", r.map(|n| report.superseded = n));
 
     let native_before = cutoff(policy.native_event_retention);
-    let r = in_batches(sh, batch, move |tx, limit| {
-        let deleted = aas_eventlog::compact_type(tx, "native", native_before, limit)?;
-        Ok((deleted, deleted == limit))
-    })
-    .await;
-    note("native events", r.map(|n| report.native = n));
+    for type_name in aas_eventlog::TRANSIENT_EVENT_TYPES {
+        let r = in_batches(sh, batch, move |tx, limit| {
+            let deleted = aas_eventlog::compact_type(tx, type_name, native_before, limit)?;
+            Ok((deleted, deleted == limit))
+        })
+        .await;
+        note("transient events", r.map(|n| report.native += n));
+    }
 
     let idem_before = cutoff(policy.idempotency_ttl);
     let ops_before = cutoff(policy.finished_operation_retention);

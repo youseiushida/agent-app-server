@@ -8,7 +8,8 @@
 //!   default model unless this is set.
 //!
 //! The background test needs an agent that confirms Cognition's background extension (Devin
-//! CLI); it deletes the session it created (`session/delete`) when it ends.
+//! CLI), the fork test its revert extension; each deletes the sessions it created
+//! (`session/delete`) when it ends.
 
 mod common;
 
@@ -21,8 +22,9 @@ use aas_harness::protocol::{
     ItemBody, ItemStatus, Subject, ThreadId, TurnStatus,
 };
 use aas_harness::{
-    AdapterContext, AdapterEvent, AdapterPolicy, BackgroundState, CommandContext, HarnessAdapter,
-    HarnessConfig, StartMode, StartRequest, StopReason, ThreadSettings, TurnInput,
+    AdapterContext, AdapterError, AdapterEvent, AdapterPolicy, BackgroundState, CommandContext,
+    ForkPoint, HarnessAdapter, HarnessConfig, SessionHandle, StartMode, StartOptions, StartRequest,
+    StopReason, ThreadSettings, TurnInput,
 };
 use aas_stdio::{Incoming, RpcPeer, RpcPeerConfig, RpcWireError};
 use aas_supervisor::{SpawnSpec, Supervisor, SupervisorPolicy, resolve_program};
@@ -41,10 +43,49 @@ struct Env {
     adapter: AcpAdapter,
     supervisor: Supervisor,
     work: tempfile::TempDir,
-    _state: tempfile::TempDir,
+    state: tempfile::TempDir,
     model: Option<String>,
     command: String,
     args: Vec<String>,
+}
+
+impl Env {
+    /// Another adapter for the same agent on the same supervisor (another daemon, as far as
+    /// what its sessions listed goes), with its own state folder `name`.
+    fn other_adapter(&self, name: &str) -> AcpAdapter {
+        adapter(
+            &self.supervisor,
+            &self.state.path().join(name),
+            &self.command,
+            &self.args,
+        )
+    }
+}
+
+fn adapter(
+    supervisor: &Supervisor,
+    state_dir: &Path,
+    command: &str,
+    args: &[String],
+) -> AcpAdapter {
+    let ctx = AdapterContext {
+        supervisor: supervisor.clone(),
+        state_dir: state_dir.to_path_buf(),
+        policy: AdapterPolicy {
+            stop_grace: Duration::from_secs(5),
+            ..AdapterPolicy::default()
+        },
+    };
+    let config = HarnessConfig {
+        id: "devin".into(),
+        kind: HarnessKind::Acp,
+        display_name: Some("Devin".into()),
+        command: command.to_owned(),
+        args: args.to_vec(),
+        env: Default::default(),
+        options: serde_json::json!({ "auth_hint": "Run `devin auth login`." }),
+    };
+    AcpAdapter::new(config, ctx)
 }
 
 fn env() -> Env {
@@ -58,39 +99,22 @@ fn env() -> Env {
         },
     )
     .unwrap();
-    let ctx = AdapterContext {
-        supervisor: supervisor.clone(),
-        state_dir: state.path().join("adapter"),
-        policy: AdapterPolicy {
-            stop_grace: Duration::from_secs(5),
-            ..AdapterPolicy::default()
-        },
-    };
     let command = std::env::var("AAS_ACP_COMMAND").unwrap_or_else(|_| "devin".into());
     let args: Vec<String> = std::env::var("AAS_ACP_ARGS")
         .unwrap_or_else(|_| "acp".into())
         .split_whitespace()
         .map(str::to_owned)
         .collect();
-    let config = HarnessConfig {
-        id: "devin".into(),
-        kind: HarnessKind::Acp,
-        display_name: Some("Devin".into()),
-        command: command.clone(),
-        args: args.clone(),
-        env: Default::default(),
-        options: serde_json::json!({ "auth_hint": "Run `devin auth login`." }),
-    };
     let model = match std::env::var("AAS_ACP_MODEL") {
         Ok(m) if m.is_empty() => None,
         Ok(m) => Some(m),
         Err(_) => Some("swe-1-7-lightning-medium".into()),
     };
     Env {
-        adapter: AcpAdapter::new(config, ctx),
+        adapter: adapter(&supervisor, &state.path().join("adapter"), &command, &args),
         supervisor,
         work,
-        _state: state,
+        state,
         model,
         command,
         args,
@@ -234,6 +258,7 @@ async fn live_turn_list_history_and_cache() {
         .commands(CommandContext {
             cwd: env.work.path().to_path_buf(),
             native_session_id: None,
+            project_trusted: None,
         })
         .await
         .unwrap();
@@ -517,4 +542,269 @@ async fn live_background_shell_and_sub_agent_are_tasks_and_stop() {
     delete_session(&env, env.work.path(), &session_id).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(env.supervisor.running_count(), 0);
+}
+
+/// The anchors of a session's turns as the events report them: a `TurnAnchor` per turn, then
+/// `TurnAnchorReplaced` naming the anchor it replaces.
+#[derive(Default)]
+struct Anchors(Vec<Value>);
+
+impl Anchors {
+    fn apply(&mut self, ev: &AdapterEvent) {
+        match ev {
+            AdapterEvent::TurnAnchor { anchor } => self.0.push(anchor.clone()),
+            AdapterEvent::TurnAnchorReplaced { previous, anchor } => {
+                let turn = self
+                    .0
+                    .iter_mut()
+                    .find(|a| *a == previous)
+                    .unwrap_or_else(|| panic!("no turn anchored at {previous}"));
+                *turn = anchor.clone();
+            }
+            _ => {}
+        }
+    }
+
+    fn settled(&self, turn: usize) -> bool {
+        self.0
+            .get(turn)
+            .is_some_and(|a| a.get("forkTargetNodeId").is_some())
+    }
+}
+
+/// Runs one turn to its end (answering nothing: the prompts need no approval) and, when the
+/// turn made a step, until its anchor holds the node ids.
+async fn live_turn(
+    handle: &mut SessionHandle,
+    f: &mut Folded,
+    anchors: &mut Anchors,
+    prompt: &str,
+) {
+    handle.control.send(TurnInput::text(prompt)).await.unwrap();
+    let before = anchors.0.len();
+    loop {
+        let ev = next_event(&mut handle.events).await;
+        anchors.apply(&ev);
+        f.apply(ev.clone());
+        if is_turn_completed(&ev) {
+            break;
+        }
+    }
+    let (status, _, error) = f.turns.last().unwrap();
+    assert_eq!(*status, TurnStatus::Completed, "{prompt}: {error:?}");
+    if anchors.0.len() > before {
+        while !anchors.settled(before) {
+            let ev = next_event(&mut handle.events).await;
+            anchors.apply(&ev);
+            f.apply(ev);
+        }
+    }
+}
+
+/// A fork of `source` at `point` (`None`: the whole session) by `adapter`.
+async fn live_fork(
+    adapter: &AcpAdapter,
+    cwd: &Path,
+    source: &str,
+    point: Option<ForkPoint>,
+) -> Result<SessionHandle, AdapterError> {
+    adapter
+        .start_with(
+            StartRequest {
+                thread_id: ThreadId::generate(),
+                cwd: cwd.to_path_buf(),
+                settings: ThreadSettings::default(),
+                mode: StartMode::Fork {
+                    native_session_id: source.to_owned(),
+                },
+            },
+            StartOptions {
+                fork_at: point,
+                ..StartOptions::default()
+            },
+        )
+        .await
+}
+
+/// Stops a session and returns what its history says: the user messages and the anchors.
+async fn live_history(
+    adapter: &AcpAdapter,
+    cwd: &Path,
+    mut handle: SessionHandle,
+) -> (String, Vec<String>, Vec<Option<Value>>) {
+    let id = handle.native_session_id.clone().expect("session id");
+    handle.control.shutdown(StopReason::User).await;
+    let mut f = Folded::default();
+    drain_to_exit(&mut handle.events, &mut f).await;
+    let (history, anchors) = adapter
+        .read_native_history_anchored(cwd, &id)
+        .await
+        .expect("history");
+    let users = history
+        .turns
+        .iter()
+        .filter_map(|t| match &t.items.first()?.body {
+            ItemBody::UserMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    (id, users, anchors)
+}
+
+/// Cognition's other extensions end to end against the real agent (docs/adapters/acp.md §17):
+/// the features, a rename, Devin's statistics, its own mode commands, and forks at a turn
+/// (with the turn, before it, of the whole session) while the source's process holds it and
+/// after it stopped, by the adapter that ran the source (it listed the nodes) and by another
+/// one (which has to read the source, and cannot while it is held). Every session is deleted
+/// afterwards.
+#[tokio::test]
+#[ignore]
+async fn live_forks_at_turns_rename_status_and_modes() {
+    if !live() {
+        return;
+    }
+    let env = env();
+    let cwd = env.work.path().to_path_buf();
+    let info = env.adapter.probe().await;
+    assert!(info.available, "unavailable: {:?}", info.unavailable_reason);
+    let features = env.adapter.features();
+    assert!(
+        features.fork_at_turn && features.fork_while_held && features.rename && features.status,
+        "{features:?}"
+    );
+    assert!(features.plan_mode.is_none() && !features.move_to_background);
+    assert!(info.capabilities.fork);
+
+    let mut handle = env
+        .adapter
+        .start(StartRequest {
+            thread_id: ThreadId::generate(),
+            cwd: cwd.clone(),
+            settings: ThreadSettings {
+                model: env.model.clone(),
+                ..ThreadSettings::default()
+            },
+            mode: StartMode::New,
+        })
+        .await
+        .expect("start");
+    let source = handle.native_session_id.clone().expect("session id");
+    let mut created = vec![source.clone()];
+    let mut f = Folded::default();
+    let mut anchors = Anchors::default();
+
+    handle.control.rename("aas live fork source").await.unwrap();
+    live_turn(&mut handle, &mut f, &mut anchors, "Reply with exactly: ONE").await;
+    live_turn(&mut handle, &mut f, &mut anchors, "Reply with exactly: TWO").await;
+    assert_eq!(anchors.0.len(), 2, "{:?}", anchors.0);
+    assert!(anchors.settled(0) && anchors.settled(1), "{:?}", anchors.0);
+    assert!(f.events.iter().any(
+        |e| matches!(e, AdapterEvent::SessionTitle { title } if title == "aas live fork source")
+    ));
+    // Devin's statistics of the last turn.
+    let status = handle.control.status().await.unwrap();
+    eprintln!("status: {status:?}");
+    assert!(
+        status
+            .iter()
+            .any(|s| s.title.ends_with("(last turn)") && !s.rows.is_empty()),
+        "{status:?}"
+    );
+    // Devin's own mode commands (no model call, no step): reported as the permission mode.
+    live_turn(&mut handle, &mut f, &mut anchors, "/ask").await;
+    assert_eq!(f.infos.last().and_then(|i| i.1.as_deref()), Some("ask"));
+    live_turn(&mut handle, &mut f, &mut anchors, "/code").await;
+    assert_eq!(
+        f.infos.last().and_then(|i| i.1.as_deref()),
+        Some("accept-edits")
+    );
+    assert_eq!(anchors.0.len(), 2, "mode commands make no step");
+    // Devin's account commands are not offered.
+    assert!(
+        f.commands
+            .iter()
+            .all(|c| !c.iter().any(|n| n == "login" || n == "logout")),
+        "{:?}",
+        f.commands
+    );
+    let commands = env
+        .adapter
+        .commands(CommandContext {
+            cwd: cwd.clone(),
+            native_session_id: None,
+            project_trusted: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        commands
+            .iter()
+            .all(|c| c.name != "login" && c.name != "logout")
+            && commands.iter().any(|c| c.name == "plan")
+    );
+
+    let (one, two) = (anchors.0[0].clone(), anchors.0[1].clone());
+    let at = |anchor: &Value, before: bool, previous: Option<&Value>| ForkPoint {
+        anchor: anchor.clone(),
+        before,
+        previous: previous.cloned(),
+    };
+    // While the source's process holds it: with the first turn, before the second, the whole
+    // session.
+    let mut forks = Vec::new();
+    for (point, expected) in [
+        (Some(at(&one, false, None)), vec!["Reply with exactly: ONE"]),
+        (
+            Some(at(&two, true, Some(&one))),
+            vec!["Reply with exactly: ONE"],
+        ),
+        (
+            None,
+            vec!["Reply with exactly: ONE", "Reply with exactly: TWO"],
+        ),
+    ] {
+        let fork = live_fork(&env.adapter, &cwd, &source, point)
+            .await
+            .expect("fork");
+        let (id, users, fork_anchors) = live_history(&env.adapter, &cwd, fork).await;
+        created.push(id.clone());
+        assert_eq!(users, expected, "{id}");
+        // The branch keeps the source's steps and nodes.
+        assert_eq!(fork_anchors[0].as_ref(), Some(&one), "{id}");
+        forks.push(id);
+    }
+    // Another adapter did not list the source's nodes: a provisional anchor needs the source
+    // read, which Devin refuses while the source is held.
+    let other = env.other_adapter("other");
+    assert!(other.probe().await.available);
+    let provisional = json!({ "stepIds": one["stepIds"].clone() });
+    let err = live_fork(&other, &cwd, &source, Some(at(&provisional, false, None)))
+        .await
+        .err()
+        .expect("a held source cannot be read");
+    eprintln!("held: {err}");
+    assert!(matches!(err, AdapterError::Harness(_)), "{err:?}");
+
+    // The source stops: its history carries the same anchors, and the other adapter can read
+    // it now.
+    let (_, users, source_anchors) = live_history(&env.adapter, &cwd, handle).await;
+    assert_eq!(users.len(), 2, "{users:?}");
+    assert_eq!(source_anchors, vec![Some(one.clone()), Some(two.clone())]);
+    let fork = live_fork(&other, &cwd, &source, Some(at(&provisional, false, None)))
+        .await
+        .expect("fork after reading the source");
+    let (id, users, _) = live_history(&other, &cwd, fork).await;
+    created.push(id);
+    assert_eq!(users, vec!["Reply with exactly: ONE"]);
+
+    for id in &created {
+        eprintln!("created session {id}");
+        delete_session(&env, &cwd, id).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        env.supervisor.running_count(),
+        0,
+        "no agent process may remain"
+    );
 }

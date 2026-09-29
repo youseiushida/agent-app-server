@@ -1,5 +1,9 @@
+@file:OptIn(ExperimentalSerializationApi::class)
+
 package dev.aas.android.protocol
 
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -25,6 +29,12 @@ sealed interface Item {
      */
     val backgroundTaskId: BackgroundTaskId?
 
+    /**
+     * The harness said explicitly that this running item can be moved to the background now
+     * (`item/moveToBackground`, feature `moveToBackground`); `false` once it ended.
+     */
+    val backgroundable: Boolean
+
     @Serializable
     data class UserMessage(
         override val id: ItemId,
@@ -38,6 +48,7 @@ sealed interface Item {
         val mentions: List<Mention> = emptyList(),
         val delivery: UserMessageDelivery = UserMessageDelivery.Normal,
         override val backgroundTaskId: BackgroundTaskId? = null,
+        @EncodeDefault(EncodeDefault.Mode.NEVER) override val backgroundable: Boolean = false,
     ) : Item
 
     /** Markdown text. */
@@ -51,6 +62,7 @@ sealed interface Item {
         override val completedAt: Millis? = null,
         val text: String,
         override val backgroundTaskId: BackgroundTaskId? = null,
+        @EncodeDefault(EncodeDefault.Mode.NEVER) override val backgroundable: Boolean = false,
     ) : Item
 
     @Serializable
@@ -63,6 +75,7 @@ sealed interface Item {
         override val completedAt: Millis? = null,
         val text: String,
         override val backgroundTaskId: BackgroundTaskId? = null,
+        @EncodeDefault(EncodeDefault.Mode.NEVER) override val backgroundable: Boolean = false,
     ) : Item
 
     @Serializable
@@ -81,6 +94,7 @@ sealed interface Item {
         val exitCode: Int? = null,
         val durationMs: Long? = null,
         override val backgroundTaskId: BackgroundTaskId? = null,
+        @EncodeDefault(EncodeDefault.Mode.NEVER) override val backgroundable: Boolean = false,
     ) : Item
 
     @Serializable
@@ -93,6 +107,7 @@ sealed interface Item {
         override val completedAt: Millis? = null,
         val changes: List<FileChange>,
         override val backgroundTaskId: BackgroundTaskId? = null,
+        @EncodeDefault(EncodeDefault.Mode.NEVER) override val backgroundable: Boolean = false,
     ) : Item
 
     @Serializable
@@ -112,6 +127,7 @@ sealed interface Item {
         val outputTruncated: Boolean = false,
         val outputBlobId: BlobId? = null,
         override val backgroundTaskId: BackgroundTaskId? = null,
+        @EncodeDefault(EncodeDefault.Mode.NEVER) override val backgroundable: Boolean = false,
     ) : Item
 
     @Serializable
@@ -124,6 +140,7 @@ sealed interface Item {
         override val completedAt: Millis? = null,
         val entries: List<PlanEntry>,
         override val backgroundTaskId: BackgroundTaskId? = null,
+        @EncodeDefault(EncodeDefault.Mode.NEVER) override val backgroundable: Boolean = false,
     ) : Item
 
     @Serializable
@@ -138,6 +155,24 @@ sealed interface Item {
         val message: String,
         val code: String? = null,
         override val backgroundTaskId: BackgroundTaskId? = null,
+        @EncodeDefault(EncodeDefault.Mode.NEVER) override val backgroundable: Boolean = false,
+    ) : Item
+
+    /**
+     * A plan the agent proposes in plan mode (Markdown), to implement next ([HarnessFeatures.planMode]).
+     * Its text streams with `text` deltas.
+     */
+    @Serializable
+    data class ProposedPlan(
+        override val id: ItemId,
+        override val threadId: ThreadId,
+        override val turnId: TurnId,
+        override val status: ItemStatus,
+        override val startedAt: Millis,
+        override val completedAt: Millis? = null,
+        val text: String,
+        override val backgroundTaskId: BackgroundTaskId? = null,
+        @EncodeDefault(EncodeDefault.Mode.NEVER) override val backgroundable: Boolean = false,
     ) : Item
 
     /** An item kind this client does not know; the raw object is kept verbatim. */
@@ -150,6 +185,7 @@ sealed interface Item {
         override val startedAt: Millis get() = raw.long("startedAt")
         override val completedAt: Millis? get() = raw.longOrNull("completedAt")
         override val backgroundTaskId: BackgroundTaskId? get() = raw.strOrNull("backgroundTaskId")
+        override val backgroundable: Boolean get() = (raw["backgroundable"] as? JsonPrimitive)?.content == "true"
     }
 
     object Serializer : TaggedUnionSerializer<Item>("Item", "kind") {
@@ -162,6 +198,7 @@ sealed interface Item {
             is ToolCall -> "toolCall"
             is Plan -> "plan"
             is Notice -> "notice"
+            is ProposedPlan -> "proposedPlan"
             is Unknown -> null
         }
 
@@ -174,6 +211,7 @@ sealed interface Item {
             "toolCall" -> ToolCall.serializer()
             "plan" -> Plan.serializer()
             "notice" -> Notice.serializer()
+            "proposedPlan" -> ProposedPlan.serializer()
             else -> null
         }
 
@@ -189,6 +227,7 @@ sealed interface Item {
 fun Item.appendDelta(field: DeltaField, text: String): Item = when {
     this is Item.AgentMessage && field == DeltaField.Text -> copy(text = this.text + text)
     this is Item.Reasoning && field == DeltaField.Text -> copy(text = this.text + text)
+    this is Item.ProposedPlan && field == DeltaField.Text -> copy(text = this.text + text)
     this is Item.CommandExecution && field == DeltaField.Output -> copy(output = output + text)
     this is Item.ToolCall && field == DeltaField.Output -> copy(output = (output ?: "") + text)
     this is Item.Unknown -> {

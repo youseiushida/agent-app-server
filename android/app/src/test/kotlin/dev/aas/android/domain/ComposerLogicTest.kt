@@ -134,7 +134,7 @@ class PaletteTest {
         // The daemon's app commands get Japanese descriptions; harness commands keep theirs.
         assertEquals(UiText.of(R.string.command_model), entries.first().description)
         assertEquals(UiText.Plain("Compact the conversation"), entries.last().description)
-        assertEquals("[instructions]", entries.last().argumentHint)
+        assertEquals(UiText.Plain("[instructions]"), entries.last().argumentHint)
         assertEquals(PaletteAction.Picker(PickerKind.Model), entries.first().action)
         assertEquals(PaletteAction.Insert("/compact "), entries.last().action)
         assertEquals(PaletteAction.Method(CommandAction.Method("thread/fork")), entries[1].action)
@@ -293,6 +293,26 @@ class SendLogicTest {
         assertFalse(SendLogic.canSendQueuedNow(running, noSteer))
         assertFalse(SendLogic.canSendQueuedNow(idle.copy(archived = true), steer))
     }
+
+    /**
+     * Messages that start a turn before one sent now (a mode change sent with it applies from
+     * the next turn): while a turn runs, the queue and the unsent messages except steers; with
+     * no turn, all but the first unsent message (it starts the next turn) and the queue behind it.
+     */
+    @Test
+    fun messagesThatStartBeforeANewOne() {
+        val queued = listOf(Samples.queued("que_1"), Samples.queued("que_2"))
+        assertEquals(0, SendLogic.messagesStartingBefore(running, emptyList(), emptyList()))
+        assertEquals(2, SendLogic.messagesStartingBefore(running, queued, emptyList()))
+        assertEquals(3, SendLogic.messagesStartingBefore(running, queued, listOf(Delivery.Queue, Delivery.Steer)))
+        assertEquals(0, SendLogic.messagesStartingBefore(idle, emptyList(), emptyList()))
+        assertEquals(0, SendLogic.messagesStartingBefore(idle, emptyList(), listOf(Delivery.Auto)), "the unsent message runs first, without the mode")
+        assertEquals(1, SendLogic.messagesStartingBefore(idle, emptyList(), listOf(Delivery.Auto, Delivery.Queue)))
+        // A paused queue waits behind a new message, and resumes behind the first unsent one.
+        val paused = idle.copy(queuePaused = true)
+        assertEquals(0, SendLogic.messagesStartingBefore(paused, queued, emptyList()))
+        assertEquals(2, SendLogic.messagesStartingBefore(paused, queued, listOf(Delivery.Auto)))
+    }
 }
 
 class HarnessSettingsTest {
@@ -309,6 +329,17 @@ class HarnessSettingsTest {
         assertFalse(HarnessSettings.needsConfirmation(harness, harness.permissionModes[0]))
         assertTrue(HarnessSettings.needsConfirmation(harness, harness.permissionModes[1]))
         assertEquals("Fake · Large · High", HarnessSettings.label(harness, ThreadSettings(model = "large", effort = "high")))
+    }
+
+    /** A model keeps the thread's effort only when it offers it (or offers no levels at all). */
+    @Test
+    fun whetherAModelOffersTheThreadsEffort() {
+        assertTrue(HarnessSettings.offersEffort(harness, "small", null), "no effort: the harness decides")
+        assertTrue(HarnessSettings.offersEffort(harness, "small", "low"))
+        assertFalse(HarnessSettings.offersEffort(harness, "small", "high"))
+        assertTrue(HarnessSettings.offersEffort(harness, "large", "high"))
+        val noLevels = harness.copy(models = listOf(dev.aas.android.protocol.Model("tiny", "Tiny", effortLevels = emptyList())))
+        assertTrue(HarnessSettings.offersEffort(noLevels, "tiny", "high"), "nothing to choose from")
     }
 
     /**

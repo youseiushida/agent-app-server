@@ -3,8 +3,12 @@
 //!
 //! The gate and the adapter talk through a fixed, machine-readable format (see
 //! `extension/aas-gate.ts`): the dialog title is `aas-gate:` + JSON, the answer is a JSON
-//! string, and the gate reports how each of its dialogs closed with a `notify` whose message
-//! is `aas-gate:` + JSON. Dialogs opened by other extensions are mapped by their `method` alone.
+//! string, and the gate reports how each of its dialogs closed, and why its fork command did
+//! not fork, with a `notify` whose message is `aas-gate:` + JSON. Dialogs opened by other
+//! extensions are mapped by their `method` alone.
+//!
+//! The gate also registers two commands: `/reload` (pi's `ctx.reload()`, which pi's RPC mode
+//! has no command for) and [`FORK_COMMAND`] (the adapter's way to fork at any entry).
 
 use std::path::{Path, PathBuf};
 
@@ -17,8 +21,12 @@ use serde_json::{Value, json};
 /// Source of the gate extension (written to the adapter's state dir and loaded with `-e`).
 pub const EXTENSION_SOURCE: &str = include_str!("../extension/aas-gate.ts");
 /// File name of the installed extension (versioned so an upgrade never loads a stale copy).
-/// v2: the gate reports the closure of its dialogs (`dialogClosed`).
-pub const EXTENSION_FILE: &str = "aas-gate-v2.ts";
+/// v2: the gate reports the closure of its dialogs (`dialogClosed`). v3: the commands
+/// `/reload` and [`FORK_COMMAND`], and the report `forkFailed`.
+pub const EXTENSION_FILE: &str = "aas-gate-v3.ts";
+/// The gate's command that forks the session: `/aas-gate-fork <entryId> <at|before>`
+/// (`ctx.fork(entryId, { position })`). Sent by the adapter only; never offered.
+pub const FORK_COMMAND: &str = "aas-gate-fork";
 /// Environment variable naming the mode file.
 pub const MODE_FILE_ENV: &str = "AAS_PI_GATE_FILE";
 const TITLE_PREFIX: &str = "aas-gate:";
@@ -92,7 +100,12 @@ pub enum Dialog {
     /// The gate's report that its dialog for a tool call closed. `aborted` means pi closed it
     /// because the turn was aborted, so no answer of ours was used.
     GateClosed { tool_call_id: String, aborted: bool },
-    /// TUI-only fire-and-forget methods (`setStatus`, `setWidget`, `setTitle`, `set_editor_text`).
+    /// The gate's report that [`FORK_COMMAND`] did not fork (pi's error, or a cancellation).
+    ForkFailed { error: String },
+    /// `set_editor_text` (an extension's `setEditorText` or `pasteToEditor`): text for the
+    /// composer.
+    EditorText { text: String },
+    /// TUI-only fire-and-forget methods (`setStatus`, `setWidget`, `setTitle`).
     Ignored,
     /// Unknown method.
     Unknown,
@@ -258,24 +271,37 @@ pub fn interpret(req: &Value) -> Dialog {
                 message: message.to_owned(),
             }
         }
-        "setStatus" | "setWidget" | "setTitle" | "set_editor_text" => Dialog::Ignored,
+        "set_editor_text" => match req.get("text").and_then(Value::as_str) {
+            Some(text) => Dialog::EditorText {
+                text: text.to_owned(),
+            },
+            None => Dialog::Unknown,
+        },
+        "setStatus" | "setWidget" | "setTitle" => Dialog::Ignored,
         _ => Dialog::Unknown,
     }
 }
 
-/// A `notify` from the gate (`aas-gate:` + JSON). Only `dialogClosed` exists; anything else
+/// A `notify` from the gate (`aas-gate:` + JSON): `dialogClosed` or `forkFailed`; anything else
 /// is not ours to interpret.
 fn gate_report(json: &str) -> Dialog {
     let Ok(report) = serde_json::from_str::<Value>(json) else {
         return Dialog::Unknown;
     };
-    match (
-        report.get("event").and_then(Value::as_str),
-        report.get("toolCallId").and_then(Value::as_str),
-    ) {
-        (Some("dialogClosed"), Some(id)) => Dialog::GateClosed {
-            tool_call_id: id.to_owned(),
-            aborted: report.get("reason").and_then(Value::as_str) == Some("aborted"),
+    match report.get("event").and_then(Value::as_str) {
+        Some("dialogClosed") => match report.get("toolCallId").and_then(Value::as_str) {
+            Some(id) => Dialog::GateClosed {
+                tool_call_id: id.to_owned(),
+                aborted: report.get("reason").and_then(Value::as_str) == Some("aborted"),
+            },
+            None => Dialog::Unknown,
+        },
+        Some("forkFailed") => Dialog::ForkFailed {
+            error: report
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("the gate did not say why")
+                .to_owned(),
         },
         _ => Dialog::Unknown,
     }
@@ -639,6 +665,19 @@ mod tests {
         );
 
         assert_eq!(interpret(&json!({"method":"setStatus"})), Dialog::Ignored);
+        // Recorded from pi 0.85.1 (`ctx.ui.setEditorText`, also `pasteToEditor`).
+        assert_eq!(
+            interpret(
+                &json!({"type":"extension_ui_request","id":"e1","method":"set_editor_text","text":"Hello from the extension"})
+            ),
+            Dialog::EditorText {
+                text: "Hello from the extension".into()
+            }
+        );
+        assert_eq!(
+            interpret(&json!({"method":"set_editor_text"})),
+            Dialog::Unknown
+        );
         assert_eq!(
             interpret(&json!({"method":"somethingNew"})),
             Dialog::Unknown
@@ -676,6 +715,19 @@ mod tests {
         assert_eq!(
             interpret(&report(json!({"v":1,"event":"somethingElse"}))),
             Dialog::Unknown
+        );
+        assert_eq!(
+            interpret(&report(
+                json!({"v":1,"event":"forkFailed","error":"Invalid entry ID for forking"})
+            )),
+            Dialog::ForkFailed {
+                error: "Invalid entry ID for forking".into()
+            }
+        );
+        assert_eq!(
+            interpret(&report(json!({"v":1,"event":"dialogClosed"}))),
+            Dialog::Unknown,
+            "a closure names its tool call"
         );
         let broken = json!({"method":"notify","message":"aas-gate:{oops"});
         assert_eq!(interpret(&broken), Dialog::Unknown);

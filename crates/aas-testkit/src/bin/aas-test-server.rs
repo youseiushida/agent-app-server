@@ -26,7 +26,8 @@
 //!
 //! Commands (stdin, one per line): `chaos pass`, `chaos drop`, `chaos blackhole`,
 //! `chaos delay <ms>`, `restart`, `reset`, `pairing-code`,
-//! `native-session <folder> <prompt…>`, `quit` (EOF on stdin is `quit`).
+//! `native-session <folder> <prompt…>`, `hold-session <nativeSessionId>`,
+//! `release-session <nativeSessionId>`, `quit` (EOF on stdin is `quit`).
 //!
 //! The proxy keeps its port for the life of the process; after a restart it forwards to the
 //! new server. Every agent process records itself in `<state-dir>/agent-pids` (see
@@ -47,6 +48,21 @@
 //! for a line break (so a prompt can hold several scenario directives, see
 //! `aas_adapter_fake::agent`). Requests are answered by a scripted user (approvals allowed,
 //! first choices picked).
+//!
+//! `hold-session <nativeSessionId>` marks a native session as held by another process (like a
+//! Codex thread open in Codex desktop): resuming it fails (the thread's next turn ends as
+//! `resumeFailed`, with the agent's coloured error on its stderr), forking it works.
+//! `release-session <nativeSessionId>` ends the hold.
+//!
+//! # Extended features
+//!
+//! The fake harness offers every feature of `Harness.features` (forks at a turn, forks of held
+//! sessions, renames, the harness status, side questions, moving running work to the
+//! background, plan mode with proposed plans, fast mode with `fake-fast`, the project trust
+//! decision) and a session-switching command with an alias (`/fake-clear`, `/fake-reset`). The
+//! scenarios that exercise them (`@switch-session`, `@permission`, `@effort`, `@plan-mode`,
+//! `@proposed-plan`, `@fast-state`, `@rename`, `@editor`, `@tool`, `@refuse-steers`, `@trust`,
+//! `@stderr`) are in the directive table of `aas_adapter_fake::agent`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -563,6 +579,12 @@ impl TestServer {
                 emit(json!({"event": "pairingCode", "code": code}))?;
             }
             ["native-session", ..] => self.native_session(line).await?,
+            ["hold-session", id] => SessionStore::new(self.paths.native_sessions())
+                .hold(id)
+                .with_context(|| format!("holding session {id}"))?,
+            ["release-session", id] => SessionStore::new(self.paths.native_sessions())
+                .release(id)
+                .with_context(|| format!("releasing session {id}"))?,
             ["quit"] => return Ok(true),
             _ => bail!("unknown command"),
         }

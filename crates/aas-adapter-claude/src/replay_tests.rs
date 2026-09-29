@@ -2,7 +2,7 @@
 //! core over in-memory pipes.
 //!
 //! A fixture is the (sanitized) exchange with the real CLI: `{"dir":"in"|"out"|"exit",
-//! "msg":…}`. The fake CLI writes every `out` line and, at every `in` line, reads what the
+//! "msg":…}`, and `"act":"steer"` on a user message the recorder sent while a turn ran. The fake CLI writes every `out` line and, at every `in` line, reads what the
 //! adapter wrote and checks it against the recording (ids the adapter chooses — control request
 //! ids and user message uuids — are mapped to the recorded ones). The driver reproduces the
 //! recorded user actions through the public `SessionControl` API only, each at the point of
@@ -16,14 +16,13 @@ use std::time::Duration;
 
 use aas_harness::protocol::{
     ExpireReason, InteractionRequest, InteractionResolution, ItemBody, ItemStatus, QuestionAnswer,
-    ThreadSettings, ToolCategory, TurnStatus, TurnTrigger,
+    ThreadModes, ThreadSettings, ToolCategory, TurnStatus, TurnTrigger,
 };
 use aas_harness::{
     AdapterError, AdapterEvent, BackgroundState, BackgroundTaskInfo, BackgroundTaskKind, ExitInfo,
-    SessionControl, StopReason, TurnInput, TurnInputPart,
+    SessionControl, SideAnswer, StatusSection, StopReason, TurnInput, TurnInputPart,
 };
 use base64::Engine as _;
-use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::{mpsc, watch};
@@ -36,6 +35,8 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 struct Line {
     dir: String,
     msg: Value,
+    /// How the driver reproduces an `in` line when its kind alone does not say (`steer`).
+    act: Option<String>,
 }
 
 fn load(name: &str) -> Vec<Line> {
@@ -55,6 +56,7 @@ fn parse_lines(text: &str) -> Vec<Line> {
             Line {
                 dir: v["dir"].as_str().unwrap().to_owned(),
                 msg: v["msg"].clone(),
+                act: v["act"].as_str().map(str::to_owned),
             }
         })
         .collect()
@@ -85,7 +87,19 @@ fn map_uuids(value: &mut Value, uuids: &HashMap<String, String>) {
 fn check_control_request(got: &Value, want: &Value, uuids: &HashMap<String, String>) {
     let (g, w) = (&got["request"], &want["request"]);
     assert_eq!(g["subtype"], w["subtype"], "control subtype; got {got}");
-    for key in ["mode", "model", "settings", "detail", "task_id"] {
+    for key in [
+        "mode",
+        "model",
+        "settings",
+        "detail",
+        "task_id",
+        "title",
+        "source",
+        "session_id",
+        "question",
+        "tool_use_id",
+        "skip_behaviors",
+    ] {
         if !w[key].is_null() {
             assert_eq!(g[key], w[key], "control field {key}; got {got}");
         }
@@ -254,7 +268,7 @@ fn params(dir: &std::path::Path, settings: ThreadSettings) -> SessionParams {
         stop_grace: Duration::from_secs(5),
         request_timeout: STEP_TIMEOUT,
         max_line_bytes: 1 << 24,
-        command_cache: Arc::new(Mutex::new(HashMap::new())),
+        command_cache: crate::commands::CommandCache::default(),
         agent_progress_summaries: None,
     }
 }
@@ -365,6 +379,13 @@ struct Replayed {
     sends: Vec<Result<(), AdapterError>>,
     /// The outcome of every `stop_background`, in order.
     stops: Vec<Result<(), AdapterError>>,
+    /// The engine's ids of the steered messages, and each `steer_message`'s outcome, in order.
+    steers: Vec<(String, Result<(), AdapterError>)>,
+    /// Every `status`, `rename`, `side_question` and `move_to_background`, in order.
+    statuses: Vec<Result<Vec<StatusSection>, AdapterError>>,
+    renames: Vec<Result<(), AdapterError>>,
+    answers: Vec<Result<SideAnswer, AdapterError>>,
+    moves: Vec<Result<(), AdapterError>>,
 }
 
 /// Pumps the adapter's events while the driver waits for a point of the recording.
@@ -374,6 +395,8 @@ struct Driver {
     open_turns: i64,
     requests: HashSet<String>,
     tasks: HashSet<String>,
+    /// Items the adapter reported backgroundable.
+    backgroundable: HashSet<String>,
 }
 
 impl Driver {
@@ -386,6 +409,12 @@ impl Driver {
             }
             AdapterEvent::BackgroundTask { task } => {
                 self.tasks.insert(task.key.clone());
+            }
+            AdapterEvent::ItemBackgroundable {
+                key,
+                backgroundable: true,
+            } => {
+                self.backgroundable.insert(key.clone());
             }
             AdapterEvent::Exited { .. } => panic!("process exited early"),
             _ => {}
@@ -472,6 +501,7 @@ async fn replay_with(name: &str, start_settings: ThreadSettings) -> Replayed {
         open_turns: 0,
         requests: HashSet::new(),
         tasks: HashSet::new(),
+        backgroundable: HashSet::new(),
     };
     assert_eq!(inputs[0].msg["request"]["subtype"], "initialize");
     d.h.session.initialize().await.unwrap();
@@ -480,15 +510,33 @@ async fn replay_with(name: &str, start_settings: ThreadSettings) -> Replayed {
         permission_mode: Some("default".into()),
         ..start_settings
     };
+    let mut modes = ThreadModes::default();
     let mut sends = Vec::new();
+    let mut steers = Vec::new();
     let mut spawned_stops = Vec::new();
     let mut interrupts = Vec::new();
+    let mut statuses = Vec::new();
+    let mut renames = Vec::new();
+    let mut answers = Vec::new();
+    let mut moves = Vec::new();
     for (index, line) in inputs.iter().enumerate().skip(1) {
         let msg = &line.msg;
         match (
             msg["type"].as_str().unwrap(),
             msg["request"]["subtype"].as_str(),
         ) {
+            ("user", _) if line.act.as_deref() == Some("steer") => {
+                d.wait(index, "a steer", |d| d.open_turns > 0).await;
+                let message_id = format!("steer-{index}");
+                let steered =
+                    d.h.session
+                        .steer_message(
+                            &message_id,
+                            input_from(&msg["message"]["content"], d.h.tmp.path()),
+                        )
+                        .await;
+                steers.push((message_id, steered));
+            }
             ("user", _) => {
                 d.wait(index, "a user message", |d| d.open_turns == 0).await;
                 let sent =
@@ -535,11 +583,60 @@ async fn replay_with(name: &str, start_settings: ThreadSettings) -> Replayed {
                     .await
                     .unwrap();
             }
-            // Written by the adapter by itself.
+            // Written by the adapter by itself (`get_usage` and `get_plan` by `status`).
             (
                 "control_request",
-                Some("get_context_usage" | "get_settings" | "cancel_async_message"),
+                Some(
+                    "get_context_usage"
+                    | "get_settings"
+                    | "cancel_async_message"
+                    | "get_usage"
+                    | "get_plan",
+                ),
             ) => {}
+            ("control_request", Some("get_status")) => {
+                d.wait(index, "a status", |_| true).await;
+                let s = d.h.session.clone();
+                statuses.push(tokio::spawn(async move { s.status().await }));
+            }
+            ("control_request", Some("rename_session")) => {
+                d.wait(index, "a rename", |d| d.open_turns == 0).await;
+                let title = msg["request"]["title"].as_str().unwrap().to_owned();
+                renames.push(d.h.session.rename(&title).await);
+            }
+            ("control_request", Some("side_question")) => {
+                d.wait(index, "a side question", |_| true).await;
+                let question = msg["request"]["question"].as_str().unwrap().to_owned();
+                let s = d.h.session.clone();
+                answers.push(tokio::spawn(
+                    async move { s.side_question(&question).await },
+                ));
+            }
+            ("control_request", Some("background_tasks")) => {
+                let key = format!("tool:{}", msg["request"]["tool_use_id"].as_str().unwrap());
+                d.wait(index, "work to move to the background", |d| {
+                    d.backgroundable.contains(&key)
+                })
+                .await;
+                let s = d.h.session.clone();
+                moves.push(tokio::spawn(
+                    async move { s.move_to_background(&key).await },
+                ));
+            }
+            ("control_request", Some("set_permission_mode"))
+                if msg["request"]["mode"] == "plan" =>
+            {
+                d.wait(index, "plan mode", |d| d.open_turns == 0).await;
+                modes.plan = true;
+                d.h.session.apply_modes(&modes).await.unwrap();
+            }
+            ("control_request", Some("apply_flag_settings"))
+                if msg["request"]["settings"]["fastMode"].is_boolean() =>
+            {
+                d.wait(index, "fast mode", |d| d.open_turns == 0).await;
+                modes.fast = msg["request"]["settings"]["fastMode"] == true;
+                d.h.session.apply_modes(&modes).await.unwrap();
+            }
             ("control_request", Some("interrupt")) => {
                 d.wait(index, "an interrupt", |d| d.open_turns > 0).await;
                 let s = d.h.session.clone();
@@ -554,6 +651,10 @@ async fn replay_with(name: &str, start_settings: ThreadSettings) -> Replayed {
             ("control_request", Some(subtype)) => {
                 d.wait(index, "a settings change", |d| d.open_turns == 0)
                     .await;
+                // The engine takes over the permission mode the CLI reports (design.md 5.5).
+                if let Some(mode) = reported_permission_mode(&d.events) {
+                    settings.permission_mode = Some(mode);
+                }
                 match subtype {
                     "set_permission_mode" => {
                         settings.permission_mode =
@@ -582,6 +683,18 @@ async fn replay_with(name: &str, start_settings: ThreadSettings) -> Replayed {
     for s in spawned_stops {
         stops.push(s.await.unwrap());
     }
+    let mut status_results = Vec::new();
+    for s in statuses {
+        status_results.push(s.await.unwrap());
+    }
+    let mut answer_results = Vec::new();
+    for a in answers {
+        answer_results.push(a.await.unwrap());
+    }
+    let mut move_results = Vec::new();
+    for m in moves {
+        move_results.push(m.await.unwrap());
+    }
     let exit = d.h.session.shutdown(StopReason::Shutdown).await;
     assert_eq!(
         exit.stopped, None,
@@ -598,7 +711,23 @@ async fn replay_with(name: &str, start_settings: ThreadSettings) -> Replayed {
         events: d.events,
         sends,
         stops,
+        steers,
+        statuses: status_results,
+        renames,
+        answers: answer_results,
+        moves: move_results,
     }
+}
+
+/// The permission mode the CLI reported last (`SessionInfo`).
+fn reported_permission_mode(events: &[AdapterEvent]) -> Option<String> {
+    events.iter().rev().find_map(|e| match e {
+        AdapterEvent::SessionInfo {
+            permission_mode: Some(mode),
+            ..
+        } => Some(mode.clone()),
+        _ => None,
+    })
 }
 
 fn turn_statuses(events: &[AdapterEvent]) -> Vec<TurnStatus> {
@@ -948,8 +1077,21 @@ async fn replays_approvals_session() {
             .iter()
             .any(|(_, b, _)| matches!(b, ItemBody::ToolCall { name, .. } if name == "Read"))
     );
-    // The permission mode changes (session rule, then set_permission_mode) are reported.
-    assert!(events.iter().any(|e| matches!(e, AdapterEvent::SessionInfo { permission_mode: Some(m), .. } if m == "acceptEdits")));
+    // "Allow for this session" returned Claude Code's `setMode acceptEdits` suggestion: the
+    // CLI switched and said so (`system/status`), and the switch is reported for the thread.
+    // The recorder's own switch to acceptEdits afterwards was dropped from the fixture: the CLI
+    // was in that mode already, so the adapter sends nothing (docs/adapters/claude.md §18).
+    let modes: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::SessionInfo {
+                permission_mode: Some(m),
+                ..
+            } => Some(m.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(modes, ["default", "acceptEdits"]);
 }
 
 /// E1 (claude-live): a background agent, a Bash its agent put in the background, the agent's
@@ -1036,6 +1178,7 @@ async fn replays_stopping_background_tasks() {
         events,
         sends,
         stops,
+        ..
     } = replay("bg_stop_agent_then_bash.jsonl").await;
     assert!(sends.iter().all(Result::is_ok), "{sends:?}");
     assert_eq!(stops.len(), 3);
@@ -1090,6 +1233,7 @@ async fn replays_a_workflow_across_an_interrupt() {
         events,
         sends,
         stops,
+        ..
     } = replay("bg_workflow_interrupt_stop.jsonl").await;
     assert!(sends.iter().all(Result::is_ok), "{sends:?}");
     assert!(stops.iter().all(Result::is_ok), "{stops:?}");
@@ -1287,6 +1431,7 @@ fn synthetic(lines: &[Value]) -> Vec<Line> {
         .map(|l| Line {
             dir: l["dir"].as_str().unwrap().to_owned(),
             msg: l["msg"].clone(),
+            act: l["act"].as_str().map(str::to_owned),
         })
         .collect()
 }
@@ -1696,14 +1841,11 @@ async fn ultracode_is_confirmed_by_reading_back_the_settings() {
             _ => None,
         })
         .collect();
+    // Leaving ultracode for the CLI's default reports nothing: the level the default resolves
+    // to (`medium` here) is not the thread's choice.
     assert_eq!(
         efforts,
-        vec![
-            Some("ultracode".into()),
-            None,
-            Some("ultracode".into()),
-            Some("medium".into())
-        ]
+        vec![Some("ultracode".into()), None, Some("ultracode".into())]
     );
 }
 
@@ -2129,4 +2271,888 @@ async fn an_interrupt_the_cli_never_answers_fails_within_the_stop_grace() {
         seen.iter().any(|m| m["request"]["subtype"] == "interrupt"),
         "the interrupt was sent: {seen:?}"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// Recordings of Claude Code 2.1.284 (rec2): steers, rename, status, side questions, fast mode,
+// moving work to the background, plan mode, turn anchors (docs/adapters/claude.md §18).
+// -------------------------------------------------------------------------------------------
+
+/// The anchors the adapter reported, in order.
+fn anchors(events: &[AdapterEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::TurnAnchor { anchor } => {
+                Some(crate::mapping::anchor_uuid(anchor).unwrap().to_owned())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn agent_messages(events: &[AdapterEvent]) -> Vec<String> {
+    completed(events)
+        .into_iter()
+        .filter_map(|(_, b, _)| match b {
+            ItemBody::AgentMessage { text } => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every turn's anchor comes before its completion.
+fn assert_anchored_before_completion(events: &[AdapterEvent]) {
+    let mut anchored = false;
+    for e in events {
+        match e {
+            AdapterEvent::TurnStarted => anchored = false,
+            AdapterEvent::TurnAnchor { .. } => anchored = true,
+            AdapterEvent::TurnCompleted { .. } => assert!(anchored, "a turn completed unanchored"),
+            _ => {}
+        }
+    }
+}
+
+/// a1: a message sent while the turn's first Bash ran was taken at the tool boundary
+/// (`command_lifecycle started` before the turn's `result`, no new `init`): no second turn, no
+/// returned steer, and the answer honours it.
+#[tokio::test]
+async fn replays_a_steer_the_turn_takes_at_a_tool_boundary() {
+    let Replayed {
+        events,
+        sends,
+        steers,
+        ..
+    } = replay("steer_absorbed.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_eq!(steers.len(), 1);
+    assert!(steers[0].1.is_ok(), "{steers:?}");
+    assert_well_formed(&events);
+    assert_eq!(turn_statuses(&events), vec![TurnStatus::Completed]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::SteerReturned { .. }))
+    );
+    assert!(
+        agent_messages(&events)
+            .last()
+            .unwrap()
+            .ends_with("PINEAPPLE")
+    );
+    // The anchor is the turn's last assistant message.
+    assert_eq!(anchors(&events), ["bb06a71c-a942-4712-867f-e4d881fd6a1b"]);
+    assert_anchored_before_completion(&events);
+    // Both Bash calls ran in the foreground; the first one long enough to be reported.
+    assert!(events.iter().any(|e| matches!(e, AdapterEvent::ItemBackgroundable { key, backgroundable: true } if key == "tool:toolu_017Ke8Sye5hwGKpBwMNP6wt3")));
+}
+
+/// a2 as recorded: no tool boundary was left, and the CLI had dequeued the steer when the
+/// withdrawal came (`{cancelled: false}`): it runs as the CLI's next run, which answers it. The
+/// first turn completes before that run starts; nothing is handed back.
+#[tokio::test]
+async fn replays_a_steer_the_cli_runs_next() {
+    let Replayed { events, steers, .. } = replay("steer_next_run.jsonl").await;
+    assert!(steers[0].1.is_ok(), "{steers:?}");
+    assert_well_formed(&events);
+    assert_eq!(
+        turn_statuses(&events),
+        vec![TurnStatus::Completed, TurnStatus::Completed]
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::SteerReturned { .. }))
+    );
+    assert_eq!(
+        agent_messages(&events).last().map(String::as_str),
+        Some("MANGO")
+    );
+    // The run answers a person's message: no trigger.
+    assert_eq!(turn_triggers(&events), vec![None, None]);
+    // Its anchor starts with the message itself (the steer's uuid is its transcript entry).
+    assert_eq!(anchors(&events).len(), 2);
+    assert_anchored_before_completion(&events);
+}
+
+/// a2 with the withdrawal first (`{cancelled: true}`, the shape of recording a3): the steer is
+/// handed back before the turn completes, and the engine's resend is an ordinary turn.
+#[tokio::test]
+async fn replays_a_returned_steer() {
+    let Replayed {
+        events,
+        sends,
+        steers,
+        ..
+    } = replay("steer_returned.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_well_formed(&events);
+    let (message_id, steered) = &steers[0];
+    assert!(steered.is_ok());
+    let returned = position(
+        &events,
+        |e| matches!(e, AdapterEvent::SteerReturned { message_id: m } if m == message_id),
+    );
+    let first_end = position(&events, |e| matches!(e, AdapterEvent::TurnCompleted { .. }));
+    assert!(
+        returned < first_end,
+        "handed back before the turn completed"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AdapterEvent::SteerReturned { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(turn_statuses(&events).len(), 2);
+    assert_eq!(
+        agent_messages(&events).last().map(String::as_str),
+        Some("MANGO")
+    );
+}
+
+/// b1: the status (`get_status` and `get_usage`), a rename as the host, side questions while
+/// idle and while a Bash runs (answered beside the turn), and the Bash reported backgroundable.
+#[tokio::test]
+async fn replays_status_rename_and_side_questions() {
+    let Replayed {
+        events,
+        sends,
+        statuses,
+        renames,
+        answers,
+        ..
+    } = replay("rename_status_btw.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_well_formed(&events);
+    assert_eq!(turn_statuses(&events).len(), 4);
+    assert_eq!(renames.len(), 1);
+    assert!(renames[0].is_ok(), "{renames:?}");
+    // The status: the CLI's own sections, then the plan's usage and the session's usage.
+    assert_eq!(statuses.len(), 2);
+    let first = statuses[0].as_ref().unwrap();
+    let titles: Vec<&str> = first.iter().map(|s| s.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        ["Session", "Environment", "Plan usage", "Session usage"]
+    );
+    let row = |sections: &[StatusSection], title: &str, label: &str| -> Option<String> {
+        sections
+            .iter()
+            .find(|s| s.title == title)?
+            .rows
+            .iter()
+            .find(|r| r.label == label)
+            .map(|r| r.value.clone())
+    };
+    assert_eq!(row(first, "Session", "Version").as_deref(), Some("2.1.284"));
+    assert_eq!(row(first, "Plan usage", "Plan").as_deref(), Some("max"));
+    assert_eq!(
+        row(first, "Plan usage", "Current session").as_deref(),
+        Some("43% used, resets 2026-09-28T20:20:00.469143+00:00")
+    );
+    assert!(row(first, "Plan usage", "Current week (all models)").is_some());
+    assert!(row(first, "Plan usage", "Current week (Fable)").is_some());
+    assert_eq!(
+        row(first, "Plan usage", "Usage credits").as_deref(),
+        Some("off (out_of_credits)")
+    );
+    // After the rename the CLI shows the session's name.
+    let second = statuses[1].as_ref().unwrap();
+    assert_eq!(
+        row(second, "Session", "Session name").as_deref(),
+        Some("Rec2 host title")
+    );
+    assert_eq!(
+        row(second, "Session usage", "Cost").as_deref(),
+        Some("$0.0124")
+    );
+    // Side questions: the CLI's answers, not in the history.
+    assert_eq!(answers.len(), 2);
+    let during = answers[1].as_ref().unwrap();
+    assert!(!during.synthetic);
+    assert!(during.answer.as_deref().unwrap().contains("side question"));
+    assert!(
+        !agent_messages(&events)
+            .iter()
+            .any(|m| m.contains("side question"))
+    );
+    // `control_request_progress` is progress of our own request, not an unknown message.
+    assert!(!events.iter().any(|e| matches!(e, AdapterEvent::Native { payload } if payload["subtype"] == "control_request_progress")));
+    assert!(events.iter().any(|e| matches!(e, AdapterEvent::ItemBackgroundable { key, backgroundable: true } if key == "tool:toolu_01191VJsg4ezTSESwopzv9bE")));
+    assert_eq!(anchors(&events).len(), 4);
+}
+
+/// e1: fast mode on (the flag setting), the CLI's state for it, the server's refusal as a
+/// notice, and off again.
+#[tokio::test]
+async fn replays_fast_mode() {
+    let Replayed { events, sends, .. } = replay("fast_mode.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_well_formed(&events);
+    let states: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ModesReported {
+                fast_state: Some(s),
+                ..
+            } => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(states, ["off", "on", "off"]);
+    assert!(events.iter().any(|e| matches!(e, AdapterEvent::Notice { level: aas_harness::NoticeLevel::Error, message, code: Some(c) } if c == "fast-mode-overage-rejected" && message == "Fast mode disabled · usage credits exhausted")));
+}
+
+/// f1b: a foreground Bash, backgroundable once the CLI registered its task, moved to the
+/// background: the item closes as `backgrounded` with its shell task, the turn goes on.
+#[tokio::test]
+async fn replays_moving_a_bash_to_the_background() {
+    let Replayed {
+        events,
+        sends,
+        moves,
+        ..
+    } = replay("background_bash.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_eq!(moves.len(), 1);
+    assert!(moves[0].is_ok(), "{moves:?}");
+    assert_well_formed(&events);
+    let key = "tool:toolu_01MBWgr8oNAwmCQLyBTdcHt4";
+    let backgroundable = position(
+        &events,
+        |e| matches!(e, AdapterEvent::ItemBackgroundable { key: k, .. } if k == key),
+    );
+    let closed = position(
+        &events,
+        |e| matches!(e, AdapterEvent::ItemCompleted { key: k, status: ItemStatus::Backgrounded, .. } if k == key),
+    );
+    assert!(backgroundable < closed);
+    let task = last_state(&events, "b0psjkcj9");
+    assert_eq!(task.kind, BackgroundTaskKind::Shell);
+    assert_eq!(task.origin_item_key.as_deref(), Some(key));
+    assert_eq!(task.state, BackgroundState::Completed);
+    assert_eq!(turn_statuses(&events), vec![TurnStatus::Completed]);
+}
+
+/// f2: a foreground Agent moved to the background ends the turn; its end starts a run the
+/// result marks.
+#[tokio::test]
+async fn replays_moving_an_agent_to_the_background() {
+    let Replayed {
+        events,
+        sends,
+        moves,
+        ..
+    } = replay("background_agent.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert!(moves[0].is_ok(), "{moves:?}");
+    assert_well_formed(&events);
+    let key = "tool:toolu_01QQSCQKj2ES3fi8GEYiNT5F";
+    assert!(
+        completed(&events)
+            .iter()
+            .any(|(k, _, s)| k == key && *s == ItemStatus::Backgrounded)
+    );
+    let agent = last_state(&events, "adddbb491bccbcff1");
+    assert_eq!(agent.kind, BackgroundTaskKind::Agent);
+    assert_eq!(agent.origin_item_key.as_deref(), Some(key));
+    assert_eq!(
+        turn_triggers(&events),
+        vec![None, Some(TurnTrigger::BackgroundTask)]
+    );
+}
+
+/// h1: the permission modes set (acceptEdits, default), plan mode, the plan presented for
+/// approval (a proposed plan), plan mode left after the approval (back to default), and the
+/// approval that switched to acceptEdits — each reported for the thread.
+#[tokio::test]
+async fn replays_plan_mode_and_the_permission_modes_the_cli_reports() {
+    let Replayed { events, sends, .. } = replay("plan_mode.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_well_formed(&events);
+    let modes: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::SessionInfo {
+                permission_mode: Some(m),
+                ..
+            } => Some(m.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(modes, ["default", "acceptEdits", "default", "acceptEdits"]);
+    let plan: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ModesReported { plan: Some(p), .. } => Some(*p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plan, [false, true, false]);
+    // No permission mode `plan` is ever reported.
+    assert!(!modes.contains(&"plan"));
+    let proposed: Vec<(String, ItemStatus)> = completed(&events)
+        .into_iter()
+        .filter_map(|(_, b, s)| match b {
+            ItemBody::ProposedPlan { text } => Some((text, s)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(proposed.len(), 1);
+    assert!(proposed[0].0.contains("hello.txt"), "{proposed:?}");
+    assert_eq!(proposed[0].1, ItemStatus::Completed);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AdapterEvent::InteractionRequested {
+            request: InteractionRequest::Approval {
+                subject: aas_harness::protocol::Subject::Plan { .. },
+                ..
+            },
+            ..
+        }
+    )));
+}
+
+/// g1: each turn's anchor is its last assistant message — the uuids the fork recordings resumed
+/// at (`--resume-session-at`; g2: "1. APPLE 2. BANANA" for the second).
+#[tokio::test]
+async fn replays_three_turns_with_their_anchors() {
+    let Replayed { events, sends, .. } = replay("three_turns.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_well_formed(&events);
+    assert_eq!(
+        anchors(&events),
+        [
+            "cffd151b-1a78-4509-882b-5c8460ad0617",
+            "018cc139-cfac-4f9a-bb3c-d5959641a34c",
+            "e53b7015-438e-44db-be34-f68e6484399e"
+        ]
+    );
+    assert_anchored_before_completion(&events);
+}
+
+// -------------------------------------------------------------------------------------------
+// Scripted exchanges for the paths the rec2 recordings do not reach.
+// -------------------------------------------------------------------------------------------
+
+/// A user message the adapter writes, and the CLI taking it into a run.
+fn own_run(uuid: &str, text: &str) -> Vec<Value> {
+    vec![
+        json!({"dir": "in", "msg": {"type": "user", "uuid": uuid, "message": {"role": "user", "content": text}}}),
+        lifecycle(uuid, "queued"),
+        lifecycle(uuid, "started"),
+        init_with_lifecycle(),
+    ]
+}
+
+fn result_line() -> Value {
+    json!({"dir": "out", "msg": {"type": "result", "subtype": "success", "is_error": false, "total_cost_usd": 0.1,
+        "usage": {"input_tokens": 1, "output_tokens": 1}}})
+}
+
+/// Waits until the fake CLI consumed `n` input lines.
+async fn consumed(h: &mut Harness, n: usize, seen: &mut Vec<AdapterEvent>) {
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    while h.progress.borrow().consumed < n {
+        tokio::select! {
+            ev = h.events.recv() => seen.push(ev.expect("events")),
+            changed = h.progress.changed() => changed.expect("the fake CLI ended early"),
+            _ = tokio::time::sleep_until(deadline) => panic!("the fake CLI did not consume {n} lines"),
+        }
+    }
+}
+
+/// The CLI refused a steer (`command_lifecycle refused` before it started): it goes back to the
+/// engine at once, and the turn's end withdraws nothing.
+#[tokio::test]
+async fn a_refused_steer_is_handed_back() {
+    let mut script = init_exchange();
+    script.extend(own_run("U1", "work"));
+    script.push(json!({"dir": "in", "act": "steer", "msg": {"type": "user", "uuid": "S1", "message": {"role": "user", "content": "also this"}}}));
+    script.push(lifecycle("S1", "queued"));
+    script.push(lifecycle("S1", "refused"));
+    script.push(text_message("m1", "done"));
+    script.push(result_line());
+    script.extend(context_exchange("ctx1"));
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    h.session.send(TurnInput::text("work")).await.unwrap();
+    h.session
+        .steer_message("M1", TurnInput::text("also this"))
+        .await
+        .unwrap();
+    let events = collect_until_exit(&mut h).await;
+    let returned = position(
+        &events,
+        |e| matches!(e, AdapterEvent::SteerReturned { message_id } if message_id == "M1"),
+    );
+    let end = position(&events, |e| matches!(e, AdapterEvent::TurnCompleted { .. }));
+    assert!(returned < end);
+}
+
+/// A steer that comes after the turn's `result` (its completion still waits for the context
+/// answer) goes back to the engine without being written; one that comes after the completion
+/// fails, since the engine's turn is over.
+#[tokio::test]
+async fn a_steer_after_the_result_is_handed_back_or_refused() {
+    let status = |id: &str| {
+        [
+            json!({"dir": "in", "msg": {"type": "control_request", "request_id": id, "request": {"subtype": "get_status"}}}),
+            json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success", "request_id": id,
+                "response": {"sections": []}}}}),
+            json!({"dir": "in", "msg": {"type": "control_request", "request_id": format!("{id}u"),
+                "request": {"subtype": "get_usage", "skip_behaviors": true}}}),
+            json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success",
+                "request_id": format!("{id}u"), "response": {}}}}),
+        ]
+    };
+    let mut script = init_exchange();
+    script.extend(own_run("U1", "work"));
+    script.push(text_message("m1", "done"));
+    script.push(result_line());
+    // The context request is read; its answer comes after the status the test asks for.
+    script.push(
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "ctx1",
+        "request": {"subtype": "get_context_usage", "detail": "summary"}}}),
+    );
+    let [ask, answer, ask_usage, usage] = status("s1");
+    script.push(ask);
+    script.extend(context_exchange("ctx1").into_iter().skip(1));
+    script.extend([answer, ask_usage, usage]);
+    // Keeps the CLI's output open for the last steer.
+    let [ask, ..] = status("s2");
+    script.push(ask);
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    h.session.send(TurnInput::text("work")).await.unwrap();
+    let mut seen = Vec::new();
+    // The fake CLI read the context request: the result has been handled.
+    consumed(&mut h, 3, &mut seen).await;
+    h.session
+        .steer_message("M1", TurnInput::text("late"))
+        .await
+        .unwrap();
+    next_matching(
+        &mut h,
+        &mut seen,
+        |e| matches!(e, AdapterEvent::SteerReturned { message_id } if message_id == "M1"),
+    )
+    .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnCompleted { .. })),
+        "handed back before the turn completed"
+    );
+    // The status request lets the CLI answer the context: the turn completes.
+    h.session.status().await.unwrap();
+    next_matching(&mut h, &mut seen, |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert!(matches!(
+        h.session
+            .steer_message("M2", TurnInput::text("too late"))
+            .await,
+        Err(AdapterError::Other(_))
+    ));
+    let s = h.session.clone();
+    let last = tokio::spawn(async move { s.status().await });
+    collect_until_exit(&mut h).await;
+    assert!(
+        last.await.unwrap().is_err(),
+        "the CLI ended without an answer"
+    );
+}
+
+/// A CLI without `msg_lifecycle_v1` would never say whether it took a steer: steering fails.
+#[tokio::test]
+async fn a_steer_needs_the_lifecycle_frames() {
+    let mut script = init_exchange();
+    script.extend([
+        json!({"dir": "in", "msg": {"type": "user", "uuid": "U1", "message": {"role": "user", "content": "work"}}}),
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "init", "session_id": "replay"}}),
+        // Keeps the CLI's output open until the steer was refused.
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "i1", "request": {"subtype": "interrupt"}}}),
+    ]);
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    h.session.send(TurnInput::text("work")).await.unwrap();
+    let mut seen = Vec::new();
+    next_matching(&mut h, &mut seen, |e| {
+        matches!(e, AdapterEvent::TurnStarted)
+    })
+    .await;
+    match h.session.steer_message("M1", TurnInput::text("x")).await {
+        Err(AdapterError::Harness(m)) => assert!(m.contains("msg_lifecycle_v1"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let s = h.session.clone();
+    let interrupt = tokio::spawn(async move { s.interrupt().await });
+    collect_until_exit(&mut h).await;
+    let _ = interrupt.await.unwrap();
+}
+
+/// The CLI started a run of its own (a task notification) before it answered the withdrawal of
+/// the previous turn's steer: that turn completed already, so the user is told that the message
+/// was not delivered instead.
+#[tokio::test]
+async fn a_steer_withdrawn_after_its_turn_completed_is_reported() {
+    let mut script = init_exchange();
+    script.extend(own_run("U1", "work"));
+    script.push(json!({"dir": "in", "act": "steer", "msg": {"type": "user", "uuid": "S1", "message": {"role": "user", "content": "also"}}}));
+    script.push(lifecycle("S1", "queued"));
+    script.push(text_message("m1", "done"));
+    script.push(result_line());
+    script.push(
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "ctx1",
+        "request": {"subtype": "get_context_usage", "detail": "summary"}}}),
+    );
+    script.push(
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "wd1",
+        "request": {"subtype": "cancel_async_message", "message_uuid": "S1"}}}),
+    );
+    // A run of the CLI's own begins: the previous turn completes without its answers.
+    script.push(init_with_lifecycle());
+    script.push(
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success",
+        "request_id": "wd1", "response": {"cancelled": true}}}}),
+    );
+    script.push(lifecycle("S1", "cancelled"));
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    h.session.send(TurnInput::text("work")).await.unwrap();
+    h.session
+        .steer_message("M1", TurnInput::text("also"))
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    next_matching(
+        &mut h,
+        &mut seen,
+        |e| matches!(e, AdapterEvent::Notice { code: Some(c), .. } if c == "steerNotDelivered"),
+    )
+    .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::SteerReturned { .. }))
+    );
+    h.session.shutdown(StopReason::Shutdown).await;
+}
+
+/// Plan mode over the thread's permission mode: on (`plan`), a new permission mode while in plan
+/// mode (set, then plan again, so that the CLI returns to it after the approval), off (the
+/// permission mode again). Fast mode is the flag setting.
+#[tokio::test]
+async fn modes_are_the_plan_permission_mode_and_the_fast_flag() {
+    let mut script = init_exchange();
+    let set = |id: &str, mode: &str| {
+        [
+            json!({"dir": "in", "msg": {"type": "control_request", "request_id": id,
+                "request": {"subtype": "set_permission_mode", "mode": mode}}}),
+            json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success",
+                "request_id": id, "response": {"mode": mode}}}}),
+            json!({"dir": "out", "msg": {"type": "system", "subtype": "status", "status": null, "permissionMode": mode}}),
+        ]
+    };
+    script.extend(set("p1", "plan"));
+    script.extend(set("p2", "acceptEdits"));
+    script.extend(set("p3", "plan"));
+    script.extend(ctl(
+        "f1",
+        json!({"subtype": "apply_flag_settings", "settings": {"fastMode": true}}),
+    ));
+    script.extend(set("p4", "acceptEdits"));
+    script.extend(ctl(
+        "f2",
+        json!({"subtype": "apply_flag_settings", "settings": {"fastMode": false}}),
+    ));
+    let mut settings = ThreadSettings {
+        permission_mode: Some("default".into()),
+        ..ThreadSettings::default()
+    };
+    let mut h = start_with(synthetic(&script), settings.clone());
+    h.session.initialize().await.unwrap();
+    let mut modes = ThreadModes {
+        plan: true,
+        fast: false,
+    };
+    h.session.apply_modes(&modes).await.unwrap();
+    settings.permission_mode = Some("acceptEdits".into());
+    h.session.apply_settings(&settings).await.unwrap();
+    modes.fast = true;
+    h.session.apply_modes(&modes).await.unwrap();
+    modes = ThreadModes::default();
+    h.session.apply_modes(&modes).await.unwrap();
+    let events = collect_until_exit(&mut h).await;
+    let plan: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ModesReported { plan: Some(p), .. } => Some(*p),
+            _ => None,
+        })
+        .collect();
+    // The CLI's reports as they came: plan, acceptEdits for a moment, plan, acceptEdits.
+    assert_eq!(plan, [false, true, false, true, false]);
+}
+
+/// A thread stored with the permission mode `plan` of earlier versions, on a CLI in plan mode:
+/// plan mode is never the mode to return to, so leaving it sets `default`. After the change,
+/// the CLI's next word on plan mode reaches the engine even when it says plan mode again.
+#[tokio::test]
+async fn leaving_plan_mode_never_returns_to_plan() {
+    let mut script = vec![
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "r0", "request": {"subtype": "initialize"}}}),
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success", "request_id": "r0",
+            "response": {"commands": [], "models": [], "current_permission_mode": "plan"}}}}),
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "p1",
+            "request": {"subtype": "set_permission_mode", "mode": "default"}}}),
+        // No `system/status` follows this time.
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success",
+            "request_id": "p1", "response": {"mode": "default"}}}}),
+    ];
+    // Something the adapter sends after `apply_modes` has returned, so that the report below
+    // comes after it.
+    script.extend(ctl(
+        "f1",
+        json!({"subtype": "apply_flag_settings", "settings": {"fastMode": true}}),
+    ));
+    script.push(json!({"dir": "out", "msg": {"type": "system", "subtype": "status", "status": null, "permissionMode": "plan"}}));
+    let settings = ThreadSettings {
+        permission_mode: Some("plan".into()),
+        ..ThreadSettings::default()
+    };
+    let mut h = start_with(synthetic(&script), settings);
+    h.session.initialize().await.unwrap();
+    h.session
+        .apply_modes(&ThreadModes::default())
+        .await
+        .unwrap();
+    h.session
+        .apply_modes(&ThreadModes {
+            plan: false,
+            fast: true,
+        })
+        .await
+        .unwrap();
+    let events = collect_until_exit(&mut h).await;
+    let plan: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ModesReported { plan: Some(p), .. } => Some(*p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plan, [true, true]);
+    assert_eq!(reported_permission_mode(&events), None);
+}
+
+/// The status in plan mode adds the plan (`get_plan`); a failed `get_usage` becomes a section
+/// that says so.
+#[tokio::test]
+async fn the_status_in_plan_mode_shows_the_plan() {
+    let mut script = init_exchange();
+    script.extend([
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "status", "status": null, "permissionMode": "plan"}}),
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "s1", "request": {"subtype": "get_status"}}}),
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success", "request_id": "s1",
+            "response": {"sections": [{"title": "Session", "rows": [{"label": "Version", "value": "2.1.284"}, {"label": "Session name", "value": null}]}]}}}}),
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "u1", "request": {"subtype": "get_usage", "skip_behaviors": true}}}),
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "error", "request_id": "u1",
+            "error": "\u{1b}[31mnot signed in\u{1b}[0m"}}}),
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "g1", "request": {"subtype": "get_plan"}}}),
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success", "request_id": "g1",
+            "response": {"exists": true, "content": "# Plan\n\n1. Do it", "path": "C:\\Users\\user\\.claude\\plans\\p.md"}}}}),
+    ]);
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    let mut seen = Vec::new();
+    next_matching(&mut h, &mut seen, |e| {
+        matches!(
+            e,
+            AdapterEvent::ModesReported {
+                plan: Some(true),
+                ..
+            }
+        )
+    })
+    .await;
+    let sections = h.session.status().await.unwrap();
+    let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+    assert_eq!(titles, ["Session", "Plan usage", "Plan"]);
+    assert_eq!(sections[0].rows[1].value, "");
+    assert_eq!(sections[1].rows[0].label, "Error");
+    assert_eq!(sections[1].rows[0].value, "get_usage: not signed in");
+    assert_eq!(sections[2].rows[1].value, "# Plan\n\n1. Do it");
+    h.session.shutdown(StopReason::Shutdown).await;
+}
+
+/// Moving work that is not reported backgroundable fails without a request; a `background_tasks`
+/// the CLI answers with `backgrounded: false` (recording f3: too early) fails too.
+#[tokio::test]
+async fn moving_to_the_background_needs_foreground_work_the_cli_moves() {
+    let mut script = init_exchange();
+    script.extend(own_run("U1", "work"));
+    script.extend([
+        json!({"dir": "out", "msg": {"type": "assistant", "parent_tool_use_id": null, "uuid": "a1", "message": {"id": "m1",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "sleep 30"}}]}}}),
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "task_started", "task_id": "b1", "tool_use_id": "t1",
+            "description": "sleep", "is_backgrounded": false, "task_type": "local_bash"}}),
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "bg1",
+            "request": {"subtype": "background_tasks", "tool_use_id": "t1"}}}),
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success",
+            "request_id": "bg1", "response": {"backgrounded": false}}}}),
+    ]);
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    h.session.send(TurnInput::text("work")).await.unwrap();
+    let mut seen = Vec::new();
+    next_matching(&mut h, &mut seen, |e| {
+        matches!(e, AdapterEvent::ItemBackgroundable { key, backgroundable: true } if key == "tool:t1")
+    })
+    .await;
+    assert!(matches!(
+        h.session.move_to_background("tool:t2").await,
+        Err(AdapterError::Other(_))
+    ));
+    match h.session.move_to_background("tool:t1").await {
+        Err(AdapterError::Harness(m)) => assert!(m.contains("backgrounded"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    h.session.shutdown(StopReason::Shutdown).await;
+}
+
+/// `system/commands_changed` replaces the list; `system/init` leaves out the terminal-only
+/// commands and adds what the list lacks; the menu is reported only when it changed, and the
+/// adapter's per-directory menu follows.
+#[tokio::test]
+async fn the_menu_follows_the_cli_lists() {
+    let mut script = vec![
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "r0", "request": {"subtype": "initialize"}}}),
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success", "request_id": "r0",
+            "response": {"current_permission_mode": "default", "models": [], "commands": [
+                {"name": "clear", "description": "Start a new session", "aliases": ["reset", "new"]},
+                {"name": "code-review", "description": "Review", "aliases": ["review"]},
+                {"name": "color", "description": "Set the prompt bar color"}]}}}}),
+    ];
+    script.extend(own_run("U1", "hi"));
+    script.extend([
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "init", "session_id": "replay",
+            "capabilities": ["msg_lifecycle_v1"], "slash_commands": ["clear", "code-review", "color", "mcp__docs__search"],
+            "terminal_slash_commands": ["color"]}}),
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "commands_changed", "commands": [
+            {"name": "clear", "description": "Start a new session", "aliases": ["reset", "new"]},
+            {"name": "code-review", "description": "Review", "aliases": ["review"]},
+            {"name": "color", "description": "Set the prompt bar color"},
+            {"name": "my-skill", "description": "A skill"}]}}),
+        // The same list again: nothing to report.
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "commands_changed", "commands": [
+            {"name": "clear", "description": "Start a new session", "aliases": ["reset", "new"]},
+            {"name": "code-review", "description": "Review", "aliases": ["review"]},
+            {"name": "color", "description": "Set the prompt bar color"},
+            {"name": "my-skill", "description": "A skill"}]}}),
+        text_message("m1", "hello"),
+        result_line(),
+    ]);
+    script.extend(context_exchange("ctx1"));
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    h.session.send(TurnInput::text("hi")).await.unwrap();
+    let events = collect_until_exit(&mut h).await;
+    let menus: Vec<Vec<String>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::CommandsChanged { commands } => {
+                Some(commands.iter().map(|c| c.name.clone()).collect())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        menus,
+        vec![
+            vec!["clear", "code-review", "color", "reset", "new", "review"],
+            vec![
+                "clear",
+                "code-review",
+                "reset",
+                "new",
+                "review",
+                "mcp__docs__search"
+            ],
+            vec![
+                "clear",
+                "code-review",
+                "my-skill",
+                "reset",
+                "new",
+                "review",
+                "mcp__docs__search"
+            ],
+        ]
+    );
+}
+
+/// An unknown `--resume-session-at` anchor: Claude Code answers the handshake with a failed
+/// `result` and ends (recording g6). Its text is the start's error.
+#[tokio::test]
+async fn a_refused_start_reports_the_cli_text() {
+    let script = vec![
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "r0", "request": {"subtype": "initialize"}}}),
+        json!({"dir": "out", "msg": {"type": "result", "subtype": "error_during_execution", "is_error": true, "num_turns": 0,
+            "errors": ["No message found with message.uuid of: 11111111-2222-4333-8444-555555555555"]}}),
+        // The process ends by itself (the script's end closes its output).
+    ];
+    let mut h = start(synthetic(&script));
+    match h.session.initialize().await {
+        Err(e @ AdapterError::Harness(_)) => assert_eq!(
+            e.detail(),
+            "No message found with message.uuid of: 11111111-2222-4333-8444-555555555555"
+        ),
+        other => panic!("{other:?}"),
+    }
+    let events = collect_until_exit(&mut h).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::Native { .. })),
+        "{events:?}"
+    );
+}
+
+/// A rename names the session the process runs; the CLI's refusal is the error. A side question
+/// the CLI answers with no text has no answer.
+#[tokio::test]
+async fn rename_and_side_question_answers() {
+    let mut script = init_exchange();
+    script.extend([
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "n1", "request": {"subtype": "rename_session",
+            "title": "Mine", "source": "host", "session_id": "replay"}}}),
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "error", "request_id": "n1",
+            "error": "session_id is not the current session"}}}),
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "q1", "request": {"subtype": "side_question", "question": "why?"}}}),
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success", "request_id": "q1",
+            "response": {"response": null, "synthetic": true}}}}),
+    ]);
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    match h.session.rename("Mine").await {
+        Err(e @ AdapterError::Harness(_)) => assert_eq!(
+            e.detail(),
+            "rename_session: session_id is not the current session"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        h.session.side_question("why?").await.unwrap(),
+        SideAnswer {
+            answer: None,
+            synthetic: true
+        }
+    );
+    collect_until_exit(&mut h).await;
 }

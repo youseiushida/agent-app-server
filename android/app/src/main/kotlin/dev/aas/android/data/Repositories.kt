@@ -25,6 +25,8 @@ import dev.aas.android.protocol.InputPart
 import dev.aas.android.protocol.Interaction
 import dev.aas.android.protocol.InteractionResolution
 import dev.aas.android.protocol.InteractionRespondParams
+import dev.aas.android.protocol.ItemId
+import dev.aas.android.protocol.ItemMoveToBackgroundParams
 import dev.aas.android.protocol.Methods
 import dev.aas.android.protocol.NativeImportParams
 import dev.aas.android.protocol.NativeListParams
@@ -56,18 +58,25 @@ import dev.aas.android.protocol.ThreadCursor
 import dev.aas.android.protocol.ThreadDiffParams
 import dev.aas.android.protocol.ThreadDiffResult
 import dev.aas.android.protocol.ThreadForkParams
+import dev.aas.android.protocol.ThreadHarnessStatusParams
+import dev.aas.android.protocol.ThreadHarnessStatusResult
 import dev.aas.android.protocol.ThreadId
 import dev.aas.android.protocol.ThreadListParams
 import dev.aas.android.protocol.ThreadListResult
+import dev.aas.android.protocol.ThreadModesUpdate
 import dev.aas.android.protocol.ThreadResult
 import dev.aas.android.protocol.ThreadSettings
+import dev.aas.android.protocol.ThreadSideQuestionParams
+import dev.aas.android.protocol.ThreadSideQuestionResult
 import dev.aas.android.protocol.ThreadStopParams
 import dev.aas.android.protocol.ThreadUpdateParams
 import dev.aas.android.protocol.ThreadUpdateResult
+import dev.aas.android.protocol.TurnId
 import dev.aas.android.protocol.TurnInterruptParams
 import dev.aas.android.protocol.TurnStartParams
 import dev.aas.android.protocol.TurnStartResult
 import dev.aas.android.protocol.WorkspaceSpec
+import dev.aas.android.sync.OutboxChain
 import dev.aas.android.sync.OutboxDiscard
 import dev.aas.android.sync.PendingMutation
 import dev.aas.android.sync.SyncEngine
@@ -80,6 +89,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
@@ -113,6 +123,15 @@ class HarnessRepository(private val engine: SyncEngine) {
      * @throws NotConnectedException offline.
      */
     suspend fun refresh(harnessId: String? = null): List<Harness> = engine.refreshHarnesses(harnessId)
+
+    /**
+     * The user's decision whether [harnessId] (feature `projectTrust`) may load [projectId]'s own
+     * resources (`project/update { harnessTrust }`). Asked explicitly, never decided by the app;
+     * the harness's agents of the project start with it from their next turn.
+     */
+    suspend fun setTrust(projectId: ProjectId, harnessId: String, trusted: Boolean) {
+        engine.enqueue(Methods.ProjectUpdate) { crid -> ProjectUpdateParams(crid, projectId, harnessTrust = mapOf(harnessId to trusted)) }
+    }
 }
 
 /** Workspace-level state: projects, threads, pending interactions, the 要対応 inbox. */
@@ -244,6 +263,12 @@ class ProjectRepository(private val engine: SyncEngine, private val reads: Reads
 }
 
 /**
+ * The requests of a new thread created in plan mode ([ThreadRepository.createInPlanMode]): the
+ * creation, and the first message that follows it once plan mode is on.
+ */
+data class PlanningCreation(val creation: PendingMutation<ThreadCreateResult>, val request: PendingMutation<TurnStartResult>)
+
+/**
  * An open thread and everything done to it. Reads go through [reads] (sent again after a
  * reconnect); lists the screens key by id pass [lists] (each id once).
  */
@@ -314,24 +339,104 @@ class ThreadRepository(private val engine: SyncEngine, private val reads: Reads,
         engine.enqueue(Methods.BackgroundTaskStop) { crid -> BackgroundTaskStopParams(crid, threadId, taskId) }
     }
 
-    suspend fun rename(threadId: ThreadId, title: String) {
-        engine.enqueue(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, title = title) }
-    }
+    /**
+     * `thread/update { title }`, committed to the outbox. The answer says whether the native
+     * session got the name too (`nativeRename`, harnesses with the feature `rename`).
+     */
+    suspend fun rename(threadId: ThreadId, title: String): PendingMutation<ThreadUpdateResult> =
+        engine.submit(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, title = title) }
 
     suspend fun setPinned(threadId: ThreadId, pinned: Boolean) {
         engine.enqueue(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, pinned = pinned) }
     }
 
-    /** Model / effort / permission mode; waits for `settingsOutcome` (applied now or next turn). */
-    suspend fun updateSettings(threadId: ThreadId, settings: ThreadSettings): ThreadUpdateResult =
-        engine.mutate(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, settings = settings) }
+    /**
+     * Model / effort / permission mode and the modes (fast mode); waits for `settingsOutcome`
+     * (applied now or next turn). A part without changes is left out of the request.
+     */
+    suspend fun updateSettings(threadId: ThreadId, settings: ThreadSettings, modes: ThreadModesUpdate? = null): ThreadUpdateResult =
+        engine.mutate(Methods.ThreadUpdate) { crid ->
+            ThreadUpdateParams(crid, threadId, settings = settings.takeIf { it != ThreadSettings() }, modes = modes)
+        }
+
+    /** Plan mode or fast mode on or off (`thread/update { modes }`), committed to the outbox. */
+    suspend fun setModes(threadId: ThreadId, modes: ThreadModesUpdate): PendingMutation<ThreadUpdateResult> =
+        engine.submit(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, modes = modes) }
+
+    /**
+     * `/plan <request>` in a thread: plan mode on (`thread/update { modes: { plan: true } }`), then
+     * [input] as a `turn/start` — one chain (docs/android.md 6.3): committed together, sent in this
+     * order, and the request is never sent without plan mode (a refused mode change drops it,
+     * [dev.aas.android.sync.OutboxChainBrokenException]).
+     */
+    suspend fun sendInPlanMode(threadId: ThreadId, input: List<InputPart>, delivery: Delivery): PendingMutation<TurnStartResult> =
+        engine.submitChain {
+            add(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, modes = ThreadModesUpdate(plan = true)) }
+            add(Methods.TurnStart) { crid -> TurnStartParams(crid, threadId, input, delivery) }
+        }
+
+    /**
+     * `/plan <request>` as a new thread's first message: `thread/create` without input, plan mode
+     * on, and [input] as the created thread's first `turn/start` — one chain (docs/android.md
+     * 6.3), committed together before anything is awaited, so leaving the screen (or the process
+     * ending) while the creation waits cannot keep the mode and the request from following it.
+     * They go to the created thread in this order once it exists, and are dropped (never sent)
+     * when the creation or the mode change is refused.
+     */
+    suspend fun createInPlanMode(
+        projectId: ProjectId,
+        harnessId: String,
+        settings: ThreadSettings?,
+        workspace: WorkspaceSpec?,
+        input: List<InputPart>,
+    ): PlanningCreation = engine.submitChain {
+        val creation = add(Methods.ThreadCreate) { crid -> ThreadCreateParams(crid, projectId, harnessId, settings = settings, workspace = workspace) }
+        add(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, OutboxChain.CREATED_THREAD, modes = ThreadModesUpdate(plan = true)) }
+        val request = add(Methods.TurnStart) { crid -> TurnStartParams(crid, OutboxChain.CREATED_THREAD, input, Delivery.Auto) }
+        PlanningCreation(creation, request)
+    }
 
     suspend fun archive(threadId: ThreadId, archived: Boolean) {
         engine.enqueue(Methods.ThreadArchive) { crid -> ThreadArchiveParams(crid, threadId, archived) }
     }
 
-    /** `thread/fork`; waits for the new thread. */
-    suspend fun fork(threadId: ThreadId): Thread = engine.mutate(Methods.ThreadFork) { crid -> ThreadForkParams(crid, threadId) }.thread
+    /**
+     * `thread/fork`; waits for the new thread. Without [atTurnId] the whole session; with it up to
+     * and including that turn, or ([before]) up to right before it.
+     */
+    suspend fun fork(threadId: ThreadId, atTurnId: TurnId? = null, before: Boolean = false): Thread =
+        engine.mutate(Methods.ThreadFork) { crid -> ThreadForkParams(crid, threadId, atTurnId, before) }.thread
+
+    /**
+     * `item/moveToBackground`: asks the harness to move a running item's work to the background.
+     * The item then closes as `backgrounded` and the work goes on as a background task.
+     */
+    suspend fun moveToBackground(threadId: ThreadId, itemId: ItemId) {
+        engine.enqueue(Methods.ItemMoveToBackground) { crid -> ItemMoveToBackgroundParams(crid, threadId, itemId) }
+    }
+
+    /** `thread/harnessStatus`: the harness's own status in its words (read-only; needs a connection). */
+    suspend fun harnessStatus(threadId: ThreadId): ThreadHarnessStatusResult = reads.query(Methods.ThreadHarnessStatus, ThreadHarnessStatusParams(threadId))
+
+    /**
+     * `thread/sideQuestion` (`/btw`): the running agent answers beside the conversation. Sent
+     * once, not again after a lost connection like the other reads ([Reads]): the question is
+     * answered by the model, and asking twice would ask it twice.
+     */
+    suspend fun sideQuestion(threadId: ThreadId, question: String): ThreadSideQuestionResult =
+        engine.query(Methods.ThreadSideQuestion, ThreadSideQuestionParams(threadId, question))
+
+    /**
+     * What the harness relays to this thread's open screen without storing it: text for the
+     * composer (`composer/insert`) and the agent moving to another native session.
+     */
+    fun relayed(threadId: ThreadId): Flow<SyncSignal> = engine.signals.filter { signal ->
+        when (signal) {
+            is SyncSignal.ComposerInsert -> signal.threadId == threadId
+            is SyncSignal.NativeSessionChanged -> signal.threadId == threadId
+            else -> false
+        }
+    }
 
     suspend fun removeQueued(threadId: ThreadId, queuedId: QueuedInputId) {
         engine.enqueue(Methods.QueueRemove) { crid -> QueueRemoveParams(crid, threadId, queuedId) }

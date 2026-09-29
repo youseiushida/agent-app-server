@@ -7,6 +7,7 @@
 //! See `docs/adapters/claude.md` for the full mapping.
 
 mod background;
+mod commands;
 mod mapping;
 mod native;
 mod session;
@@ -15,23 +16,27 @@ mod time;
 #[cfg(test)]
 mod replay_tests;
 
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aas_harness::protocol::{Command, HarnessCapabilities, HarnessKind, ThreadSettings};
+use aas_harness::protocol::{
+    Command, HarnessCapabilities, HarnessFeatures, HarnessKind, PlanModeFeature, ThreadSettings,
+};
 use aas_harness::{
-    AdapterContext, AdapterError, CommandContext, HarnessAdapter, HarnessConfig, HarnessInfo,
-    NativeHistory, NativeSessionScan, NativeSessionSummary, SessionHandle, StartGuard, StartMode,
-    StartRequest, StopReason,
+    AdapterContext, AdapterError, CommandContext, ForkPoint, HarnessAdapter, HarnessConfig,
+    HarnessInfo, NativeHistory, NativeSessionScan, NativeSessionSummary, SessionControl,
+    SessionHandle, StartGuard, StartMode, StartOptions, StartRequest, StatusSection, StopReason,
+    UpgradedSettings,
 };
 use aas_supervisor::{SpawnSpec, ToolSpec, resolve_program};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::Deserialize;
+use serde_json::Value;
 
-use crate::session::{ClaudeSession, CommandCache, ProcessLink, SessionParams};
+use crate::commands::{CommandCache, SESSION_SWITCHING_COMMANDS, menu_from_initialize};
+use crate::session::{ClaudeSession, ProcessLink, SessionParams};
 
 /// Adapter-specific options (`[[harness]] options = { … }`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -56,6 +61,13 @@ impl ClaudeOptions {
     }
 }
 
+/// A process spawned and past its `initialize` handshake.
+type Launched = (
+    Arc<ClaudeSession>,
+    tokio::sync::mpsc::UnboundedReceiver<aas_harness::AdapterEvent>,
+    Value,
+);
+
 /// Claude Code harness.
 pub struct ClaudeAdapter {
     config: HarnessConfig,
@@ -63,6 +75,8 @@ pub struct ClaudeAdapter {
     display_name: String,
     options: Result<ClaudeOptions, String>,
     commands: CommandCache,
+    /// The models the last probe's `initialize` marked `supportsFastMode`.
+    fast_mode_models: Mutex<Vec<String>>,
 }
 
 impl ClaudeAdapter {
@@ -77,7 +91,8 @@ impl ClaudeAdapter {
             ctx,
             display_name,
             options,
-            commands: Arc::new(Mutex::new(HashMap::new())),
+            commands: CommandCache::default(),
+            fast_mode_models: Mutex::new(Vec::new()),
         }
     }
 
@@ -99,7 +114,9 @@ impl ClaudeAdapter {
             })
     }
 
-    /// Spawns a process and completes the `initialize` handshake.
+    /// Spawns a process and completes the `initialize` handshake. A failed handshake stops the
+    /// process; its error carries the CLI's refusal (a failed `result` before the handshake,
+    /// e.g. an unknown `--resume-session-at` anchor) or else the last lines of its stderr.
     async fn launch(
         &self,
         label: String,
@@ -108,14 +125,7 @@ impl ClaudeAdapter {
         args: Vec<OsString>,
         native_session_id: String,
         settings: ThreadSettings,
-    ) -> Result<
-        (
-            Arc<ClaudeSession>,
-            tokio::sync::mpsc::UnboundedReceiver<aas_harness::AdapterEvent>,
-            serde_json::Value,
-        ),
-        AdapterError,
-    > {
+    ) -> Result<Launched, AdapterError> {
         let program = self.program()?;
         let mut spec = SpawnSpec::new(label.clone(), program, cwd)
             .args(self.config.args.iter().map(OsString::from))
@@ -166,40 +176,65 @@ impl ClaudeAdapter {
             }
             Err(e) => {
                 let exit = guard.stop(StopReason::Shutdown).await;
-                let tail = exit.stderr_tail.trim().to_owned();
-                let tail = if tail.is_empty() {
-                    session.stderr_tail().trim().to_owned()
+                if session.startup_error().is_some() {
+                    // The CLI's own words; its stderr repeats them.
+                    return Err(e);
+                }
+                let tail = if exit.stderr_tail.trim().is_empty() {
+                    session.stderr_tail()
                 } else {
-                    tail
+                    exit.stderr_tail
                 };
-                Err(if tail.is_empty() {
-                    e
-                } else {
-                    AdapterError::Harness(format!("{e}; claude stderr: {tail}"))
-                })
+                Err(self.ctx.policy.with_stderr(e, &tail))
             }
         }
     }
 
-    /// Spawns a throwaway process (no session persistence) to read models and commands.
-    async fn handshake_probe(&self, cwd: &Path) -> Result<serde_json::Value, AdapterError> {
-        let args = common_args(false);
-        let mut args = args;
+    /// Spawns a throwaway process (no session persistence) in `cwd`: it answers requests
+    /// about the CLI (models, commands, usage) without a conversation.
+    async fn probe_process(&self, cwd: &Path) -> Result<Launched, AdapterError> {
+        let mut args = common_args(false);
         args.push("--no-session-persistence".into());
-        let (session, _events, raw) = self
-            .launch(
-                format!("{}[probe]", self.config.id),
-                cwd,
-                None,
-                args,
-                String::new(),
-                ThreadSettings::default(),
-            )
-            .await?;
+        self.launch(
+            format!("{}[probe]", self.config.id),
+            cwd,
+            None,
+            args,
+            String::new(),
+            ThreadSettings::default(),
+        )
+        .await
+    }
+
+    /// The `initialize` response of a throwaway process in `cwd`.
+    async fn handshake_probe(&self, cwd: &Path) -> Result<Value, AdapterError> {
+        let (session, _events, raw) = self.probe_process(cwd).await?;
         StartGuard::for_session(session)
             .stop(StopReason::Shutdown)
             .await;
         Ok(raw)
+    }
+
+    /// The directory the throwaway processes of `probe` and `status` run in.
+    fn probe_dir(&self) -> Result<PathBuf, AdapterError> {
+        let dir = self.ctx.state_dir.join("probe");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| AdapterError::Other(format!("cannot create {}: {e}", dir.display())))?;
+        Ok(dir)
+    }
+
+    /// Brings a session that just started to `modes` (`StartOptions::modes`): plan mode begins
+    /// from the permission mode the process started with, which Claude Code returns to after
+    /// the plan's approval. A mode the CLI does not take fails the start.
+    async fn start_in_modes(
+        &self,
+        session: &Arc<ClaudeSession>,
+        options: &StartOptions,
+    ) -> Result<(), AdapterError> {
+        if options.modes == aas_harness::ThreadModes::default() {
+            return Ok(());
+        }
+        session.apply_modes(&options.modes).await.map(|_| ())
     }
 }
 
@@ -257,7 +292,77 @@ fn settings_args(settings: &ThreadSettings) -> Result<Vec<OsString>, AdapterErro
     Ok(args)
 }
 
-/// `claude --version` prints e.g. `2.1.283 (Claude Code)`.
+/// The session arguments of a start and the native session id it runs:
+/// * new: `--session-id=<new>`;
+/// * resume: `--resume=<id>`;
+/// * fork: `--resume=<source> [--resume-session-at=<uuid>] --fork-session --session-id=<new>`.
+///   A fork at a turn (`fork_at`) keeps the transcript up to the anchor of that turn, or of the
+///   turn before it (`before`, the user edits the turn's prompt). `--resume-drops-turn` is not
+///   used: Claude Code refuses it whenever a later turn exists (recording g3a), and the cut at
+///   the previous turn's anchor alone keeps exactly the turns before (g3b).
+fn session_args(
+    mode: &StartMode,
+    fork_at: Option<&ForkPoint>,
+) -> Result<(Vec<OsString>, String), AdapterError> {
+    let mut args: Vec<OsString> = Vec::new();
+    if fork_at.is_some() && !matches!(mode, StartMode::Fork { .. }) {
+        return Err(AdapterError::Other(
+            "a fork point was given for a start that is not a fork".into(),
+        ));
+    }
+    let id = match mode {
+        StartMode::New => {
+            let id = uuid::Uuid::new_v4().to_string();
+            args.push(format!("--session-id={id}").into());
+            id
+        }
+        StartMode::Resume { native_session_id } => {
+            args.push(format!("--resume={}", checked_arg("session id", native_session_id)?).into());
+            native_session_id.clone()
+        }
+        StartMode::Fork { native_session_id } => {
+            let id = uuid::Uuid::new_v4().to_string();
+            args.push(format!("--resume={}", checked_arg("session id", native_session_id)?).into());
+            if let Some(point) = fork_at {
+                let at = fork_anchor(point)?;
+                args.push(
+                    format!("--resume-session-at={}", checked_arg("fork anchor", at)?).into(),
+                );
+            }
+            args.push("--fork-session".into());
+            args.push(format!("--session-id={id}").into());
+            id
+        }
+    };
+    Ok((args, id))
+}
+
+/// The transcript uuid a fork at `point` keeps up to: the anchor of the turn, or with `before`
+/// the anchor of the turn before it.
+fn fork_anchor(point: &ForkPoint) -> Result<&str, AdapterError> {
+    let anchor = if point.before {
+        point.previous.as_ref().ok_or_else(|| {
+            AdapterError::Other(
+                "the turn before the fork point has no recorded anchor, so the fork cannot end right before it".into(),
+            )
+        })?
+    } else {
+        &point.anchor
+    };
+    mapping::anchor_uuid(anchor)
+        .ok_or_else(|| AdapterError::Other(format!("not a Claude Code turn anchor: {anchor}")))
+}
+
+/// The anchors [`session_args`] needs for a fork at `point`: the turn's own, or before it the
+/// one of the turn before (Claude Code keeps the transcript up to a message; there is no cut
+/// before one), each a plain id.
+fn check_fork_point(point: &ForkPoint) -> Result<(), AdapterError> {
+    fork_anchor(point)
+        .and_then(|at| checked_arg("fork anchor", at))
+        .map(|_| ())
+}
+
+/// `claude --version` prints e.g. `2.1.284 (Claude Code)`.
 fn parse_version(stdout: &str) -> Option<String> {
     stdout
         .split_whitespace()
@@ -289,10 +394,10 @@ impl HarnessAdapter for ClaudeAdapter {
             Ok(p) => p,
             Err(e) => return HarnessInfo::unavailable(e.to_string()),
         };
-        let probe_dir = self.ctx.state_dir.join("probe");
-        if let Err(e) = std::fs::create_dir_all(&probe_dir) {
-            return HarnessInfo::unavailable(format!("cannot create {}: {e}", probe_dir.display()));
-        }
+        let probe_dir = match self.probe_dir() {
+            Ok(dir) => dir,
+            Err(e) => return HarnessInfo::unavailable(e.detail()),
+        };
         let version = match self
             .ctx
             .supervisor
@@ -303,7 +408,10 @@ impl HarnessAdapter for ClaudeAdapter {
             Ok(out) => {
                 return HarnessInfo::unavailable(format!(
                     "`claude --version` failed: {}",
-                    out.stderr_lossy().trim()
+                    aas_harness::stderr_excerpt(
+                        &out.stderr_lossy(),
+                        self.ctx.policy.stderr_excerpt_lines
+                    )
                 ));
             }
             Err(e) => return HarnessInfo::unavailable(format!("`claude --version` failed: {e}")),
@@ -311,15 +419,15 @@ impl HarnessAdapter for ClaudeAdapter {
         let raw = match self.handshake_probe(&probe_dir).await {
             Ok(raw) => raw,
             Err(e) => {
-                let mut info = HarnessInfo::unavailable(format!("claude handshake failed: {e}"));
+                let mut info =
+                    HarnessInfo::unavailable(format!("claude handshake failed: {}", e.detail()));
                 info.version = version;
                 info.executable = Some(program);
                 return info;
             }
         };
-        self.commands
-            .lock()
-            .insert(probe_dir, mapping::commands_from_initialize(&raw));
+        menu_from_initialize(&self.commands, &probe_dir, &raw);
+        *self.fast_mode_models.lock() = mapping::fast_mode_models(&raw);
         let models = mapping::models_from_initialize(&raw);
         let effort_levels = mapping::effort_levels(&models);
         let current_mode = raw.get("current_permission_mode").and_then(|v| v.as_str());
@@ -334,7 +442,9 @@ impl HarnessAdapter for ClaudeAdapter {
                 background_tasks: true,
                 background_stop: true,
                 interrupt: true,
-                steer: false,
+                // Claude Code takes a message into the running turn at its next tool boundary
+                // and says so (`command_lifecycle started`); one it did not take is returned.
+                steer: true,
                 approvals: true,
                 questions: true,
                 resume: true,
@@ -355,31 +465,25 @@ impl HarnessAdapter for ClaudeAdapter {
     }
 
     async fn start(&self, req: StartRequest) -> Result<SessionHandle, AdapterError> {
-        let options = self.options()?.clone();
-        let mut args = common_args(options.allow_bypass_permissions);
-        let native_session_id = match &req.mode {
-            StartMode::New => {
-                let id = uuid::Uuid::new_v4().to_string();
-                args.push(format!("--session-id={id}").into());
-                id
-            }
-            StartMode::Resume { native_session_id } => {
-                args.push(
-                    format!("--resume={}", checked_arg("session id", native_session_id)?).into(),
-                );
-                native_session_id.clone()
-            }
-            StartMode::Fork { native_session_id } => {
-                let id = uuid::Uuid::new_v4().to_string();
-                args.push(
-                    format!("--resume={}", checked_arg("session id", native_session_id)?).into(),
-                );
-                args.push("--fork-session".into());
-                args.push(format!("--session-id={id}").into());
-                id
-            }
-        };
-        args.extend(settings_args(&req.settings)?);
+        self.start_with(req, StartOptions::default()).await
+    }
+
+    async fn start_with(
+        &self,
+        req: StartRequest,
+        options: StartOptions,
+    ) -> Result<SessionHandle, AdapterError> {
+        let allow_bypass = self.options()?.allow_bypass_permissions;
+        // A thread stored with the permission mode `plan` of earlier versions runs in plan mode
+        // over the CLI's default permission mode; the CLI's reports of both reach the thread
+        // (docs/adapters/claude.md §19.6).
+        let UpgradedSettings { settings, plan } = mapping::upgrade_settings(req.settings.clone());
+        let mut options = options;
+        options.modes.plan |= plan;
+        let mut args = common_args(allow_bypass);
+        let (session_args, native_session_id) = session_args(&req.mode, options.fork_at.as_ref())?;
+        args.extend(session_args);
+        args.extend(settings_args(&settings)?);
         let label = format!("{}[{}]", self.config.id, req.thread_id);
         let (session, events, _raw) = self
             .launch(
@@ -388,9 +492,15 @@ impl HarnessAdapter for ClaudeAdapter {
                 Some(req.thread_id.to_string()),
                 args,
                 native_session_id.clone(),
-                req.settings.clone(),
+                settings,
             )
             .await?;
+        let guard = StartGuard::for_session(session.clone());
+        if let Err(e) = self.start_in_modes(&session, &options).await {
+            guard.stop(StopReason::Shutdown).await;
+            return Err(e);
+        }
+        guard.disarm();
         Ok(SessionHandle {
             native_session_id: Some(native_session_id),
             control: session,
@@ -398,20 +508,68 @@ impl HarnessAdapter for ClaudeAdapter {
         })
     }
 
+    /// What Claude Code offers beyond the capabilities (docs/adapters/claude.md §19):
+    /// * fork at any turn (`--resume-session-at`), also of a session another process holds
+    ///   (recording g7: a held session resumes and forks);
+    /// * rename (`rename_session`), side questions (`side_question`), moving foreground work to
+    ///   the background (`background_tasks`), status (`get_status` / `get_usage`);
+    /// * plan mode (the permission mode `plan`; the CLI continues by itself after the plan's
+    ///   approval, so there is no prompt to implement it);
+    /// * fast mode for the models the CLI marks `supportsFastMode`.
+    /// See [`check_fork_point`].
+    fn check_fork_point(&self, point: &ForkPoint) -> Result<(), AdapterError> {
+        check_fork_point(point)
+    }
+
+    /// The permission mode `plan` of earlier versions is plan mode ([`mapping::upgrade_settings`]).
+    fn upgrade_settings(&self, settings: ThreadSettings) -> UpgradedSettings {
+        mapping::upgrade_settings(settings)
+    }
+
+    fn features(&self) -> HarnessFeatures {
+        HarnessFeatures {
+            fork_at_turn: true,
+            fork_while_held: true,
+            rename: true,
+            side_question: true,
+            move_to_background: true,
+            status: true,
+            project_trust: false,
+            plan_mode: Some(PlanModeFeature {
+                implement_prompt: None,
+                new_thread_preamble: None,
+            }),
+            fast_mode_models: self.fast_mode_models.lock().clone(),
+        }
+    }
+
     async fn commands(&self, ctx: CommandContext) -> Result<Vec<Command>, AdapterError> {
-        if let Some(cached) = self.commands.lock().get(&ctx.cwd).cloned() {
+        if let Some(cached) = self.commands.lock().menu(&ctx.cwd) {
             return Ok(cached);
         }
         let raw = self.handshake_probe(&ctx.cwd).await?;
-        let commands = mapping::commands_from_initialize(&raw);
-        self.commands
-            .lock()
-            .insert(ctx.cwd.clone(), commands.clone());
-        Ok(commands)
+        Ok(menu_from_initialize(&self.commands, &ctx.cwd, &raw))
     }
 
     fn session_switching_commands(&self) -> &'static [&'static str] {
         SESSION_SWITCHING_COMMANDS
+    }
+
+    fn session_switching_names(&self) -> Vec<String> {
+        self.commands.lock().switching_names()
+    }
+
+    /// The status without a session: the plan's usage (`get_usage` of a throwaway process).
+    /// `get_status` describes the session of the process that answers, which a throwaway
+    /// process does not have, so it is left out.
+    async fn status(&self, _cwd: &Path) -> Result<Vec<StatusSection>, AdapterError> {
+        let dir = self.probe_dir()?;
+        let (session, _events, _raw) = self.probe_process(&dir).await?;
+        let usage = session.usage().await;
+        StartGuard::for_session(session)
+            .stop(StopReason::Shutdown)
+            .await;
+        Ok(mapping::usage_sections(&usage?, false))
     }
 
     async fn list_native_sessions(
@@ -438,6 +596,19 @@ impl HarnessAdapter for ClaudeAdapter {
         cwd: &Path,
         native_session_id: &str,
     ) -> Result<NativeHistory, AdapterError> {
+        Ok(self
+            .read_native_history_anchored(cwd, native_session_id)
+            .await?
+            .0)
+    }
+
+    /// The history with each turn's anchor: the uuid of its last main-thread entry
+    /// (docs/adapters/claude.md §10).
+    async fn read_native_history_anchored(
+        &self,
+        cwd: &Path,
+        native_session_id: &str,
+    ) -> Result<(NativeHistory, Vec<Option<Value>>), AdapterError> {
         let dir = Self::projects_dir()?;
         let cwd = cwd.to_path_buf();
         let id = native_session_id.to_owned();
@@ -456,34 +627,13 @@ impl HarnessAdapter for ClaudeAdapter {
     }
 }
 
-/// Claude Code's commands that leave the session the thread is bound to (never offered, see
-/// [`HarnessAdapter::session_switching_commands`]):
-/// * `clear` — "Start a new session with empty context; previous session stays on disk
-///   (resumable with /resume)" (Claude Code 2.1.283 lists it in `initialize.commands` and runs
-///   it in stream-json mode; the CLI then reports a new `session_id`);
-/// * `resume` — its session picker (interactive-only today; excluded should a version offer it
-///   in this mode).
-const SESSION_SWITCHING_COMMANDS: &[&str] = &["clear", "resume"];
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn the_session_switching_commands_are_named_as_claude_code_reports_them() {
-        // The shape of `initialize.commands` of Claude Code 2.1.283 (descriptions as reported).
-        let init = serde_json::json!({"commands": [
-            {"name": "clear", "description": "Start a new session with empty context; previous session stays on disk (resumable with /resume)", "argumentHint": "[name]"},
-            {"name": "compact", "description": "Free up context by summarizing the conversation so far", "argumentHint": "<optional custom summarization instructions>"},
-            {"name": "rename", "description": "Rename the current conversation", "argumentHint": "[name]"},
-            {"name": "/resume", "description": "Resume a conversation", "argumentHint": ""},
-        ]});
-        let kept: Vec<String> = mapping::commands_from_initialize(&init)
-            .into_iter()
-            .map(|c| c.name)
-            .filter(|name| !SESSION_SWITCHING_COMMANDS.contains(&name.as_str()))
-            .collect();
-        assert_eq!(kept, ["compact", "rename"]);
+    fn strings(args: Vec<OsString>) -> Vec<String> {
+        args.into_iter().map(|a| a.into_string().unwrap()).collect()
     }
 
     #[test]
@@ -529,9 +679,8 @@ mod tests {
             permission_mode: Some("acceptEdits".into()),
         })
         .unwrap();
-        let args: Vec<String> = args.into_iter().map(|a| a.into_string().unwrap()).collect();
         assert_eq!(
-            args,
+            strings(args),
             vec![
                 "--model",
                 "haiku",
@@ -543,12 +692,146 @@ mod tests {
         );
     }
 
+    /// The command lines of recordings g2 (the turn included) and g3b (right before it).
+    #[test]
+    fn a_fork_at_a_turn_resumes_at_the_anchor() {
+        let source = "ab417fbf-6aad-4b16-8592-6c5ec1d777e5";
+        let mode = StartMode::Fork {
+            native_session_id: source.into(),
+        };
+        let t1 = mapping::turn_anchor("cffd151b-1a78-4509-882b-5c8460ad0617");
+        let t2 = mapping::turn_anchor("018cc139-cfac-4f9a-bb3c-d5959641a34c");
+        let at = ForkPoint {
+            anchor: t2.clone(),
+            before: false,
+            previous: Some(t1.clone()),
+        };
+        let (args, id) = session_args(&mode, Some(&at)).unwrap();
+        assert_eq!(
+            strings(args),
+            vec![
+                format!("--resume={source}"),
+                "--resume-session-at=018cc139-cfac-4f9a-bb3c-d5959641a34c".to_owned(),
+                "--fork-session".to_owned(),
+                format!("--session-id={id}"),
+            ]
+        );
+        assert_ne!(id, source);
+        let before = ForkPoint {
+            before: true,
+            ..at.clone()
+        };
+        let (args, _) = session_args(&mode, Some(&before)).unwrap();
+        assert!(
+            strings(args)
+                .contains(&"--resume-session-at=cffd151b-1a78-4509-882b-5c8460ad0617".to_owned())
+        );
+        assert_eq!(check_fork_point(&at), Ok(()));
+        assert_eq!(check_fork_point(&before), Ok(()));
+        // Without the turn before, the fork cannot end right before the turn: the check says
+        // so before anything starts.
+        let no_previous = ForkPoint {
+            previous: None,
+            ..before
+        };
+        assert!(session_args(&mode, Some(&no_previous)).is_err());
+        assert!(check_fork_point(&no_previous).is_err());
+        // An anchor of another shape, or one that is not a plain id, is refused.
+        let bogus = ForkPoint {
+            anchor: json!({"turn": 3}),
+            before: false,
+            previous: None,
+        };
+        assert!(session_args(&mode, Some(&bogus)).is_err());
+        let unsafe_anchor = ForkPoint {
+            anchor: mapping::turn_anchor("x&calc"),
+            before: false,
+            previous: None,
+        };
+        assert!(session_args(&mode, Some(&unsafe_anchor)).is_err());
+        assert!(check_fork_point(&bogus).is_err());
+        assert!(check_fork_point(&unsafe_anchor).is_err());
+        // The whole session, and the other modes.
+        let (args, id) = session_args(&mode, None).unwrap();
+        assert_eq!(
+            strings(args),
+            vec![
+                format!("--resume={source}"),
+                "--fork-session".to_owned(),
+                format!("--session-id={id}"),
+            ]
+        );
+        assert!(
+            session_args(
+                &StartMode::Resume {
+                    native_session_id: source.into()
+                },
+                Some(&at)
+            )
+            .is_err()
+        );
+        let (args, id) = session_args(&StartMode::New, None).unwrap();
+        assert_eq!(strings(args), vec![format!("--session-id={id}")]);
+    }
+
     #[test]
     fn version_parsing() {
         assert_eq!(
-            parse_version("2.1.283 (Claude Code)\n").as_deref(),
-            Some("2.1.283")
+            parse_version("2.1.284 (Claude Code)\n").as_deref(),
+            Some("2.1.284")
         );
         assert_eq!(parse_version("error").as_deref(), None);
+    }
+
+    fn adapter(dir: &Path) -> ClaudeAdapter {
+        let supervisor = aas_supervisor::Supervisor::new(
+            &dir.join("supervisor"),
+            aas_supervisor::SupervisorPolicy {
+                prevent_sleep: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        ClaudeAdapter::new(
+            HarnessConfig {
+                id: "claude".into(),
+                kind: HarnessKind::Claude,
+                display_name: None,
+                command: "claude".into(),
+                args: Vec::new(),
+                env: Default::default(),
+                options: Value::Null,
+            },
+            AdapterContext {
+                supervisor,
+                state_dir: dir.join("claude"),
+                policy: aas_harness::AdapterPolicy::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn features_follow_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter(dir.path());
+        let features = adapter.features();
+        assert!(features.fork_at_turn && features.fork_while_held && features.rename);
+        assert!(features.side_question && features.move_to_background && features.status);
+        assert!(!features.project_trust);
+        // Claude Code continues by itself after the plan's approval.
+        assert_eq!(features.plan_mode, Some(PlanModeFeature::default()));
+        assert!(features.fast_mode_models.is_empty());
+        *adapter.fast_mode_models.lock() = vec!["opus".into()];
+        assert_eq!(adapter.features().fast_mode_models, ["opus"]);
+    }
+
+    #[test]
+    fn switching_names_are_the_commands_and_their_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter(dir.path());
+        let names = adapter.session_switching_names();
+        for name in ["clear", "reset", "new", "resume", "continue"] {
+            assert!(names.iter().any(|n| n == name), "{name}: {names:?}");
+        }
     }
 }

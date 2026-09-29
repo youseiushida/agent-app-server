@@ -22,7 +22,12 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /** An image stored on the daemon (`POST /v1/blobs`), ready to be referenced by a message. */
-data class UploadedImage(val blobId: BlobId, val mime: String, val size: Long) {
+data class UploadedImage(
+    val blobId: BlobId,
+    val mime: String,
+    /** Bytes stored by the daemon; `null` for an attachment of a sent message (only its blob id and type are known). */
+    val size: Long?,
+) {
     /** The `turn/start` / `thread/create` input part. */
     val inputPart: InputPart get() = InputPart.Image(blobId)
 

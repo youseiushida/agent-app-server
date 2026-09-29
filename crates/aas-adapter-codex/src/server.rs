@@ -67,9 +67,11 @@ pub(crate) async fn spawn_app_server(
 ///
 /// `experimentalApi` is on for `thread/backgroundTerminals/list` and `…/terminate`, which
 /// app-server refuses otherwise (-32600): the list is the only signal of which commands still
-/// run after their turn, the terminate the only way to stop one of them. With it on, Codex
-/// also sends `thread/settings/updated` (ignored); every other message keeps its shape
-/// (compared on recordings of codex-cli 0.148.0 with the flag on and off).
+/// run after their turn, the terminate the only way to stop one of them. It also enables the
+/// experimental `turn/start.collaborationMode` (plan mode) and `thread/fork.beforeTurnId`. With
+/// it on, Codex also sends `thread/settings/updated` (the source of the plan and fast mode
+/// reports); every other message keeps its shape (compared on recordings of codex-cli 0.148.0
+/// with the flag on and off).
 pub(crate) async fn initialize(peer: &RpcPeer, timeout: Duration) -> Result<(), AdapterError> {
     let params = json!({
         "clientInfo": {
@@ -85,22 +87,6 @@ pub(crate) async fn initialize(peer: &RpcPeer, timeout: Duration) -> Result<(), 
     peer.notify("initialized", json!({}))
         .await
         .map_err(|e| rpc_err("initialized", e))
-}
-
-/// Adds the child's stderr tail to a start failure.
-pub(crate) fn with_stderr(error: AdapterError, handle: &ChildHandle) -> AdapterError {
-    let tail = handle.stderr_tail();
-    let tail = tail.trim();
-    if tail.is_empty() {
-        return error;
-    }
-    let message = format!("{error}; stderr: {tail}");
-    match error {
-        AdapterError::Unavailable(_) => AdapterError::Unavailable(message),
-        AdapterError::Protocol(_) => AdapterError::Protocol(message),
-        AdapterError::Harness(_) => AdapterError::Harness(message),
-        _ => AdapterError::Spawn(message),
-    }
 }
 
 /// Runs `f` against a temporary app-server (for probes and listings) and stops it afterwards.
@@ -152,7 +138,7 @@ where
     }
     .await;
     guard.stop(StopReason::Shutdown).await;
-    result.map_err(|e| with_stderr(e, &handle))
+    result.map_err(|e| ctx.policy.with_stderr(e, &handle.stderr_tail()))
 }
 
 /// Guards a freshly spawned app-server until its session is handed over: the staged stop of

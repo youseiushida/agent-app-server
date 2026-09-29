@@ -284,6 +284,16 @@ async fn devin_recorded_turns() {
                 && i.1.as_deref() == Some("accept-edits"))
     );
     assert!(f.commands.iter().any(|c| c.contains(&"plan".to_owned())));
+    // Devin's account commands are not offered (the agent declares Cognition's capabilities);
+    // its own `/plan` and `/status` stay.
+    assert!(
+        f.commands
+            .iter()
+            .all(|c| !c.iter().any(|n| n == "login" || n == "logout")),
+        "{:?}",
+        f.commands
+    );
+    assert!(f.commands.iter().all(|c| c.contains(&"status".to_owned())));
     // Extension notifications are not forwarded by default; session titles become SessionTitle.
     assert!(
         f.natives.iter().all(|n| n.get("method").is_none()),
@@ -311,7 +321,8 @@ async fn devin_recorded_turns() {
     assert_eq!(
         init["params"]["clientCapabilities"],
         json!({"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "elicitation": {"form": {}, "url": {}},
-               "_meta": {"cognition.ai/subagentSupport": true, "cognition.ai/subagentControl": true}})
+               "_meta": {"cognition.ai/subagentSupport": true, "cognition.ai/subagentControl": true,
+                         "cognition.ai/revert": true}})
     );
     let prompt = client
         .iter()

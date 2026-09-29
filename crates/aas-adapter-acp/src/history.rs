@@ -3,6 +3,10 @@
 //! Turn boundaries: a `user_message_chunk` that follows anything other than another user
 //! chunk starts a new turn; contiguous user chunks form one user message. Updates before the
 //! first user chunk form a turn without a user message.
+//!
+//! Each turn keeps the id its first user chunk carried (Devin's
+//! `_meta["cognition.ai/clientMessageId"]`, the prompt's step id), from which the turn's
+//! anchor is found (`crate::revert::history_anchors`).
 
 use std::collections::HashMap;
 
@@ -14,6 +18,10 @@ use crate::tracker::Emit;
 #[derive(Debug, Default)]
 pub struct HistoryBuilder {
     turns: Vec<HistoryTurn>,
+    /// The client message id of each turn's first user chunk, parallel to `turns`.
+    message_ids: Vec<Option<String>>,
+    /// The id of the user chunk being pushed ([`user_message_id`](Self::user_message_id)).
+    pending_message_id: Option<String>,
     index: HashMap<String, (usize, usize)>,
     in_user_message: bool,
     title: Option<String>,
@@ -30,9 +38,21 @@ impl HistoryBuilder {
         }
     }
 
+    /// The client message id of the user chunk whose emits are pushed next (`None`: it has
+    /// none). Cleared by [`user_chunk_done`](Self::user_chunk_done).
+    pub fn user_message_id(&mut self, id: Option<String>) {
+        self.pending_message_id = id;
+    }
+
+    /// The user chunk's emits were pushed.
+    pub fn user_chunk_done(&mut self) {
+        self.pending_message_id = None;
+    }
+
     fn current_turn(&mut self) -> usize {
         if self.turns.is_empty() {
             self.turns.push(HistoryTurn::default());
+            self.message_ids.push(None);
         }
         self.turns.len() - 1
     }
@@ -55,6 +75,7 @@ impl HistoryBuilder {
                         existing.push_str(&text);
                     }
                 } else {
+                    self.message_ids.push(self.pending_message_id.clone());
                     self.turns.push(HistoryTurn {
                         started_at: None,
                         completed_at: None,
@@ -108,10 +129,52 @@ impl HistoryBuilder {
         }
     }
 
-    pub fn finish(self) -> NativeHistory {
-        NativeHistory {
-            title: self.title,
-            turns: self.turns,
-        }
+    /// The history, and the client message id of each turn (same order).
+    pub fn finish(self) -> (NativeHistory, Vec<Option<String>>) {
+        (
+            NativeHistory {
+                title: self.title,
+                turns: self.turns,
+            },
+            self.message_ids,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn message(text: &str) -> Emit {
+        Emit::Event(AdapterEvent::ItemStarted {
+            key: format!("msg-{text}"),
+            body: ItemBody::AgentMessage { text: text.into() },
+        })
+    }
+
+    #[test]
+    fn each_turn_keeps_the_id_of_its_first_user_chunk() {
+        let mut b = HistoryBuilder::new();
+        // Updates before any user chunk: a turn without a user message (and without an id).
+        b.push(message("hello"));
+        b.user_message_id(Some("a".into()));
+        b.push(Emit::UserText("one".into()));
+        b.user_chunk_done();
+        // A continued user message keeps the first chunk's id.
+        b.user_message_id(Some("ignored".into()));
+        b.push(Emit::UserText(" more".into()));
+        b.user_chunk_done();
+        b.push(message("ONE"));
+        b.user_message_id(None);
+        b.push(Emit::UserText("two".into()));
+        b.user_chunk_done();
+        let (history, ids) = b.finish();
+        assert_eq!(history.turns.len(), 3);
+        assert_eq!(ids, vec![None, Some("a".into()), None]);
+        assert!(matches!(
+            &history.turns[1].items[0].body,
+            ItemBody::UserMessage { text, .. } if text == "one more"
+        ));
     }
 }

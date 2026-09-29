@@ -1,0 +1,9 @@
+{
+  "id": 45,
+  "jsonrpc": "2.0",
+  "method": "thread/sideQuestion",
+  "params": {
+    "question": "Which file holds the heartbeat timer?",
+    "threadId": "thr_01K6A0000000000000000THR01"
+  }
+}

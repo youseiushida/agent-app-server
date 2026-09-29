@@ -630,3 +630,163 @@ async fn native_sessions_are_listed_imported_resumed_and_forked() {
         "agent processes outlived the test server: {survivors:?}"
     );
 }
+
+/// The completed turn `turn` of `thread` in what the client applied.
+fn completed_turn(
+    state: &aas_testkit::client::ClientState,
+    thread: &str,
+    turn: &str,
+) -> Option<aas_protocol::Turn> {
+    let stream = format!("thread:{thread}");
+    client_events(state, &stream)
+        .iter()
+        .find_map(|e| match &e.event {
+            Event::TurnCompleted { turn: t } if t.id.as_str() == turn => Some(t.clone()),
+            _ => None,
+        })
+}
+
+/// Starts `text` in `thread` and waits for its completion (whatever its status).
+async fn finished_turn(c: &ReliableClient, thread: &str, text: &str) -> aas_protocol::Turn {
+    let r = mutate(
+        c,
+        "turn/start",
+        json!({"threadId": thread, "input": [{"type": "text", "text": text}]}),
+        STEP,
+    )
+    .await;
+    let turn = r["turnId"].as_str().expect("turn started").to_owned();
+    c.wait_until(STEP, |s| completed_turn(s, thread, &turn).is_some())
+        .await;
+    c.with_state(|s| completed_turn(s, thread, &turn))
+        .expect("the turn completed")
+}
+
+/// The extended features through the real server with a real agent process: a session held by
+/// another process makes the next turn fail as `resumeFailed` with the agent's own words (its
+/// coloured stderr without escapes), a fork at a turn still runs, a typed session switch is
+/// refused, and the harness status and side questions answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_sessions_forks_at_turns_and_side_questions_through_the_real_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let agent_pids: PathBuf = state.join("agent-pids");
+    let mut cleanup = Cleanup::new();
+    cleanup.dir(&agent_pids);
+    let mut server = TestServerProcess::spawn(&state);
+    let ready = server.next_event().await;
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let root = PathBuf::from(ready["root"].as_str().unwrap());
+    let folder = root.join("extended");
+    std::fs::create_dir_all(&folder).unwrap();
+    let c = client(&ready);
+    wait_connects(&c, 1).await;
+    let features =
+        mutate(&c, "harness/list", json!({}), STEP).await["harnesses"][0]["features"].clone();
+    assert_eq!(features["forkAtTurn"], true, "{features}");
+    assert_eq!(features["forkWhileHeld"], true, "{features}");
+    let project = mutate(
+        &c,
+        "project/open",
+        json!({"path": folder.display().to_string()}),
+        STEP,
+    )
+    .await;
+    let thread = mutate(
+        &c,
+        "thread/create",
+        json!({"projectId": project["project"]["id"], "harnessId": "fake"}),
+        STEP,
+    )
+    .await["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    c.subscribe(&format!("thread:{thread}"));
+    let first = finished_turn(&c, &thread, "first").await;
+    assert!(first.forkable, "{first:?}");
+    finished_turn(&c, &thread, "second").await;
+
+    // A typed session switch never reaches the agent.
+    let crid = c.mutate(
+        "turn/start",
+        json!({"threadId": thread, "input": [{"type": "text", "text": "/fake-clear"}]}),
+    );
+    let refused = c.result(&crid, STEP).await.unwrap_err();
+    assert_eq!(
+        refused.kind(),
+        Some(aas_protocol::ErrorKind::SessionSwitchingCommand)
+    );
+
+    // Held by another process: the resume fails with the agent's own words.
+    let native = mutate(&c, "thread/get", json!({"threadId": thread}), STEP).await["thread"]
+        ["nativeSessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    mutate(&c, "thread/stop", json!({"threadId": thread}), STEP).await;
+    server.ok(&format!("hold-session {native}")).await;
+    let failed = finished_turn(&c, &thread, "third").await;
+    let error = failed.error.expect("the turn failed");
+    assert_eq!(error.kind, "resumeFailed", "{error:?}");
+    assert!(
+        error.message.contains("is held by another process"),
+        "{error:?}"
+    );
+    assert!(!error.message.contains('\u{1b}'), "{error:?}");
+
+    // A fork at the first turn still runs, beside the held session.
+    let fork = mutate(
+        &c,
+        "thread/fork",
+        json!({"threadId": thread, "atTurnId": first.id}),
+        STEP,
+    )
+    .await["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    c.subscribe(&format!("thread:{fork}"));
+    let forked = finished_turn(&c, &fork, "@text in the fork\n@sleep 200").await;
+    assert_eq!(
+        forked.status,
+        aas_protocol::TurnStatus::Completed,
+        "{forked:?}"
+    );
+    let status = mutate(&c, "thread/harnessStatus", json!({"threadId": fork}), STEP).await;
+    assert_eq!(status["live"], true, "{status}");
+    let answer = mutate(
+        &c,
+        "thread/sideQuestion",
+        json!({"threadId": fork, "question": "still there?"}),
+        STEP,
+    )
+    .await;
+    assert_eq!(answer["answer"], "side answer: still there?");
+
+    // Released, the thread resumes its session again.
+    server.ok(&format!("release-session {native}")).await;
+    let resumed = finished_turn(&c, &thread, "fourth").await;
+    assert_eq!(resumed.status, aas_protocol::TurnStatus::Completed);
+    for bad in ["hold-session", "hold-session no-such-session"] {
+        let out = server.command(bad).await;
+        assert_eq!(out.last().unwrap()["event"], "error", "{bad}: {out:?}");
+    }
+    drop(c);
+
+    let agents: Vec<Proc> = proc::recorded(&agent_pids);
+    server.ok("quit").await;
+    let status = tokio::time::timeout(STEP, server.child.wait())
+        .await
+        .expect("exits after quit")
+        .expect("exit status");
+    assert_eq!(status.code(), Some(0));
+    let survivors =
+        tokio::task::spawn_blocking(move || proc::wait_all_dead(&agents, Duration::from_secs(10)))
+            .await
+            .unwrap();
+    assert!(
+        survivors.is_empty(),
+        "agent processes outlived the test server: {survivors:?}"
+    );
+}

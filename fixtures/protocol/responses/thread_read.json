@@ -339,6 +339,29 @@
         "threadId": "thr_01K6A0000000000000000THR01",
         "title": "Review the reconnect logic",
         "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "completedAt": 1790000003010,
+        "id": "itm_01K6A00000000000000000IT10",
+        "kind": "proposedPlan",
+        "startedAt": 1790000002010,
+        "status": "completed",
+        "text": "1. Reproduce the race\n2. Order the ack before the heartbeat\n3. Run the reconnect tests\n",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
+      },
+      {
+        "backgroundable": true,
+        "command": "npm run dev",
+        "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
+        "id": "itm_01K6A00000000000000000IT11",
+        "kind": "commandExecution",
+        "output": "ready on http://localhost:5173\n",
+        "outputTruncated": false,
+        "startedAt": 1790000002011,
+        "status": "inProgress",
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "turnId": "trn_01K6A0000000000000000TRN01"
       }
     ],
     "queued": [
@@ -370,6 +393,7 @@
       "createdAt": 1790000000000,
       "cwd": "C:\\Users\\me\\Documents\\agent-app-server",
       "diffAvailable": true,
+      "fastModeState": "on",
       "harnessId": "claude",
       "head": 42,
       "id": "thr_01K6A0000000000000000THR01",
@@ -384,6 +408,10 @@
         "index": 0,
         "startedAt": 1790000002000,
         "status": "running"
+      },
+      "modes": {
+        "fast": true,
+        "plan": false
       },
       "nativeSessionId": "7c2d1c1e-5b0e-4a51-9b1e-2f0c3a1b9d10",
       "pendingInteractions": 1,
@@ -422,6 +450,7 @@
           "files": 2,
           "insertions": 40
         },
+        "forkable": true,
         "id": "trn_01K6A0000000000000000TRN01",
         "index": 0,
         "model": "opus",
