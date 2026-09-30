@@ -1,10 +1,11 @@
 //! The engine: request dispatch, idempotency, recovery, pairing, blobs and stream access.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aas_eventlog::{Batch, HeadHub};
 use aas_harness::{CommandContext, HarnessInfo};
@@ -47,6 +48,26 @@ pub struct RequestCtx {
 pub struct AuthenticatedDevice {
     pub id: DeviceId,
     pub name: String,
+}
+
+/// Why the engine is not live (`GET /v1/liveness`, design.md §18.2).
+#[derive(Debug, thiserror::Error)]
+pub enum NotLive {
+    /// A write transaction has held the database's writer longer than the deadline: until it
+    /// ends, nothing else can be written (agent output, the end of a turn, pairing).
+    #[error(
+        "a database write transaction started at {caller} has been open for {held:?}; no other write can proceed"
+    )]
+    WriterHeld {
+        caller: &'static Location<'static>,
+        held: Duration,
+    },
+    #[error("the engine did not answer within {0:?}")]
+    NoAnswer(Duration),
+    #[error("the engine could not read its database: {0}")]
+    Unreadable(CoreError),
+    #[error("the workspace stream is missing")]
+    NoWorkspaceStream,
 }
 
 /// Pairing failure.
@@ -307,6 +328,28 @@ impl Engine {
     /// Devices revoked while connected (the transport closes their connections).
     pub fn revocations(&self) -> broadcast::Receiver<DeviceId> {
         self.revoked.subscribe()
+    }
+
+    /// The engine's side of the liveness contract with the watchdog (`GET /v1/liveness`,
+    /// design.md §18.2): no write transaction has held the database's writer for longer than
+    /// `deadline`, and a read through the reader pool (a round trip through the runtime and the
+    /// blocking pool) completes within it.
+    pub async fn check_liveness(&self, deadline: Duration) -> Result<(), NotLive> {
+        if let Some(write) = self.sh.db.write_in_progress() {
+            let held = write.since.elapsed();
+            if held > deadline {
+                return Err(NotLive::WriterHeld {
+                    caller: write.caller,
+                    held,
+                });
+            }
+        }
+        match tokio::time::timeout(deadline, self.stream_head(WORKSPACE_STREAM)).await {
+            Ok(Ok(Some(_))) => Ok(()),
+            Ok(Ok(None)) => Err(NotLive::NoWorkspaceStream),
+            Ok(Err(e)) => Err(NotLive::Unreadable(e)),
+            Err(_) => Err(NotLive::NoAnswer(deadline)),
+        }
     }
 
     /// Head of a stream if it exists (workspace, or a non-removed thread).
@@ -2783,6 +2826,12 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn failpoint(&self) -> &crate::db::WriteFailpoint {
         self.sh.db.failpoint()
+    }
+
+    /// The state shared with the thread actors (tests of this crate).
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> &Shared {
+        &self.sh
     }
 
     /// Database integrity check (for `doctor`).

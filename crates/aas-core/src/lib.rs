@@ -31,7 +31,7 @@ mod fail_stop_tests;
 
 pub use aas_eventlog::Batch;
 pub use config::{EngineConfig, HeuristicsConfig, Policy};
-pub use engine::{AuthenticatedDevice, Engine, PairError, RequestCtx};
+pub use engine::{AuthenticatedDevice, Engine, NotLive, PairError, RequestCtx};
 pub use error::{CoreError, CoreResult};
 pub use registry::HarnessRegistry;
 pub use retention::MaintenanceReport;

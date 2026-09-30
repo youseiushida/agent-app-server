@@ -1,7 +1,7 @@
 //! Storage failures (design.md §6.2), driven by the database's test-only write failpoint:
 //! a transient failure loses nothing once a retry succeeds; a persistent one takes the
 //! fail-stop path — no more work is accepted, every agent process is stopped, and a restart
-//! recovers as after any stop.
+//! recovers as after any stop. A write that never ends makes the engine not live (§18.2).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::{Engine, EngineConfig, HarnessRegistry, Policy, RequestCtx};
+use crate::{Engine, EngineConfig, HarnessRegistry, NotLive, Policy, RequestCtx};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -516,5 +516,55 @@ async fn storage_failures_of_request_handlers_reach_the_client_without_a_fail_st
         "a client is told; nothing was lost"
     );
     open_project(&engine, &path).await;
+    engine.shutdown(false).await;
+}
+
+/// A write transaction that holds the database's writer past the liveness deadline makes the
+/// engine not live, naming the code that started it; once it ends, the engine is live again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_that_holds_the_writer_makes_the_engine_not_live() {
+    let (_dir, data, root, _project) = dirs();
+    let supervisor = supervisor(&data, &policy());
+    let engine = start(&data, &root, fake(&data, &supervisor), supervisor).await;
+    let deadline = Duration::from_millis(200);
+    engine.check_liveness(deadline).await.unwrap();
+
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let held_tx = std::sync::Mutex::new(Some(held_tx));
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let write = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .shared()
+                .tx_durable("a write that waits", move |_tx, _em| {
+                    if let Some(held) = held_tx.lock().unwrap().take() {
+                        let _ = held.send(());
+                    }
+                    release_rx.lock().unwrap().recv().ok();
+                    Ok(())
+                })
+                .await
+        })
+    };
+    held_rx.await.unwrap();
+    // Within the deadline a write in progress is normal.
+    engine.check_liveness(deadline).await.unwrap();
+    tokio::time::sleep(deadline * 2).await;
+    match engine.check_liveness(deadline).await {
+        Err(NotLive::WriterHeld { caller, held }) => {
+            assert_eq!(
+                caller.file(),
+                file!(),
+                "the transaction's own caller is named"
+            );
+            assert!(held > deadline, "{held:?}");
+        }
+        other => panic!("expected a held writer, got {other:?}"),
+    }
+    release_tx.send(()).unwrap();
+    write.await.unwrap().unwrap();
+    engine.check_liveness(deadline).await.unwrap();
     engine.shutdown(false).await;
 }

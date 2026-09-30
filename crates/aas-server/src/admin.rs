@@ -10,10 +10,10 @@
 
 use std::sync::Arc;
 
-use aas_core::CoreError;
+use aas_core::{CoreError, NotLive};
 use aas_protocol::http::*;
 use aas_protocol::methods::{HarnessListResult, HarnessRefreshParams};
-use aas_protocol::{DeviceId, ErrorKind, WORKSPACE_STREAM};
+use aas_protocol::{DeviceId, ErrorKind};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -41,29 +41,28 @@ fn check(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
 }
 
 /// `GET /v1/liveness`: the liveness contract with the watchdog (design.md §18.2). Answers
-/// 200 only after a round trip through the engine — this task being scheduled by the runtime
-/// and a read of the database through the engine's reader pool — completes within
-/// `policy.liveness_deadline`; 503 otherwise.
+/// 200 only when, within `policy.liveness_deadline`, no write transaction has held the
+/// database's writer longer and a round trip through the engine — this task being scheduled by
+/// the runtime and a read of the database through the engine's reader pool — completes
+/// ([`aas_core::Engine::check_liveness`]); 503 with the reason otherwise.
 pub(crate) async fn liveness(State(state): State<Arc<AppState>>) -> Response {
     let deadline = state.policy.liveness_deadline;
-    match tokio::time::timeout(deadline, state.engine.stream_head(WORKSPACE_STREAM)).await {
-        Ok(Ok(Some(_))) => Json(Health { ok: true }).into_response(),
-        Ok(Ok(None)) => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "the workspace stream is missing",
-        ),
-        Ok(Err(e)) => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            format!("the engine could not read its database: {e}"),
-        ),
-        Err(_) => {
-            tracing::warn!(?deadline, "the liveness round trip missed its deadline");
+    match state.engine.check_liveness(deadline).await {
+        Ok(()) => Json(Health { ok: true }).into_response(),
+        Err(e) => {
+            match &e {
+                NotLive::WriterHeld { caller, held } => {
+                    tracing::error!(%caller, ?held, "not live: a write transaction holds the database's writer")
+                }
+                NotLive::NoAnswer(_) => {
+                    tracing::warn!(?deadline, "the liveness round trip missed its deadline")
+                }
+                NotLive::Unreadable(_) | NotLive::NoWorkspaceStream => {}
+            }
             error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
-                format!("the engine did not answer within {deadline:?}"),
+                e.to_string(),
             )
         }
     }

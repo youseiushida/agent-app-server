@@ -1,16 +1,17 @@
 //! SQLite access: one writer connection (serialized), a pool of readers, WAL mode.
 //! All calls run on the blocking pool.
 
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::error::{CoreError, CoreResult};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// SQLite's `auto_vacuum` value for incremental vacuuming (free pages are kept until
 /// `PRAGMA incremental_vacuum` returns them).
@@ -276,6 +277,11 @@ UPDATE turns SET delivered = 0
       AND json_extract(error, '$.kind') IN ('spawnFailed', 'resumeFailed', 'harnessUnavailable', 'forkOutdated', 'interrupted');
 "#;
 
+// v8 has no statements of its own: the event log's item index also holds the event type
+// (`events_item_type`, see `aas_eventlog::migrate`), so that delta compaction checks an item's
+// completion with one lookup instead of reading the events it would have to check (design.md
+// §6.1). Building it reads the whole log once.
+
 /// Connection settings (from [`crate::Policy`]).
 #[derive(Debug, Clone, Copy)]
 pub struct DbOptions {
@@ -339,11 +345,55 @@ impl WriteFailpoint {
     }
 }
 
+/// The write transaction in progress: where it was started and since when. The liveness
+/// contract with the watchdog reports a daemon whose writer stays held as not live (design.md
+/// §18.2), and says which transaction holds it.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteInProgress {
+    /// The code that asked for the transaction ([`Db::write`], [`Db::write_blocking`], or the
+    /// caller of `Shared::tx` and its variants).
+    pub caller: &'static Location<'static>,
+    pub since: Instant,
+}
+
+/// Records a write transaction as in progress for as long as it lives (it is created once the
+/// writer is held and dropped before the writer is released).
+struct InProgress<'a> {
+    inner: &'a Inner,
+    write: WriteInProgress,
+}
+
+impl<'a> InProgress<'a> {
+    fn begin(inner: &'a Inner, caller: &'static Location<'static>) -> Self {
+        let write = WriteInProgress {
+            caller,
+            since: Instant::now(),
+        };
+        *inner.in_progress.lock() = Some(write);
+        Self { inner, write }
+    }
+}
+
+impl Drop for InProgress<'_> {
+    fn drop(&mut self) {
+        *self.inner.in_progress.lock() = None;
+        let held = self.write.since.elapsed();
+        let limit = self.inner.options.busy_timeout;
+        if held > limit {
+            // Every other write waited this long: longer than a writer of another process
+            // would have waited for the database before giving up.
+            tracing::warn!(caller = %self.write.caller, ?held, ?limit, "a write transaction held the database writer longer than policy.sqlite_busy_timeout");
+        }
+    }
+}
+
 struct Inner {
     path: PathBuf,
     options: DbOptions,
     /// `None` once the database is closed.
     writer: Mutex<Option<Connection>>,
+    /// The transaction that holds `writer` (see [`WriteInProgress`]).
+    in_progress: Mutex<Option<WriteInProgress>>,
     readers: Mutex<Readers>,
     /// Signalled whenever a reader connection is handed back.
     returned: Condvar,
@@ -418,6 +468,7 @@ impl Db {
                 path,
                 options,
                 writer: Mutex::new(Some(writer)),
+                in_progress: Mutex::new(None),
                 readers: Mutex::new(Readers::default()),
                 returned: Condvar::new(),
                 #[cfg(test)]
@@ -508,13 +559,27 @@ impl Db {
     }
 
     /// Runs `f` in an immediate write transaction and commits it.
-    pub async fn write<T, F>(&self, f: F) -> CoreResult<T>
+    #[track_caller]
+    pub fn write<T, F>(&self, f: F) -> impl Future<Output = CoreResult<T>> + Send + 'static
     where
         T: Send + 'static,
         F: FnOnce(&Transaction<'_>) -> CoreResult<T> + Send + 'static,
     {
-        let db = self.clone();
-        tokio::task::spawn_blocking(move || db.write_blocking(f))
+        self.clone().write_at(Location::caller(), f)
+    }
+
+    /// [`write`](Self::write) on behalf of `caller` (for wrappers that pass their own caller
+    /// on, so that [`write_in_progress`](Self::write_in_progress) names the code that wrote).
+    pub(crate) async fn write_at<T, F>(
+        self,
+        caller: &'static Location<'static>,
+        f: F,
+    ) -> CoreResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Transaction<'_>) -> CoreResult<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || self.write_from(caller, f))
             .await
             .map_err(|e| CoreError::Internal(format!("database task failed: {e}")))?
     }
@@ -543,18 +608,35 @@ impl Db {
 
     /// Synchronous write (startup code that is not on the runtime yet, and work that runs on
     /// a blocking thread anyway).
+    #[track_caller]
     pub fn write_blocking<T>(
         &self,
         f: impl FnOnce(&Transaction<'_>) -> CoreResult<T>,
     ) -> CoreResult<T> {
+        self.write_from(Location::caller(), f)
+    }
+
+    fn write_from<T>(
+        &self,
+        caller: &'static Location<'static>,
+        f: impl FnOnce(&Transaction<'_>) -> CoreResult<T>,
+    ) -> CoreResult<T> {
         let mut writer = self.inner.writer.lock();
         let conn = writer.as_mut().ok_or_else(closed_error)?;
+        // Declared after the writer's guard and before the transaction: it ends after the
+        // transaction (committed or rolled back) and before the writer is released.
+        let _in_progress = InProgress::begin(&self.inner, caller);
         #[cfg(test)]
         self.inner.failpoint.trip()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&tx)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    /// The write transaction in progress, if any.
+    pub fn write_in_progress(&self) -> Option<WriteInProgress> {
+        *self.inner.in_progress.lock()
     }
 
     /// Runs `PRAGMA quick_check` (used by `doctor`).
@@ -651,6 +733,12 @@ fn migrate(conn: &mut Connection) -> CoreResult<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(SCHEMA_V7)?;
         tx.pragma_update(None, "user_version", 7)?;
+        tx.commit()?;
+    }
+    if version < 8 {
+        let tx = conn.transaction()?;
+        aas_eventlog::migrate(&tx)?;
+        tx.pragma_update(None, "user_version", 8)?;
         tx.commit()?;
     }
     // A file created before incremental vacuuming was enabled is rebuilt with it once.
@@ -1129,6 +1217,53 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A version 7 database gets the event log's item index that also holds the event type
+    /// (v8); the item index it replaces is gone.
+    #[tokio::test]
+    async fn a_version_7_database_gains_the_item_type_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v7.db");
+        {
+            let mut conn = open_connection(&path, &opts()).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(SCHEMA_V1).unwrap();
+            aas_eventlog::migrate(&tx).unwrap();
+            // The item index as version 7 had it.
+            tx.execute_batch(
+                "DROP INDEX events_item_type;
+                 CREATE INDEX events_item ON events(item_id) WHERE item_id IS NOT NULL;",
+            )
+            .unwrap();
+            for schema in [
+                SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+            ] {
+                tx.execute_batch(schema).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 7).unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path, opts()).unwrap();
+        let (version, indexes) = db
+            .read(|tx| {
+                let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                let indexes = tx
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events'",
+                    )?
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((version, indexes))
+            })
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(
+            indexes.iter().any(|i| i == "events_item_type"),
+            "{indexes:?}"
+        );
+        assert!(!indexes.iter().any(|i| i == "events_item"), "{indexes:?}");
     }
 
     /// `lastEnded` never goes back: a task that starts a new run under the same id keeps its

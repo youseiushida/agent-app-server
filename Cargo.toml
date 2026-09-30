@@ -100,3 +100,7 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 4
+# Function names and source lines go into the PDBs next to the executables
+# (`agent_app_server.pdb`, `agent_app_server_daemon.pdb`), not into the executables: installed
+# with them, they let a memory dump of a stuck daemon be read (docs/design.md §18.1).
+debug = "line-tables-only"

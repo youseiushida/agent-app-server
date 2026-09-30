@@ -465,6 +465,9 @@ running ──turn が completed で完了 かつ queue あり（一時停止で
 放っておくとディスクの使用量は増え続ける（blob、削除したスレッドとプロジェクトのデータ、delta 以外のイベント）。何をいつ消すかを次のように決めている。消す処理はすべて `policy.maintenance_interval` ごとのメンテナンス（`Engine::run_maintenance`。実装は `aas-core::retention`）で行い、1トランザクションあたり `policy.maintenance_batch_size` 件ずつ、短いトランザクションに分けて進める（エージェントのイベントの保存を長く待たせないため）。
 
 - **イベントログ**。消してよいかは、追記時に型付きの内容から作って列に保存したキー（`events.item_id`、`thread_id`、`snapshot_key`、`supersedable`。`aas_eventlog::event_keys`）だけで判断する。保存した JSON を検索して判断することはない。
+  - 消す行を探すクエリは、索引の範囲で候補を古い順に取り、1行ごとの条件（後のイベントや `item/completed` があるか）を索引の1回の引き当てで確かめる。1回のトランザクションの仕事は消す件数（`policy.maintenance_batch_size` 以下）に比例し、ログの大きさには比例しない。
+    - daemon は `ANALYZE` を実行しないので、SQLite は統計なしで計画を選ぶ。どのクエリがどの索引を使うかは、テストで固定している（`aas-eventlog` の `compaction_queries_use_their_indexes`。同梱の SQLite を上げて計画が変わればテストが落ちる）。delta の圧縮は、1回の仕事がそれまでに完了した Item の数に比例しないことも確かめている（`compacting_deltas_does_not_grow_with_the_log`。SQLite の仮想マシンの命令数で数えるので、機械の速さによらない）。
+    - 経緯: v7 までは Item の索引が `item_id` だけだった。プランナは「Item に `item/completed` があるか」を、delta 1行ごとにログのすべての `item/completed` を表から読んで確かめる計画を選んでいた。`events` の列は本文（`data`）の後にキーの列があるので、キーを表から読むと本文（大きなものは overflow ページ）まで読む。トークン単位の細かい delta（1 Item に数千〜1万件）が保持期間を過ぎると、最初のトランザクションが何時間も終わらず、その間 writer を持ち続けて、ほかの書き込みがすべて止まった（2026-09-30）。v8 で索引を `(item_id, type)`（`events_item_type`）にし、1回の delta の圧縮を「Item ごとにすべての delta」から「`maintenance_batch_size` 行まで」に変えた。
   - `item/completed` がある Item の `item/delta` で、`policy.delta_retention` より古いもの。
   - 同じ実体（スレッド、プロジェクト、ハーネス、Operation、Item、ターンの使用量、キュー、コマンド一覧、workspace の保留中の Interaction、バックグラウンドタスク）について、同じストリームの後のイベントが内容をすべて持っているイベントで、`policy.superseded_event_retention` より古いもの。例: 古い `thread/updated` / `thread/upserted`、`item/completed` より前の `item/updated`、`turn/completed` より前の `turn/usageUpdated`、`interaction/closed` より前の `interaction/pending`、同じタスクの後の `backgroundTask/updated` がある古いもの（どの状態も後の更新がタスク全体を持つ。タスクの最後の更新は残る）、同じタスクの後の `backgroundTask/updated` がある `backgroundTask/outputDelta`（後の更新がその時点までの出力を持つか、出力全体を持つ終わりか、出力なしで始まる新しい run）。
     - 終わりを表すイベント（`turn/completed`、`item/completed`、`thread/removed`、`interaction/closed`）と、後のイベントが繰り返さないもの（`turn/started`、`item/started`、`turn/diffUpdated`、thread ストリームの Interaction のイベント）は消さない。
@@ -501,7 +504,7 @@ running ──turn が completed で完了 かつ queue あり（一時停止で
 
 ### 主なテーブル
 - `aas-core`: `meta`（epoch など）、`devices`、`pairing_codes`、`projects`、`threads`（`pinned` を含む）、`turns`（`base_tree` / `end_tree` / `start_trigger` を含む）、`items`（`background_task_id` を含む）、`interactions`（`background_task_id` と、内部用の `anchor_turn_id` を含む）、`queued_inputs`、`background_tasks(id, thread_id, status, ambient, turn_id, started_at, ended_at, task)`（`task` はプロトコルの `BackgroundTask` の JSON。ほかの列は検索用）、`blobs`（`orphaned_at` を含む）、`blob_refs`、`cleanup_jobs`、`operations`（`progress` と、内部用の作業フォルダ `work_dir` を含む）、`idempotency(device_id, client_request_id, method, params_hash, response, created_at)`。v6 で `threads` に `modes`・`fast_mode_state`・`fork_at`・`native_rename_pending`、`turns` に `native_anchor`、`items` に `backgroundable`、`projects` に `harness_trust` が加わった。v7 で `turns` に `anchor_session`（印が前のネイティブセッションのものならその ID）と `delivered`（入力がエージェントに届いたか）が加わった。
-- スキーマは `PRAGMA user_version` で管理し、起動時に順に移行する（v1: 初版、v2: `threads.pinned`、`operations.progress` / `work_dir`、v3: 保持と削除のための `blobs.orphaned_at`・`blob_refs`・`cleanup_jobs`、イベントのキーの列。v3 への移行では、既存の Item とキューの入力から blob の参照を記録し、既存のイベントのキーを埋める。v4: `background_tasks`、`items.background_task_id`、`interactions.background_task_id` / `anchor_turn_id`、`turns.start_trigger`。既存の行はどれも値を持たない。v5: `background_last_ended`（スレッドのバックグラウンドの作業の最後の終わり。移行時に既存のタスクから埋める）。v6: ハーネスの拡張機能のための列（上）。既存の行はどれも値を持たない（モードは切、fork の位置なし、印なし）。v7: `turns.anchor_session` と `turns.delivered`。既存の印は今のセッションのもの。既存のターンは届いたものとし、エンジンが送らなかったターンにだけ付けるエラーの種類（`spawnFailed`、`resumeFailed`、`harnessUnavailable`、`forkOutdated`、送る前の中断の `interrupted`）で終わったターンだけを届いていないものにする。
+- スキーマは `PRAGMA user_version` で管理し、起動時に順に移行する（v1: 初版、v2: `threads.pinned`、`operations.progress` / `work_dir`、v3: 保持と削除のための `blobs.orphaned_at`・`blob_refs`・`cleanup_jobs`、イベントのキーの列。v3 への移行では、既存の Item とキューの入力から blob の参照を記録し、既存のイベントのキーを埋める。v4: `background_tasks`、`items.background_task_id`、`interactions.background_task_id` / `anchor_turn_id`、`turns.start_trigger`。既存の行はどれも値を持たない。v5: `background_last_ended`（スレッドのバックグラウンドの作業の最後の終わり。移行時に既存のタスクから埋める）。v6: ハーネスの拡張機能のための列（上）。既存の行はどれも値を持たない（モードは切、fork の位置なし、印なし）。v7: `turns.anchor_session` と `turns.delivered`。既存の印は今のセッションのもの。既存のターンは届いたものとし、エンジンが送らなかったターンにだけ付けるエラーの種類（`spawnFailed`、`resumeFailed`、`harnessUnavailable`、`forkOutdated`、送る前の中断の `interrupted`）で終わったターンだけを届いていないものにする。v8: イベントログの Item の索引を `events_item(item_id)` から `events_item_type(item_id, type)` に替える（6.1）。移行はログ全体を1回読んで索引を作るので、大きなログでは時間がかかる（490MB・イベント 114 万件の DB で、ディスクのキャッシュに載っていない状態から約 75 秒。ready の前に終わり、`policy.watchdog_ready_timeout` に収まる）。
   - `anchor_turn_id`: ターンに属さない Interaction（バックグラウンドタスクやスレッドに属するもの）を、求められたときに動いていたターン（なければその時点の最後のターン）と一緒に `thread/read` で返すための内部の列。
 - `aas-eventlog`: `streams(name, head)`、`events(stream, seq, ts, type, data, item_id, thread_id, snapshot_key, supersedable)`。
 - PID 台帳は SQLite ではなく supervisor の `children.json`（4.5）。
@@ -932,7 +935,7 @@ UI はこれを見て機能を出し分ける。例えば pi で承認ゲート�
 | `harness_probe_min_interval` | 10s | 0 | 使えないハーネスが必要な要求が probe し直す前に、この時間内に始まった probe があればその結果を使う（9.4）。outbox からまとめて再送された要求で CLI を何度も起動しない。`harness/refresh` はいつも probe する |
 | `harness_retry_initial_delay` | 30s | 1s | 使えないと分かったハーネスを自分で probe し直すまでの最初の待ち時間（9.4）。ログオン直後のネットワーク、初回起動の遅さ、あとからのログインなど、時間とともに解消する理由を拾う |
 | `harness_retry_max_delay` | 15min | 1s | 失敗が続くたびに倍にするその待ち時間の上限。使えないままのハーネス（未インストール、未ログイン）の費用は 15 分に1回の probe で、直ったハーネスは要求がなくても 15 分以内に見つかる。`harness_retry_initial_delay` 以上でなければ設定エラー |
-| `sqlite_busy_timeout` | 5s | 0 | SQLite のロックを待つ上限。書き込みは1本の接続に直列化しているので daemon 自身はほとんど待たない。バックアップやウイルス対策ソフト、`doctor` が一時的にファイルを掴んだ場合に備える |
+| `sqlite_busy_timeout` | 5s | 0 | SQLite のロックを待つ上限。書き込みは1本の接続に直列化しているので daemon 自身はほとんど待たない。バックアップやウイルス対策ソフト、`doctor` が一時的にファイルを掴んだ場合に備える。これより長く writer を持った書き込みのトランザクションは、その間ほかの書き込みを待たせたので、始めたコードの場所と時間を warn で記録する |
 | `sqlite_journal_size_limit` | 64MiB | 0 | チェックポイントのあとに WAL ファイルを縮める大きさ。大量の出力が続いたあとに大きな `-wal` ファイルが残り続けない |
 | `storage_retry_attempts` | 5 | 1 | 応答を待つクライアントのいない書き込み（エージェントのイベントなど）の試行回数（初回を含む）。一時的な失敗（ほかのプログラムのロック、ファイルを一時的に排他で開かれた）は数秒で解消する。それでも書けなければ、書けないまま出力を受け取り続けるより fail-stop する方が安全（6.2） |
 | `storage_retry_initial_backoff` | 200ms | 10ms | 2回目の試行までの待ち時間。以後は倍々にする |
@@ -951,7 +954,7 @@ UI はこれを見て機能を出し分ける。例えば pi で承認ゲート�
 | `snapshot_operation_limit` | 20 | 1 | `workspace/snapshot` に含める Operation の件数（新しい順）。初回の同期に必要な最近のものだけ |
 | `writer_flush_timeout` | 5s | 100ms | transport。閉じる接続がキューに残ったもの（`server/shuttingDown` と close フレームを含む）を送り切るまで待つ上限。遅い回線の生きているクライアントには届き、読まなくなった相手が接続の資源や daemon の停止を待たせ続けない |
 | `stream_batch_queue` | 4 | 1 | transport。接続ごとに溜める `stream/batch` の数。満杯なら購読タスクが待つので、遅いクライアントは自分の読み取り位置が遅れるだけ（ログがバッファ）。次のバッチをログから読む間もソケットを空けず、Interaction が待たされるのはたかだか4バッチ分 |
-| `liveness_deadline` | 5s | 100ms | transport。`/v1/liveness` のエンジンを通る往復（DB の読み取り）の期限。通常は数ミリ秒で、ウイルス対策のスキャンや WAL のチェックポイントで遅くなっても収まり、DB に届かなくなった daemon は 503 になる |
+| `liveness_deadline` | 5s | 100ms | transport。`/v1/liveness` のエンジンを通る往復（DB の読み取り）の期限で、書き込みのトランザクションが writer を持ち続けてよい長さの上限でもある。どちらも通常は数ミリ秒で、ウイルス対策のスキャンや WAL のチェックポイントで遅くなっても収まる。DB に届かなくなった daemon と、書き込みが進まなくなった daemon は 503 になる |
 | `transport_shutdown_timeout` | 10s | 100ms | transport。公開 listener を閉じるときに、処理中のもの（送信中の HTTP の応答（blob のダウンロードなど）と、`server/shuttingDown` と close フレームを送る WebSocket の接続）を待つ上限。過ぎたら残りを捨てて停止を進める。`writer_flush_timeout` の2倍で、生きている接続には送り切る時間があり、読まなくなった相手（アプリを凍結されたスマホ）が停止や fail-stop を止め続けない。`writer_flush_timeout` 以上でなければ設定エラー |
 | `admin_connect_timeout` | 5s | 100ms | daemon。CLI と watchdog が管理 listener につなぐ上限。同じ PC なので、つながるか拒否されるかはすぐ分かる。高負荷の PC だけを見込む |
 | `admin_request_timeout` | 30s | 100ms | daemon。管理 API の1回の要求（`pair`、`status`、`stop` など）の上限。どれも DB の読み書き1回で、ディスクが混んでいても収まり、応答しない daemon で CLI が止まり続けない。`harness refresh` は CLI の probe を待つので、次の値を使う |
@@ -1010,8 +1013,8 @@ UI はこれを見て機能を出し分ける。例えば pi で承認ゲート�
   - 起動時の後始末（4.5）: job の外で動くツリー（孫まで）を台帳に書いておくと、根と子孫だけが終了し、無関係のプロセスや PID が再利用されたプロセスは残ること。根がすでに消えている場合、その子は終了させないこと（`process_tree.rs`）。親子の判定の規則（作成時刻が親より古いものを除く）は `aas-supervisor` の単体テストで確かめる。
   - アダプタの起動の取り消し（4.3）: codex / claude / pi / acp の `start` と、codex / acp の一覧用の短命プロセスを途中で捨てると、`stop_grace` の間は残り、そのあと終了すること（`adapter_start_cancel.rs`）。
 - **強制停止**（4.3）: fake エージェントの `@hang <ms>`（中断にも入力の終わりにも反応しない）で、`interrupt_grace` と `stop_grace` のあとにツリーごと終了させられ、ターンが `interrupted`（`forced`）で終わり、次のターンが新しいプロセスで動き、プロセスが残らないことを確かめる（`aas-core` の `tests/engine.rs` と、実プロセスの `aas-testkit/tests/forced_stop.rs`）。
-- **保存の失敗**（6.2）: `#[cfg(test)]` のときだけある DB の書き込みの failpoint で、一時的な失敗では出力が失われないこと、失敗が続くと fail-stop し、実プロセスのエージェント（`cmd /c ping`）が supervisor の段階停止で残らず止まり、再起動で通常の復旧が行われることを確かめる（`aas-core::fail_stop_tests`）。
-- **保持と削除**（6.1）: 参照のない blob が猶予の後に消えて参照のあるものは残ること、プロジェクトの削除でスレッドのデータ・スナップショットの ref・worktree が消えること（未コミットの変更がある worktree では何も消さずに断ること）、圧縮したログを追いかけたクライアントが同じ状態になること、容量が OS に返ること、前回の実行が残したファイルが起動時に消えることを確かめる（`aas-core` の `tests/engine.rs`、`aas-eventlog` と `db` の単体テスト）。
+- **保存の失敗**（6.2）: `#[cfg(test)]` のときだけある DB の書き込みの failpoint で、一時的な失敗では出力が失われないこと、失敗が続くと fail-stop し、実プロセスのエージェント（`cmd /c ping`）が supervisor の段階停止で残らず止まり、再起動で通常の復旧が行われることを確かめる（`aas-core::fail_stop_tests`）。writer を持ったまま終わらない書き込みでエンジンが liveness を満たさなくなり、503 の理由がそのトランザクションを始めたコードを指し、終われば戻ることも同じ場所で確かめる。
+- **保持と削除**（6.1）: 参照のない blob が猶予の後に消えて参照のあるものは残ること、プロジェクトの削除でスレッドのデータ・スナップショットの ref・worktree が消えること（未コミットの変更がある worktree では何も消さずに断ること）、圧縮したログを追いかけたクライアントが同じ状態になること、容量が OS に返ること、前回の実行が残したファイルが起動時に消えることを確かめる（`aas-core` の `tests/engine.rs`、`aas-eventlog` と `db` の単体テスト）。圧縮のクエリが使う索引（計画）と、delta の圧縮の1回の仕事がログの大きさに比例しないこと、1回に消すのが上限の件数までであることは `aas-eventlog` の単体テストで確かめる（6.1）。
 - **ハーネスの回復**（9.4）: 使えるかを切り替えられるハーネス（fake を包んだもの）で、起動時に使えなかったハーネスが要求なしに再試行の予定で回復して `harness/updated` が出ること、要求が断る前に probe し直すこと（`harnessUnavailable` は保存されず、同じ `clientRequestId` の再送がログインの後に成功する）、最近の probe の再利用、遅い probe を `handshake_timeout` だけ待つこと、能力の分からないハーネスで `capabilityUnsupported` を返さないこと、`thread/update` の設定を使えるハーネスの一覧に対して要求が指定した値だけ検査すること（使えない間は受け付け、CLI の更新で一覧から消えたスレッドの値はほかの値の変更を妨げない。5.4）を確かめる（`aas-core` の `tests/harness_recovery.rs`）。予定の計算（倍々、上限、回復で元に戻る）と probe の共有は止めた時計で確かめる（`registry.rs` の単体テスト）。
 - **セッションの終了**（18.8）: 入力の終わりにも中断にも反応しないエージェントで、`shutdown_for_end_session` が `end_session_stop_grace` で戻り、記録できなかったターンが次の起動で `systemShutdown` になり、その記録が1回で消えることを確かめる（`aas-core` の `tests/end_session.rs`）。
 - **スレッドとネイティブセッション**（9.5）: 同じセッションを何度も並べるアダプタ（台本で動くハーネス）で、`native/list` が各セッションを1回だけ、最初の位置と最新の内容で返し、取り込み済みの印も付くこと、`resume` とアダプタが挙げたコマンドが `command/list` に出ないこと（アダプタの `commands` と、動いているセッションの `CommandsChanged` の両方）を確かめる（`aas-core` の `tests/actor.rs`）。手で打ったセッション切り替えのコマンド（名前と別名）がどの経路でも `sessionSwitchingCommand` で断られること、CLI が自分でセッションを替えたことが `thread/nativeSessionChanged` と notice で知らされることは `tests/harness_features.rs`。 Codex の rollout ごとの重複とページングは、観察した形から作った台本で確かめる（`crates/aas-adapter-codex/tests/replay.rs`）。
@@ -1113,6 +1116,9 @@ args = ["acp"]      # アダプタ自身の引数より前に置かれる
 - 2つの実行ファイルを同じフォルダに置く（`cargo build --release` で `target\release\` にできる）。
   - `agent-app-server.exe`（コンソール）: 管理 CLI と、daemon 本体（`run`）。
   - `agent-app-server-daemon.exe`（windows サブシステム）: watchdog。コンソールウィンドウを出さずに、隣の `agent-app-server.exe run --background` を子プロセスとして起動し、見張る。
+- **PDB も一緒に置く**。release のビルドは、関数名と行番号を実行ファイルではなく隣の PDB（`agent_app_server.pdb`、`agent_app_server_daemon.pdb`）に書く（`Cargo.toml` の `[profile.release] debug = "line-tables-only"`）。実行ファイルは PDB をファイル名だけで指す（ビルドしたパスを持たない）ので、デバッガは実行ファイルと同じフォルダで探す。PDB は同じビルドのものでないと使えないので、実行ファイルを置き換えるときは PDB も同じビルドのものに置き換え、前の版を残すときは PDB も一緒に残す。
+  - 書き込みが止まったときは、まず liveness の理由（`curl http://127.0.0.1:7879/v1/liveness`）と daemon のログを見る。writer を持っているトランザクションを始めたコードの場所と経過時間が出ている（18.2）。
+  - それでも分からないとき（応答しない、どこで止まっているか分からない）は、強制終了する前にメモリダンプを取る。追加のツールは要らない: タスクマネージャーの「詳細」で `agent-app-server.exe` を右クリックし、「メモリ ダンプ ファイルの作成」を選ぶ（`%LOCALAPPDATA%\Temp\agent-app-server.DMP` にできる）。あとで WinDbg で、ダンプと、同じビルドの実行ファイルと PDB を置いたフォルダを指定して開き、`~*k` ですべてのスレッドのスタックを見る。
 - サブコマンド（共通オプション `--config-dir`、`--data-dir`）:
   - `run [--background]`: daemon をこのコンソールで動かす（Ctrl+C / Ctrl+Break で停止）。`--background` は watchdog が使う: ログをファイルだけに書き、準備ができたら stdout に ready 行を出し、stdin の制御行を読む（18.2）。
   - `init`: 設定がなければ作り、場所と内容の要約を表示する。
@@ -1148,9 +1154,11 @@ args = ["acp"]      # アダプタ自身の引数より前に置かれる
 - **liveness（ハングの検出）**: daemon の終了だけでなく、生きていて応答しない daemon も直す。推測ではなく、heartbeat と同じく明示的な約束とポリシー値で行う。
   1. daemon（`run --background`）は、両方の listener で待ち受け、エンジンが起動（復旧を含む）したら、stdout に1行の ready 行を出す: `{"event":"ready","pid":…,"listen":"127.0.0.1:7878","adminListen":"127.0.0.1:7879"}`。
   2. `policy.watchdog_ready_timeout`（既定 2 分）以内に ready 行が来なければ、ハングとみなしてプロセスツリーごと止め、通常の待ち時間で再起動する。
-  3. ready のあと、watchdog は `policy.liveness_interval`（既定 30 秒）ごとに管理 listener の `GET /v1/liveness` を呼ぶ。daemon は、エンジンを通る往復（ランタイムがこの要求を処理し、エンジンの読み取り用接続で DB を読む）が `policy.liveness_deadline`（既定 5 秒）以内に終われば 200、そうでなければ 503 を返す。
+  3. ready のあと、watchdog は `policy.liveness_interval`（既定 30 秒）ごとに管理 listener の `GET /v1/liveness` を呼ぶ。daemon は次の両方を満たせば 200、そうでなければ理由を付けて 503 を返す（`Engine::check_liveness`）。
+     - 書き込みのトランザクションが `policy.liveness_deadline`（既定 5 秒）より長く writer を持っていない。書き込みは1本の接続に直列化しているので、writer を持ったまま終わらないトランザクションがあると、エージェントの出力、ターンの終わり、ペアリングなど、ほかの書き込みがすべて止まる（読み取りは WAL なので止まらない）。503 の理由には、そのトランザクションを始めたコードの場所（`crates\aas-core\src\retention.rs:97:13` など。`#[track_caller]` で記録する）と経過時間を入れ、daemon のログにも error で書く。
+     - エンジンを通る往復（ランタイムがこの要求を処理し、エンジンの読み取り用接続で DB を読む）が `policy.liveness_deadline` 以内に終わる。
   4. `policy.liveness_timeout`（既定 10 秒）以内に 200 が返らなければ失敗。`policy.liveness_failures`（既定 3）回続けて失敗したら、daemon のプロセスツリーを Job Object ごと止め（エージェントも入れ子の job ごと消える）、通常の待ち時間で再起動する。1回でも成功すれば失敗の数は 0 に戻る。
-  5. 停止の途中（drain を含む）も管理 listener は最後まで応答するので、止まりかけの daemon を liveness で止めることはない。
+  5. 停止の途中（drain を含む）も管理 listener は最後まで応答するので、止まりかけの daemon を liveness で止めることはない。ただし、writer を持ったまま終わらないトランザクションがある場合は、停止も終わらない（drain は実行中のターンの終わりを、停止はターンの終わりの記録を待つ）ので、停止の途中でも 503 を返し、watchdog がプロセスツリーを止めて再起動する。`stop` の要求は再起動で失われるので、もう一度 `stop` を送る。
 - **制御行**: watchdog は daemon の stdin を開いたままにし、1行の命令を書く。今は `end-session`（18.8）だけ。stdin が閉じても daemon は止まらない（制御行が来なくなるだけ）。
 - watchdog 自身の記録は `%LOCALAPPDATA%\agent-app-server\logs\watchdog.log`（起動、ready、liveness の失敗、終了理由、stderr の末尾）。
 - watchdog は起動時に `%LOCALAPPDATA%\agent-app-server\watchdog.lock` を OS のファイルロックで排他的にロックし、動いている間保持する。取れなければ（同じデータフォルダの watchdog がもう動いている）何もせずに終了コード 3 で終わる。2つ目の watchdog が台帳の掃除（4.5）で、動いている daemon とそのエージェントを止めてしまわないため。
@@ -1159,7 +1167,10 @@ args = ["acp"]      # アダプタ自身の引数より前に置かれる
 - `autostart install` が2つのタスクを XML 定義で登録し、ログオンのタスクをすぐに1回実行する。どちらも `agent-app-server-daemon.exe`（watchdog）を、`install` が使ったフォルダの `--config-dir` / `--data-dir` 付きで実行する（作業フォルダはデータフォルダ）。フォルダを引数で渡すので、ログオン時の環境変数に左右されない。
   - `agent-app-server`: ログオン時に起動する。明示的な起動（18.2 の記録を消す）。
   - `agent-app-server-keepalive`: 登録した時点から `policy.autostart_keepalive_interval`（既定 5 分）ごとに `--keepalive` を付けて起動する。意図した終了の記録があれば、ロックを取らずに daemon を起動せずに終わる（終了コード 0）。watchdog が動いていればロックが取れずにすぐ終わる（終了コード 3）。どちらでもなければ（watchdog 自身が落ちた）通常どおり動き出す。
-- 共通の登録内容: ログオン中のユーザーの権限（`InteractiveToken`、`LeastPrivilege`）、実行時間の制限なし、バッテリー駆動でも開始・継続する、多重起動しない（`IgnoreNew`）。
+- 共通の登録内容: ログオン中のユーザーの権限（`InteractiveToken`、`LeastPrivilege`）、実行時間の制限なし、バッテリー駆動でも開始・継続する、多重起動しない（`IgnoreNew`）、優先度 4（`autostart::TASK_PRIORITY`）。
+  - **優先度**: タスクの優先度は、起動したプログラムの CPU の優先度だけでなく、I/O とメモリの優先度も決める。子プロセスはこれを引き継ぐので、watchdog、daemon、すべてのエージェントが同じになる。タスクスケジューラの既定の 7 では、CPU は BelowNormal、I/O は Low、メモリの優先度は 2 になる。メモリが足りなくなるとまず daemon のページが追い出され、ディスクの I/O はほかのプログラムの後に回される。以前はこの 7 で登録していたため、ミリ秒で終わる DB の書き込みが writer を 5〜13 秒持ち続けた（2026-09-30、daemon の working set は 18MB まで削られていた）。4 は、利用者が起動したプログラムと同じ（Normal、I/O Normal、メモリの優先度 5）。
+    - 測った結果（2026-09-30、Windows 11 Pro 10.0.26200。優先度だけを変えたタスクで起動したプロセスの値を `GetProcessInformation(ProcessMemoryPriority)` と `NtQueryInformationProcess(ProcessIoPriority)` で読んだ）: 4 → Normal・メモリ 5・I/O 2（Normal）、5 → Normal・メモリ 4・I/O 2、6 → Normal・メモリ 3・I/O 2、7 → BelowNormal・メモリ 2・I/O 1（Low）。
+    - 以前の優先度で登録したままの場合は、`doctor` が WARN にするので `autostart install` をやり直す。登録し直しても、動いている watchdog の優先度は変わらない（次に起動したときから効く）。
 - **タスクスケジューラの「失敗時の再起動」は使わない**。実際に測った結果（`tests/autostart.rs`、18.3 末尾）、この設定はプログラムが 0 以外の終了コードで終わっても再起動しない（終了コードは `LastTaskResult` に記録されるだけ）。以前の登録内容（「失敗したら 1 分間隔で再起動、最大 999 回」）は、watchdog の失敗を何も直していなかった。代わりに:
   - daemon の失敗（クラッシュ、ハング、保存の失敗）は watchdog が再起動する（18.2）。
   - watchdog 自身の失敗（panic、クラッシュ、起動時のロックや supervisor の失敗（終了コード 1））は、keep-alive のタスクが `autostart_keepalive_interval` 以内に起動し直す。

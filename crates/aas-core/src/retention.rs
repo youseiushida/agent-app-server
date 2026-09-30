@@ -16,6 +16,7 @@
 //!   records and pairing codes expire as before.
 //! * The space is returned to the file system with `incremental_vacuum`.
 
+use std::panic::Location;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -58,8 +59,14 @@ fn cutoff(retention: std::time::Duration) -> aas_protocol::Millis {
 }
 
 /// Runs `step` with a limit of `batch` (one transaction each) until it reports that nothing
-/// more is left. `step` returns how many rows it deleted and whether there may be more.
-async fn in_batches<F>(sh: &Shared, batch: usize, step: F) -> CoreResult<usize>
+/// more is left. `step` returns how many rows it deleted and whether there may be more. The
+/// transactions are recorded as the caller's (`Db::write_in_progress`).
+#[track_caller]
+fn in_batches<F>(
+    sh: &Shared,
+    batch: usize,
+    step: F,
+) -> impl Future<Output = CoreResult<usize>> + Send + '_
 where
     F: Fn(&rusqlite::Transaction<'_>, usize) -> CoreResult<(usize, bool)>
         + Send
@@ -67,13 +74,20 @@ where
         + Clone
         + 'static,
 {
-    let mut total = 0;
-    loop {
-        let step = step.clone();
-        let (deleted, more) = sh.db.write(move |tx| step(tx, batch)).await?;
-        total += deleted;
-        if !more {
-            return Ok(total);
+    let caller = Location::caller();
+    async move {
+        let mut total = 0;
+        loop {
+            let step = step.clone();
+            let (deleted, more) = sh
+                .db
+                .clone()
+                .write_at(caller, move |tx| step(tx, batch))
+                .await?;
+            total += deleted;
+            if !more {
+                return Ok(total);
+            }
         }
     }
 }
@@ -95,10 +109,8 @@ pub(crate) async fn run(sh: &Arc<Shared>) -> CoreResult<MaintenanceReport> {
 
     let deltas_before = cutoff(policy.delta_retention);
     let r = in_batches(sh, batch, move |tx, limit| {
-        // `limit` items per transaction, with all of their old deltas.
-        let items = aas_eventlog::compactable_items(tx, deltas_before, limit)?;
-        let deleted = aas_eventlog::compact_deltas(tx, deltas_before, &items)?;
-        Ok((deleted, items.len() == limit))
+        let deleted = aas_eventlog::compact_deltas(tx, deltas_before, limit)?;
+        Ok((deleted, deleted == limit))
     })
     .await;
     note("deltas", r.map(|n| report.deltas = n));

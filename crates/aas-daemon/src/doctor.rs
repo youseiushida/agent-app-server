@@ -345,6 +345,17 @@ pub fn autostart_checks(
     let mut out = Vec::new();
     for (name, status) in tasks {
         match status {
+            Some(s) if s.enabled && s.priority != crate::autostart::TASK_PRIORITY => {
+                out.push(check(
+                    Status::Warn,
+                    "autostart",
+                    format!(
+                        "{} — registered with priority {}: the watchdog, the daemon and the agents run with lower CPU, I/O and memory priority than the programs you start; run `agent-app-server autostart install` again",
+                        s.describe(),
+                        s.priority
+                    ),
+                ))
+            }
             Some(s) if s.enabled => out.push(check(Status::Ok, "autostart", s.describe())),
             Some(s) => out.push(check(
                 Status::Warn,
@@ -470,6 +481,7 @@ mod tests {
         let task = |name: &str, enabled: bool| TaskStatus {
             name: name.into(),
             enabled,
+            priority: crate::autostart::TASK_PRIORITY,
             state: "ready",
             last_run: None,
             last_result: crate::autostart::SCHED_S_TASK_HAS_NOT_RUN,
@@ -491,6 +503,21 @@ mod tests {
         assert!(old.iter().all(|c| c.status == Status::Warn), "{old:#?}");
         assert!(old.iter().any(|c| c.detail.contains("disabled")));
         assert!(old.iter().any(|c| c.detail.contains(KEEPALIVE_TASK_NAME)));
+        // A registration from before the tasks ran at normal priority.
+        let low = |name: &str| TaskStatus {
+            priority: 7,
+            ..task(name, true)
+        };
+        let below_normal = autostart_checks(&[
+            (TASK_NAME, Some(low(TASK_NAME))),
+            (KEEPALIVE_TASK_NAME, Some(low(KEEPALIVE_TASK_NAME))),
+        ]);
+        assert!(
+            below_normal
+                .iter()
+                .all(|c| c.status == Status::Warn && c.detail.contains("priority 7")),
+            "{below_normal:#?}"
+        );
     }
 
     #[test]

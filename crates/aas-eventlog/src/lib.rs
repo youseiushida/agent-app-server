@@ -19,7 +19,6 @@
 
 use std::collections::HashMap;
 
-use aas_protocol::ItemId;
 use aas_protocol::events::{Event, EventEnvelope};
 use aas_protocol::types::Millis;
 use parking_lot::Mutex;
@@ -73,8 +72,14 @@ pub fn migrate(conn: &Connection) -> Result<(), LogError> {
         )?;
         backfill_keys(conn)?;
     }
+    // `events_item_type` answers "has this item completed?" with one lookup that reads no event
+    // body ([`compact_deltas`]). The earlier `events_item(item_id)` left the query planner, which
+    // has no statistics, to check the type of every event of the item (or of every
+    // `item/completed` event of the log) per delta, reading the rows' bodies: with token-sized
+    // deltas one compaction transaction ran for hours and held the database's writer.
     conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS events_item ON events(item_id) WHERE item_id IS NOT NULL;
+        "DROP INDEX IF EXISTS events_item;
+         CREATE INDEX IF NOT EXISTS events_item_type ON events(item_id, type) WHERE item_id IS NOT NULL;
          CREATE INDEX IF NOT EXISTS events_thread ON events(stream, thread_id) WHERE thread_id IS NOT NULL;
          CREATE INDEX IF NOT EXISTS events_snapshot ON events(stream, snapshot_key, seq) WHERE snapshot_key IS NOT NULL;
          CREATE INDEX IF NOT EXISTS events_supersedable ON events(ts) WHERE supersedable = 1;
@@ -393,38 +398,31 @@ fn decode(stream: &str, seq: u64, type_name: &str, data: &str) -> Result<Event, 
     })
 }
 
-/// Deletes `item/delta` events of the given completed items that are older than `before`.
-/// Returns the number of deleted rows.
+/// `item/delta` events older than `?1` whose item has an `item/completed` event, oldest first
+/// (at most `?2`). The deltas come from `events_type_ts` in time order and each one's
+/// completion is one covering lookup in `events_item_type`, so the work is proportional to the
+/// rows returned, not to the size of the log (`compaction_queries_use_their_indexes`,
+/// `compacting_deltas_does_not_grow_with_the_log`).
+const COMPACTABLE_DELTAS: &str = "SELECT d.stream, d.seq FROM events d
+     WHERE d.type = 'item/delta' AND d.ts < ?1
+       AND EXISTS (SELECT 1 FROM events c WHERE c.item_id = d.item_id AND c.type = 'item/completed')
+     LIMIT ?2";
+
+/// Deletes up to `limit` `item/delta` events older than `before` whose item has an
+/// `item/completed` event (which carries the item's final content). Returns the number
+/// deleted; the caller repeats while it equals `limit`.
 pub fn compact_deltas(
     tx: &Transaction<'_>,
     before: Millis,
-    completed_items: &[ItemId],
-) -> rusqlite::Result<usize> {
-    let mut stmt = tx.prepare_cached(
-        "DELETE FROM events WHERE item_id = ?1 AND type = 'item/delta' AND ts < ?2",
-    )?;
-    let mut total = 0;
-    for item in completed_items {
-        total += stmt.execute(params![item.as_str(), before])?;
-    }
-    Ok(total)
-}
-
-/// Delta events that are eligible for compaction: deltas older than `before` whose item has
-/// a later `item/completed` event. Returned as item ids (at most `limit`).
-pub fn compactable_items(
-    conn: &Connection,
-    before: Millis,
     limit: usize,
-) -> rusqlite::Result<Vec<ItemId>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT DISTINCT d.item_id FROM events d
-         WHERE d.type = 'item/delta' AND d.ts < ?1 AND d.item_id IS NOT NULL
-           AND EXISTS (SELECT 1 FROM events c WHERE c.item_id = d.item_id AND c.type = 'item/completed')
-         LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![before, limit as i64], |r| r.get::<_, String>(0))?;
-    rows.map(|r| r.map(ItemId::from)).collect()
+) -> rusqlite::Result<usize> {
+    let rows: Vec<(String, i64)> = tx
+        .prepare_cached(COMPACTABLE_DELTAS)?
+        .query_map(params![before, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    delete_rows(tx, &rows)
 }
 
 fn delete_rows(tx: &Transaction<'_>, rows: &[(String, i64)]) -> rusqlite::Result<usize> {
@@ -436,6 +434,15 @@ fn delete_rows(tx: &Transaction<'_>, rows: &[(String, i64)]) -> rusqlite::Result
     Ok(total)
 }
 
+/// Supersedable events older than `?1` with a later event of the same entity in the same
+/// stream (at most `?2`): `events_supersedable` in time order, and the later event is one
+/// covering lookup in `events_snapshot`.
+const SUPERSEDED_EVENTS: &str = "SELECT e.stream, e.seq FROM events e
+     WHERE e.supersedable = 1 AND e.ts < ?1
+       AND EXISTS (SELECT 1 FROM events l
+                   WHERE l.stream = e.stream AND l.snapshot_key = e.snapshot_key AND l.seq > e.seq)
+     LIMIT ?2";
+
 /// Deletes up to `limit` events older than `before` whose content a later event of the same
 /// entity in the same stream carries in full ([`EventKeys::supersedable`]). Returns the
 /// number deleted; the caller repeats while it equals `limit`.
@@ -445,17 +452,25 @@ pub fn compact_superseded(
     limit: usize,
 ) -> rusqlite::Result<usize> {
     let rows: Vec<(String, i64)> = tx
-        .prepare_cached(
-            "SELECT e.stream, e.seq FROM events e
-             WHERE e.supersedable = 1 AND e.ts < ?1
-               AND EXISTS (SELECT 1 FROM events l
-                           WHERE l.stream = e.stream AND l.snapshot_key = e.snapshot_key AND l.seq > e.seq)
-             LIMIT ?2",
-        )?
-        .query_map(params![before, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .prepare_cached(SUPERSEDED_EVENTS)?
+        .query_map(params![before, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     delete_rows(tx, &rows)
 }
+
+/// `backgroundTask/outputDelta` events older than `?1` with a later `backgroundTask/updated` of
+/// their task in the same stream (at most `?3`; `?2` is where the task id starts in the delta's
+/// snapshot key): `events_type_ts` in time order, and the later update is one covering lookup
+/// in `events_snapshot`.
+const SUPERSEDED_OUTPUT_DELTAS: &str = "SELECT e.stream, e.seq FROM events e
+     WHERE e.type = 'backgroundTask/outputDelta' AND e.ts < ?1
+       AND EXISTS (SELECT 1 FROM events l
+                   WHERE l.stream = e.stream
+                     AND l.snapshot_key = 'background:' || substr(e.snapshot_key, ?2)
+                     AND l.seq > e.seq)
+     LIMIT ?3";
 
 /// Deletes up to `limit` `backgroundTask/outputDelta` events older than `before` whose task
 /// has a later `backgroundTask/updated` in the same stream: every update carries the task's
@@ -467,15 +482,7 @@ pub fn compact_background_output(
     limit: usize,
 ) -> rusqlite::Result<usize> {
     let rows: Vec<(String, i64)> = tx
-        .prepare_cached(
-            "SELECT e.stream, e.seq FROM events e
-             WHERE e.type = 'backgroundTask/outputDelta' AND e.ts < ?1
-               AND EXISTS (SELECT 1 FROM events l
-                           WHERE l.stream = e.stream
-                             AND l.snapshot_key = 'background:' || substr(e.snapshot_key, ?2)
-                             AND l.seq > e.seq)
-             LIMIT ?3",
-        )?
+        .prepare_cached(SUPERSEDED_OUTPUT_DELTAS)?
         .query_map(
             params![before, BACKGROUND_OUTPUT_KEY.len() as i64 + 1, limit as i64],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -489,6 +496,9 @@ pub fn compact_background_output(
 /// deleted once they are older than `policy.native_event_retention` ([`compact_type`]).
 pub const TRANSIENT_EVENT_TYPES: &[&str] = &["native", "composer/insert"];
 
+/// Events of type `?1` older than `?2` (at most `?3`), from the covering `events_type_ts`.
+const EXPIRED_OF_TYPE: &str = "SELECT stream, seq FROM events WHERE type = ?1 AND ts < ?2 LIMIT ?3";
+
 /// Deletes up to `limit` events of type `type_name` older than `before` (used for the
 /// [`TRANSIENT_EVENT_TYPES`], which no state is built from). Returns the number deleted.
 pub fn compact_type(
@@ -498,7 +508,7 @@ pub fn compact_type(
     limit: usize,
 ) -> rusqlite::Result<usize> {
     let rows: Vec<(String, i64)> = tx
-        .prepare_cached("SELECT stream, seq FROM events WHERE type = ?1 AND ts < ?2 LIMIT ?3")?
+        .prepare_cached(EXPIRED_OF_TYPE)?
         .query_map(params![type_name, before, limit as i64], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?
@@ -584,6 +594,7 @@ impl HeadHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aas_protocol::ItemId;
     use aas_protocol::examples;
     use aas_protocol::types::DeltaField;
     use pretty_assertions::assert_eq;
@@ -760,10 +771,13 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
-        let items = compactable_items(&conn, 200, 100).unwrap();
-        assert_eq!(items, vec![done_id.clone()]);
         let tx = conn.transaction().unwrap();
-        assert_eq!(compact_deltas(&tx, 200, &items).unwrap(), 1);
+        assert_eq!(
+            compact_deltas(&tx, 100, 100).unwrap(),
+            0,
+            "not older than the cutoff"
+        );
+        assert_eq!(compact_deltas(&tx, 200, 100).unwrap(), 1);
         tx.commit().unwrap();
         let batch = read_batch(
             &conn,
@@ -777,6 +791,128 @@ mod tests {
         .unwrap();
         let seqs: Vec<u64> = batch.events.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![2, 3], "cursor semantics survive gaps");
+    }
+
+    fn completed(id: &str) -> Event {
+        let mut item = examples::items()[6].clone();
+        item.id = ItemId::from(id);
+        item.status = aas_protocol::ItemStatus::Completed;
+        Event::ItemCompleted { item }
+    }
+
+    #[test]
+    fn delta_compaction_deletes_at_most_its_limit_oldest_first() {
+        let mut conn = db();
+        let tx = conn.transaction().unwrap();
+        for (ts, item) in [(10, "itm_a"), (20, "itm_b")] {
+            let mut events: Vec<Event> =
+                (0..4).map(|_| delta(item, DeltaField::Text, "x")).collect();
+            events.push(completed(item));
+            append(&tx, "s", ts, events).unwrap();
+        }
+        tx.commit().unwrap();
+        // Counted in the table: reading merges consecutive deltas.
+        let deltas_of = |conn: &Connection, item: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM events WHERE item_id = ?1 AND type = 'item/delta'",
+                [item],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let tx = conn.transaction().unwrap();
+        assert_eq!(compact_deltas(&tx, 100, 3).unwrap(), 3, "one batch");
+        tx.commit().unwrap();
+        assert_eq!(
+            (deltas_of(&conn, "itm_a"), deltas_of(&conn, "itm_b")),
+            (1, 4)
+        );
+        let tx = conn.transaction().unwrap();
+        assert_eq!(compact_deltas(&tx, 100, 3).unwrap(), 3);
+        assert_eq!(
+            compact_deltas(&tx, 100, 3).unwrap(),
+            2,
+            "the last, short batch"
+        );
+        assert_eq!(compact_deltas(&tx, 100, 3).unwrap(), 0);
+        tx.commit().unwrap();
+        assert_eq!(all(&conn, "s").len(), 2, "both completions stay");
+    }
+
+    /// Query plan of `sql` as SQLite reports it (one line per step).
+    fn plan(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let nulls = vec![rusqlite::types::Null; stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The daemon never runs `ANALYZE`, so the planner chooses without statistics, as here. Each
+    /// compaction query must find its rows through an index range and check each row with an
+    /// index lookup: a plan that scans (or checks every `item/completed` event per delta) makes
+    /// one maintenance transaction as long as the log is large, and it holds the writer.
+    #[test]
+    fn compaction_queries_use_their_indexes() {
+        let conn = db();
+        assert_eq!(
+            plan(&conn, COMPACTABLE_DELTAS),
+            vec![
+                "SEARCH d USING INDEX events_type_ts (type=? AND ts<?)",
+                "SEARCH c EXISTS USING COVERING INDEX events_item_type (item_id=? AND type=?)",
+            ]
+        );
+        assert_eq!(
+            plan(&conn, SUPERSEDED_EVENTS),
+            vec![
+                "SEARCH e USING INDEX events_supersedable (ts<?)",
+                "SEARCH l EXISTS USING COVERING INDEX events_snapshot (stream=? AND snapshot_key=? AND seq>?)",
+            ]
+        );
+        assert_eq!(
+            plan(&conn, SUPERSEDED_OUTPUT_DELTAS),
+            vec![
+                "SEARCH e USING INDEX events_type_ts (type=? AND ts<?)",
+                "SEARCH l EXISTS USING COVERING INDEX events_snapshot (stream=? AND snapshot_key=? AND seq>?)",
+            ]
+        );
+        assert_eq!(
+            plan(&conn, EXPIRED_OF_TYPE),
+            vec!["SEARCH events USING COVERING INDEX events_type_ts (type=? AND ts<?)"]
+        );
+    }
+
+    /// One batch of delta compaction does the same work however many items completed before
+    /// (measured in SQLite's virtual machine steps, which do not depend on the machine).
+    #[test]
+    fn compacting_deltas_does_not_grow_with_the_log() {
+        let steps = |completed_before: usize| -> i32 {
+            let mut conn = db();
+            let tx = conn.transaction().unwrap();
+            let earlier: Vec<Event> = (0..completed_before)
+                .map(|n| completed(&format!("itm_old{n}")))
+                .collect();
+            append(&tx, "s", 1, earlier).unwrap();
+            let mut now: Vec<Event> = (0..50)
+                .map(|_| delta("itm_now", DeltaField::Text, "x"))
+                .collect();
+            now.push(completed("itm_now"));
+            append(&tx, "s", 2, now).unwrap();
+            tx.commit().unwrap();
+            let mut stmt = conn.prepare(COMPACTABLE_DELTAS).unwrap();
+            let found = stmt
+                .query_map(params![10, 20], |r| r.get::<_, i64>(1))
+                .unwrap()
+                .count();
+            assert_eq!(found, 20);
+            stmt.get_status(rusqlite::StatementStatus::VmStep)
+        };
+        let (few, many) = (steps(10), steps(2_000));
+        assert!(
+            many <= few + few / 10,
+            "a batch took {few} steps after 10 completed items but {many} after 2000"
+        );
     }
 
     fn all(conn: &Connection, stream: &str) -> Vec<(u64, Event)> {

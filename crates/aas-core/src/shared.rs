@@ -1,5 +1,6 @@
 //! State shared by the engine and all thread actors.
 
+use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -122,14 +123,25 @@ pub enum Publish {
 impl Shared {
     /// Runs `f` in a write transaction, appends the events it emitted and publishes the new
     /// heads after commit.
-    pub async fn tx<T, F>(&self, f: F) -> CoreResult<T>
+    #[track_caller]
+    pub fn tx<T, F>(&self, f: F) -> impl Future<Output = CoreResult<T>> + Send + '_
+    where
+        T: Send + 'static,
+        F: FnOnce(&Transaction<'_>, &mut Emitter) -> CoreResult<T> + Send + 'static,
+    {
+        self.tx_at(Location::caller(), f)
+    }
+
+    /// [`tx`](Self::tx) on behalf of `caller` (see [`Db::write_at`]).
+    async fn tx_at<T, F>(&self, caller: &'static Location<'static>, f: F) -> CoreResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&Transaction<'_>, &mut Emitter) -> CoreResult<T> + Send + 'static,
     {
         let (value, heads) = self
             .db
-            .write(move |tx| {
+            .clone()
+            .write_at(caller, move |tx| {
                 let mut em = Emitter::new(store::now_ms());
                 let value = f(tx, &mut em)?;
                 em.flush(tx)?;
@@ -148,7 +160,25 @@ impl Shared {
     /// attempt fails the daemon fail-stops ([`fail_stop`](Self::fail_stop)) and the error is
     /// returned. Once the fail-stop has begun, writes are tried once (the daemon is only
     /// winding down; the restart reconciles the state).
-    pub async fn tx_durable<T, F>(&self, what: &'static str, f: F) -> CoreResult<T>
+    #[track_caller]
+    pub fn tx_durable<T, F>(
+        &self,
+        what: &'static str,
+        f: F,
+    ) -> impl Future<Output = CoreResult<T>> + Send + '_
+    where
+        T: Send + 'static,
+        F: Fn(&Transaction<'_>, &mut Emitter) -> CoreResult<T> + Send + Sync + 'static,
+    {
+        self.tx_durable_at(Location::caller(), what, f)
+    }
+
+    async fn tx_durable_at<T, F>(
+        &self,
+        caller: &'static Location<'static>,
+        what: &'static str,
+        f: F,
+    ) -> CoreResult<T>
     where
         T: Send + 'static,
         F: Fn(&Transaction<'_>, &mut Emitter) -> CoreResult<T> + Send + Sync + 'static,
@@ -158,7 +188,7 @@ impl Shared {
         let mut attempt = 1u32;
         loop {
             let g = f.clone();
-            let error = match self.tx(move |tx, em| g(tx, em)).await {
+            let error = match self.tx_at(caller, move |tx, em| g(tx, em)).await {
                 Ok(value) => {
                     if attempt > 1 {
                         tracing::info!(what, attempt, "persisting succeeded after a retry");
@@ -214,19 +244,23 @@ impl Shared {
     }
 
     /// Like [`tx`](Self::tx), also storing the value as the idempotent result of `idem`.
-    pub async fn tx_idem<T, F>(&self, idem: Option<Idem>, f: F) -> CoreResult<T>
+    #[track_caller]
+    pub fn tx_idem<T, F>(
+        &self,
+        idem: Option<Idem>,
+        f: F,
+    ) -> impl Future<Output = CoreResult<T>> + Send + '_
     where
         T: Serialize + Send + 'static,
         F: FnOnce(&Transaction<'_>, &mut Emitter) -> CoreResult<T> + Send + 'static,
     {
-        self.tx(move |tx, em| {
+        self.tx_at(Location::caller(), move |tx, em| {
             let value = f(tx, em)?;
             if let Some(idem) = &idem {
                 idem.store_result(tx, &value)?;
             }
             Ok(value)
         })
-        .await
     }
 
     pub fn turn_started(&self) {

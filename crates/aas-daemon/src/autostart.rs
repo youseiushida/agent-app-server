@@ -67,11 +67,22 @@ pub struct TaskDefinition {
     pub restart_on_failure: Option<(Duration, u32)>,
 }
 
+/// Task Scheduler priority of both tasks: what the watchdog runs with, and through it the
+/// daemon and every agent (child processes inherit it). 4 is what a program the user starts
+/// gets: normal CPU priority, I/O priority normal and memory priority 5 (measured, design.md
+/// §18.3; 5 and 6 lower the memory priority to 4 and 3). Task Scheduler's default, 7, runs them
+/// below normal with low I/O priority and memory priority 2: the memory manager takes the
+/// daemon's pages first and its disk I/O waits behind every other program, so database writes
+/// that take milliseconds held the writer for 5 to 13 seconds.
+pub const TASK_PRIORITY: i32 = 4;
+
 /// State of a registered task (`IRegisteredTask`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskStatus {
     pub name: String,
     pub enabled: bool,
+    /// The priority it runs its program with (see [`TASK_PRIORITY`]).
+    pub priority: i32,
     /// `TASK_STATE`: unknown, disabled, queued, ready or running.
     pub state: &'static str,
     /// Last start (an OLE automation date in local time; `None` when it never ran).
@@ -261,7 +272,7 @@ pub fn task_xml(def: &TaskDefinition) -> String {
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
+    <Priority>{priority}</Priority>
 {restart}  </Settings>
   <Actions Context="Author">
     <Exec>
@@ -278,6 +289,7 @@ pub fn task_xml(def: &TaskDefinition) -> String {
                 xs_duration(interval)
             ))
             .unwrap_or_default(),
+        priority = TASK_PRIORITY,
         description = xml_escape(&def.description),
         name = xml_escape(&def.name),
         exe = xml_escape(&def.action.program.display().to_string()),
@@ -531,9 +543,12 @@ mod scheduler {
                 let last_run =
                     (last_result != super::SCHED_S_TASK_HAS_NOT_RUN).then_some(task.LastRunTime()?);
                 let next_run = Some(task.NextRunTime()?).filter(|d| *d > 0.0);
+                let mut priority = 0;
+                task.Definition()?.Settings()?.Priority(&mut priority)?;
                 Ok(Some(TaskStatus {
                     name: name.to_owned(),
                     enabled: task.Enabled()? != VARIANT_BOOL(0),
+                    priority,
                     state,
                     last_run,
                     last_result,
@@ -614,6 +629,7 @@ mod tests {
         ));
         assert!(xml.contains("<LogonTrigger>") && !xml.contains("<TimeTrigger>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<Priority>4</Priority>"));
         assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
         assert!(xml.contains(r"<UserId>PC\me</UserId>"));
         assert!(xml.contains(r"<URI>\agent-app-server</URI>"));
@@ -622,6 +638,7 @@ mod tests {
         assert!(xml.contains("<Arguments>--keepalive --config-dir"));
         assert!(xml.contains("<Interval>PT5M</Interval>") && !xml.contains("<LogonTrigger>"));
         assert!(xml.contains(r"<URI>\agent-app-server-keepalive</URI>"));
+        assert!(xml.contains("<Priority>4</Priority>"));
     }
 
     /// Read-only against the real Task Scheduler: "does not exist" is an answer, not an error.
