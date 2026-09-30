@@ -52,8 +52,17 @@ pub struct Policy {
     pub delta_retention: Duration,
     pub max_batch_events: usize,
     pub max_batch_bytes: usize,
-    /// Command / tool output beyond this many bytes goes to a blob instead of deltas.
+    /// Command / tool output beyond this many bytes goes to a blob instead of deltas. The same
+    /// bound holds for what a running background task streams (`BackgroundTask.output`): its
+    /// whole output comes with its end.
     pub max_inline_output_bytes: usize,
+    /// Upper bound of what an adapter reads of a file in which the harness kept a background
+    /// task's output (Claude Code's `task_notification.output_file`). A longer file is read from
+    /// its end (the latest output, with the exit line the CLI appends) and the task's result
+    /// says how much was left out (`outputOmittedBytes`). 8 MiB holds the whole output of
+    /// builds and test runs and hours of a development server's log, while a file that grew
+    /// without bound is neither held in memory whole nor stored as a blob a phone downloads.
+    pub max_output_file_bytes: u64,
     /// Diffs larger than this are returned as a blob.
     pub max_inline_patch_bytes: usize,
     pub max_blob_bytes: u64,
@@ -192,7 +201,8 @@ pub struct Policy {
     #[serde(with = "humantime_serde")]
     pub unreferenced_blob_grace: Duration,
     /// Events whose whole content is carried by a later event of the same entity (for
-    /// example an older `thread/updated`) are deleted once they are this old.
+    /// example an older `thread/updated`, or a background task's output deltas that a later
+    /// update of the task carries) are deleted once they are this old.
     #[serde(with = "humantime_serde")]
     pub superseded_event_retention: Duration,
     /// `native` events (raw harness output that no state is built from) are deleted once
@@ -242,6 +252,7 @@ impl Default for Policy {
             max_batch_events: 512,
             max_batch_bytes: 256 * 1024,
             max_inline_output_bytes: 64 * 1024,
+            max_output_file_bytes: 8 * 1024 * 1024,
             max_inline_patch_bytes: 64 * 1024,
             max_blob_bytes: 25 * 1024 * 1024,
             max_client_frame_bytes: 1024 * 1024,
@@ -474,6 +485,10 @@ impl Policy {
             (
                 "max_inline_output_bytes",
                 F::count(self.max_inline_output_bytes, 1),
+            ),
+            (
+                "max_output_file_bytes",
+                F::count(self.max_output_file_bytes, 1),
             ),
             (
                 "max_inline_patch_bytes",
@@ -723,6 +738,7 @@ impl Policy {
             first_message_title_chars: self.first_message_title_chars,
             harness_title_chars: self.harness_title_chars,
             stderr_excerpt_lines: self.exit_message_stderr_lines,
+            max_output_file_bytes: self.max_output_file_bytes,
         }
     }
 

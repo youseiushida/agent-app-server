@@ -220,6 +220,7 @@ private fun sendHint(send: SendState): String? = when {
     send.blocked == SendBlock.UploadFailed -> stringResource(R.string.composer_blocked_upload_failed)
     send.blocked == SendBlock.ImagesUnsupported -> stringResource(R.string.composer_blocked_images_unsupported)
     send.blocked == SendBlock.Archived -> stringResource(R.string.composer_blocked_archived)
+    send.blocked == SendBlock.PermissionUnavailable -> stringResource(R.string.composer_blocked_permission_unavailable)
     send.blocked == SendBlock.Interrupting -> stringResource(R.string.composer_interrupting)
     send.primary == SendAction.Queue && send.alternate == SendAction.Steer -> stringResource(R.string.composer_hint_queue_or_steer)
     send.primary == SendAction.Steer && send.alternate == SendAction.Queue -> stringResource(R.string.composer_hint_steer_or_queue)

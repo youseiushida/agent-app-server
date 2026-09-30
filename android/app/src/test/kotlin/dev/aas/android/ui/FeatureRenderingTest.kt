@@ -42,6 +42,7 @@ import dev.aas.android.testing.Fixtures
 import dev.aas.android.testing.TestEngine
 import dev.aas.android.testing.item
 import dev.aas.android.ui.common.LocalAppContainer
+import dev.aas.android.ui.composer.ModelChoice
 import dev.aas.android.ui.composer.ModelSheet
 import dev.aas.android.ui.theme.AasTheme
 import dev.aas.android.ui.thread.ComposerInsertOffer
@@ -232,7 +233,7 @@ class FeatureRenderingTest {
                 TestEngine.fakeHarness(),
                 ThreadSettings(model = "large", effort = "high"),
                 allowDefaultEffort = false,
-                onApply = { model, effort, _ -> applied += model to effort },
+                onApply = { choice -> applied += choice.model to choice.effort },
                 onDismiss = {},
                 initialModel = "small",
             )
@@ -243,6 +244,46 @@ class FeatureRenderingTest {
         compose.onNodeWithText("Low").performClick()
         compose.onNodeWithText("適用").assertIsEnabled().performClick()
         assertEquals(listOf<Pair<String?, String?>>("small" to "low"), applied)
+    }
+
+    /**
+     * A model that does not run in the thread's permission mode (`Model.permissionModes`, like
+     * Claude Code's Haiku without auto mode): the model sheet asks for one of its modes (a mode
+     * other than the default is confirmed first) and applies both together; the permission sheet
+     * offers only the model's modes and names the others.
+     */
+    @Test
+    fun aModelThatDoesNotRunInTheThreadsModeAsksForOneOfItsModes() {
+        val harness = TestEngine.fakeHarness().copy(
+            models = TestEngine.fakeHarness().models + dev.aas.android.protocol.Model("lite", "Lite", permissionModes = listOf("ask", "plan")),
+            permissionModes = TestEngine.fakeHarness().permissionModes + dev.aas.android.protocol.PermissionMode("plan", "Plan only", description = "Reads, never writes"),
+        )
+        val applied = mutableListOf<ModelChoice>()
+        var sheet by androidx.compose.runtime.mutableStateOf("model")
+        content(scroll = false) {
+            when (sheet) {
+                "model" -> ModelSheet(harness, ThreadSettings(model = "large", permissionMode = "full"), allowDefaultEffort = true, onApply = { applied += it }, onDismiss = {})
+                else -> dev.aas.android.ui.composer.PermissionSheet(harness, ThreadSettings(model = "lite", permissionMode = "ask"), onApply = {}, onDismiss = {})
+            }
+        }
+        compose.onNodeWithText("Lite").performClick()
+        compose.onNodeWithText("Lite は権限「Full access」で動けません。このモデルで使える権限を選んでください").assertIsDisplayed()
+        compose.onNodeWithText("このモデルで使える権限を選んでください").assertIsDisplayed()
+        compose.onNodeWithText("適用").assertIsNotEnabled()
+        compose.onNodeWithText("Full access").assertDoesNotExist()
+        // A mode other than the default asks first.
+        compose.onNodeWithText("Plan only").performClick()
+        compose.onNodeWithText("権限を「Plan only」にしますか？").assertIsDisplayed()
+        compose.onNodeWithText("変更する").performClick()
+        compose.onNodeWithText("適用").assertIsEnabled().performClick()
+        assertEquals(listOf(ModelChoice("lite", null, null, "plan")), applied)
+
+        // The permission sheet of a thread on that model: its modes only, the others named.
+        sheet = "permission"
+        compose.waitForIdle()
+        compose.onNodeWithText("Lite では「Full access」は使えません").assertIsDisplayed()
+        compose.onNodeWithText("Plan only").assertIsDisplayed()
+        compose.onNodeWithText("Full access").assertDoesNotExist()
     }
 
     @Test

@@ -156,6 +156,10 @@
     <string name="picker_permission_confirm_title">権限を「%1$s」にしますか？</string>
     <string name="picker_permission_confirm_body">既定ではない権限モードです。エージェントが確認なしで行える操作が変わります。</string>
     <string name="picker_permission_confirm">変更する</string>
+    <string name="picker_permission">権限</string>
+    <string name="picker_permission_unavailable_for_model">%1$s は権限「%2$s」で動けません。このモデルで使える権限を選んでください</string>
+    <string name="picker_permission_required">このモデルで使える権限を選んでください</string>
+    <string name="picker_permission_model_limits">%1$s では「%2$s」は使えません</string>
     <string name="settings_applied">設定を変更しました</string>
     <string name="settings_applied_live">設定を反映しました</string>
     <string name="settings_applies_next_turn">設定は次のターンから反映されます</string>
@@ -179,6 +183,7 @@
     <string name="composer_blocked_upload_failed">アップロードできなかった画像があります。再試行するか外してください</string>
     <string name="composer_blocked_images_unsupported">このハーネスは画像を受け付けません。画像を外してください</string>
     <string name="composer_blocked_archived">アーカイブを解除すると送信できます</string>
+    <string name="composer_blocked_permission_unavailable">選んだモデルはこの権限で動けません。権限を選び直してください</string>
     <string name="composer_attach_image">画像を添付</string>
     <string name="composer_pick_photos">写真を選ぶ</string>
     <string name="composer_take_photo">カメラで撮る</string>

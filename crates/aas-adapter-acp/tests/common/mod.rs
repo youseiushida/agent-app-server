@@ -262,6 +262,9 @@ pub struct Folded {
     pub task_events: Vec<BackgroundTaskInfo>,
     /// The latest report of each background task, by key.
     pub tasks: HashMap<String, BackgroundTaskInfo>,
+    /// What each background task streamed as its output (appends applied, replacements
+    /// taking over), by key.
+    pub outputs: HashMap<String, String>,
     pub notices: Vec<(NoticeLevel, String, Option<String>)>,
     pub natives: Vec<Value>,
     pub infos: Vec<(Option<String>, Option<String>, Option<String>)>,
@@ -360,6 +363,19 @@ impl Folded {
                 }
                 self.task_events.push((**task).clone());
                 self.tasks.insert(task.key.clone(), (**task).clone());
+            }
+            AdapterEvent::BackgroundOutput { key, output } => {
+                // The port's contract: output of a task that was reported and still runs.
+                let task = self.tasks.get(key);
+                assert!(
+                    task.is_some_and(|t| !t.state.is_ended()),
+                    "output of a task that does not run: {key} {task:?}"
+                );
+                let text = self.outputs.entry(key.clone()).or_default();
+                match output {
+                    aas_harness::OutputUpdate::Append(t) => text.push_str(t),
+                    aas_harness::OutputUpdate::Replace(t) => *text = t.clone(),
+                }
             }
             AdapterEvent::InteractionWithdrawn { request_id } => {
                 self.withdrawn.push(request_id.clone())

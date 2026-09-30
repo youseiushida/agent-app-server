@@ -370,6 +370,29 @@ class HarnessSettingsTest {
         assertNull(HarnessSettings.effort(claude, ThreadSettings()))
     }
 
+    /**
+     * A model that lists the permission modes it runs in (`Model.permissionModes`: Claude Code's
+     * Haiku has no auto mode) is offered those only; the mode in effect (the thread's, else the
+     * harness default) must be one of them. A model without a list runs in all.
+     */
+    @Test
+    fun aModelRunsInThePermissionModesItLists() {
+        val limited = harness.copy(models = harness.models + dev.aas.android.protocol.Model("lite", "Lite", permissionModes = listOf("ask")))
+        assertEquals(listOf("ask"), HarnessSettings.permissionModes(limited, "lite").map { it.id })
+        assertEquals(listOf("ask", "full"), HarnessSettings.permissionModes(limited, "large").map { it.id })
+        assertEquals(listOf("ask", "full"), HarnessSettings.permissionModes(limited, "gone").map { it.id }, "an unknown model: the harness's list")
+        assertTrue(HarnessSettings.offersPermission(limited, "lite", ThreadSettings()), "the default mode is one of its modes")
+        assertTrue(HarnessSettings.offersPermission(limited, "lite", ThreadSettings(permissionMode = "ask")))
+        assertFalse(HarnessSettings.offersPermission(limited, "lite", ThreadSettings(permissionMode = "full")))
+        assertTrue(HarnessSettings.offersPermission(limited, "large", ThreadSettings(permissionMode = "full")))
+        // A default mode the model does not run in does not fit either.
+        val strict = limited.copy(models = limited.models + dev.aas.android.protocol.Model("strict", "Strict", permissionModes = listOf("full")))
+        assertFalse(HarnessSettings.offersPermission(strict, "strict", ThreadSettings()))
+        // The project's last mode is dropped for a model that does not run in it.
+        val defaults = ProjectDefaults(harnessId = "fake", model = "lite", permissionMode = "full")
+        assertEquals(ThreadSettings(model = "lite"), HarnessSettings.initial(limited, defaults))
+    }
+
     @Test
     fun newThreadsStartFromTheProjectsLastChoicesForTheSameHarness() {
         val defaults = ProjectDefaults(harnessId = "fake", model = "large", effort = "high", permissionMode = "full")

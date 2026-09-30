@@ -5,6 +5,7 @@ import dev.aas.android.protocol.Event
 import dev.aas.android.protocol.Item
 import dev.aas.android.protocol.Methods
 import dev.aas.android.protocol.RpcMessage
+import dev.aas.android.protocol.StoredModels
 import dev.aas.android.protocol.ThreadReadResult
 import dev.aas.android.protocol.WORKSPACE_STREAM
 import dev.aas.android.protocol.WorkspaceSnapshotResult
@@ -138,6 +139,7 @@ class SyncEngineThreadsTest {
     fun openingAThreadShowsItsStoredContentWhileTheSetupWaitsForTheServer() = withFixture { f ->
         f.store.transaction { tx ->
             tx.setEpoch("epoch-1")
+            tx.setModelVersion(StoredModels.VERSION)
             tx.setCursor(WORKSPACE_STREAM, 0)
             tx.upsertThread(Samples.thread("thr_1"))
             tx.upsertTurn(Samples.turn("trn_1"))

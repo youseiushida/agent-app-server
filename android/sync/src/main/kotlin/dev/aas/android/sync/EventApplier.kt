@@ -10,6 +10,7 @@ import dev.aas.android.protocol.Item
 import dev.aas.android.protocol.Operation
 import dev.aas.android.protocol.OperationStatus
 import dev.aas.android.protocol.QueuedInput
+import dev.aas.android.protocol.StoredModels
 import dev.aas.android.protocol.StreamBatch
 import dev.aas.android.protocol.Thread
 import dev.aas.android.protocol.ThreadReadResult
@@ -145,6 +146,12 @@ internal object EventApplier {
             is Event.InteractionResolved -> upsertInteraction(tx, e.interaction, signals)
             is Event.InteractionExpired -> upsertInteraction(tx, e.interaction, signals)
             is Event.BackgroundTaskUpdated -> upsertBackgroundTask(tx, e.task, signals)
+            // Appended to the stored task's output (protocol.md §3.1). A task that is not stored
+            // (its thread was read after the task's last update) gets its output with the next
+            // `backgroundTask/updated` or `thread/read`.
+            is Event.BackgroundTaskOutputDelta -> tx.backgroundTask(e.taskId)?.let {
+                tx.upsertBackgroundTask(it.copy(output = it.output.orEmpty() + e.text))
+            }
             is Event.QueueUpdated -> threadIdOfStream(stream)?.let { tx.replaceQueued(it, uniqueQueued(it, e.queued, warn)) }
             Event.CommandsChanged -> threadIdOfStream(stream)?.let { id ->
                 val meta = tx.threadMeta(id)
@@ -163,20 +170,30 @@ internal object EventApplier {
     }
 
     /**
-     * Replaces the local workspace with a snapshot (first sync, epoch change, or a server head
-     * behind the cursor): wipe (the outbox stays), epoch, entities, workspace cursor. Threads
-     * present at the snapshot count as read. Pending interactions are reported as signals —
+     * Replaces the local workspace with a snapshot (first sync, epoch change, stored data of
+     * another model version, or a server head behind the cursor): wipe (the outbox stays), epoch,
+     * model version, entities, workspace cursor. Threads present at the snapshot count as read,
+     * except with [keepViewStates] (the same server data read again): threads that had a view
+     * state keep it, so their unread marks survive. Pending interactions are reported as signals —
      * they need the user's attention whether or not they were known before.
      */
-    suspend fun applySnapshot(tx: SyncTx, epoch: String, snapshot: WorkspaceSnapshotResult, signals: MutableList<SyncSignal>) {
+    suspend fun applySnapshot(
+        tx: SyncTx,
+        epoch: String,
+        snapshot: WorkspaceSnapshotResult,
+        signals: MutableList<SyncSignal>,
+        keepViewStates: Boolean = false,
+    ) {
+        val viewStates = if (keepViewStates) tx.viewStates() else emptyMap()
         tx.wipeSyncedData()
         tx.setEpoch(epoch)
+        tx.setModelVersion(StoredModels.VERSION)
         tx.replaceHarnesses(snapshot.harnesses)
         snapshot.projects.forEach { tx.upsertProject(it) }
         val threads = snapshot.threads.associateBy { it.id }
         for (thread in snapshot.threads) {
             tx.upsertThread(thread)
-            tx.setViewState(thread.id, ThreadViewState(lastViewedHead = thread.head))
+            tx.setViewState(thread.id, viewStates[thread.id] ?: ThreadViewState(lastViewedHead = thread.head))
         }
         for (interaction in snapshot.pendingInteractions) {
             tx.upsertInteraction(interaction)

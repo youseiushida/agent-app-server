@@ -12,6 +12,7 @@
     <string name="typed_model_unknown">「%1$s」はこのハーネスのモデルの一覧にありません</string>
     <string name="typed_effort_unknown">「%1$s」はこのモデルの推論レベルの一覧にありません</string>
     <string name="typed_model_effort_unavailable">%1$s には推論「%2$s」がありません。推論を選んでから反映してください</string>
+    <string name="typed_model_permission_unavailable">%1$s は権限「%2$s」で動けません。権限を選んでから反映してください</string>
     <string name="btw_needs_question">/btw の後に質問を書いてください</string>
     <string name="newthread_plan_needs_request">/plan の後に、計画してほしい依頼を書いてください</string>
     <string name="newthread_already_new">新しいスレッドは新しい会話から始まります（/%1$s は要りません）</string>

@@ -108,9 +108,7 @@ impl Env {
         std::fs::create_dir_all(&dir).unwrap();
         if git {
             run_git(&dir, &["init", "-q"]);
-            run_git(&dir, &["config", "user.email", "t@example.com"]);
-            run_git(&dir, &["config", "user.name", "t"]);
-            run_git(&dir, &["config", "core.autocrlf", "false"]);
+            configure_test_repo(&dir);
             std::fs::write(dir.join("README.md"), "hello\n").unwrap();
             run_git(&dir, &["add", "-A"]);
             run_git(&dir, &["commit", "-q", "-m", "init"]);
@@ -219,13 +217,23 @@ impl Env {
     }
 }
 
+/// Gives the test repository at `dir` (just initialised) an identity and LF line endings. The
+/// settings are appended to `.git/config` in one write: `git config` replaces the file through a
+/// lock file and a rename for every setting, and on Windows that rename fails when another
+/// process (a virus scanner indexing the fresh repository) has the file open at that moment.
+fn configure_test_repo(dir: &Path) {
+    use std::io::Write;
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join(".git").join("config"))
+        .expect("the repository's config");
+    config
+        .write_all(b"[user]\n\temail = t@example.com\n\tname = t\n[core]\n\tautocrlf = false\n")
+        .expect("writing the repository's config");
+}
+
 fn run_git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?} failed");
+    git_output(dir, args);
 }
 
 fn agent_text(items: &[Item]) -> String {
@@ -485,12 +493,18 @@ async fn steering_adds_a_user_message_to_the_running_turn() {
     let env = env().await;
     let project = env.project("p", false).await;
     let thread = env.thread(&project).await;
-    env.send(&thread.id, "@sleep 600\n@text done", Delivery::Auto)
-        .await;
+    // The turn waits for the steer (no time window it must arrive in), and the steer is sent
+    // once the agent has the turn's input (before that it would join the input instead).
+    env.send(
+        &thread.id,
+        "@text waiting\n@await-steer\n@text done",
+        Delivery::Auto,
+    )
+    .await;
     env.wait_for(
         &thread_stream(&thread.id),
         0,
-        |e| matches!(e, Event::ThreadUpdated { thread } if thread.status == ThreadStatus::Running),
+        |e| matches!(e, Event::ItemCompleted { item } if matches!(&item.body, ItemBody::AgentMessage { text } if text == "waiting")),
     )
     .await;
     let s = env.send(&thread.id, "go faster", Delivery::Steer).await;
@@ -508,6 +522,59 @@ async fn steering_adds_a_user_message_to_the_running_turn() {
     assert!(read.items.iter().any(
         |i| matches!(&i.body, ItemBody::Notice { message, .. } if message.contains("go faster"))
     ));
+}
+
+/// A steer the turn did not take in before it ended comes back (the agent returns it before
+/// its completion): its message is shown as not delivered, and it goes back to the queue, which
+/// runs it as the next turn once the turn completed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steer_the_turn_did_not_read_goes_back_to_the_queue() {
+    let env = env().await;
+    let project = env.project("p", false).await;
+    let thread = env.thread(&project).await;
+    env.send(
+        &thread.id,
+        "@text waiting\n@await-steer unread\n@text done",
+        Delivery::Auto,
+    )
+    .await;
+    // The agent has the turn's input (a steer before that would join the input instead).
+    env.wait_for(
+        &thread_stream(&thread.id),
+        0,
+        |e| matches!(e, Event::ItemCompleted { item } if matches!(&item.body, ItemBody::AgentMessage { text } if text == "waiting")),
+    )
+    .await;
+    let s = env.send(&thread.id, "go faster", Delivery::Steer).await;
+    assert_eq!(s.disposition, Disposition::Steered);
+    // The returned steer runs as the next turn.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let read = loop {
+        let read = env.read(&thread.id).await;
+        if read.turns.len() == 2 && read.turns[1].status == TurnStatus::Completed {
+            break read;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{read:#?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(read.turns[0].status, TurnStatus::Completed);
+    let steered = read
+        .items
+        .iter()
+        .find(|i| {
+            matches!(
+                &i.body,
+                ItemBody::UserMessage {
+                    delivery: UserMessageDelivery::Steer,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert_eq!(steered.status, ItemStatus::Declined);
+    assert!(read.items.iter().any(|i| i.turn_id == read.turns[1].id
+        && matches!(&i.body, ItemBody::AgentMessage { text } if text == "echo: go faster")));
+    assert!(read.queued.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -773,6 +840,219 @@ async fn git_turn_diff_and_worktree_threads() {
         .unwrap();
     assert!(archived.thread.archived);
     assert!(!Path::new(&path).exists());
+}
+
+/// A new thread in another thread's workspace (`workspace: {kind: "thread"}`): it works in the
+/// same worktree, like a fork of that thread; the worktree is not removed while both use it; a
+/// thread of another project, an unknown thread and a removed worktree are refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_thread_can_work_in_another_threads_worktree() {
+    if aas_supervisor::resolve_program("git").is_err() {
+        eprintln!("git not installed; skipping");
+        return;
+    }
+    let env = env().await;
+    let project = env.project("repo", true).await;
+    let create = |workspace: WorkspaceSpec, input: Option<&str>| ThreadCreateParams {
+        client_request_id: crid(),
+        project_id: project.id.clone(),
+        harness_id: "fake".into(),
+        settings: None,
+        workspace: Some(workspace),
+        title: None,
+        input: input.map(|t| vec![InputPart::Text { text: t.into() }]),
+    };
+    let wt = env
+        .call::<spec::ThreadCreate>(create(
+            WorkspaceSpec::Worktree {
+                base_ref: None,
+                branch: None,
+            },
+            None,
+        ))
+        .await
+        .unwrap()
+        .thread;
+    let Workspace::Worktree { path, .. } = wt.workspace.clone() else {
+        panic!("expected a worktree")
+    };
+    let same = env
+        .call::<spec::ThreadCreate>(create(
+            WorkspaceSpec::Thread {
+                thread_id: wt.id.clone(),
+            },
+            Some("@write plan.txt implemented"),
+        ))
+        .await
+        .unwrap()
+        .thread;
+    assert_eq!(
+        (same.workspace.clone(), same.cwd.clone()),
+        (wt.workspace.clone(), wt.cwd.clone())
+    );
+    env.wait_turn_done(&same.id, 0).await;
+    assert!(Path::new(&path).join("plan.txt").exists());
+    assert!(!Path::new(&project.path).join("plan.txt").exists());
+    // The worktree is shared: removing it with either thread is refused.
+    let e = env
+        .call::<spec::ThreadArchive>(ThreadArchiveParams {
+            client_request_id: crid(),
+            thread_id: wt.id.clone(),
+            archived: true,
+            remove_worktree: true,
+            force: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), Some(ErrorKind::InvalidState));
+    // A thread in the project's folder shares the folder.
+    let local = env.thread(&project).await;
+    let beside = env
+        .call::<spec::ThreadCreate>(create(
+            WorkspaceSpec::Thread {
+                thread_id: local.id.clone(),
+            },
+            None,
+        ))
+        .await
+        .unwrap()
+        .thread;
+    assert_eq!(
+        (beside.workspace, beside.cwd),
+        (Workspace::Local, project.path.clone())
+    );
+    // Another project's thread, an unknown thread.
+    let other = env.project("other", false).await;
+    let other_thread = env.thread(&other).await;
+    let e = env
+        .call::<spec::ThreadCreate>(create(
+            WorkspaceSpec::Thread {
+                thread_id: other_thread.id.clone(),
+            },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), Some(ErrorKind::InvalidParams));
+    let e = env
+        .call::<spec::ThreadCreate>(create(
+            WorkspaceSpec::Thread {
+                thread_id: ThreadId::from("thr_missing"),
+            },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), Some(ErrorKind::NotFound));
+    // A worktree that was removed.
+    let gone = env
+        .call::<spec::ThreadCreate>(create(
+            WorkspaceSpec::Worktree {
+                base_ref: None,
+                branch: None,
+            },
+            None,
+        ))
+        .await
+        .unwrap()
+        .thread;
+    env.call::<spec::ThreadArchive>(ThreadArchiveParams {
+        client_request_id: crid(),
+        thread_id: gone.id.clone(),
+        archived: true,
+        remove_worktree: true,
+        force: true,
+    })
+    .await
+    .unwrap();
+    let e = env
+        .call::<spec::ThreadCreate>(create(
+            WorkspaceSpec::Thread {
+                thread_id: gone.id.clone(),
+            },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), Some(ErrorKind::InvalidState));
+}
+
+/// A model that lists its permission modes (`Model.permissionModes`) runs in those only: the
+/// combination is checked whenever a request sets the model or the mode (and at creation),
+/// and a request that changes both together is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_runs_only_in_the_permission_modes_it_lists() {
+    let env = env().await;
+    let project = env.project("p", false).await;
+    let harness = env
+        .call::<spec::HarnessList>(Empty {})
+        .await
+        .unwrap()
+        .harnesses
+        .into_iter()
+        .find(|h| h.id == "fake")
+        .unwrap();
+    let lite = harness
+        .models
+        .iter()
+        .find(|m| m.id == aas_adapter_fake::LIMITED_MODEL)
+        .unwrap();
+    assert_eq!(
+        lite.permission_modes.as_deref(),
+        Some(&["ask".to_owned()][..])
+    );
+    let settings = |model: Option<&str>, mode: Option<&str>| ThreadSettings {
+        model: model.map(str::to_owned),
+        effort: None,
+        permission_mode: mode.map(str::to_owned),
+    };
+    let e = env
+        .call::<spec::ThreadCreate>(ThreadCreateParams {
+            client_request_id: crid(),
+            project_id: project.id.clone(),
+            harness_id: "fake".into(),
+            settings: Some(settings(Some("fake-lite"), Some("auto"))),
+            workspace: None,
+            title: None,
+            input: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), Some(ErrorKind::InvalidParams));
+    let thread = env.thread(&project).await;
+    let update = |s: ThreadSettings| ThreadUpdateParams {
+        client_request_id: crid(),
+        thread_id: thread.id.clone(),
+        title: None,
+        settings: Some(s),
+        pinned: None,
+        modes: None,
+    };
+    env.call::<spec::ThreadUpdate>(update(settings(None, Some("auto"))))
+        .await
+        .unwrap();
+    // The model alone would leave the thread in a mode the model does not have.
+    let e = env
+        .call::<spec::ThreadUpdate>(update(settings(Some("fake-lite"), None)))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), Some(ErrorKind::InvalidParams));
+    assert_eq!(e.data.unwrap()["permissionMode"], "auto");
+    // Both together.
+    let r = env
+        .call::<spec::ThreadUpdate>(update(settings(Some("fake-lite"), Some("ask"))))
+        .await
+        .unwrap();
+    assert_eq!(r.thread.settings.model.as_deref(), Some("fake-lite"));
+    let e = env
+        .call::<spec::ThreadUpdate>(update(settings(None, Some("auto"))))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), Some(ErrorKind::InvalidParams));
+    // A model that runs in every mode.
+    env.call::<spec::ThreadUpdate>(update(settings(Some("fake-slow"), Some("auto"))))
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1349,15 +1629,20 @@ async fn a_queued_input_can_be_sent_now() {
     let project = env.project("p", false).await;
     let thread = env.thread(&project).await;
     let stream = thread_stream(&thread.id);
+    // The turn waits for the steer, then runs until it is interrupted (no time windows).
     let running = env
-        .send(&thread.id, "@sleep 800\n@text done", Delivery::Auto)
+        .send(
+            &thread.id,
+            "@text waiting\n@await-steer\n@sleep 600000\n@text done",
+            Delivery::Auto,
+        )
         .await
         .turn_id
         .unwrap();
     env.wait_for(
         &stream,
         0,
-        |e| matches!(e, Event::ThreadUpdated { thread } if thread.status == ThreadStatus::Running),
+        |e| matches!(e, Event::ItemCompleted { item } if matches!(&item.body, ItemBody::AgentMessage { text } if text == "waiting")),
     )
     .await;
     let q = env

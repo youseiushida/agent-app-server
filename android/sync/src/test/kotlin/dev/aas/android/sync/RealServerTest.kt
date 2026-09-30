@@ -46,6 +46,8 @@ import dev.aas.android.protocol.TurnStartParams
 import dev.aas.android.protocol.TurnStatus
 import dev.aas.android.protocol.TurnTrigger
 import dev.aas.android.protocol.WORKSPACE_STREAM
+import dev.aas.android.protocol.Workspace
+import dev.aas.android.protocol.WorkspaceSpec
 import dev.aas.android.protocol.threadStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -64,6 +66,7 @@ import org.junit.Assume
 import org.junit.Before
 import org.junit.Rule
 import org.junit.rules.Timeout
+import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -73,6 +76,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -892,10 +897,20 @@ class RealServerTest {
 
         val stop = AtomicBoolean(false)
         val stats = AtomicInteger(0)
+        val forced = AtomicInteger(0)
         val chaos = launch(Dispatchers.IO) {
             val rng = Random(seed)
-            while (!stop.get()) {
+            // The only coroutine that drives the proxy (its commands must not interleave).
+            while (!stop.get() || forced.get() < CHAOS_FORCED_DROPS) {
                 delay(rng.nextLong(100, 501))
+                // Whatever the seed draws, every run drops established connections explicitly
+                // (the first steps, so it happens while the turns stream).
+                if (forced.get() < CHAOS_FORCED_DROPS) {
+                    forceDrop(c)
+                    forced.incrementAndGet()
+                    stats.incrementAndGet()
+                    continue
+                }
                 if (stop.get()) break
                 when (rng.nextInt(4)) {
                     0 -> server.chaos(AasTestServer.Chaos.Drop)
@@ -957,7 +972,20 @@ class RealServerTest {
         }
         println("chaos seed $seed: ${stats.get()} chaos steps, ${c.engine.status.value.reconnects} reconnects, " +
             "${c.sendsByRequestId("turn/start").values.sum()} turn/start sends for $CHAOS_TURNS turns")
-        assertTrue(c.engine.status.value.reconnects >= 2, "the chaos forced reconnects: ${c.engine.status.value}")
+        assertEquals(CHAOS_FORCED_DROPS, forced.get())
+        assertTrue(c.engine.status.value.reconnects >= CHAOS_FORCED_DROPS, "the chaos forced reconnects: ${c.engine.status.value}")
+    }
+
+    /**
+     * Drops the client's established connection once and waits until it is established again on
+     * a new one: a reconnect that happened, whatever else the chaos does meanwhile.
+     */
+    private suspend fun forceDrop(c: Client) {
+        val established = c.waitFor("online before the forced drop") { c.engine.status.value.takeIf { it.isOnline } }
+        server.chaos(AasTestServer.Chaos.Drop)
+        c.waitFor("reconnected after the forced drop") {
+            c.engine.status.value.takeIf { it.isOnline && it.reconnects > established.reconnects }
+        }
     }
 
     // ----- background work (the fake agent's `@bg`, docs/adapters/fake.md §5) ---------------------
@@ -1133,6 +1161,224 @@ class RealServerTest {
         c.assertThreadMatchesServer(threadId)
     }
 
+    // ----- background output, questions outside a turn, wakeups (the fake agent's directives) -------
+
+    /**
+     * A dev server's output reaches the phone while it runs (`backgroundTask/outputDelta`,
+     * protocol.md §3.1), on a daemon whose inline limit is 64 bytes: the task's output goes on
+     * from the launching command's (`early=2`), grows to the limit and then says it stopped
+     * streaming (`outputTruncated`). The copy the phone built from the deltas equals the
+     * daemon's. At the end the harness's whole output replaces it: the result, and a blob with
+     * everything (fetched over HTTP).
+     */
+    @Test
+    fun backgroundOutputStreamsToTheLimitAndEndsWithTheWholeOutput() = realTest {
+        restartWith(AasTestServer.Policy(maxInlineOutputBytes = INLINE_OUTPUT_BYTES))
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("output"))
+        val state = openLive(c, threadId)
+
+        c.runTurn(threadId, "@bg dev kind=shell ms=0 output=10 width=20 early=2 npm run dev")
+        val launcher = state.value.items.filterIsInstance<Item.CommandExecution>().single()
+        assertEquals(ItemStatus.Backgrounded, launcher.status)
+        assertEquals(listOf("dev line 1", "dev line 2"), launcher.output.lines().filter { it.isNotEmpty() }.map { it.trimEnd('.') })
+        val limited = task(c, threadId, "the output at the limit") { it.status == BackgroundTaskStatus.Running && it.outputTruncated }
+        val output = assertNotNull(limited.output)
+        assertEquals(INLINE_OUTPUT_BYTES, output.toByteArray(Charsets.UTF_8).size.toLong(), "cut at the inline limit: $output")
+        assertTrue(output.startsWith(launcher.output), "the task goes on from its command's output: $output")
+        assertTrue(output.contains("dev line 3"), "streamed beyond the command: $output")
+        c.assertThreadMatchesServer(threadId)
+
+        c.engine.mutate(Methods.BackgroundTaskStop) { crid -> BackgroundTaskStopParams(crid, threadId, limited.id) }
+        val ended = task(c, threadId, "stopped") { it.id == limited.id && it.status == BackgroundTaskStatus.Stopped }
+        assertNull(ended.output, "the whole output is in the result now")
+        assertTrue(!ended.outputTruncated)
+        val result = assertNotNull(ended.result)
+        assertTrue(result.outputTruncated)
+        val whole = String(AasHttp(OkHttpClient()).downloadBlob(server.ready.credentials, assertNotNull(result.outputBlobId)), Charsets.UTF_8)
+        assertTrue(whole.startsWith(output), "the streamed part is the beginning of the whole output")
+        // Every line the shell printed until it was stopped (at least those streamed), then its end.
+        val lines = whole.lines().filter { it.isNotEmpty() }.map { it.trimEnd('.') }
+        assertEquals("ran npm run dev", lines.last())
+        val printed = lines.dropLast(1)
+        assertTrue(printed.size in 4..10, "$lines")
+        assertEquals((1..printed.size).map { "dev line $it" }, printed)
+        c.assertThreadMatchesServer(threadId)
+    }
+
+    /**
+     * A question the harness asks while no turn runs (a pi extension's dialog; the fake agent's
+     * `@dialog`) belongs to the thread, and the agent waits for it: the idle agent is not stopped
+     * however long it stays unanswered (design.md 4.7). Answered, nothing keeps it any more.
+     */
+    @Test
+    fun aQuestionOutsideATurnKeepsTheAgentUntilItIsAnswered() = realTest {
+        restartWith(AasTestServer.Policy(idleProcessTtlMs = IDLE_TTL_MS))
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("dialog"))
+        openLive(c, threadId)
+
+        c.runTurn(threadId, "@dialog Deploy now?")
+        val pending = c.waitFor("the dialog") {
+            c.signals.filterIsInstance<SyncSignal.InteractionPending>().firstOrNull { it.interaction.threadId == threadId }
+        }
+        assertNull(pending.interaction.turnId, "asked outside a turn")
+        assertNull(pending.interaction.backgroundTaskId)
+        assertEquals(1, c.engine.workspace.value.pendingInteractions.count { it.threadId == threadId })
+        // Well past the idle time: the agent waits for the answer, so its process stays.
+        delay(IDLE_TTL_MS * 3)
+        assertEquals(ThreadStatus.Ready, c.engine.workspace.value.threads.first { it.thread.id == threadId }.thread.status)
+
+        c.engine.mutate(Methods.InteractionRespond) { crid ->
+            InteractionRespondParams(crid, pending.interaction.id, InteractionResolution.Question(listOf(QuestionAnswer("choice", listOf("no")))))
+        }
+        c.waitFor("closed") { c.signals.filterIsInstance<SyncSignal.InteractionClosed>().firstOrNull { it.interactionId == pending.interaction.id } }
+        summary(c, threadId, "idle-stopped once answered") { it.status == ThreadStatus.Idle }
+        c.assertThreadMatchesServer(threadId)
+    }
+
+    /**
+     * A wakeup the agent scheduled (Claude Code's `ScheduleWakeup`; the fake agent's `@wakeup`) is
+     * a scheduled task from the moment it is set: when it runs next, not stoppable on its own.
+     * When it comes due the agent starts its own turn (`trigger: scheduled`) and the task ends.
+     */
+    @Test
+    fun aScheduledWakeupIsShownUntilItStartsItsOwnTurn() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("wakeup"))
+        val state = openLive(c, threadId)
+
+        val first = c.runTurn(threadId, "@wakeup 1500 check the build")
+        assertEquals(TurnStatus.Completed, first.status)
+        val wakeup = task(c, threadId, "the scheduled wakeup") { it.kind == BackgroundTaskKind.Scheduled }
+        assertEquals("check the build", wakeup.title)
+        assertTrue(!wakeup.stoppable)
+        val launcher = state.value.items.single { it.backgroundTaskId == wakeup.id }
+        assertEquals(ItemStatus.Backgrounded, launcher.status)
+        assertEquals(wakeup.id, launcher.backgroundTaskId)
+        val woke = c.waitFor("the scheduled turn") { state.value.turns.firstOrNull { it.trigger == TurnTrigger.Scheduled && it.status.isTerminal } }
+        assertEquals(TurnStatus.Completed, woke.status)
+        assertEquals("echo: check the build", state.value.items.filterIsInstance<Item.AgentMessage>().last { it.turnId == woke.id }.text)
+        val done = task(c, threadId, "the wakeup ended") { it.id == wakeup.id && it.status.isTerminal }
+        assertEquals(BackgroundTaskStatus.Completed, done.status)
+        c.assertThreadMatchesServer(threadId)
+    }
+
+    /**
+     * A steer the running turn took but never read comes back when the turn ends (the fake
+     * agent's `@await-steer unread`, like Claude Code between tool calls): its message is
+     * `declined`, it goes back to the queue and runs as the next turn.
+     */
+    @Test
+    fun aSteerTheTurnDidNotReadRunsAsTheNextTurn() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val threadId = c.createThread(c.createProject("steer"))
+        val state = openLive(c, threadId)
+
+        val turnId = c.startTurn(threadId, "@text waiting\n@await-steer unread\n@text done")
+        // The agent has the turn's input (a steer before that would join the input instead).
+        c.waitFor("the agent waiting for a steer") {
+            state.value.items.filterIsInstance<Item.AgentMessage>().firstOrNull { it.turnId == turnId && it.text == "waiting" && it.status == ItemStatus.Completed }
+        }
+        val steered = c.engine.mutate(Methods.TurnStart) { crid -> TurnStartParams(crid, threadId, listOf(InputPart.Text("also this")), Delivery.Steer) }
+        assertEquals(Disposition.Steered, steered.disposition)
+        assertEquals(TurnStatus.Completed, c.awaitTurnEnd(threadId, turnId).status)
+        val returned = c.waitFor("the returned steer") {
+            state.value.items.filterIsInstance<Item.UserMessage>().firstOrNull { it.text == "also this" && it.turnId == turnId && it.status == ItemStatus.Declined }
+        }
+        assertEquals(turnId, returned.turnId)
+        val next = c.waitFor("the next turn") {
+            state.value.items.filterIsInstance<Item.UserMessage>().firstOrNull { it.text == "also this" && it.turnId != turnId }?.turnId
+        }
+        c.awaitTurnEnd(threadId, next)
+        c.assertThreadMatchesServer(threadId)
+    }
+
+    /**
+     * A model the harness lists with `permissionModes` runs in those modes only (Claude Code's
+     * Haiku without auto mode; the fake's `fake-lite`): the daemon refuses a model change the
+     * thread's permission mode does not fit, and a creation of such a pair; model and mode changed
+     * in one request are accepted.
+     */
+    @Test
+    fun aModelRunsOnlyInThePermissionModesItLists() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val lite = c.engine.workspace.value.harnesses.single().models.single { it.id == LIMITED_MODEL }
+        assertEquals(listOf("ask"), lite.permissionModes)
+        val projectId = c.createProject("modes")
+        val threadId = c.createThread(projectId)
+        openLive(c, threadId)
+        c.engine.mutate(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, settings = ThreadSettings(permissionMode = "auto")) }
+
+        val refused = assertFailsWith<RpcException> {
+            c.engine.mutate(Methods.ThreadUpdate) { crid -> ThreadUpdateParams(crid, threadId, settings = ThreadSettings(model = LIMITED_MODEL)) }
+        }
+        assertEquals(ErrorKind.InvalidParams, refused.kind)
+        c.engine.mutate(Methods.ThreadUpdate) { crid ->
+            ThreadUpdateParams(crid, threadId, settings = ThreadSettings(model = LIMITED_MODEL, permissionMode = "ask"))
+        }
+        summary(c, threadId, "the pair applied") { it.settings.model == LIMITED_MODEL && it.settings.permissionMode == "ask" }
+
+        val creation = assertFailsWith<RpcException> {
+            c.engine.mutate(Methods.ThreadCreate) { crid ->
+                ThreadCreateParams(crid, projectId, HARNESS, settings = ThreadSettings(model = LIMITED_MODEL, permissionMode = "auto"))
+            }
+        }
+        assertEquals(ErrorKind.InvalidParams, creation.kind)
+        c.assertThreadMatchesServer(threadId)
+    }
+
+    /**
+     * `thread/create { workspace: { kind: "thread" } }` (protocol.md §4): a new thread works where
+     * a worktree thread of the same project works, sharing its worktree (how 「新しいスレッドで実装」
+     * continues a worktree thread's plan). Another project's thread is refused.
+     */
+    @Test
+    fun aNewThreadCanWorkInAnotherThreadsWorktree() = realTest {
+        val c = Client(server.ready.credentials, "phone")
+        c.awaitOnline()
+        val project = c.engine.mutate(Methods.ProjectCreate) { crid ->
+            ProjectCreateParams(crid, parentPath = server.ready.root, name = "shared-worktree", init = ProjectInit.GitInit)
+        }.project!!
+        // `git worktree add` needs a commit to start from.
+        commitEmpty(File(project.path))
+        val source = c.engine.mutate(Methods.ThreadCreate) { crid ->
+            ThreadCreateParams(crid, project.id, HARNESS, workspace = WorkspaceSpec.Worktree())
+        }.thread
+        val worktree = assertIs<Workspace.Worktree>(source.workspace)
+
+        val created = c.engine.mutate(Methods.ThreadCreate) { crid ->
+            ThreadCreateParams(crid, project.id, HARNESS, workspace = WorkspaceSpec.Thread(source.id), input = listOf(InputPart.Text("implement it")))
+        }
+        assertEquals(worktree, created.thread.workspace, "the same worktree")
+        assertEquals(source.cwd, created.thread.cwd)
+        openLive(c, created.thread.id)
+        assertEquals(TurnStatus.Completed, c.awaitTurnEnd(created.thread.id, assertNotNull(created.turnId)).status)
+
+        val other = c.createProject("elsewhere")
+        val refused = assertFailsWith<RpcException> {
+            c.engine.mutate(Methods.ThreadCreate) { crid -> ThreadCreateParams(crid, other, HARNESS, workspace = WorkspaceSpec.Thread(source.id)) }
+        }
+        assertEquals(ErrorKind.InvalidParams, refused.kind)
+        c.assertWorkspaceMatchesServer()
+    }
+
+    /** An empty first commit in [repo] with a fixed identity (test support: the PC's own git). */
+    private fun commitEmpty(repo: File) {
+        val process = ProcessBuilder(
+            "git", "-C", repo.absolutePath, "-c", "user.name=aas-test", "-c", "user.email=aas-test@localhost",
+            "commit", "--allow-empty", "-q", "-m", "init",
+        ).redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().readText()
+        assertTrue(process.waitFor(STEP_MS, TimeUnit.MILLISECONDS), "git commit did not finish")
+        assertEquals(0, process.exitValue(), "git commit failed: $output")
+    }
+
     companion object {
         const val HARNESS = "fake"
         const val HEARTBEAT_MS = 300L
@@ -1146,11 +1392,23 @@ class RealServerTest {
         const val MAX_TURNS = 200
         const val CHAOS_TURNS = 10
 
+        /**
+         * Established connections every chaos run drops on purpose, before its random steps: a
+         * seeded schedule may draw no drop at all, and the run must still go through reconnects.
+         */
+        const val CHAOS_FORCED_DROPS = 2
+
         /** The daemon's `idle_process_ttl` in the background tests: short, so an idle stop happens within the test. */
         const val IDLE_TTL_MS = 1_500L
 
         /** The daemon's `background_stop_confirm_timeout` in the unconfirmed-stop test. */
         const val STOP_CONFIRM_MS = 800L
+
+        /** The daemon's `max_inline_output_bytes` in the output test: a few lines of 20 bytes. */
+        const val INLINE_OUTPUT_BYTES = 64L
+
+        /** The fake harness's model that runs in permission mode `ask` only (docs/adapters/fake.md). */
+        const val LIMITED_MODEL = "fake-lite"
         val CHAOS_SCRIPTS = listOf("@stream 200 2", "@approve some-cmd", "@bigoutput 100000")
 
         /** Short client policies: the test server's timeouts are short too. */

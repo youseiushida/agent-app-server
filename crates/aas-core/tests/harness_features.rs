@@ -772,9 +772,10 @@ async fn returned_steers_run_next_and_composer_text_is_relayed() {
     let project = env.project().await;
     let thread = env.thread(&project).await;
     let after = env.head(&thread.id).await;
+    // The turn waits for the steer (and returns it): no time window it must arrive in.
     env.start(
         &thread.id,
-        "@refuse-steers\n@editor draft for you\n@sleep 600",
+        "@refuse-steers\n@editor draft for you\n@await-steer",
     )
     .await
     .unwrap();

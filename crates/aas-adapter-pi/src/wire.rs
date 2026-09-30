@@ -92,6 +92,7 @@ impl PiModel {
             description,
             is_default,
             effort_levels: Some(self.supported_thinking_levels()),
+            permission_modes: None,
         }
     }
 }

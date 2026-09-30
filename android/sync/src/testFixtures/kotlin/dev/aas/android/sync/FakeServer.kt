@@ -6,6 +6,7 @@ import dev.aas.android.protocol.DeviceInfo
 import dev.aas.android.protocol.ErrorKind
 import dev.aas.android.protocol.Event
 import dev.aas.android.protocol.EventEnvelope
+import dev.aas.android.protocol.HarnessListResult
 import dev.aas.android.protocol.InitializeParams
 import dev.aas.android.protocol.InitializeResult
 import dev.aas.android.protocol.Methods
@@ -64,6 +65,14 @@ class FakeServer(private val token: String = "tok") : AutoCloseable {
 
     @Volatile
     var snapshot: WorkspaceSnapshotResult = WorkspaceSnapshotResult(emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), 0)
+
+    /**
+     * The daemon's harnesses as `harness/list` reports them now; `null`: those of [snapshot]. A
+     * test sets it to a list the workspace stream never announced (a daemon updated while the
+     * client was away).
+     */
+    @Volatile
+    var harnessList: List<dev.aas.android.protocol.Harness>? = null
 
     /** Answers `initialize` with an error while it returns one (argument: 0-based initialize count). */
     @Volatile
@@ -211,6 +220,10 @@ class FakeServer(private val token: String = "tok") : AutoCloseable {
                     if (failure != null) error(msg, failure) else respond(msg, AasJson.encodeToJsonElement(InitializeResult.serializer(), initResult(p)))
                 }
                 Methods.WorkspaceSnapshot.name -> respond(msg, AasJson.encodeToJsonElement(WorkspaceSnapshotResult.serializer(), snapshot))
+                Methods.HarnessList.name -> respond(
+                    msg,
+                    AasJson.encodeToJsonElement(HarnessListResult.serializer(), HarnessListResult(harnessList ?: snapshot.harnesses)),
+                )
                 Methods.Subscribe.name -> {
                     val p = AasJson.decodeFromJsonElement(SubscribeParams.serializer(), msg.params!!)
                     val statuses = p.subscriptions.map { s ->

@@ -75,6 +75,7 @@ pub fn harness() -> Harness {
                 description: None,
                 is_default: true,
                 effort_levels: None,
+                permission_modes: None,
             },
             Model {
                 id: "sonnet".into(),
@@ -82,6 +83,16 @@ pub fn harness() -> Harness {
                 description: Some("Fast".into()),
                 is_default: false,
                 effort_levels: Some(vec!["low".into(), "medium".into(), "high".into()]),
+                permission_modes: None,
+            },
+            Model {
+                id: "haiku".into(),
+                display_name: "Haiku".into(),
+                description: Some("Fastest for quick answers".into()),
+                is_default: false,
+                effort_levels: Some(Vec::new()),
+                // Runs in some of the harness's modes only.
+                permission_modes: Some(vec!["default".into()]),
             },
         ],
         default_model: Some("opus".into()),
@@ -491,6 +502,8 @@ pub fn background_task() -> BackgroundTask {
         stop_requested_at: None,
         stop_unconfirmed_at: None,
         next_run_at: None,
+        output: None,
+        output_truncated: false,
     }
 }
 
@@ -542,7 +555,8 @@ pub fn stopped_workflow() -> BackgroundTask {
     }
 }
 
-/// A shell task that finished, with its exit code and output.
+/// A shell task that finished, with its exit code and output: the end of an output file too
+/// long to read whole (its start was left out), that end kept whole in a blob.
 pub fn finished_shell() -> BackgroundTask {
     BackgroundTask {
         id: background_task_id(2),
@@ -557,10 +571,29 @@ pub fn finished_shell() -> BackgroundTask {
         result: Some(BackgroundResult {
             summary: None,
             exit_code: Some(0),
-            output: Some("built in 41.2s\n".into()),
-            output_truncated: false,
-            output_blob_id: None,
+            output: Some("[4/4] bundling\nbuilt in 41.2s\n".into()),
+            output_truncated: true,
+            output_blob_id: Some(BlobId::from_sha256_hex(
+                "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+            )),
+            output_omitted_bytes: Some(9_437_184),
         }),
+        ..background_task()
+    }
+}
+
+/// A background shell that still runs: what it printed so far, as the harness streamed it (cut
+/// at the inline limit).
+pub fn running_shell() -> BackgroundTask {
+    BackgroundTask {
+        id: background_task_id(4),
+        native_id: "mock_TERM_1".into(),
+        kind: BackgroundTaskKind::Shell,
+        title: "npm run dev".into(),
+        origin_item_id: Some(item_id(8)),
+        progress: None,
+        output: Some("> vite\n\n  VITE ready in 412 ms\n  Local: http://localhost:5173/\n".into()),
+        output_truncated: true,
         ..background_task()
     }
 }
@@ -1064,7 +1097,12 @@ pub fn request_examples() -> Vec<(ClientRequest, Value)> {
                 items: items(),
                 interactions: vec![approval(), question(), background_approval()],
                 queued: vec![queued()],
-                background_tasks: vec![background_task(), finished_shell(), stopped_workflow()],
+                background_tasks: vec![
+                    background_task(),
+                    finished_shell(),
+                    stopped_workflow(),
+                    running_shell(),
+                ],
                 head: 1850,
                 has_more_before: false,
             }),
@@ -1359,6 +1397,42 @@ pub fn all_requests() -> Vec<ClientRequest> {
     request_examples().into_iter().map(|(r, _)| r).collect()
 }
 
+/// Requests whose params take a shape the example of their method in [`request_examples`] does
+/// not show, each with the suffix of its fixture (`requests/<method>_<suffix>.json`). A client
+/// that sends the shape needs a daemon that reads it, so each gets a golden fixture of its own.
+/// The result has the method's shape (its response fixture), so there is no second response.
+pub fn request_variants() -> Vec<(&'static str, ClientRequest)> {
+    let plan = "1. Retry the upload once on a network error.\n2. Add a test for the retry.";
+    vec![(
+        // 「新しいスレッドで実装」 on a worktree thread: the new thread works in that thread's
+        // worktree (protocol.md §4 `thread/create`).
+        // (Here the thread `worktree_thread` of the project, whose plan a Codex thread implements.)
+        "workspaceThread",
+        ClientRequest::ThreadCreate(ThreadCreateParams {
+            client_request_id: crid(24),
+            project_id: project_id(),
+            harness_id: "codex".into(),
+            settings: Some(ThreadSettings {
+                model: Some("gpt-5.5".into()),
+                effort: Some("high".into()),
+                permission_mode: None,
+            }),
+            workspace: Some(WorkspaceSpec::Thread {
+                thread_id: worktree_thread().id,
+            }),
+            title: None,
+            input: Some(vec![InputPart::Text {
+                text: format!(
+                    "{}\n\n{plan}",
+                    implementing_plan_mode()
+                        .new_thread_preamble
+                        .unwrap_or_default()
+                ),
+            }]),
+        }),
+    )]
+}
+
 /// One event of every type.
 pub fn events() -> Vec<EventEnvelope> {
     let items = items();
@@ -1450,6 +1524,10 @@ pub fn events() -> Vec<EventEnvelope> {
             harness_id: "codex".into(),
             payload: json!({"method": "model/rerouted"}),
         }),
+        env(Event::BackgroundTaskOutputDelta {
+            task_id: background_task_id(4),
+            text: "  hmr update /src/App.tsx".into(),
+        }),
     ];
     // A coalesced delta.
     out.push(EventEnvelope {
@@ -1511,7 +1589,9 @@ fn file_name(name: &str) -> String {
 /// Every golden fixture.
 pub fn fixtures() -> Vec<Fixture> {
     let mut out = Vec::new();
-    for (i, (req, result)) in request_examples().into_iter().enumerate() {
+    let examples = request_examples();
+    let variants_from = examples.len() as i64 + 1;
+    for (i, (req, result)) in examples.into_iter().enumerate() {
         let id = RequestId::Number(i as i64 + 1);
         let request = RpcMessage::request(id.clone(), req.method(), req.params_json());
         out.push(Fixture {
@@ -1522,6 +1602,14 @@ pub fn fixtures() -> Vec<Fixture> {
         out.push(Fixture {
             path: format!("responses/{}.json", file_name(req.method())),
             value: serde_json::to_value(&response).unwrap(),
+        });
+    }
+    for (i, (suffix, req)) in request_variants().into_iter().enumerate() {
+        let id = RequestId::Number(variants_from + i as i64);
+        let request = RpcMessage::request(id, req.method(), req.params_json());
+        out.push(Fixture {
+            path: format!("requests/{}_{suffix}.json", file_name(req.method())),
+            value: serde_json::to_value(&request).unwrap(),
         });
     }
     for env in events() {
@@ -1663,6 +1751,7 @@ mod tests {
             "queue/updated",
             "commands/changed",
             "backgroundTask/updated",
+            "backgroundTask/outputDelta",
             "thread/nativeSessionChanged",
             "composer/insert",
             "native",

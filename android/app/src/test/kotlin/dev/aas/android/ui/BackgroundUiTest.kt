@@ -13,7 +13,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.v2.createComposeRule
@@ -30,6 +32,7 @@ import dev.aas.android.MainActivity
 import dev.aas.android.appContainer
 import dev.aas.android.protocol.AasJson
 import dev.aas.android.protocol.BackgroundEndReason
+import dev.aas.android.protocol.BackgroundTaskKind
 import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.BackgroundTaskStopParams
 import dev.aas.android.protocol.Item
@@ -81,7 +84,7 @@ class BackgroundViewsTest {
     val compose = createComposeRule()
 
     private val read = Fixtures.threadRead
-    private val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running }
+    private val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running && it.kind == BackgroundTaskKind.Agent }
     private val build = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Completed }
     private val workflow = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Stopped }
 
@@ -128,7 +131,12 @@ class BackgroundViewsTest {
         compose.onNodeWithText("npm run build").assertIsDisplayed()
         compose.onNode(hasText("シェル · 完了 · ", substring = true)).assertIsDisplayed()
         compose.onNodeWithText("終了コード 0").assertIsDisplayed()
-        compose.onNodeWithText("built in 41.2s").assertIsDisplayed()
+        // Only the beginning is inline (the whole output is a blob): it reads from its start.
+        compose.onNodeWithTag(BackgroundTags.output(build.id)).assertTextEquals("[4/4] bundling\nbuilt in 41.2s")
+        compose.onNodeWithText("出力が長いため、最初の部分を表示しています").assertIsDisplayed()
+        compose.onNode(hasText("出力のファイルが大きいため、最初の ", substring = true) and hasText("は読んでいません", substring = true)).assertIsDisplayed()
+        compose.onNodeWithTag(BackgroundTags.showOutput(build.id)).performClick()
+        assertEquals(listOf(build.id), opened)
         compose.onNodeWithText("review-and-fix").assertIsDisplayed()
         compose.onNodeWithText("「Review the reconnect logic」から起動").assertIsDisplayed()
         compose.onNodeWithText("Stopped by request").assertIsDisplayed()
@@ -138,6 +146,38 @@ class BackgroundViewsTest {
         compose.onNodeWithText("ツール 12 回 · 31.5k トークン").assertIsDisplayed()
         // No 停止 on ended tasks.
         assertEquals(0, compose.onAllNodes(hasTestTag(BackgroundTags.stop(build.id))).fetchSemanticsNodes().size)
+    }
+
+    /**
+     * A dev server's output while it runs (`BackgroundTask.output`, streamed by the harness): its
+     * newest lines, marked as running, growing with each `backgroundTask/outputDelta`; at the
+     * daemon's limit it says the rest comes at the end. 出力の全文を表示 opens the live view.
+     */
+    @Test
+    fun aRunningShellShowsItsNewestOutputAsItGrows() {
+        val devServer = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running && it.kind == BackgroundTaskKind.Shell }
+        var task by mutableStateOf(devServer.copy(output = "> vite\n", outputTruncated = false))
+        val opened = mutableListOf<String>()
+        content { BackgroundTaskCard(task, 0, null, BackgroundStop.Available, onStop = {}, onOpenOutput = { opened += task.id }) }
+        compose.onNodeWithText("出力（実行中）").assertIsDisplayed()
+        compose.onNodeWithTag(BackgroundTags.output(task.id)).assertTextEquals("> vite")
+        // More output: the card follows its end (display.taskOutputLines lines).
+        task = task.copy(output = task.output + (1..8).joinToString("") { "hmr update $it\r\n" })
+        compose.onNodeWithTag(BackgroundTags.output(task.id)).assertTextEquals((3..8).joinToString("\n") { "hmr update $it" })
+        compose.onNodeWithText("表示できる出力の上限に達しました。続きは作業が終わったときに表示します").assertDoesNotExist()
+        // The fixture's copy: at the limit.
+        task = devServer
+        compose.onNodeWithTag(BackgroundTags.output(task.id)).assertTextEquals("> vite\n\n  VITE ready in 412 ms\n  Local: http://localhost:5173/")
+        compose.onNodeWithText("表示できる出力の上限に達しました。続きは作業が終わったときに表示します").assertIsDisplayed()
+        compose.onNodeWithTag(BackgroundTags.showOutput(task.id)).performClick()
+        assertEquals(listOf(devServer.id), opened)
+        // Ended with the whole output reported: that replaces the streamed copy.
+        task = devServer.copy(
+            status = BackgroundTaskStatus.Stopped, endedAt = devServer.startedAt + 1, output = null, outputTruncated = false,
+            result = dev.aas.android.protocol.BackgroundResult(output = "> vite\nbye\n"),
+        )
+        compose.onNodeWithText("出力（実行中）").assertDoesNotExist()
+        compose.onNodeWithTag(BackgroundTags.output(task.id)).assertTextEquals("> vite\nbye")
     }
 
     @Test
@@ -211,7 +251,7 @@ class BackgroundScreenTest {
 
     private val app get() = ApplicationProvider.getApplicationContext<Application>()
     private val read = Fixtures.threadRead
-    private val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running }
+    private val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running && it.kind == BackgroundTaskKind.Agent }
 
     private fun seed() = runBlocking {
         val container = app.appContainer
@@ -220,7 +260,7 @@ class BackgroundScreenTest {
         val thread = read.thread.copy(
             lastTurn = read.thread.lastTurn!!.copy(id = read.turns.last().id, index = 1, status = TurnStatus.Completed),
             status = ThreadStatus.Ready,
-            background = ThreadBackground(running = 1),
+            background = ThreadBackground(running = 2),
             head = 5,
         )
         container.syncStore.transaction { tx ->
@@ -256,20 +296,23 @@ class BackgroundScreenTest {
         ActivityScenario.launch(MainActivity::class.java).use {
             waitFor("agent-app-server")
             compose.onNodeWithText("agent-app-server").performClick()
-            waitFor("バックグラウンドで実行中 (1)")
+            waitFor("バックグラウンドで実行中 (2)")
             compose.onNodeWithText("Fix the flaky reconnect test").performClick()
             waitFor("Review the reconnect logic")
             compose.onNodeWithTag(BackgroundTags.HEADER).assertIsDisplayed()
-            compose.onNodeWithText("実行中 1 · 終了 2").assertIsDisplayed()
+            compose.onNodeWithText("実行中 2 · 終了 2").assertIsDisplayed()
             compose.onNodeWithText("終了した作業 (2)").assertIsDisplayed()
             // Ended tasks open on demand.
             compose.onNodeWithTag(BackgroundTags.ENDED).performClick()
             waitFor("npm run build")
 
             // 停止 asks first, then the request waits in the outbox and the card says so.
+            compose.onNodeWithTag(THREAD_LIST_TAG).performScrollToNode(hasContentDescription("「Review the reconnect logic」を停止"))
             compose.onNodeWithContentDescription("「Review the reconnect logic」を停止").performClick()
             waitFor("バックグラウンドの作業を止めますか？")
-            compose.onNode(hasText("停止") and hasClickAction() and !hasTestTag(BackgroundTags.stop(agent.id))).performClick()
+            // The dialog's 停止 (not the 停止 of a card).
+            val cardStops = read.backgroundTasks.map { !hasTestTag(BackgroundTags.stop(it.id)) }.reduce { a, b -> a and b }
+            compose.onNode(hasText("停止") and hasClickAction() and cardStops).performClick()
             compose.waitUntil(WAIT_MS) {
                 idle()
                 app.appContainer.engine.outbox.value.any { it.method == Methods.BackgroundTaskStop.name }
@@ -308,8 +351,9 @@ class BackgroundScreenTest {
             compose.onNodeWithContentDescription("その他の操作").performClick()
             idle()
             compose.onNodeWithText("プロセスを停止").performClick()
-            waitFor("1 件のバックグラウンド作業も止まります")
+            waitFor("2 件のバックグラウンド作業も止まります")
             compose.onNodeWithText("・Review the reconnect logic").assertIsDisplayed()
+            compose.onNodeWithText("・npm run dev").assertIsDisplayed()
         }
     }
 

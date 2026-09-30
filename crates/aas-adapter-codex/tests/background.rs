@@ -8,8 +8,8 @@ use aas_harness::protocol::{
     BackgroundTaskKind, InteractionResolution, ItemBody, ItemStatus, NoticeLevel,
 };
 use aas_harness::{
-    AdapterError, AdapterEvent, BackgroundState, BackgroundTaskInfo, ExpireReason, StartMode,
-    ThreadSettings, TurnInput, TurnStatus,
+    AdapterError, AdapterEvent, BackgroundState, BackgroundTaskInfo, ExpireReason, OutputUpdate,
+    StartMode, ThreadSettings, TurnInput, TurnStatus,
 };
 use aas_supervisor::StopReason;
 use pretty_assertions::assert_eq;
@@ -105,10 +105,30 @@ async fn shutdown_cleanly(mut r: Replay) {
 const TERM_A: &str = "mock_TERM_0";
 const TERM_B: &str = "mock_TERM_1";
 
+/// What was streamed as the output of task `key`, and at which event positions.
+fn streamed(r: &Replay, key: &str) -> (String, Vec<usize>) {
+    let mut text = String::new();
+    let mut at = Vec::new();
+    for (i, e) in r.events.iter().enumerate() {
+        if let AdapterEvent::BackgroundOutput { key: k, output } = e
+            && k == key
+        {
+            match output {
+                OutputUpdate::Append(t) => text.push_str(t),
+                OutputUpdate::Replace(t) => panic!("Codex streams deltas, not snapshots: {t:?}"),
+            }
+            at.push(i);
+        }
+    }
+    (text, at)
+}
+
 /// Two commands outlive their turn: each becomes a background terminal (its task before its
 /// item closes as backgrounded, both before the turn ends). A later turn and its interrupt leave
 /// them running; the terminal stopped from the phone ends as stopped with Codex's exit code and
-/// output, the other one completes by itself. Their output after the turn is not an item's.
+/// output, the other one completes by itself. Their output after the turn is not an item's: it
+/// is streamed as the task's output (Codex's later `item/commandExecution/outputDelta`), while
+/// the task runs.
 #[tokio::test]
 async fn commands_that_outlive_their_turn_become_background_terminals() {
     let mut r = start("bg_terminals.jsonl").await;
@@ -199,7 +219,8 @@ async fn commands_that_outlive_their_turn_become_background_terminals() {
             .ends_with("TICK_A 9\r\nBG_A_DONE\r\n")
     );
 
-    // Their output after the turn ended was not forwarded as item output.
+    // Their output after the turn ended was not forwarded as item output, but as the tasks'
+    // (what came before they went on in the background was the items').
     assert!(
         r.events[turn_end..].iter().all(|e| !matches!(
             e,
@@ -207,6 +228,30 @@ async fn commands_that_outlive_their_turn_become_background_terminals() {
         )),
         "no deltas of the backgrounded items"
     );
+    let (a_out, a_at) = streamed(&r, TERM_A);
+    assert_eq!(
+        a_out,
+        "TICK_A 6\r\nTICK_A 7\r\nTICK_A 8\r\nTICK_A 9\r\nBG_A_DONE\r\n"
+    );
+    // TICK_B 3 came after the turn's `turn/completed`, which the adapter answers by listing the
+    // terminals before it reads on: from then on the output is the terminal's.
+    let (b_out, b_at) = streamed(&r, TERM_B);
+    assert_eq!(b_out, "TICK_B 3\r\nTICK_B 4\r\n");
+    for (key, at) in [(TERM_A, &a_at), (TERM_B, &b_at)] {
+        let closed = position(
+            &r,
+            |e| matches!(e, AdapterEvent::ItemCompleted { key: k, status: ItemStatus::Backgrounded, .. } if k == key),
+        );
+        let ended = r
+            .events
+            .iter()
+            .position(|e| task_event(e, key).is_some_and(|t| t.state.is_ended()))
+            .expect("ended");
+        assert!(
+            at.iter().all(|i| closed < *i && *i < ended),
+            "{key}: streamed between going to the background ({closed}) and the end ({ended}): {at:?}"
+        );
+    }
     // An ended task, or one this session does not know, cannot be stopped.
     assert!(r.handle.control.stop_background(TERM_A).await.is_err());
     assert!(r.handle.control.stop_background("nope").await.is_err());

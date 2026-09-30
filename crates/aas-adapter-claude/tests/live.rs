@@ -586,6 +586,217 @@ async fn live_background_agent_completion_starts_a_marked_run() {
     remove_transcripts(&[native]);
 }
 
+/// Starts a haiku session in the default permission mode (the tests approve every request).
+async fn haiku_session(
+    adapter: &ClaudeAdapter,
+    work: &std::path::Path,
+) -> (aas_harness::SessionHandle, String) {
+    let handle = adapter
+        .start(StartRequest {
+            thread_id: ThreadId::generate(),
+            cwd: work.to_path_buf(),
+            settings: ThreadSettings {
+                model: Some("haiku".into()),
+                effort: None,
+                permission_mode: Some("default".into()),
+            },
+            mode: StartMode::New,
+        })
+        .await
+        .unwrap();
+    let native = handle.native_session_id.clone().unwrap();
+    (handle, native)
+}
+
+/// Shuts the session down and checks that nothing supervised remains.
+async fn shut_down(mut handle: aas_harness::SessionHandle, supervisor: &Supervisor) {
+    handle.control.shutdown(StopReason::User).await;
+    while let Ok(Some(ev)) =
+        tokio::time::timeout(Duration::from_secs(30), handle.events.recv()).await
+    {
+        if matches!(ev, AdapterEvent::Exited { .. }) {
+            break;
+        }
+    }
+    assert_eq!(
+        supervisor.running_count(),
+        0,
+        "no supervised process may remain"
+    );
+}
+
+/// A background Bash that ends by itself: its output is the file the CLI names at its end
+/// (`task_notification.output_file`), read by the adapter (nothing is parsed from text).
+#[tokio::test]
+#[ignore = "spends tokens; set AAS_LIVE_TESTS=1 and pass --ignored"]
+async fn live_background_shell_output_is_the_file_its_end_names() {
+    if !live() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (adapter, supervisor) = adapter(state.path());
+    let (mut handle, native) = haiku_session(&adapter, work.path()).await;
+    // Removes what the session left even when an assertion fails.
+    let cleanup = Cleanup::default();
+    cleanup.session(&native);
+    let mut seen = Vec::new();
+    handle
+        .control
+        .send(TurnInput::text(
+            "Use the Bash tool with run_in_background set to true to run exactly this command: \
+             echo LIVE_OUT_START; sleep 15; echo LIVE_OUT_END . \
+             After starting it, end your turn immediately with a one-line reply; do not wait for it or check on it.",
+        ))
+        .await
+        .unwrap();
+    until(&mut handle, &mut seen, "the shell's turn", |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    let shell = seen
+        .iter()
+        .filter_map(task_of)
+        .rfind(|t| t.kind == aas_harness::BackgroundTaskKind::Shell)
+        .cloned()
+        .expect("a background shell was reported");
+    // The end comes with `task_updated` (the state) and `task_notification` (the result, with
+    // the output file).
+    let ended = |e: &AdapterEvent| {
+        task_of(e).is_some_and(|t| t.key == shell.key && t.state.is_ended() && t.result.is_some())
+    };
+    let end = match seen.iter().rfind(|e| ended(e)).cloned() {
+        Some(end) => end,
+        None => until(&mut handle, &mut seen, "the shell's end", ended).await,
+    };
+    let end = task_of(&end).unwrap();
+    assert_eq!(
+        end.state,
+        aas_harness::BackgroundState::Completed,
+        "{end:?}"
+    );
+    let result = end.result.as_ref().expect("the end's result");
+    let output = result.output.as_deref().unwrap_or_default();
+    assert!(
+        output.contains("LIVE_OUT_START") && output.contains("LIVE_OUT_END"),
+        "{result:?}"
+    );
+    assert_eq!(
+        result.output_omitted_bytes, None,
+        "a small file is read whole"
+    );
+    // Claude Code streams nothing while the shell runs.
+    assert!(
+        seen.iter()
+            .all(|e| !matches!(e, AdapterEvent::BackgroundOutput { .. })),
+        "{seen:#?}"
+    );
+    shut_down(handle, &supervisor).await;
+}
+
+/// A `ScheduleWakeup`: live, with the `scheduledFor` of its result, from that result on (before
+/// the turn ends), until it fires: the CLI starts a run by itself, and the Stop hook's list of
+/// that run no longer holds it, so it ends as completed.
+#[tokio::test]
+#[ignore = "spends tokens; set AAS_LIVE_TESTS=1 and pass --ignored"]
+async fn live_a_schedule_wakeup_is_live_until_it_fires() {
+    if !live() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (adapter, supervisor) = adapter(state.path());
+    let (mut handle, native) = haiku_session(&adapter, work.path()).await;
+    // Removes what the session left even when an assertion fails.
+    let cleanup = Cleanup::default();
+    cleanup.session(&native);
+    let mut seen = Vec::new();
+    let prompt = "Reply with exactly: woke-up";
+    handle
+        .control
+        .send(TurnInput::text(format!(
+            "This is a test of the ScheduleWakeup tool. Call the ScheduleWakeup tool exactly once with delaySeconds 60, \
+             reason \"live test\", prompt \"{prompt}\", and noop false. If the tool's schema is not loaded yet, load it \
+             with ToolSearch first. After the ScheduleWakeup call returns, end your turn immediately with a one-line reply."
+        )))
+        .await
+        .unwrap();
+    until(&mut handle, &mut seen, "the scheduling turn", |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    let turn_end = seen.len() - 1;
+    let (at, wakeup) = seen
+        .iter()
+        .enumerate()
+        .find_map(|(i, e)| {
+            task_of(e)
+                .filter(|t| t.kind == aas_harness::BackgroundTaskKind::Scheduled)
+                .map(|t| (i, t.clone()))
+        })
+        .expect("the wakeup was reported");
+    assert!(
+        at < turn_end,
+        "live from the tool result, before the turn ended"
+    );
+    assert!(wakeup.key.starts_with("wakeup:"), "{wakeup:?}");
+    assert!(
+        wakeup.live && !wakeup.stoppable && wakeup.state == aas_harness::BackgroundState::Running,
+        "{wakeup:?}"
+    );
+    assert_eq!(wakeup.title, prompt);
+    assert!(wakeup.origin_item_key.is_some());
+    let due = wakeup.next_run_at.expect("scheduledFor");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    assert!(
+        u128::try_from(due).is_ok_and(|due| due > now),
+        "comes due later: {due} (now {now})"
+    );
+    // Still live after the turn (the Stop hook's list holds it).
+    let latest = |seen: &[AdapterEvent]| {
+        seen.iter()
+            .filter_map(task_of)
+            .rfind(|t| t.key == wakeup.key)
+            .cloned()
+            .unwrap()
+    };
+    assert!(latest(&seen).live, "{:?}", latest(&seen));
+
+    // It fires: a run the CLI starts by itself. Its Stop hook (before its result) lists no
+    // wakeup any more, so the wakeup ended as completed by then.
+    until(&mut handle, &mut seen, "the woken run's end", |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert!(
+        seen[turn_end + 1..]
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnStarted)),
+        "the CLI started the run by itself"
+    );
+    let ended = latest(&seen);
+    assert_eq!(
+        (ended.state, ended.live),
+        (aas_harness::BackgroundState::Completed, false),
+        "{ended:?}"
+    );
+    let reply: String = seen[turn_end..]
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ItemCompleted {
+                body: Some(ItemBody::AgentMessage { text }),
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(reply.contains("woke-up"), "{reply:?}");
+    shut_down(handle, &supervisor).await;
+}
+
 #[tokio::test]
 #[ignore = "spends tokens; set AAS_LIVE_TESTS=1 and pass --ignored"]
 async fn live_interrupt_and_shutdown_mid_turn() {
@@ -1105,7 +1316,9 @@ async fn live_plan_mode_anchors_and_forks_at_a_turn() {
 }
 
 /// Fast mode for a model the CLI marks: on at the start, the CLI's state for it reported, off
-/// again (one turn on opus).
+/// again (one turn on opus). An account that cannot use fast mode (its extra usage is off) has
+/// the CLI keep it off and say why (`fast_mode_disabled_reason`), which must reach the user as
+/// the `fastModeDisabled` notice instead.
 #[tokio::test]
 #[ignore = "spends tokens; set AAS_LIVE_TESTS=1 and pass --ignored"]
 async fn live_fast_mode() {
@@ -1148,12 +1361,22 @@ async fn live_fast_mode() {
         matches!(e, AdapterEvent::TurnCompleted { .. })
     })
     .await;
-    assert!(
-        seen.iter().any(
-            |e| matches!(e, AdapterEvent::ModesReported { fast_state: Some(s), .. } if s == "on")
-        ),
-        "{seen:?}"
-    );
+    let on = seen
+        .iter()
+        .any(|e| matches!(e, AdapterEvent::ModesReported { fast_state: Some(s), .. } if s == "on"));
+    let kept_off = seen.iter().find_map(|e| match e {
+        AdapterEvent::Notice {
+            message,
+            code: Some(c),
+            ..
+        } if c == "fastModeDisabled" => Some(message.clone()),
+        _ => None,
+    });
+    match (on, kept_off) {
+        (true, None) => {}
+        (false, Some(why)) => eprintln!("this account cannot use fast mode: {why}"),
+        _ => panic!("fast mode neither on nor explained: {seen:?}"),
+    }
     handle
         .control
         .apply_modes(&ThreadModes::default())

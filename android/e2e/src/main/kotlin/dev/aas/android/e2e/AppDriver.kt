@@ -370,22 +370,27 @@ class AppDriver(val instrumentation: Instrumentation = InstrumentationRegistry.g
     }
 
     /** The texts and descriptions on screen (of [onlyPackage] when given), for failure messages and change checks. */
-    fun screenSummary(onlyPackage: String? = null): String {
+    fun screenSummary(onlyPackage: String? = null): String = try {
+        screenTexts(onlyPackage).distinct().joinToString(" | ").take(SUMMARY_CHARS)
+    } catch (e: Exception) {
+        "(the window hierarchy could not be read: $e)"
+    }
+
+    /**
+     * Every text and description on screen (of [onlyPackage] when given), in the hierarchy's
+     * order, read in one dump of the window hierarchy. For a screen that changes many times a
+     * second (a running output): the elements [findAll] returns go stale before each is read.
+     */
+    fun screenTexts(onlyPackage: String? = null): List<String> {
         val out = ByteArrayOutputStream()
-        return try {
-            refresh()
-            device.dumpWindowHierarchy(out)
-            NODE.findAll(out.toString(Charsets.UTF_8.name()))
-                .map { it.value }
-                .filter { node -> onlyPackage == null || attribute(node, "package") == onlyPackage }
-                .flatMap { node -> listOfNotNull(attribute(node, "text"), attribute(node, "content-desc")) }
-                .filter { it.isNotEmpty() }
-                .distinct()
-                .joinToString(" | ")
-                .take(SUMMARY_CHARS)
-        } catch (e: Exception) {
-            "(the window hierarchy could not be read: $e)"
-        }
+        refresh()
+        device.dumpWindowHierarchy(out)
+        return NODE.findAll(out.toString(Charsets.UTF_8.name()))
+            .map { it.value }
+            .filter { node -> onlyPackage == null || attribute(node, "package") == onlyPackage }
+            .flatMap { node -> listOfNotNull(attribute(node, "text"), attribute(node, "content-desc")) }
+            .filter { it.isNotEmpty() }
+            .toList()
     }
 
     private fun attribute(node: String, name: String): String? = Regex("\\s${Regex.escape(name)}=\"([^\"]*)\"").find(node)?.groupValues?.get(1)

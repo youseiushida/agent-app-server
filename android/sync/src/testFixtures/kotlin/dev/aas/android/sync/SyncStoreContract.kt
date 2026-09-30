@@ -84,14 +84,17 @@ abstract class SyncStoreContract {
     fun metadataRoundTrips() = test { store ->
         store.transaction { tx ->
             assertNull(tx.epoch())
+            assertNull(tx.modelVersion())
             assertNull(tx.cursor(WORKSPACE_STREAM))
             assertNull(tx.lastSyncAtMs())
             tx.setEpoch("e1")
+            tx.setModelVersion(7)
             tx.setCursor(WORKSPACE_STREAM, 12)
             tx.setLastSyncAtMs(99)
         }
         store.transaction { tx ->
             assertEquals("e1", tx.epoch())
+            assertEquals(7, tx.modelVersion())
             assertEquals(12L, tx.cursor(WORKSPACE_STREAM))
             assertEquals(99L, tx.lastSyncAtMs())
             assertEquals(ThreadMeta(), tx.threadMeta("thr_unknown"))
@@ -103,6 +106,7 @@ abstract class SyncStoreContract {
     fun wipeKeepsOnlyTheOutbox() = test { store ->
         store.transaction { tx ->
             tx.setEpoch("e1")
+            tx.setModelVersion(1)
             tx.setCursor(WORKSPACE_STREAM, 3)
             tx.setLastSyncAtMs(5)
             tx.replaceHarnesses(listOf(Harness("fake", HarnessKind.Fake, "Fake", available = true)))
@@ -119,6 +123,7 @@ abstract class SyncStoreContract {
             tx.addOutbox(entry("c1", "thr_1"))
             tx.wipeSyncedData()
             assertNull(tx.epoch())
+            assertNull(tx.modelVersion())
             assertTrue(tx.cursors().isEmpty())
             assertNull(tx.lastSyncAtMs())
             assertTrue(tx.harnesses().isEmpty())

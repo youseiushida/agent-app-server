@@ -70,19 +70,28 @@
   | `unstoppable` | 1つだけ止めることはできない（`stoppable: false`） |
   | `stubborn` | 止める求めを無視する（エージェントの終了では終わる。確認されない停止のテスト用） |
   | `detached` | 起動した Item を報告しない |
+  | `output=<n>` | 1回の run で `n` 行（`<key> line <i>`）を出力する。run の長さに均等に（`ms=0` なら 50 ミリ秒ごとに）出し、タスクの出力として流す（`backgroundOutput`、アダプタの `BackgroundOutput`）。`shell` の結果の出力は、出した行のあとに `ran <タイトル>` |
+  | `width=<バイト数>` | 出力の各行を、改行を含めてこの長さに `.` で埋める（出力の上限や blob を確かめるため） |
+  | `early=<k>` | `output` のうち最初の `k` 行は、起動したコマンド（`kind=shell` で起動した Item があるとき）がターンの中で出す（その Item の出力）。残りをタスクが出す（バックグラウンドに移ったコマンドの出力の続き） |
+  | `snapshots` | 出力を、それまでの出力全体（置き換え）として報告する（Devin のように途中経過を全体で送るハーネスの形） |
 
-- 結果は台本から決まるものだけ: `shell` は終了コードと出力 `ran <タイトル>`、ほかは要約 `<タイトル> <状態>`。`kind=scheduled` は `nextRunAt`（開始 + `ms`）を報告する。
+- 結果は台本から決まるものだけ: `shell` は終了コードと出力（出した行と `ran <タイトル>`）、ほかは要約 `<タイトル> <状態>`。`kind=scheduled` は `nextRunAt`（開始 + `ms`）を報告する。
+- **予約した起床**（`@wakeup <ms> [times=<n>] [プロンプト…]`。Claude Code の `ScheduleWakeup` の形）: ターンは `ScheduleWakeup` の toolCall の Item と、キー `wakeup:<その Item のキー>` の `scheduled` のタスク（タイトルはプロンプト、`nextRunAt`、止められない。`stoppable: false`）を報告し、Item を `backgrounded` で閉じる。`ms` 後に起床が来ると、エージェントは自分でターンを始め（`trigger` は `scheduled`）、プロンプトを台本として実行する（既定のプロンプトは `woke up`、指示がなければ `echo: <プロンプト>`）。タスクはそのたびに `completed` になり、`times` 回（既定 1）まで同じキーで次の run が始まる。
+- **ターンの外の質問**（`@dialog [タイトル…]`。pi の拡張のダイアログの形）: ターンの完了を報告したすぐあとに、Item にもタスクにも属さない質問（選択肢 `yes` / `no`）を出す。エンジンではスレッドに属する Interaction になり、答えを待つ間はプロセスをアイドル回収しない（design.md 4.7）。答えを受けると `dialog <タイトル>: <選んだ id>`（辞退なら `dismissed`）の Notice を出す。
 - ライブセットは `live`（動いている間 `true`、終わったら `false`）で表す。
 - 止める: アダプタの `stop_background(key)` は `stopBackground` を送り、タスクは `stopped` で終わる（`stubborn` は無視する）。動いていない key には警告の Notice を出す（止めたことにはしない）。
 - エージェントが自分で始めるターン（`wake`）は、動いているターンが終わってから順に始まる。本文は `background task <key> <状態>` で、少しの間（200ms）続く。その間に届いたプロンプトは `promptAck { accepted: false, ownRun: true }` で断られ、アダプタは `AdapterError::TurnInProgress` を返す（そのターンの `turnStarted` は先に届いている）。エンジンは利用者のターンを失敗にせず、そのターンのあとに送る。
 - すべてのプロンプトに `promptAck`（受け付けた / 断った）が返り、アダプタの `send` はそれを待つ（上限は `handshake_timeout`）。
+- **steer**: すべての `steer` に `steerAck`（受け付けた / 断った）が返り、アダプタの `steer` / `steer_message` はそれを待つ。動いているターンが受け付けた steer は、ターンの区切り（`@sleep`、ストリーミング、答えの待ち、`@tool`、`@await-steer`）で取り込み（利用者のメッセージとして記録し、`steered: <本文>` の Notice）、終わるまでに読まなかったものはターンの完了の直前に `steerReturned` で返す（ID のない steer は取り込む）。Claude Code と pi が実行に取り込まなかったメッセージを返すのと同じ。ターンが終わってから届いた steer は断り、アダプタは `AdapterError::Other`（「send it as a new message」）を返す（エンジンは何も記録せず、クライアントは新しいターンとして送り直す）。
+  - `@await-steer` は steer が届くまで待って取り込む（中断できる）。`@await-steer unread` は届いた steer を読まずに残し、ターンの終わりに返させる。steer のテストが時間の窓に頼らないため。
 - タスクはエージェントとともに終わる（`@crash` なら、エンジンは動いていたタスクを `lost` と記録する）。
 
 ## 6. テスト
 
 - 単体テスト（`src/store.rs`、`src/agent.rs`、`src/background.rs`、`src/lib.rs`）: 台本の解釈（`@bg` のオプションを含む）、`@hang`、ターンの終わりの順序、`rejected`、ストア（一覧、fork、id の検査、壊れたファイルの報告）、アダプタ（一覧・履歴・resume・fork、落ちたターンの保存、ストアがないときの `Unsupported`、設定の誤り、台本からのセッション、バックグラウンドのタスクの報告・自分で始めるターン・`TurnInProgress`・停止）。
-- `crates/aas-core/tests/background.rs`: `@bg` の台本で、エンジンを通したバックグラウンドの作業（起動した Item とタスク、進捗、終わり、自分で始めるターンの `trigger`、停止、タスクに属する承認の期限切れ、落ちたときの `lost`）。
-- `crates/aas-testkit/tests/test_server.rs`: `aas-test-server` 経由で、用意されたネイティブセッションの一覧と取り込み、取り込んだスレッドの続行（resume）、fork、`native-session` コマンドを確かめる。実プロセスのエージェントで、止められるまで続くバックグラウンドのタスクがアイドル回収を止め、`backgroundTask/stop` のあとにアイドル回収が続くことも確かめる。
+- `crates/aas-core/tests/background.rs`: `@bg` の台本で、エンジンを通したバックグラウンドの作業（起動した Item とタスク、進捗、終わり、自分で始めるターンの `trigger`、停止、タスクに属する承認の期限切れ、落ちたときの `lost`）、動いている間の出力（Item の出力から始まり、残りが delta で流れ、終わりの全体に置き換わる）、`@wakeup` の起床（`nextRunAt`、`scheduled` のターン）、`@dialog` がプロセスを残すこと。
+- `src/lib.rs` の単体テスト: steer の取り込み・返却・ターンのあとの拒否、出力の追記と全体（`snapshots`）、`@wakeup` の回数、`@dialog` の答え。
+- `crates/aas-testkit/tests/test_server.rs`: `aas-test-server` 経由で、出力が上限（`--max-inline-output-bytes`）で切られて流れ、全体が blob になること、`@dialog` の答えまでアイドル回収されないこと、用意されたネイティブセッションの一覧と取り込み、取り込んだスレッドの続行（resume）、fork、`native-session` コマンドを確かめる。実プロセスのエージェントで、止められるまで続くバックグラウンドのタスクがアイドル回収を止め、`backgroundTask/stop` のあとにアイドル回収が続くことも確かめる。
 
 ## 7. 拡張機能（design.md 9.6）
 
@@ -100,7 +109,8 @@
 | ハーネスの状態 | セッションでは `query { status }` への答え（節 `Fake agent`: セッション、モデル、プランモード、高速モード、プロジェクトの信頼）。セッションなしでは `HarnessAdapter::status`（節 `Fake harness`: 保存の場所、動かし方） |
 | 会話に入らない質問 | `query { sideQuestion }` に `side answer: <質問>` と答える。実行中のターンがあっても待たない |
 | バックグラウンドへの移動 | `@tool [ms] [タイトル]` は前面で `ms`（既定 5000）動くコマンドで、始まるとすぐに移せると報告する（`ItemBackgroundable`）。`background { key }` を受けると残りの時間を動くシェルのタスク（`bg-<key>`）を報告してから、Item を `backgrounded` で閉じる |
-| 取り込まれなかった steer | `@refuse-steers` のあとのそのターンの steer は取り込まず、`steerReturned { messageId }` で返す（`SteerReturned`） |
+| 取り込まれなかった steer | `@refuse-steers` のあとのそのターンの steer は取り込まず、`steerReturned { messageId }` で返す（`SteerReturned`）。読まれないままターンが終わった steer も返す（5章） |
+| モデルごとの権限モード | モデル `fake-lite`（`LIMITED_MODEL`）は権限モード `ask` だけで動く（`Model.permissionModes`。Claude Code の Haiku に auto モードがないのと同じ形）。エンジンがモデルと権限モードの組を確かめることを試すため |
 | 入力欄へのテキスト | `@editor <テキスト>`（`ComposerText`） |
 | プロジェクトの信頼 | `hello` の `projectTrusted` を覚え、`@trust` に `project trusted: yes` / `no` / `undecided` と答える |
 | ハーネスが変えた設定 | `@permission <モード>`、`@effort <推論量>` はエージェントが自分で変えた値の報告（`SessionInfo`） |
@@ -108,5 +118,5 @@
 | セッションの切り替え | `fake-clear`（別名 `fake-reset` も一覧に出す）はセッションを切り替えるコマンド（`session_switching_names`）。エンジンは手で打ったものを断る。エージェントが受け取った場合と `@switch-session` は、新しいセッションに移って `ready` を送り直す（`SessionIdentified`。保存するセッションなら新しいトランスクリプト） |
 | stderr | `@stderr <テキスト>` は stderr に書く（`\e` はエスケープ文字。制御文字の除去を確かめるため） |
 
-- アダプタとエージェントの間の追加の op と ev は `src/wire.rs`（`setModes`、`rename`、`query` / `queryResult`、`background`、`steer` の `messageId`、`hello` の `forkAt` / `modes` / `projectTrusted`、`modes`、`title`、`anchor`、`provisionalAnchor`、`anchorSettled`、`backgroundable`、`steerReturned`、`editorText`）。
+- アダプタとエージェントの間の追加の op と ev は `src/wire.rs`（`setModes`、`rename`、`query` / `queryResult`、`background`、`steer` の `messageId`、`hello` の `forkAt` / `modes` / `projectTrusted`、`modes`、`title`、`anchor`、`provisionalAnchor`、`anchorSettled`、`backgroundable`、`steerAck`、`steerReturned`、`editorText`、`backgroundOutput`）。
 - テスト: `src/lib.rs` の単体テスト（印と fork、あとで確定する印、持たれているセッション、エージェントが自分で変えたものの報告、モード・状態・質問・名前、バックグラウンドへの移動と戻された steer）、`crates/aas-core/tests/harness_features.rs`（エンジンを通したすべて）、`crates/aas-testkit/tests/test_server.rs`（実プロセスで、持たれているセッション、途中のターンからの fork、質問、状態）。

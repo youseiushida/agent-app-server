@@ -270,6 +270,7 @@ fn params(dir: &std::path::Path, settings: ThreadSettings) -> SessionParams {
         max_line_bytes: 1 << 24,
         command_cache: crate::commands::CommandCache::default(),
         agent_progress_summaries: None,
+        max_output_file_bytes: aas_harness::AdapterPolicy::default().max_output_file_bytes,
     }
 }
 
@@ -277,13 +278,57 @@ fn start(script: Vec<Line>) -> Harness {
     start_with(script, ThreadSettings::default())
 }
 
+/// The content the replays give the output file of task `task_id` (the recordings do not hold
+/// the files the CLI wrote).
+fn recorded_output(task_id: &str) -> String {
+    format!("output of {task_id}\n[exited with code 0]\n")
+}
+
+/// Points every non-empty `task_notification.output_file` of the script at a file in `dir`
+/// holding [`recorded_output`] (the recorded paths are the recording PC's).
+fn with_output_files(script: Vec<Line>, dir: &std::path::Path) -> Vec<Line> {
+    let files = dir.join("task-outputs");
+    std::fs::create_dir_all(&files).unwrap();
+    script
+        .into_iter()
+        .map(|mut line| {
+            if line.dir == "out"
+                && line.msg["subtype"] == "task_notification"
+                && line.msg["output_file"]
+                    .as_str()
+                    .is_some_and(|f| !f.is_empty())
+            {
+                let task = line.msg["task_id"].as_str().unwrap_or("task").to_owned();
+                let path = files.join(format!("{task}.output"));
+                std::fs::write(&path, recorded_output(&task)).unwrap();
+                line.msg["output_file"] = Value::String(path.display().to_string());
+            }
+            line
+        })
+        .collect()
+}
+
+/// Like [`start`], with the script's output files as they are (not rewritten).
+fn start_raw(script: Vec<Line>) -> Harness {
+    start_in(
+        script,
+        ThreadSettings::default(),
+        tempfile::tempdir().unwrap(),
+    )
+}
+
 fn start_with(script: Vec<Line>, settings: ThreadSettings) -> Harness {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = with_output_files(script, tmp.path());
+    start_in(script, settings, tmp)
+}
+
+fn start_in(script: Vec<Line>, settings: ThreadSettings, tmp: tempfile::TempDir) -> Harness {
     let (adapter_in, fake_out) = tokio::io::duplex(1 << 20);
     let (fake_in, adapter_out) = tokio::io::duplex(1 << 20);
     let (exit_tx, exit_rx) = watch::channel(None);
     let (progress_tx, progress) = watch::channel(Progress::default());
     let fake = tokio::spawn(fake_cli(script, fake_in, fake_out, exit_tx, progress_tx));
-    let tmp = tempfile::tempdir().unwrap();
     let (session, events) = ClaudeSession::start(
         adapter_in,
         adapter_out,
@@ -1375,6 +1420,570 @@ async fn replays_scheduled_wakeups() {
     // explicit (no trigger).
     assert_eq!(turn_triggers(&events), vec![None; 5]);
     assert_eq!(sends.len(), 3);
+}
+
+/// w1: `ScheduleWakeup` schedules a wakeup (its result says when it comes due, not its id). The
+/// task is live from that result, the item goes on as it, the Stop hook's list names the same
+/// wakeup (no second task for its entry), and when it came due the list at the end of the run
+/// it started no longer holds it: it completed.
+#[tokio::test]
+async fn replays_a_schedule_wakeup_that_fires() {
+    let Replayed { events, sends, .. } = replay("schedule_wakeup_fire.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_well_formed(&events);
+    let key = "wakeup:toolu_018MmP8CaLmXXaaJjuuYeA8i";
+    let history = task_history(&events);
+    let first = &history[key][0];
+    assert_eq!(
+        (
+            first.kind,
+            first.title.as_str(),
+            first.live,
+            first.stoppable,
+            first.next_run_at
+        ),
+        (
+            BackgroundTaskKind::Scheduled,
+            "Reply with exactly: woke-up",
+            true,
+            false,
+            Some(1_790_596_080_000)
+        )
+    );
+    assert_eq!(
+        first.progress.as_ref().and_then(|p| p.summary.as_deref()),
+        Some("recording test"),
+        "the reason the model gave, for people"
+    );
+    let item = first
+        .origin_item_key
+        .clone()
+        .expect("the ScheduleWakeup item");
+    let (_, body, status) = completed(&events)
+        .into_iter()
+        .find(|(k, _, _)| *k == item)
+        .unwrap();
+    assert!(matches!(&body, ItemBody::ToolCall { name, .. } if name == "ScheduleWakeup"));
+    assert_eq!(status, ItemStatus::Backgrounded);
+    let task_at = position(
+        &events,
+        |e| matches!(e, AdapterEvent::BackgroundTask { task } if task.key == key),
+    );
+    let item_at = position(
+        &events,
+        |e| matches!(e, AdapterEvent::ItemCompleted { key: k, .. } if *k == item),
+    );
+    assert!(
+        task_at < item_at,
+        "the task before the item that goes on as it"
+    );
+    assert!(
+        !history.contains_key("cron:180719e1"),
+        "the list's entry is the same wakeup: {:?}",
+        history.keys()
+    );
+    // Live through the end of the turn that scheduled it (its list named it).
+    let first_end = position(&events, |e| matches!(e, AdapterEvent::TurnCompleted { .. }));
+    let at_first_end = events[..first_end]
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AdapterEvent::BackgroundTask { task } if task.key == key => Some(task.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(at_first_end.live && at_first_end.state == BackgroundState::Running);
+    let fired = last_state(&events, key);
+    assert_eq!(
+        (fired.state, fired.live),
+        (BackgroundState::Completed, false)
+    );
+    // The run it started is the CLI's own, which the CLI marks with nothing explicit.
+    assert_eq!(turn_triggers(&events), vec![None, None]);
+}
+
+/// w3: the wakeup a turn scheduled stays live while the user's next turn is interrupted (no
+/// Stop hook, and nothing of the CLI's own ran): it still comes due, and the run it starts
+/// ends it. The interrupted turn's foreground command is never a task.
+#[tokio::test]
+async fn replays_a_wakeup_that_outlives_an_interrupted_turn() {
+    let Replayed { events, sends, .. } = replay("schedule_wakeup_interrupt.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_well_formed(&events);
+    let key = "wakeup:toolu_01WU7BWawSfQMEuioHd3Tw86";
+    assert_eq!(
+        turn_statuses(&events),
+        vec![
+            TurnStatus::Completed,
+            TurnStatus::Interrupted,
+            TurnStatus::Completed
+        ]
+    );
+    let interrupted = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, AdapterEvent::TurnCompleted { .. }))
+        .nth(1)
+        .map(|(i, _)| i)
+        .unwrap();
+    let before = events[..interrupted]
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AdapterEvent::BackgroundTask { task } if task.key == key => Some(task.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        (before.live, before.state, before.next_run_at),
+        (true, BackgroundState::Running, Some(1_790_596_260_000))
+    );
+    assert!(
+        !events[interrupted..]
+            .iter()
+            .take_while(|e| !matches!(e, AdapterEvent::TurnStarted))
+            .any(|e| matches!(e, AdapterEvent::BackgroundTask { task } if task.key == key)),
+        "the interrupted turn changed nothing about it"
+    );
+    let history = task_history(&events);
+    assert!(
+        !history.contains_key("cron:925f09a0"),
+        "{:?}",
+        history.keys()
+    );
+    assert!(!history.contains_key("b74x16gn7"), "a foreground command");
+    let fired = last_state(&events, key);
+    assert_eq!(
+        (fired.state, fired.live),
+        (BackgroundState::Completed, false)
+    );
+}
+
+/// A shell task's output is the file its `task_notification` names (recorded f1b); an
+/// agent's file is its transcript, not output (recorded f2).
+#[tokio::test]
+async fn a_shell_tasks_output_is_the_file_its_end_names() {
+    let Replayed { events, .. } = replay("background_bash.jsonl").await;
+    let shell = last_state(&events, "b0psjkcj9");
+    assert_eq!(shell.kind, BackgroundTaskKind::Shell);
+    let result = shell.result.expect("the end's result");
+    assert_eq!(
+        result.output.as_deref(),
+        Some(recorded_output("b0psjkcj9").as_str())
+    );
+    assert_eq!(result.output_omitted_bytes, None);
+    let Replayed { events, .. } = replay("background_agent.jsonl").await;
+    let agent = last_state(&events, "adddbb491bccbcff1");
+    assert_eq!(agent.kind, BackgroundTaskKind::Agent);
+    assert_eq!(agent.result.and_then(|r| r.output), None);
+}
+
+/// A shell task whose output file cannot be read ends without output, and the user is told.
+#[tokio::test]
+async fn an_unreadable_output_file_is_reported() {
+    let mut script = init_exchange();
+    script.extend([
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "task_started", "task_id": "bx",
+            "description": "npm run build", "task_type": "local_bash", "is_backgrounded": true}}),
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "task_notification", "task_id": "bx",
+            "status": "completed", "output_file": "", "summary": "done"}}),
+    ]);
+    let mut h = start(synthetic(&script));
+    // An output file that is not there (the replay only writes the named ones).
+    h.session.initialize().await.unwrap();
+    let events = collect_until_exit(&mut h).await;
+    let shell = last_state(&events, "bx");
+    assert_eq!(shell.state, BackgroundState::Completed);
+    assert_eq!(shell.result.and_then(|r| r.output), None, "no file named");
+
+    let missing = h.tmp.path().join("missing.output");
+    let mut script = init_exchange();
+    script.extend([
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "task_started", "task_id": "by",
+            "description": "npm run build", "task_type": "local_bash", "is_backgrounded": true}}),
+        json!({"dir": "out", "msg": {"type": "system", "subtype": "task_notification", "task_id": "by",
+            "status": "completed", "output_file": missing.display().to_string(), "summary": "done"}}),
+    ]);
+    // Not rewritten: the path is made to point at a file that does not exist.
+    let script: Vec<Line> = synthetic(&script)
+        .into_iter()
+        .map(|mut l| {
+            if l.msg["subtype"] == "task_notification" {
+                l.msg["output_file"] = Value::String(missing.display().to_string());
+            }
+            l
+        })
+        .collect();
+    let mut h2 = start_raw(script);
+    h2.session.initialize().await.unwrap();
+    let events = collect_until_exit(&mut h2).await;
+    let shell = last_state(&events, "by");
+    assert_eq!(shell.state, BackgroundState::Completed);
+    assert_eq!(shell.result.and_then(|r| r.output), None);
+    assert!(events.iter().any(|e| matches!(e,
+        AdapterEvent::Notice { level: aas_harness::NoticeLevel::Warning, code: Some(c), message }
+            if c == "backgroundOutputUnreadable" && message.contains("by"))));
+}
+
+/// The assistant message of a `ScheduleWakeup` call (the shape of recording w1).
+fn wakeup_call(id: &str, input: Value) -> Value {
+    json!({"dir": "out", "msg": {"type": "assistant", "parent_tool_use_id": null,
+        "message": {"id": format!("m-{id}"), "content": [
+            {"type": "tool_use", "id": id, "name": "ScheduleWakeup", "input": input}]}}})
+}
+
+/// The tool result of a `ScheduleWakeup` call, `result` its structured part (recording w1).
+fn wakeup_result(id: &str, result: Value) -> Value {
+    json!({"dir": "out", "msg": {"type": "user", "parent_tool_use_id": null,
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id,
+            "content": "Next wakeup scheduled."}]},
+        "tool_use_result": result}})
+}
+
+/// The Stop hook of a run that ends normally, with the CLI's list of pending wakeups.
+fn stop_hook(request_id: &str, crons: Value) -> [Value; 2] {
+    [
+        json!({"dir": "out", "msg": {"type": "control_request", "request_id": request_id, "request": {
+            "subtype": "hook_callback", "callback_id": crate::session::STOP_HOOK_ID, "input": {
+                "hook_event_name": "Stop", "stop_hook_active": false, "background_tasks": [],
+                "session_crons": crons}}}}),
+        json!({"dir": "in", "msg": {"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {}}}}),
+    ]
+}
+
+/// A `result` that ends a run normally.
+fn success_result(cost: f64) -> Value {
+    json!({"dir": "out", "msg": {"type": "result", "subtype": "success", "is_error": false, "total_cost_usd": cost,
+        "usage": {"input_tokens": 1, "output_tokens": 1}}})
+}
+
+/// A `result` of a run that failed on an API error (no Stop hook came before it).
+fn api_error_result(cost: f64) -> Value {
+    json!({"dir": "out", "msg": {"type": "result", "subtype": "error_during_execution", "is_error": true,
+        "errors": ["API Error: 529 overloaded"], "total_cost_usd": cost, "usage": {"input_tokens": 1, "output_tokens": 1}}})
+}
+
+/// A `ScheduleWakeup` in a turn that is interrupted (no Stop hook): its wakeup is live from the
+/// result on; the next list names the wakeup under its own id; `ScheduleWakeup {stop: true}`
+/// cancels it before it came due.
+#[tokio::test]
+async fn a_schedule_wakeup_of_an_interrupted_turn_is_live_until_a_signal_ends_it() {
+    let due = 4_102_444_800_000i64;
+    let mut script = init_exchange();
+    script.extend([
+        json!({"dir": "in", "msg": {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "loop"}}}),
+        lifecycle("u1", "queued"),
+        lifecycle("u1", "started"),
+        init_with_lifecycle(),
+        wakeup_call("toolu_W", json!({"delaySeconds": 1200, "reason": "check the deploy",
+            "prompt": "/loop check the deploy", "noop": false})),
+        wakeup_result("toolu_W", json!({"scheduledFor": due, "clampedDelaySeconds": 1200, "wasClamped": false})),
+        text_message("m1", "waiting"),
+        json!({"dir": "in", "msg": {"type": "control_request", "request_id": "i1", "request": {"subtype": "interrupt"}}}),
+        json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success", "request_id": "i1", "response": {"still_queued": []}}}}),
+        json!({"dir": "out", "msg": {"type": "result", "subtype": "error_during_execution", "is_error": true,
+            "terminal_reason": "aborted_streaming", "total_cost_usd": 0.1, "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+    ]);
+    script.extend(context_exchange("ctx1"));
+    script.push(lifecycle("u1", "cancelled"));
+    // The user's next turn ends normally: the list names the wakeup, and the model stops the
+    // loop in the turn after.
+    script.extend([
+        json!({"dir": "in", "msg": {"type": "user", "uuid": "u3", "message": {"role": "user", "content": "status?"}}}),
+        lifecycle("u3", "queued"),
+        lifecycle("u3", "started"),
+        init_with_lifecycle(),
+        text_message("m3", "still waiting"),
+    ]);
+    script.extend(stop_hook(
+        "h1",
+        json!([{"id": "5f00ba11", "schedule": "0 9 1 1 *", "recurring": false,
+            "prompt": "/loop check the deploy"}]),
+    ));
+    script.push(success_result(0.3));
+    script.extend(context_exchange("ctx3"));
+    script.push(lifecycle("u3", "completed"));
+    script.extend([
+        json!({"dir": "in", "msg": {"type": "user", "uuid": "u4", "message": {"role": "user", "content": "stop the loop"}}}),
+        lifecycle("u4", "queued"),
+        lifecycle("u4", "started"),
+        init_with_lifecycle(),
+        wakeup_call("toolu_S", json!({"stop": true})),
+        wakeup_result("toolu_S", json!({"scheduledFor": 0, "clampedDelaySeconds": 0, "wasClamped": false,
+            "stopped": true, "cancelledWakeups": 1})),
+        text_message("m4", "stopped"),
+        success_result(0.4),
+    ]);
+    script.extend(context_exchange("ctx4"));
+    script.push(lifecycle("u4", "completed"));
+    let key = "wakeup:toolu_W";
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    h.session.send(TurnInput::text("loop")).await.unwrap();
+    let mut events = Vec::new();
+    next_matching(
+        &mut h,
+        &mut events,
+        |e| matches!(e, AdapterEvent::ItemCompleted { key, .. } if key == "tool:toolu_W"),
+    )
+    .await;
+    let scheduled = last_state(&events, key);
+    assert_eq!(
+        (scheduled.live, scheduled.state, scheduled.next_run_at),
+        (true, BackgroundState::Running, Some(due))
+    );
+    next_matching(&mut h, &mut events, |e| {
+        matches!(e, AdapterEvent::ItemCompleted { .. })
+    })
+    .await;
+    h.session.interrupt().await.unwrap();
+    next_matching(&mut h, &mut events, |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert_eq!(
+        wakeup_live(&events, key),
+        (true, BackgroundState::Running),
+        "the interrupted turn's wakeup is pending"
+    );
+    h.session.send(TurnInput::text("status?")).await.unwrap();
+    next_matching(&mut h, &mut events, |e| {
+        matches!(e, AdapterEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert_eq!(wakeup_live(&events, key), (true, BackgroundState::Running));
+    assert!(!task_history(&events).contains_key("cron:5f00ba11"));
+    h.session
+        .send(TurnInput::text("stop the loop"))
+        .await
+        .unwrap();
+    events.extend(collect_until_exit(&mut h).await);
+    assert_eq!(
+        wakeup_live(&events, key),
+        (false, BackgroundState::Stopped),
+        "cancelled before it came due"
+    );
+    let stop_item = completed(&events)
+        .into_iter()
+        .find(|(k, _, _)| k == "tool:toolu_S")
+        .unwrap();
+    assert_eq!(
+        stop_item.2,
+        ItemStatus::Completed,
+        "a call that schedules nothing is not background work"
+    );
+    assert!(!task_history(&events).contains_key("wakeup:toolu_S"));
+}
+
+/// Claude Code's scheduler runs a one-shot wakeup that lands on :00 or :30 up to 90 s before the
+/// `scheduledFor` its `ScheduleWakeup` result stated (its `CronCreate` description: "one-shot
+/// tasks landing on :00 or :30 fire up to 90 s early"). Here every command of the CLI's own
+/// starts before that time (`scheduledFor` is in 2100): the run that reschedules ends the
+/// wakeup it ran as fired (not cancelled), the next wakeup's run fails without a list and
+/// leaves it unconfirmed (no longer keeping the process), and the next list, which does not
+/// hold it, ends it as fired.
+#[tokio::test]
+async fn a_wakeup_the_cli_runs_before_its_scheduled_time_ends_as_fired() {
+    // 2100-01-01T00:00:00Z and 00:30:00Z.
+    let due1 = 4_102_444_800_000i64;
+    let due2 = due1 + 30 * 60_000;
+    let prompt = "/loop check the deploy";
+    let call = |id: &str| {
+        wakeup_call(
+            id,
+            json!({"delaySeconds": 1200, "reason": "check the deploy", "prompt": prompt, "noop": false}),
+        )
+    };
+    let mut script = init_exchange();
+    // The user's turn schedules the first wakeup; the list at its end names it.
+    script.extend([
+        json!({"dir": "in", "msg": {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "loop"}}}),
+        lifecycle("u1", "queued"),
+        lifecycle("u1", "started"),
+        init_with_lifecycle(),
+        call("toolu_1"),
+        wakeup_result("toolu_1", json!({"scheduledFor": due1, "clampedDelaySeconds": 1200, "wasClamped": false})),
+        text_message("m1", "waiting"),
+    ]);
+    script.extend(stop_hook(
+        "h1",
+        json!([{"id": "c1", "schedule": "0 9 1 1 *", "recurring": false, "prompt": prompt}]),
+    ));
+    script.push(success_result(0.1));
+    script.extend(context_exchange("ctx1"));
+    script.push(lifecycle("u1", "completed"));
+    // The CLI runs it as a command of its own, and the model schedules the next one.
+    script.extend([
+        lifecycle("cli-1", "started"),
+        init_with_lifecycle(),
+        call("toolu_2"),
+        wakeup_result(
+            "toolu_2",
+            json!({"scheduledFor": due2, "clampedDelaySeconds": 1200, "wasClamped": false}),
+        ),
+        text_message("m2", "the deploy is still running"),
+    ]);
+    script.extend(stop_hook(
+        "h2",
+        json!([{"id": "c2", "schedule": "30 9 1 1 *", "recurring": false, "prompt": prompt}]),
+    ));
+    script.push(success_result(0.2));
+    script.extend(context_exchange("ctx2"));
+    script.push(lifecycle("cli-1", "completed"));
+    // The CLI runs the next one; that run fails (no Stop hook, no list).
+    script.extend([
+        lifecycle("cli-2", "started"),
+        init_with_lifecycle(),
+        text_message("m3", "checking"),
+        api_error_result(0.3),
+    ]);
+    script.extend(context_exchange("ctx3"));
+    script.push(lifecycle("cli-2", "completed"));
+    // The user's next turn ends normally; its list holds no wakeup.
+    script.extend([
+        json!({"dir": "in", "msg": {"type": "user", "uuid": "u4", "message": {"role": "user", "content": "status?"}}}),
+        lifecycle("u4", "queued"),
+        lifecycle("u4", "started"),
+        init_with_lifecycle(),
+        text_message("m4", "the loop is over"),
+    ]);
+    script.extend(stop_hook("h4", json!([])));
+    script.push(success_result(0.4));
+    script.extend(context_exchange("ctx4"));
+    script.push(lifecycle("u4", "completed"));
+
+    let (first, second) = ("wakeup:toolu_1", "wakeup:toolu_2");
+    let running = (true, BackgroundState::Running);
+    let turn_end = |e: &AdapterEvent| matches!(e, AdapterEvent::TurnCompleted { .. });
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    h.session.send(TurnInput::text("loop")).await.unwrap();
+    let mut events = Vec::new();
+    next_matching(&mut h, &mut events, turn_end).await;
+    assert_eq!(wakeup_live(&events, first), running);
+    // The run of the CLI's own that rescheduled.
+    next_matching(&mut h, &mut events, turn_end).await;
+    assert_eq!(
+        wakeup_live(&events, first),
+        (false, BackgroundState::Completed),
+        "the CLI ran it (before its scheduledFor): fired, not cancelled"
+    );
+    assert_eq!(wakeup_live(&events, second), running);
+    assert_eq!(last_state(&events, second).next_run_at, Some(due2));
+    // The failed run.
+    next_matching(&mut h, &mut events, turn_end).await;
+    assert_eq!(
+        wakeup_live(&events, second),
+        (false, BackgroundState::Running),
+        "the CLI may have run it: it no longer keeps the process until a list says"
+    );
+    h.session.send(TurnInput::text("status?")).await.unwrap();
+    events.extend(collect_until_exit(&mut h).await);
+    assert_eq!(
+        wakeup_live(&events, second),
+        (false, BackgroundState::Completed)
+    );
+    let history = task_history(&events);
+    assert!(
+        !history.contains_key("cron:c1") && !history.contains_key("cron:c2"),
+        "each list entry is the wakeup its call scheduled: {:?}",
+        history.keys()
+    );
+    assert_eq!(
+        turn_statuses(&events),
+        vec![
+            TurnStatus::Completed,
+            TurnStatus::Completed,
+            TurnStatus::Failed,
+            TurnStatus::Completed
+        ]
+    );
+}
+
+/// A CLI without lifecycle frames does not say which commands it enqueued itself: a run the
+/// adapter did not start is one (the CLI runs a wakeup only while no run is going, as a run of
+/// its own). A wakeup scheduled in an interrupted turn stays live through the user's own
+/// interrupted turns; the CLI runs it (before its `scheduledFor`, which is in 2100), the model
+/// does not reschedule, and the list at the end of that run holds only the next wakeup the CLI
+/// armed by itself with the same prompt: the wakeup fired, and the entry is another wakeup.
+#[tokio::test]
+async fn without_lifecycle_frames_a_run_of_the_clis_own_may_have_run_a_wakeup() {
+    let due = 4_102_444_800_000i64;
+    let prompt = "/loop check the deploy";
+    let init = json!({"dir": "out", "msg": {"type": "system", "subtype": "init", "session_id": "replay",
+        "capabilities": ["interrupt_receipt_v1"]}});
+    let interrupted = |request_id: &str| {
+        [
+            json!({"dir": "in", "msg": {"type": "control_request", "request_id": request_id, "request": {"subtype": "interrupt"}}}),
+            json!({"dir": "out", "msg": {"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {"still_queued": []}}}}),
+            json!({"dir": "out", "msg": {"type": "result", "subtype": "error_during_execution", "is_error": true,
+                "terminal_reason": "aborted_streaming", "total_cost_usd": 0.1, "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ]
+    };
+    let mut script = init_exchange();
+    script.extend([
+        json!({"dir": "in", "msg": {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "loop"}}}),
+        init.clone(),
+        wakeup_call("toolu_W", json!({"delaySeconds": 1200, "reason": "check the deploy",
+            "prompt": prompt, "noop": false})),
+        wakeup_result("toolu_W", json!({"scheduledFor": due, "clampedDelaySeconds": 1200, "wasClamped": false})),
+        text_message("m1", "waiting"),
+    ]);
+    script.extend(interrupted("i1"));
+    script.extend(context_exchange("ctx1"));
+    script.extend([
+        json!({"dir": "in", "msg": {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "anything new?"}}}),
+        init.clone(),
+        text_message("m2", "looking"),
+    ]);
+    script.extend(interrupted("i2"));
+    script.extend(context_exchange("ctx2"));
+    // A run the adapter did not start.
+    script.extend([init.clone(), text_message("m3", "the deploy is done")]);
+    script.extend(stop_hook(
+        "h3",
+        json!([{"id": "k1", "schedule": "30 9 1 1 *", "recurring": false, "prompt": prompt}]),
+    ));
+    script.push(success_result(0.3));
+    script.extend(context_exchange("ctx3"));
+
+    let key = "wakeup:toolu_W";
+    let running = (true, BackgroundState::Running);
+    let mut h = start(synthetic(&script));
+    h.session.initialize().await.unwrap();
+    let mut events = Vec::new();
+    for (message, answer) in [("loop", "waiting"), ("anything new?", "looking")] {
+        h.session.send(TurnInput::text(message)).await.unwrap();
+        next_matching(&mut h, &mut events, |e| {
+            matches!(e, AdapterEvent::ItemStarted { body: ItemBody::AgentMessage { text }, .. } if text == answer)
+        })
+        .await;
+        h.session.interrupt().await.unwrap();
+        next_matching(&mut h, &mut events, |e| {
+            matches!(e, AdapterEvent::TurnCompleted { .. })
+        })
+        .await;
+        assert_eq!(
+            wakeup_live(&events, key),
+            running,
+            "the user's own interrupted turn ran no wakeup"
+        );
+    }
+    events.extend(collect_until_exit(&mut h).await);
+    assert_eq!(
+        wakeup_live(&events, key),
+        (false, BackgroundState::Completed),
+        "the CLI's own run may have been it, and the list does not hold it"
+    );
+    assert_eq!(wakeup_live(&events, "cron:k1"), running);
+    assert_eq!(
+        turn_statuses(&events),
+        vec![
+            TurnStatus::Interrupted,
+            TurnStatus::Interrupted,
+            TurnStatus::Completed
+        ]
+    );
 }
 
 /// r1a: the user's message arrives while the CLI starts a run for a finished task. The adapter
@@ -2504,6 +3113,75 @@ async fn replays_fast_mode() {
         .collect();
     assert_eq!(states, ["off", "on", "off"]);
     assert!(events.iter().any(|e| matches!(e, AdapterEvent::Notice { level: aas_harness::NoticeLevel::Error, message, code: Some(c) } if c == "fast-mode-overage-rejected" && message == "Fast mode disabled · usage credits exhausted")));
+    // Fast mode was on as asked: no reason to tell.
+    assert!(!events.iter().any(|e| matches!(e, AdapterEvent::Notice { code: Some(c), .. } if c == crate::session::FAST_MODE_DISABLED_NOTICE)));
+}
+
+/// e1 against an account whose extra usage is off (probe of 2026-09-30, Claude Code 2.1.284):
+/// the CLI keeps the requested fast mode off and says why (`fast_mode_disabled_reason:
+/// extra_usage_disabled` in `init` and `result`), which reaches the user once as a notice; off
+/// by request, the opt-in reason is not news.
+#[tokio::test]
+async fn a_fast_mode_the_cli_keeps_off_is_explained_once() {
+    let Replayed { events, sends, .. } = replay("fast_mode_unavailable.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_well_formed(&events);
+    let states: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ModesReported {
+                fast_state: Some(s),
+                ..
+            } => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(states, ["off"]);
+    let notices: Vec<(&aas_harness::NoticeLevel, &str)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::Notice {
+                level,
+                message,
+                code: Some(c),
+            } if c == crate::session::FAST_MODE_DISABLED_NOTICE => Some((level, message.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        [(
+            &aas_harness::NoticeLevel::Warning,
+            "Claude Code keeps fast mode off: extra_usage_disabled"
+        )]
+    );
+}
+
+/// `fast_mode_unavailable.jsonl` with the first turn's `result` reporting `on` without a reason
+/// (live run of 2026-09-30, Claude Code 2.1.285: `init` said off with `extra_usage_disabled`, the
+/// same turn's `result` said on). The reason in `init` alone is no notice; the second turn is
+/// off by request, without a reason. A `result` off with the reason is the notice of
+/// `a_fast_mode_the_cli_keeps_off_is_explained_once`.
+#[tokio::test]
+async fn a_fast_mode_off_only_at_the_start_of_a_turn_is_no_notice() {
+    let Replayed { events, sends, .. } = replay("fast_mode_on_within_turn.jsonl").await;
+    assert!(sends.iter().all(Result::is_ok), "{sends:?}");
+    assert_well_formed(&events);
+    let states: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ModesReported {
+                fast_state: Some(s),
+                ..
+            } => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(states, ["off", "on", "off"]);
+    assert!(
+        !events.iter().any(|e| matches!(e, AdapterEvent::Notice { code: Some(c), .. } if c == crate::session::FAST_MODE_DISABLED_NOTICE)),
+        "{events:?}"
+    );
 }
 
 /// f1b: a foreground Bash, backgroundable once the CLI registered its task, moved to the

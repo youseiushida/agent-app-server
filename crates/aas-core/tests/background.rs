@@ -13,8 +13,8 @@ use aas_core::{Engine, EngineConfig, HarnessRegistry, Policy, RequestCtx};
 use aas_harness::{
     AdapterContext, AdapterError, AdapterEvent, BackgroundOutcome, BackgroundState,
     BackgroundTaskInfo, CommandContext, ExitInfo, HarnessAdapter, HarnessInfo, NativeHistory,
-    NativeSessionSummary, SessionControl, SessionHandle, SettingsApplied, StartRequest, StopReason,
-    TurnInput,
+    NativeSessionSummary, OutputUpdate, SessionControl, SessionHandle, SettingsApplied,
+    StartRequest, StopReason, TurnInput,
 };
 use aas_protocol::events::{Event, EventEnvelope};
 use aas_protocol::methods::{spec, *};
@@ -37,8 +37,10 @@ struct Script {
     sends_in_progress: AtomicUsize,
     /// `apply_settings` fails (a restart becomes necessary).
     settings_fail: AtomicBool,
-    /// `apply_settings` takes this long (it keeps the actor busy).
-    settings_delay_ms: AtomicUsize,
+    /// `expire_request` does not return until `expire_release` is notified (it keeps the actor
+    /// busy for as long as a test needs).
+    expire_held: AtomicBool,
+    expire_release: tokio::sync::Notify,
     /// `interrupt` is accepted but the turn never ends.
     interrupt_ignored: AtomicBool,
     /// The harness does not offer `backgroundStop`.
@@ -302,10 +304,6 @@ impl SessionControl for Session {
         _settings: &ThreadSettings,
     ) -> Result<SettingsApplied, AdapterError> {
         self.script.log(format!("apply#{}", self.n));
-        let delay = self.script.settings_delay_ms.load(Ordering::SeqCst);
-        if delay > 0 {
-            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
-        }
         if self.script.settings_fail.load(Ordering::SeqCst) {
             return Err(AdapterError::Protocol(
                 "no answer to set_permission_mode".into(),
@@ -329,6 +327,9 @@ impl SessionControl for Session {
     ) -> Result<(), AdapterError> {
         self.script
             .log(format!("expire#{} {request_id} {reason:?}", self.n));
+        if self.script.expire_held.load(Ordering::SeqCst) {
+            self.script.expire_release.notified().await;
+        }
         Ok(())
     }
 }
@@ -816,45 +817,47 @@ async fn the_live_set_decides_and_the_idle_wait_starts_when_it_empties() {
 /// reported meanwhile keeps the process.
 #[tokio::test(flavor = "multi_thread")]
 async fn queued_events_beat_the_idle_deadline() {
-    let env = env_with(|p| p.idle_process_ttl = Duration::from_millis(200)).await;
+    let ttl = Duration::from_millis(200);
+    let env = env_with(|p| p.idle_process_ttl = ttl).await;
     let thread = env.thread().await;
-    env.turn(&thread.id, "first", |_| {}).await;
-    env.wait_status(&thread.id, ThreadStatus::Ready).await;
-    // A settings change keeps the actor inside the adapter's call past the idle deadline; the
-    // agent reports background work meanwhile.
-    env.script.settings_delay_ms.store(600, Ordering::SeqCst);
-    let update = {
-        let engine = env.engine.clone();
-        let ctx = env.ctx.clone();
-        let thread = thread.id.clone();
-        tokio::spawn(async move {
-            let params = ThreadUpdateParams {
-                client_request_id: crid(),
-                thread_id: thread,
-                title: None,
-                settings: Some(ThreadSettings {
-                    permission_mode: Some("auto".into()),
-                    ..Default::default()
-                }),
-                pinned: None,
-                modes: None,
-            };
-            engine
-                .handle(
-                    &ctx,
-                    ClientRequest::parse(
-                        "thread/update",
-                        Some(serde_json::to_value(params).unwrap()),
-                    )
-                    .unwrap(),
-                )
-                .await
-        })
-    };
-    env.wait_logged("apply#1").await;
+    // A request of an ambient task holds the process (nothing else does).
+    env.turn(&thread.id, "watch", |s| {
+        s.task(BackgroundTaskInfo {
+            ambient: true,
+            ..agent("mon")
+        });
+        s.ask("mon-ask", Some("mon"));
+    })
+    .await;
+    env.wait_until(&thread.id, "the request", |r| !r.interactions.is_empty())
+        .await;
+    // The task's end expires the request: the commit that makes the process idle arms the idle
+    // deadline and then answers the request, and that answer keeps the actor busy until the
+    // test lets it return.
+    env.script.expire_held.store(true, Ordering::SeqCst);
+    env.script.session(1).task(BackgroundTaskInfo {
+        ambient: true,
+        ..ended(agent("mon"), BackgroundState::Completed)
+    });
+    env.wait_logged("expire#1 mon-ask TaskEnded").await;
+    // The agent reports background work while the actor is busy; the deadline, armed before the
+    // answer started, has passed when the actor returns.
     env.script.session(1).task(agent("late"));
-    update.await.unwrap().unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(ttl).await;
+    env.script.expire_release.notify_one();
+    // Had the deadline gone first, the idle stop would have been committed before the task:
+    // the thread would never be seen `ready` with it.
+    env.wait_task(&thread.id, "late", "the late task", |t| {
+        t.status == BackgroundTaskStatus::Running
+    })
+    .await;
+    let read = env.get(&thread.id).await;
+    assert_eq!(
+        (read.status, read.background.running),
+        (ThreadStatus::Ready, 1)
+    );
+    // And the task keeps the process from then on.
+    tokio::time::sleep(ttl * 3).await;
     assert!(
         !env.script
             .logged()
@@ -863,7 +866,6 @@ async fn queued_events_beat_the_idle_deadline() {
         "{:?}",
         env.script.logged()
     );
-    assert_eq!(env.get(&thread.id).await.background.running, 1);
 }
 
 // ----- tasks, items, runs -------------------------------------------------------------------
@@ -1172,6 +1174,7 @@ async fn a_long_result_output_goes_to_a_blob() {
             exit_code: Some(0),
             output: Some(output.clone()),
             summary: None,
+            output_omitted_bytes: None,
         }),
         state: BackgroundState::Completed,
         live: false,
@@ -1188,6 +1191,265 @@ async fn a_long_result_output_goes_to_a_blob() {
     let blob = result.output_blob_id.unwrap();
     let (path, _) = env.engine.blob(&blob).await.unwrap().unwrap();
     assert_eq!(std::fs::read_to_string(path).unwrap(), output);
+}
+
+// ----- output of running tasks -----------------------------------------------------------------
+
+fn shell(key: &str) -> BackgroundTaskInfo {
+    BackgroundTaskInfo {
+        kind: BackgroundTaskKind::Shell,
+        ..agent(key)
+    }
+}
+
+fn append(key: &str, text: &str) -> AdapterEvent {
+    AdapterEvent::BackgroundOutput {
+        key: key.into(),
+        output: OutputUpdate::Append(text.into()),
+    }
+}
+
+/// The output deltas of task `task` in `events`, in order.
+fn output_deltas(events: &[EventEnvelope], task: &BackgroundTaskId) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::BackgroundTaskOutputDelta { task_id, text } if task_id == task => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// What a running task streams is kept with it up to the inline limit and relayed as deltas;
+/// the moment it reaches the limit the task says so (`outputTruncated`) and nothing more is
+/// relayed; a replaced output is a whole update; the end's own output supersedes it, and a new
+/// run starts without output. Output of an unknown or ended task is ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_output_is_kept_inline_and_relayed() {
+    let env = env_with(|p| p.max_inline_output_bytes = 24).await;
+    let thread = env.thread().await;
+    env.turn(&thread.id, "serve", |s| s.task(shell("dev")))
+        .await;
+    let session = env.script.session(1);
+    session.emit(append("dev", "listening\n"));
+    session.emit(append("dev", "GET /\n"));
+    let task = env
+        .wait_task(&thread.id, "dev", "the output", |t| {
+            t.output.as_deref() == Some("listening\nGET /\n")
+        })
+        .await;
+    assert!(!task.output_truncated);
+    let stream = thread_stream(&thread.id);
+    // (Consecutive deltas of the task arrive merged: `seqFrom`.)
+    let events = env
+        .wait_for(&stream, |e| matches!(e, Event::BackgroundTaskOutputDelta { text, .. } if text.ends_with("GET /\n")))
+        .await;
+    assert_eq!(
+        output_deltas(&events, &task.id).concat(),
+        "listening\nGET /\n"
+    );
+    // Past the limit: what fits is relayed, then the task says it is cut.
+    session.emit(append("dev", "GET /favicon.ico 404\n"));
+    session.emit(append("dev", "never shown\n"));
+    let task = env
+        .wait_task(&thread.id, "dev", "the cut", |t| t.output_truncated)
+        .await;
+    assert_eq!(task.output.as_deref(), Some("listening\nGET /\nGET /fav"));
+    // Only then is the cut known; nothing after it was relayed.
+    let events = env.events(&stream).await;
+    assert_eq!(
+        output_deltas(&events, &task.id).concat(),
+        "listening\nGET /\nGET /fav"
+    );
+    let cut = events
+        .iter()
+        .rposition(
+            |e| matches!(&e.event, Event::BackgroundTaskUpdated { task } if task.output_truncated),
+        )
+        .unwrap();
+    let last_delta = events
+        .iter()
+        .rposition(|e| matches!(&e.event, Event::BackgroundTaskOutputDelta { .. }))
+        .unwrap();
+    assert!(last_delta < cut);
+    // A snapshot replaces what was streamed (and fits again).
+    session.emit(AdapterEvent::BackgroundOutput {
+        key: "dev".into(),
+        output: OutputUpdate::Replace("restarted\n".into()),
+    });
+    let task = env
+        .wait_task(&thread.id, "dev", "the replacement", |t| {
+            t.output.as_deref() == Some("restarted\n")
+        })
+        .await;
+    assert!(!task.output_truncated);
+    // Output of a task nobody reported is ignored.
+    session.emit(append("nope", "x"));
+    // The end brings the whole output: it supersedes the streamed one.
+    session.task(BackgroundTaskInfo {
+        result: Some(BackgroundOutcome {
+            exit_code: Some(0),
+            output: Some("the whole output\n".into()),
+            ..Default::default()
+        }),
+        ..ended(shell("dev"), BackgroundState::Completed)
+    });
+    let task = env
+        .wait_task(&thread.id, "dev", "the end", |t| t.status.is_terminal())
+        .await;
+    assert_eq!((task.output, task.output_truncated), (None, false));
+    assert_eq!(
+        task.result.unwrap().output.as_deref(),
+        Some("the whole output\n")
+    );
+    // Output after the end is ignored.
+    session.emit(append("dev", "late\n"));
+    // A new run starts without output; an end without an output of its own keeps the stream.
+    let second = BackgroundTaskInfo {
+        runs: 2,
+        ..shell("dev")
+    };
+    session.task(second.clone());
+    session.emit(append("dev", "again\n"));
+    env.wait_task(&thread.id, "dev", "the second run's output", |t| {
+        t.runs == 2 && t.output.as_deref() == Some("again\n")
+    })
+    .await;
+    session.task(ended(second, BackgroundState::Completed));
+    let task = env
+        .wait_task(&thread.id, "dev", "the second end", |t| {
+            t.runs == 2 && t.status.is_terminal()
+        })
+        .await;
+    assert_eq!(task.output.as_deref(), Some("again\n"));
+    let events = env.events(&stream).await;
+    assert!(
+        !events.iter().any(|e| matches!(&e.event, Event::BackgroundTaskOutputDelta { text, .. } if text.contains("late") || text.contains('x') && text.len() == 1)),
+        "nothing of an ended or unknown task"
+    );
+}
+
+/// A shell that goes on from a command of the turn starts with what the command printed: its
+/// output continues it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_from_a_command_continues_its_output() {
+    let env = env().await;
+    let thread = env.thread().await;
+    env.turn(&thread.id, "npm run dev", |s| {
+        s.emit(AdapterEvent::ItemStarted {
+            key: "cmd".into(),
+            body: ItemBody::CommandExecution {
+                command: "npm run dev".into(),
+                cwd: None,
+                output: String::new(),
+                output_truncated: false,
+                output_blob_id: None,
+                exit_code: None,
+                duration_ms: None,
+            },
+        });
+        s.emit(AdapterEvent::ItemDelta {
+            key: "cmd".into(),
+            field: DeltaField::Output,
+            text: "> vite\n".into(),
+        });
+        s.task(BackgroundTaskInfo {
+            origin_item_key: Some("cmd".into()),
+            ..shell("term")
+        });
+        s.emit(AdapterEvent::ItemCompleted {
+            key: "cmd".into(),
+            body: None,
+            status: ItemStatus::Backgrounded,
+        });
+        s.emit(append("term", "ready\n"));
+    })
+    .await;
+    let task = env
+        .wait_task(&thread.id, "term", "the output", |t| {
+            t.output.as_deref() == Some("> vite\nready\n")
+        })
+        .await;
+    assert!(task.origin_item_id.is_some());
+}
+
+// ----- what the harness waits on ----------------------------------------------------------------
+
+/// A question the agent asks outside a turn (one of the thread, like a pi extension's dialog)
+/// keeps the process: the harness waits for its answer, which a stopped process could never
+/// take. Once it is answered the idle stop runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_request_of_the_thread_keeps_the_process() {
+    let env = env_with(|p| p.idle_process_ttl = Duration::from_millis(300)).await;
+    let thread = env.thread().await;
+    env.turn(&thread.id, "go", |_| {}).await;
+    let session = env.script.session(1);
+    session.ask("dialog", None);
+    let read = env
+        .wait_until(&thread.id, "the request", |r| !r.interactions.is_empty())
+        .await;
+    let pending = read.interactions[0].clone();
+    assert_eq!(
+        (
+            pending.turn_id.as_ref(),
+            pending.background_task_id.as_ref()
+        ),
+        (None, None)
+    );
+    // Many idle periods pass: the process stays.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !env.script
+            .logged()
+            .iter()
+            .any(|l| l.starts_with("shutdown")),
+        "{:?}",
+        env.script.logged()
+    );
+    assert_eq!(env.get(&thread.id).await.status, ThreadStatus::Ready);
+    env.call::<spec::InteractionRespond>(InteractionRespondParams {
+        client_request_id: crid(),
+        interaction_id: pending.id,
+        resolution: InteractionResolution::Dismissed,
+    })
+    .await
+    .unwrap();
+    env.wait_logged("respond#1 dialog dismissed").await;
+    env.wait_logged("shutdown#1 idle").await;
+    env.wait_status(&thread.id, ThreadStatus::Idle).await;
+}
+
+/// A request of work that does not keep the process by itself (an ambient task) keeps it while
+/// it waits: the task's end expires it, and then the idle stop runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_request_of_an_ambient_task_keeps_the_process() {
+    let env = env_with(|p| p.idle_process_ttl = Duration::from_millis(300)).await;
+    let thread = env.thread().await;
+    env.turn(&thread.id, "watch", |s| {
+        s.task(BackgroundTaskInfo {
+            ambient: true,
+            ..agent("mon")
+        });
+        s.ask("mon-ask", Some("mon"));
+    })
+    .await;
+    env.wait_until(&thread.id, "the request", |r| !r.interactions.is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !env.script
+            .logged()
+            .iter()
+            .any(|l| l.starts_with("shutdown"))
+    );
+    env.script.session(1).task(BackgroundTaskInfo {
+        ambient: true,
+        ..ended(agent("mon"), BackgroundState::Completed)
+    });
+    env.wait_logged("expire#1 mon-ask TaskEnded").await;
+    env.wait_logged("shutdown#1 idle").await;
 }
 
 // ----- ends with the process ------------------------------------------------------------------
@@ -2092,6 +2354,206 @@ async fn fake_background_tasks_end_to_end() {
         thread_view.thread.background.last_ended.unwrap().task_id,
         task.id
     );
+    engine.shutdown(false).await;
+}
+
+/// A fake shell's output streams while it runs: the command printed the first line before it
+/// went on in the background (the task starts with it), the task printed the rest (deltas), and
+/// its end brings the whole output.
+#[tokio::test(flavor = "multi_thread")]
+async fn fake_shell_output_streams_end_to_end() {
+    let (_dir, engine, ctx, thread) = fake_env(|_| {}).await;
+    let _: TurnStartResult = fake_call(
+        &engine,
+        &ctx,
+        "turn/start",
+        serde_json::json!({"clientRequestId": crid(), "threadId": thread,
+            "input": [{"type": "text", "text": "@bg b kind=shell ms=400 output=4 early=1 make"}]}),
+    )
+    .await
+    .unwrap();
+    let read = fake_read_until(&engine, &ctx, &thread, "the end", |r| {
+        r.background_tasks
+            .iter()
+            .any(|t| t.status == BackgroundTaskStatus::Completed)
+    })
+    .await;
+    let task = &read.background_tasks[0];
+    let whole = "b line 1\nb line 2\nb line 3\nb line 4\nran make\n";
+    assert_eq!(task.result.as_ref().unwrap().output.as_deref(), Some(whole));
+    assert_eq!(task.output, None, "the end's output supersedes the stream");
+    let item = read
+        .items
+        .iter()
+        .find(|i| i.status == ItemStatus::Backgrounded)
+        .unwrap();
+    assert!(
+        matches!(&item.body, ItemBody::CommandExecution { output, .. } if output == "b line 1\n")
+    );
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let batch = engine
+            .read_batch(thread_stream(&thread), cursor)
+            .await
+            .unwrap();
+        if batch.events.is_empty() {
+            break;
+        }
+        cursor = batch.last_seq;
+        events.extend(batch.events);
+    }
+    let first = events
+        .iter()
+        .find_map(|e| match &e.event {
+            Event::BackgroundTaskUpdated { task } => Some(task.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        first.output.as_deref(),
+        Some("b line 1\n"),
+        "it starts with what the command printed"
+    );
+    assert_eq!(
+        output_deltas(&events, &task.id).concat(),
+        "b line 2\nb line 3\nb line 4\n"
+    );
+    engine.shutdown(false).await;
+}
+
+/// A fake wakeup (`@wakeup`, like Claude Code's `ScheduleWakeup`): a scheduled task that is
+/// live with the time it comes due, unstoppable, launched by its item; when it comes due the
+/// agent runs its prompt in a turn of its own (trigger `scheduled`) and the task completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn fake_wakeups_fire_as_scheduled_turns() {
+    let (_dir, engine, ctx, thread) = fake_env(|_| {}).await;
+    let _: TurnStartResult = fake_call(
+        &engine,
+        &ctx,
+        "turn/start",
+        serde_json::json!({"clientRequestId": crid(), "threadId": thread,
+            "input": [{"type": "text", "text": "@wakeup 300 @text woke-up\n@text scheduled"}]}),
+    )
+    .await
+    .unwrap();
+    let read = fake_read_until(&engine, &ctx, &thread, "the wakeup's run", |r| {
+        r.turns.len() == 2 && r.turns[1].status == TurnStatus::Completed
+    })
+    .await;
+    assert_eq!(read.turns[1].trigger, Some(TurnTrigger::Scheduled));
+    assert!(read.items.iter().any(|i| i.turn_id == read.turns[1].id
+        && matches!(&i.body, ItemBody::AgentMessage { text } if text == "woke-up")));
+    let task = &read.background_tasks[0];
+    assert_eq!(
+        (task.kind, task.title.as_str(), task.stoppable, task.status),
+        (
+            BackgroundTaskKind::Scheduled,
+            "@text woke-up",
+            false,
+            BackgroundTaskStatus::Completed
+        )
+    );
+    assert!(task.native_id.starts_with("wakeup:"));
+    let item = read
+        .items
+        .iter()
+        .find(|i| i.status == ItemStatus::Backgrounded)
+        .unwrap();
+    assert!(matches!(&item.body, ItemBody::ToolCall { name, .. } if name == "ScheduleWakeup"));
+    assert_eq!(item.background_task_id.as_ref(), Some(&task.id));
+    // While it was pending it said when it comes due.
+    let mut cursor = 0;
+    let mut pending = None;
+    loop {
+        let batch = engine
+            .read_batch(thread_stream(&thread), cursor)
+            .await
+            .unwrap();
+        if batch.events.is_empty() {
+            break;
+        }
+        cursor = batch.last_seq;
+        pending = pending.or(batch.events.iter().find_map(|e| match &e.event {
+            Event::BackgroundTaskUpdated { task }
+                if task.status == BackgroundTaskStatus::Running =>
+            {
+                Some(task.clone())
+            }
+            _ => None,
+        }));
+    }
+    assert!(pending.unwrap().next_run_at.is_some());
+    engine.shutdown(false).await;
+}
+
+/// A fake dialog (`@dialog`) is a question of the thread, asked right after the turn: it keeps
+/// the process until it is answered, and the answer reaches the agent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fake_dialog_keeps_the_process_until_it_is_answered() {
+    let (_dir, engine, ctx, thread) =
+        fake_env(|p| p.idle_process_ttl = Duration::from_millis(300)).await;
+    let _: TurnStartResult = fake_call(
+        &engine,
+        &ctx,
+        "turn/start",
+        serde_json::json!({"clientRequestId": crid(), "threadId": thread,
+            "input": [{"type": "text", "text": "@dialog Deploy now?\n@text asked"}]}),
+    )
+    .await
+    .unwrap();
+    let read = fake_read_until(&engine, &ctx, &thread, "the dialog", |r| {
+        r.interactions
+            .iter()
+            .any(|i| i.status == InteractionStatus::Pending)
+    })
+    .await;
+    let dialog = read.interactions[0].clone();
+    assert_eq!(
+        (dialog.turn_id.as_ref(), dialog.background_task_id.as_ref()),
+        (None, None),
+        "asked after the turn: the thread's"
+    );
+    assert_eq!(read.turns[0].status, TurnStatus::Completed);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let t: ThreadResult = fake_call(
+        &engine,
+        &ctx,
+        "thread/get",
+        serde_json::json!({"threadId": thread}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        t.thread.status,
+        ThreadStatus::Ready,
+        "the agent waits for the answer"
+    );
+    let _: InteractionRespondResult = fake_call(
+        &engine,
+        &ctx,
+        "interaction/respond",
+        serde_json::json!({"clientRequestId": crid(), "interactionId": dialog.id,
+            "resolution": {"kind": "question", "answers": [{"questionId": "choice", "choiceIds": ["yes"]}]}}),
+    )
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let t: ThreadResult = fake_call(
+            &engine,
+            &ctx,
+            "thread/get",
+            serde_json::json!({"threadId": thread}),
+        )
+        .await
+        .unwrap();
+        if t.thread.status == ThreadStatus::Idle {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "not reaped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     engine.shutdown(false).await;
 }
 

@@ -1,6 +1,6 @@
 # Claude Code アダプタ（`aas-adapter-claude`）
 
-検証済み CLI: **Claude Code 2.1.284**（Windows、npm 版。`claude.cmd` は `node_modules\@anthropic-ai\claude-code\bin\claude.exe` を呼ぶ）。
+検証済み CLI: **Claude Code 2.1.285**（Windows、npm 版。`claude.cmd` は `node_modules\@anthropic-ai\claude-code\bin\claude.exe` を呼ぶ）。実物の CLI を使うテスト（`tests/live.rs` の 10 件、18章）をこの版で通した（2026-09-30）。対応の根拠にした実機の記録は、下の 2 つのとおり 2.1.283 と 2.1.284 で取った。本文にある版の注記（「2.1.284 では…」など）は、その値を確かめた記録やコードの版を指す。
 プロトコルの出典: Agent SDK（`claude-agent-sdk-python` の `_internal/transport/subprocess_cli.py` / `_internal/query.py`、TypeScript SDK の `sdk.d.ts`）、バンドルに入っている SDK のスキーマ（`task_*`、`background_tasks_changed`、`command_lifecycle`、`initialize` と各制御要求の説明）、実 CLI との実際のやりとりの記録（`crates/aas-adapter-claude/tests/fixtures/`、18章）。
 
 - バックグラウンド作業、`command_lifecycle`、予約した起床、ultracode、`stop_task` の対応（15〜16章、3章、7章）は、2.1.283 の実機の記録（2026-09-28、haiku と sonnet）で確かめた。
@@ -178,7 +178,7 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   | 条件 | 状態 |
   |---|---|
   | こちらが拒否した | `declined` |
-  | 結果が作業をバックグラウンドに残した（15章の「起動したアイテム」、16章の `CronCreate`） | `backgrounded` |
+  | 結果が作業をバックグラウンドに残した（15章の「起動したアイテム」、16章の `CronCreate` と予約した `ScheduleWakeup`） | `backgrounded` |
   | `tool_use_result.interrupted` が true | `interrupted` |
   | `is_error` | `failed` |
   | それ以外 | `completed` |
@@ -272,6 +272,7 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   - `default` は CLI 自身の既定モデル（`isDefault`）。
   - モデルごとの effort の対応は `supportedEffortLevels` による。
 - 権限モードは固定の表: `default`（Ask）、`acceptEdits`、`auto`、`dontAsk`、`bypassPermissions`。
+  - `auto` は、CLI が `initialize.models[].supportsAutoMode: true` を付けたモデルだけのもの（「Whether this model supports auto mode」。2.1.284 では Haiku にない。記録 u1）。付いていないモデルには、`auto` を除いた権限モードの一覧を `Model.permissionModes` に入れる（`mapping::models_from_initialize`）。エンジンは、スレッドのモデルと権限モードの組がこの一覧に合わない変更を `invalidParams` で断る（protocol.md 3.1）。
   - `bypassPermissions` はオプション `allowBypassPermissions: true` のときだけ提示する（既定は off）。
   - 既定のモードは `initialize.current_permission_mode`（ユーザー設定の `defaultMode`。それが `plan` なら `default`）。
   - Claude Code の権限モード `plan` は権限モードとしては出さない。スレッドのプランモード（`modes.plan`、アプリの `/plan`）として扱う（19.6）。
@@ -371,7 +372,7 @@ ultracode は「xhigh の推論量 + 常にワークフローで作業を組み�
 
 ## 11. プローブ
 
-1. `claude --version` を `run_tool` で実行する（出力は例えば `2.1.284 (Claude Code)`）。
+1. `claude --version` を `run_tool` で実行する（出力は例えば `2.1.285 (Claude Code)`）。
 2. `--no-session-persistence` を付けてプロセスを起動し、`initialize` を送る（API 呼び出しは発生しない）。
 3. モデル、コマンド、既定の権限モードを取得したら、stdin を閉じて終了させる。
 
@@ -391,17 +392,18 @@ ultracode は「xhigh の推論量 + 常にワークフローで作業を組み�
 ## 13. ヒューリスティック
 
 使っていない。状態の判定はすべて、明示的なフィールドと、こちらが送った要求の記録だけで行う。
-- 使うフィールド: `result.is_error` / `terminal_reason` / `subtype` / `origin` / `errors` / `fast_mode_state`、`tool_result.is_error`、`tool_use_result`（`status`、`agentId`、`taskId`、`taskType`、`backgroundTaskId`、`workflowName`、`id`、`jobs`）、`command_lifecycle`、`system/init.capabilities` / `permissionMode` / `slash_commands` / `terminal_slash_commands`、`system/status.permissionMode`、`system/commands_changed.commands`（`aliases`）、`task_*` と `background_tasks_changed` の各フィールド（`task_started.is_backgrounded`）、`can_use_tool.agent_id`、Stop フックの `session_crons`、`get_settings.applied`、`cancel_async_message` と `background_tasks` の応答、`models[].supportsFastMode`、メッセージの `uuid`、トランスクリプトの `promptId` / `turnPosition` / `uuid` / `attachment.type`、`control_cancel_request` など。
+- 使うフィールド: `result.is_error` / `terminal_reason` / `subtype` / `origin` / `errors` / `fast_mode_state`、`tool_result.is_error`、`tool_use_result`（`status`、`agentId`、`taskId`、`taskType`、`backgroundTaskId`、`workflowName`、`id`、`jobs`、`scheduledFor`、`stopped`）、`task_notification.output_file`、`models[].supportsAutoMode`、`command_lifecycle`、`system/init.capabilities` / `permissionMode` / `slash_commands` / `terminal_slash_commands`、`system/status.permissionMode`、`system/commands_changed.commands`（`aliases`）、`task_*` と `background_tasks_changed` の各フィールド（`task_started.is_backgrounded`）、`can_use_tool.agent_id`、Stop フックの `session_crons`、`get_settings.applied`、`cancel_async_message` と `background_tasks` の応答、`models[].supportsFastMode`、メッセージの `uuid`、トランスクリプトの `promptId` / `turnPosition` / `uuid` / `attachment.type`、`control_cancel_request` など。
 - こちらの要求の記録: 中断を送ったか、拒否したか、どの `uuid` のメッセージ（steer を含む）を送ったか、どれを取り下げたか。
 - 名前のリスト（8章の外すコマンド、セッションを切り替えるコマンドの別名）は CLI の版ごとの固定の表で、推定ではない。
-- 読まないもの: タスクの `summary` や `description`（表示するだけ）、ツールの結果の本文（「Command running in background with ID: …」など）、`output_file` の中身、`result.result`。時間や無出力からも何も推定しない。
+- 読まないもの: タスクの `summary` や `description`（表示するだけ）、ツールの結果の本文（「Command running in background with ID: …」など）、`output_file` の中身（シェルの出力として表示するためにそのまま渡すだけで、行を解釈しない）、`result.result`。時間や無出力からも何も推定しない。
+- `ScheduleWakeup` の起床の扱い（16章）で使うのも明示的な値だけ: 結果の `scheduledFor` / `stopped`、入力の `prompt`、一覧の項目の `id` / `recurring` / `prompt`、CLI が自分のコマンドを始めたこと（`command_lifecycle`）とそれを受けた時刻（`scheduledFor` と同じ PC の時計）。一覧の項目と起床を結ぶのは、CLI が呼び出しの `prompt` をそのまま項目に入れ、動的なループの起床を 1 つだけ持つという CLI の規則による（見分けられないときは結ばない）。
 
 ## 14. 制限事項
 
 - steer はツールの区切りでしか取り込まれない（3章）。区切りがないターンの steer はキューに戻る。
 - コマンドの終了コードは CLI が出さないので未設定。バックグラウンドの Bash の終了コードも、CLI は人向けの要約（「…completed (exit code 0)」）にしか書かないので設定しない。
 - サブエージェント内部の経過は表示しない（進み具合はタスクの `progress` に出る。15章）。
-- バックグラウンドのシェルの出力は、CLI がファイル（`output_file`）に書くだけでストリームがないので、動いている間は見えない。終わったときも要約（`summary`）だけを表示する。
+- バックグラウンドのシェルの出力は、CLI がファイルに書くだけでストリームがなく、ファイルの場所も動いている間は明示的な欄で知らせない（`task_started` にはなく、Bash の結果ではモデル向けの文の中だけ）ので、動いている間は見えない。終わったときに `task_notification.output_file` のファイルを読んで結果の出力にする（15章）。
 - 履歴の取り込みでは、画像を添付として復元できない（blob がないため）。
 - 秘匿された思考（空の thinking と signature）は表示できない。
 - コンテキストの使用量はターンの終わりにだけ分かる（3章）。`get_context_usage` の値は CLI の見積もりを含む（`detail: "summary"`）。
@@ -437,9 +439,13 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
 | `task_started {task_id, tool_use_id, description, task_type, is_backgrounded?, owned_by_subagent?, workflow_name?, ambient?}` | タスクを始める（`title` = `description`、`stoppable: true`）。`is_backgrounded: false`（フォアグラウンドで、呼んだツールがそれを待っている）なら表示しない。CLI 自身のタスク一覧の規則（`is_backgrounded === false` だけを除く）と同じで、ワークフローにはこの欄がないので表示される。表示していないタスクも、ライブセットに載るか `task_updated.patch.is_backgrounded: true` が来たら表示する。同じ `task_id` の 2 回目の `task_started`（止まったエージェントが自分のタスクの完了で再開した。記録 E1）は新しい run（`runs` + 1） |
 | `task_progress {usage{total_tokens,tool_uses,duration_ms}, last_tool_name, summary?, description, workflow_progress?}` | `progress` を置き換える: `lastToolName`、`toolUses`、`tokens`、`durationMs`、`summary`（`summary`、なければ `description`。表示用で、読まない） |
 | `task_updated {patch{status?, description?, is_backgrounded?}}` | `status` が `completed` → `completed`、`failed` → `failed`、`killed` → `stopped`。`pending` / `running` / `paused` は終わりではないので何もしない。`description` はタイトルを置き換える |
-| `task_notification {status: completed\|failed\|stopped, summary, usage?}` | 終わり。`result.summary` = `summary`（CLI の文のまま）、`usage` = `usage`。`exitCode` と `output` は付けない（上の 14章） |
+| `task_notification {status: completed\|failed\|stopped, summary, usage?, output_file}` | 終わり。`result.summary` = `summary`（CLI の文のまま）、`usage` = `usage`。シェル（`local_bash`）なら `result.output` = `output_file` のファイルの内容（下）。`exitCode` は付けない（上の 14章） |
 
 - 表示していないタスクの `task_notification` はそのタスクを忘れる（フォアグラウンドのタスクは同じ ID で再開しない。再開するエージェントは必ずバックグラウンドで登録される）。まったく知らないタスクの `task_notification` は `Native`。
+- **シェルの出力**: `task_notification.output_file`（CLI のスキーマで必ずある欄。空の文字列もある）は、タスクの出力を CLI が書いたファイル。シェル（`local_bash`）では、シェルが出したものに CLI が書き足した行（`[exited with code 0]` など）が続く（記録 e2 で、CLI 自身の Read が読んだ内容）。表示しているシェルのタスクの終わりでだけ、アダプタがこのファイルを読んで `result.output` にする（書かれたまま。行を解釈しない）。
+  - 読むのは `policy.max_output_file_bytes`（既定 8 MiB）まで。大きければ終わりの部分を読み（UTF-8 の文字の途中からは始めない）、読まなかった先頭のバイト数を `result.outputOmittedBytes` にする。長い出力はエンジンが blob に移す。
+  - エージェントやワークフローのファイルはトランスクリプトなので出力にしない。ファイルの名前が空なら何もしない。読めなければ出力なしで終わらせ、Notice（warning、`backgroundOutputUnreadable`）でファイルと理由を知らせる。
+  - 動いている間の出力は流さない（ファイルの場所が明示されないため。design.md 1章の範囲外）。
 - 終わるのは、上の終わりのメッセージか、プロセスの終了（エンジンが記録する）だけ。時間では終わらせない。
 
 **ワークフローの中のエージェント**: `task_progress.workflow_progress` のうち `type: "workflow_agent"` の要素を、`index` ごとにまとめる（CLI 自身と同じく差分でも全体でも受けられる）。`label` → `label`、`phaseTitle` → `phase`、`state`（`start` / `progress` / `done` / `error`）→ `state`、`agentType` → `agentType`、`model` → `model`、`tokens` → `tokens`。`workflow_progress` のないメッセージは前の一覧を残す。要素の `agentId` は、ワークフローのエージェントの承認の持ち主を知るのに使う（5章）。
@@ -471,7 +477,7 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
 
 ## 16. 予約した起床（D5）
 
-`ScheduleWakeup`、`CronCreate` / `CronDelete` / `CronList`、`/loop` は `-p` でも動き、時刻になると CLI が自分でターンを始める（記録 w1〜w8。起床は予定の分ちょうどに来た）。アダプタはこれを `kind: scheduled` のタスクとして報告し、待っている間はプロセスを残す（ライブセットに入る）。
+`ScheduleWakeup`、`CronCreate` / `CronDelete` / `CronList`、`/loop` は `-p` でも動き、時刻になると CLI が自分でターンを始める（記録 w1〜w8。起床は予定の分ちょうどに来た。ただし :00 と :30 に当たる一度だけの起床は、CLI の仕様で予定より早く来ることがある。下の「実行されえた」）。アダプタはこれを `kind: scheduled` のタスクとして報告し、それを作ったツールの結果の時点から（そのターンが中断されても）、待っている間はプロセスを残す（ライブセットに入る）。
 
 **明示的なシグナル**:
 
@@ -481,23 +487,36 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
 | `CronList` の結果 `{jobs: [{id, cron, humanSchedule, prompt, …}]}` | 同じく全体 |
 | `CronCreate` の結果 `{id, humanSchedule, recurring, durable}` | その起床のタスクを始め（`originItemKey` = そのアイテム、`title` = 入力の `prompt`、スケジュールは `humanSchedule`）、アイテムを `backgrounded` で閉じる |
 | `CronDelete` の結果 `{id}` | その起床を `stopped` にし、ライブから外す |
+| `ScheduleWakeup` の結果 `{scheduledFor, clampedDelaySeconds, wasClamped, stopped?, cancelledWakeups?}` | 下の「`ScheduleWakeup` の起床」 |
 | Stop フックの `hook_callback` | すぐに `{}`（続行）を返す。CLI は `result` の前にこの応答を待つ |
-| `command_lifecycle started` で、その前に `queued` がなかったもの | CLI が自分でキューに入れたコマンド（CLI のスキーマ: 「cron triggers, teammate shutdown prompts, deferred-turn resume … emit started/terminal without 'queued'」。記録 w1・w3・w4 の起床もこの形）。起床が実行されたかもしれない印として覚え、次の一覧で消す。こちらが送ったメッセージは必ず `queued` から始まる |
+| `command_lifecycle started` で、その前に `queued` がなかったもの | CLI が自分でキューに入れたコマンド（CLI のスキーマ: 「cron triggers, teammate shutdown prompts, deferred-turn resume … emit started/terminal without 'queued'」。記録 w1・w3・w4 の起床もこの形）。そのとき分かっている一度だけの起床すべてについて、実行されたかもしれない印として覚え（時刻とは比べない。下の「実行されえた」）、次の一覧で消す。こちらが送ったメッセージは必ず `queued` から始まる |
+| `command_lifecycle` を報告しない CLI（`init` の `capabilities` に `msg_lifecycle_v1` がない）で、アダプタが送ったメッセージのない実行が始まったこと | 上と同じ印。CLI は起床を、実行が動いていない間にだけ、自分の実行として始める（`CronCreate` の説明: 「Jobs only fire while the REPL is idle (not mid-query)」） |
 | Stop フックの一覧なしで終わったターンの `result` | 下の「一覧なしで終わったターン」 |
 
-- スケジュールは、CLI が人向けに書いた `humanSchedule`（「Every minute」など）を、後の一覧の cron 式より優先して残す。次に実行される時刻（`nextRunAt`）は付けない（`ScheduleWakeup` の結果の `scheduledFor` には ID がなく、一覧のどの起床かを結べないため。cron 式から時刻を計算することもしない）。
-- `ScheduleWakeup` の結果には ID がないので、その起床はそのターンの終わりの Stop フックの一覧で初めて分かる。アイテムは `completed` のまま。
+- スケジュールは、CLI が人向けに書いた `humanSchedule`（「Every minute」など）を、後の一覧の cron 式より優先して残す。`CronCreate` と一覧の起床には、次に実行される時刻（`nextRunAt`）を付けない（CLI が時刻を明示しないため。cron 式から時刻を計算することもしない）。
 - 起床で始まったターンは、`command_lifecycle started`（CLI が作った `uuid`）と `init` で始まるが、`result` に `origin` がなく、stdout に「予定の起床」を示すものもない（`scheduled_task_fire` は内部用で出ない。起床以外の CLI の自動の続行も同じ形になる）。そのため `trigger: scheduled` は付けない。
+
+**`ScheduleWakeup` の起床**: 動的な `/loop` の次の起床。CLI は待っている動的なループの起床を 1 つだけ持つ（`ScheduleWakeup` の呼び出しは、待っている起床を消してから次を予約する。`stop: true` は消すだけ、ループが最長の時間に達したときは予約しない（`scheduledFor: 0`）。2.1.283 の実装）。
+
+- 結果が予約を示したら（`scheduledFor` > 0 で `stopped` でない）、キー `wakeup:<tool_use_id>` のタスクを始める: `title` = 入力の `prompt`、`progress.summary` = 入力の `reason`（モデルが書いた、利用者に見せる理由）、`nextRunAt` = `scheduledFor`（表示だけに使う。状態の判定には使わない）、`stoppable: false`、`originItemKey` = そのアイテム。アイテムは `backgrounded` で閉じる。そのターンが中断や失敗で終わっても（Stop フックが来なくても）ライブのまま。
+- それまで待っていた動的なループの起床は、どの結果でも（予約、`stop: true`、`scheduledFor: 0`）なくなる: CLI がそれを実行しえた（下の「実行されえた」）なら `completed`、そうでなければ（実行前に取り消された）`stopped`。予約しなかった結果のアイテムは `completed` のまま。
+- 一覧（Stop フック、`CronList`）には、この起床が ID 付きの一度だけの項目として載る（`prompt` は呼び出しの `prompt` のまま。長いものは一覧のスキーマのとおり 1000 文字で切られ「… [+N chars]」が付く）。まだ実行されえない間に、タスクのない一度だけの項目でその `prompt` のものがちょうど 1 つあれば、それがこの起床の ID になる（タスクは `wakeup:` のまま。`cron:<id>` のタスクは作らない）。2 つ以上あれば決めずに待つ（警告のログ）。実行されえたあとは、同じ `prompt` の項目は CLI が自分で予約した次の起床（モデルが予約し直さなかったときの keepalive）でありうるので、別の起床として扱う。
+- 一覧にこの起床がなければ: 実行されえたなら `completed`、そうでなければ `stopped`（取り消された）。ただし一度も一覧で ID が分かっておらず、まだ実行されえないときは、そのまま残す（項目を見分けられなかっただけかもしれないため。警告のログ）。
+- `CronDelete` がその ID を消したら `stopped`。止める制御要求はない（`stop_background` は断る）。
+- **実行されえた**: その起床が分かって（結果が届くか、一覧に載って）から、CLI が自分のコマンドを始めたとき（`queued` のない `started`。`command_lifecycle` を報告しない CLI では、アダプタが送ったメッセージのない実行の始まり）。いつ始まったかは見ない。`scheduledFor` は起床が来る時刻の下限ではない: CLI のスケジューラは、:00 と :30 に当たる一度だけの起床を予定より最大 90 秒早く実行する（`CronCreate` の説明にある CLI の仕様「one-shot tasks landing on :00 or :30 fire up to 90 s early」。幅は CLI が取得する設定で変わる。2.1.285 の実装では、実行の時刻は「`scheduledFor` から幅を引いた時刻」と「CLI が起床を作った時刻」の遅いほうで、後者は結果にない）。そのため、ほかの起床など別のコマンドでも、この起床として扱う。その影響（どれも安全な側）:
+  - 別のコマンドの実行が一覧なしで終わると、この起床もライブから外れる（次の一覧で決まる。下の「一覧なしで終わったターン」）。
+  - まだ一覧で ID が分かっていない起床（予約したターンが中断された）は、次の一覧で同じ `prompt` の項目と結ばない（CLI が自分で予約した次の起床かもしれないため）。一覧になければ `completed`、同じ `prompt` の項目は `cron:<id>` の別のタスクとしてライブになる。実際には別のコマンドで、起床がまだ待っていたときは、表示が「`completed` と、同じ内容の別の起床」になるが、待っている起床はその別のタスクとしてプロセスを残す。
+- 記録: w1（予約、一覧、実行、次の一覧で `completed`）、w3（予約のあとの利用者のターンが中断されてもライブのまま、あとで実行）。
 
 **一覧なしで終わったターン**: CLI は Stop フック（とその一覧）を、普通に終わったターンにだけ送る。中断されたターン（記録 w3）と、API のエラーや利用上限で失敗したターン（CLI は StopFailure フックを使い、その入力に `session_crons` はない。2.1.283 のスキーマ）のあとには一覧が来ない。一度だけの起床（`recurring` が `true` でないもの）は実行されると CLI の一覧から消える（記録 w1）ので、実行で始まったターンがそのまま中断や失敗で終わると、アダプタはその起床が消えたことを知る手段がない。そこで:
 
-- 一覧なしでターンが終わったとき、前の一覧のあとに CLI が自分のコマンドを始めていた（上の `queued` のない `started`）か、CLI が `command_lifecycle` を報告しない（`init` の `capabilities` に `msg_lifecycle_v1` がない）なら、一度だけの起床をライブから外す。終わらせはしない（実行されたかどうかは分からない）ので、タスクは `running` のまま表示され、プロセスを残す理由にならない（一覧にない起床と同じ）。繰り返しの起床は実行されても一覧に残るので、ライブのまま。
+- 一覧なしでターンが終わったとき、一度だけの起床のうち、その起床が分かって（作られるか一覧に載って）から CLI が自分のコマンドを始めていたもの（上の「実行されえた」。`command_lifecycle` を報告しない CLI では、アダプタが送ったメッセージのない実行が始まっていたもの）を、ライブから外す。終わらせはしない（実行されたかどうかは分からない）ので、タスクは `running` のまま表示され、プロセスを残す理由にならない（一覧にない起床と同じ）。繰り返しの起床は実行されても一覧に残るので、ライブのまま。CLI のコマンドより後に作られた起床（中断されたターンの `CronCreate` など）は実行されえないので、ライブのまま。
 - 次の完全な一覧（Stop フック、`CronList`）で決まる: そこにあれば実行されていなかったのでライブに戻り（同じ run のまま）、なければ一覧から消えた起床と同じく `completed` になる。`CronCreate` の起床は作られた時点で一覧にあるのでライブ、`CronDelete` の起床は `stopped`。
 - CLI が自分のコマンドを始めていないターン（利用者が自分のターンを中断した、など）は、一覧を変えない。記録 w3 でも、中断のあとで起床は予定どおり実行された。
 - こうして外した起床のほかに何もプロセスを残していなければ、プロセスはアイドル回収の対象になる。そのときまだ CLI に残っていた起床はプロセスとともに消え、タスクはエンジンが記録する（プロセスとともに終わるタスクと同じ）。CLI が自分で入れるコマンドには起床のほかにチームメイトの終了とターンの再開もあるので、それらのあとに失敗したターンでも同じく扱う（どちらの場合も、決めるのは次の一覧）。
 
 **制限**:
-- 一覧が届くのは普通に終わったターンのあとだけ。中断されたターンのあとには Stop フックが来ないので、中断されたターンで予約された `ScheduleWakeup` は、次に普通に終わるターンまで分からない（その間、プロセスを残す理由にならない）。起床で始まったターンが中断や失敗で終わったときの扱いは上のとおり。
+- 一覧が届くのは普通に終わったターンのあとだけ。中断されたターンで予約された起床は、その結果（`CronCreate`、`ScheduleWakeup`）から分かり、ライブになる。起床で始まったターンが中断や失敗で終わったときの扱いは上のとおり。
 - 起床を 1 つずつ止める制御要求はない（止められるのはモデル自身の `CronDelete` / `ScheduleWakeup {stop: true}` か、プロセスの終了だけ。中断では消えない。記録 w3）。スマホから止めるには、エージェントに頼むか、スレッドを止める。
 - `durable: true` でも CLI はセッション限りとして扱う（記録 w7）。プロセスが終わると起床は消え、タスクはエンジンが `stopped` / `lost` として記録する。
 
@@ -510,8 +529,8 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
 ## 18. テスト
 
 - 単体テスト:
-  - `src/mapping.rs`: 対応表、承認と質問（エスケープシーケンスの除去を含む）、使用量とコンテキストの応答の解釈、起動の結果の形（E1 / E2 / E3a / w4 の記録の形）、`Workflow` のタイトル、`origin` からの `trigger`、期限切れの応答、ultracode の effort の一覧と `apply_flag_settings` の形、権限モードの表（`plan` を出さない）、高速モードのモデル、`ExitPlanMode` の `proposedPlan`、`get_status` / `get_usage` / `get_plan` の節（b1 の形）、起動を断った `result` の文（g6 / g3a の形）。
-  - `src/background.rs`: ライブセットと開始の順序、表示しないフォアグラウンドのタスク、同じ ID の再開、終わりの対応、サブエージェントのタスクの親（両方の順序）、ワークフローのエージェントの統合と承認の持ち主、予約した起床の一覧・作成・削除、一覧なしで終わったターンのあとの一度だけの起床（16章）。
+  - `src/mapping.rs`: 対応表、承認と質問（エスケープシーケンスの除去を含む）、モデルごとの `auto`（`supportsAutoMode`）、`ScheduleWakeup` の結果の形（w1、`stop`、`scheduledFor: 0`）、使用量とコンテキストの応答の解釈、起動の結果の形（E1 / E2 / E3a / w4 の記録の形）、`Workflow` のタイトル、`origin` からの `trigger`、期限切れの応答、ultracode の effort の一覧と `apply_flag_settings` の形、権限モードの表（`plan` を出さない）、高速モードのモデル、`ExitPlanMode` の `proposedPlan`、`get_status` / `get_usage` / `get_plan` の節（b1 の形）、起動を断った `result` の文（g6 / g3a の形）。
+  - `src/background.rs`: ライブセットと開始の順序、表示しないフォアグラウンドのタスク、同じ ID の再開、終わりの対応、サブエージェントのタスクの親（両方の順序）、ワークフローのエージェントの統合と承認の持ち主、予約した起床の一覧・作成・削除、一覧なしで終わったターンのあとの一度だけの起床（16章）、`ScheduleWakeup` の起床（結果からライブ、CLI のコマンドはいつ始まっても実行でありうること（`scheduledFor` より前に実行された起床の置き換え、失敗した実行、一覧にないこと）、置き換えと `stop`、一覧の項目の決め方（切られた `prompt`、見分けられない項目、実行のあとの keepalive））、シェルの出力のファイル（シェルだけ、終わりの部分と `outputOmittedBytes`）。
   - `src/commands.rs`: 別名の展開、端末専用と名前のリストのコマンドを外すこと、`init` で足される名前、セッションを切り替えるコマンドの別名（固定のものと一覧から読んだもの）、最後の `init` の端末専用の一覧をプローブの一覧に使うこと。
   - `src/native.rs`: fork したトランスクリプト（同じ `promptId`、違う `turnPosition`）のターン、取り込まれた steer（`queued_command`）、ターンのアンカー。
   - `src/lib.rs`: fork の引数（g2 / g3b のコマンドライン、前のターンのアンカーがないとき、形の違うアンカー、コマンドラインに載せられない値）と、同じ判断を起動の前にする `check_fork_point`、機能、セッションを切り替える名前、オプション。
@@ -525,6 +544,8 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
   | `bg_stop_agent_then_bash.jsonl` | rec-claude s3 | `perTaskStopAffordance` と Stop フック、バックグラウンドのエージェントの承認（`background_key`）、`stop_task`、表示しないフォアグラウンドのタスク |
   | `bg_workflow_interrupt_stop.jsonl` | rec-claude s4 | `Workflow` のアイテム、ワークフローのエージェントの進み具合と承認、中断してもワークフローが動き続けること、`stop_task`、終了コード 1 |
   | `scheduled_crons.jsonl` | rec-claude w4 | `CronCreate`（一度だけと繰り返し）、起床で始まるターン、Stop フックの一覧、`CronList`、`CronDelete` |
+  | `schedule_wakeup_fire.jsonl` | rec-claude w1 | `ScheduleWakeup` の結果からのタスク（`nextRunAt` = `scheduledFor`、`backgrounded` のアイテム）、一覧の項目が同じ起床になること（`cron:` のタスクを作らない）、実行のあとの一覧で `completed` |
+  | `schedule_wakeup_interrupt.jsonl` | rec-claude w3 | 予約のあとの利用者のターンが中断されても起床がライブのままで、あとで実行されること。前面の Bash がタスクにならないこと |
   | `race_notification_turn.jsonl` | rec-claude r1a（下の変更あり） | CLI が自分のターンを先に始めたときの `TurnInProgress`、取り下げ、送り直したメッセージのターン |
   | `ultracode_turn.jsonl` | rec-claude u4 | ultracode の反映と `get_settings` での確認、`origin` 付きのメッセージ |
   | `steer_absorbed.jsonl` | rec2 a1 | ツールの区切りで取り込まれた steer（`SteerReturned` なし、1 ターン、答えに反映）、アンカー、Bash の `ItemBackgroundable` |
@@ -532,6 +553,8 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
   | `steer_returned.jsonl` | rec2 a2（下の変更あり） | 取り下げた steer の `SteerReturned` が `TurnCompleted` より前に出ること、送り直しのターン |
   | `rename_status_btw.jsonl` | rec2 b1 | `get_status` と `get_usage` の節、`rename_session`、待機中と実行中の `side_question`、`control_request_progress` |
   | `fast_mode.jsonl` | rec2 e1 | `apply_flag_settings {fastMode}`、`fast_mode_state` の報告、`fast-mode-overage-rejected` の Notice |
+  | `fast_mode_unavailable.jsonl` | rec2 e1 を 2026-09-30 の確認の値に替えたもの（最初のターンの `init` と `result` を `off` + `extra_usage_disabled` に、知らせの行を除く） | 高速モードを求めても CLI が `off` とその理由を示したときの `fastModeDisabled` の Notice（1 回だけ）（19.7） |
+  | `fast_mode_on_within_turn.jsonl` | `fast_mode_unavailable.jsonl` の最初のターンの `result` を `on`（理由なし）にしたもの（2026-09-30 の実機で見た形） | `init` だけが `off` と理由を示し、同じターンの `result` が `on` なら Notice を出さないこと（19.7） |
   | `background_bash.jsonl` | rec2 f1b | 前面の Bash の `ItemBackgroundable`、`background_tasks`、`backgrounded` の Item とシェルのタスク |
   | `background_agent.jsonl` | rec2 f2 | 前面の Agent のバックグラウンドへの移動、その終わりで CLI が始める実行の `trigger` |
   | `plan_mode.jsonl` | rec2 h1 | 権限モードの報告（`system/status`、承認の `setMode`）、プランモードの出入り、`proposedPlan` |
@@ -552,7 +575,8 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
     - `steer_next_run.jsonl`: `result` の直後に `cancel_async_message` の要求を、steer の `started` の直後にその応答 `{"cancelled": false}` を加えた（アダプタが送る取り下げ。記録係は送らなかった）。
     - `steer_returned.jsonl`: 取り下げが先に届いた形にした。`result` の直後に `cancel_async_message` の要求、`command_lifecycle cancelled`、応答 `{"cancelled": true}` を加え（形は記録 a3）、steer の実行を、エンジンが送り直したメッセージ（別の `uuid`、`queued` / `started` / `completed` 付き）の実行にした。
   - 元の記録とその変換のスクリプトは、利用者のアカウント情報を含むのでリポジトリに入れない。変換の手順は、この一覧がすべて。
-- 手書きの台本で確かめること: 断られた steer の `SteerReturned`、`result` のあと・`TurnCompleted` のあとの steer、`msg_lifecycle_v1` のない CLI での steer、ターンの完了のあとに届いた取り下げ（`steerNotDelivered`）、プランモードと高速モード（プランモード中の権限モードの変更）、以前の版の権限モード `plan` を持つスレッドでプランモードを出ると `default` を送り、そのあと CLI がプランモードだと報告したらエンジンに出すこと、プランモードの状態の `get_plan` と失敗した `get_usage` の節、バックグラウンドへ移せない作業と `backgrounded: false`、`commands_changed` と `init` のコマンドの一覧、起動を断った `result`、断られた名前の変更と答えのない質問、エラーの `result`（`get_context_usage` の error 応答で context なし）、CLI が自分で始めたターン（次のターンが先に始まったら、遅れて届いた応答を別のターンに付けない。`origin` の `trigger`）、CLI のターン中の `send`（何も書かずに `TurnInProgress`）、取り下げが間に合わず CLI のターンに取り込まれたメッセージ（そのターンが利用者のターン）、CLI が断ったメッセージ、ultracode の確認（有効・モデル変更で無効・戻して有効・既定に戻す。応答は u1 / u5 の形）と ultracode での起動の失敗、期限切れの回答、予約した起床を止められないこと、起床で始まったターンが一覧なしで終わったときの一度だけの起床（ライブから外れ、利用者のターンの中断では外れず、次の一覧で戻るか終わる。16章）、ターン途中のプロセス終了、画像とメンション、詰まった書き込みがあっても止まれる shutdown、応答しない中断。
+- 再生テストでは、`task_notification.output_file` の記録のパスを一時フォルダのファイル（`output of <task id>` と終わりの行）に置き換える（記録の PC のパスなので）。シェルの結果の出力がその内容になり、エージェントのファイルは読まないことを確かめる（`background_bash.jsonl`、`background_agent.jsonl`）。
+- 手書きの台本で確かめること: 読めない出力のファイル（出力なしの結果と `backgroundOutputUnreadable`）、中断されたターンの `ScheduleWakeup`（結果からライブ、次の一覧で同じ起床になる、`stop: true` で `stopped`）、`scheduledFor` より前に CLI が実行した起床（予約し直した実行で `completed`、次の起床の実行が一覧なしで失敗するとライブから外れ、次の一覧で `completed`）、`msg_lifecycle_v1` のない CLI で、アダプタが始めていない実行を CLI のコマンドとすること（利用者の中断されたターンでは起床はライブのまま、CLI の実行のあとの一覧にない起床は `completed` で、同じ `prompt` の項目は別の起床）、断られた steer の `SteerReturned`、`result` のあと・`TurnCompleted` のあとの steer、`msg_lifecycle_v1` のない CLI での steer、ターンの完了のあとに届いた取り下げ（`steerNotDelivered`）、プランモードと高速モード（プランモード中の権限モードの変更）、以前の版の権限モード `plan` を持つスレッドでプランモードを出ると `default` を送り、そのあと CLI がプランモードだと報告したらエンジンに出すこと、プランモードの状態の `get_plan` と失敗した `get_usage` の節、バックグラウンドへ移せない作業と `backgrounded: false`、`commands_changed` と `init` のコマンドの一覧、起動を断った `result`、断られた名前の変更と答えのない質問、エラーの `result`（`get_context_usage` の error 応答で context なし）、CLI が自分で始めたターン（次のターンが先に始まったら、遅れて届いた応答を別のターンに付けない。`origin` の `trigger`）、CLI のターン中の `send`（何も書かずに `TurnInProgress`）、取り下げが間に合わず CLI のターンに取り込まれたメッセージ（そのターンが利用者のターン）、CLI が断ったメッセージ、ultracode の確認（有効・モデル変更で無効・戻して有効・既定に戻す。応答は u1 / u5 の形）と ultracode での起動の失敗、期限切れの回答、予約した起床を止められないこと、起床で始まったターンが一覧なしで終わったときの一度だけの起床（ライブから外れ、利用者のターンの中断では外れず、次の一覧で戻るか終わる。16章）、ターン途中のプロセス終了、画像とメンション、詰まった書き込みがあっても止まれる shutdown、応答しない中断。
 - `crates/aas-testkit/tests/adapter_start_cancel.rs`: ハンドシェイクの途中で `start` を捨てると段階停止されること。
 - 実物のテスト（`tests/live.rs`、`AAS_LIVE_TESTS=1 cargo test -p aas-adapter-claude --test live -- --ignored`。トークンを使う）:
   - 1ターン目の `TurnCompleted` にコンテキストの使用量が付くこと、承認、履歴、再開、中断。
@@ -560,7 +584,9 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
   - `live_background_agent_completion_starts_a_marked_run`: バックグラウンドのエージェントの承認がそのエージェントに属すること、その完了のあとに CLI が始めるターンに `trigger: backgroundTask` が付くこと。
   - `live_steer_side_question_rename_status_and_background`: プロセスなしとありの状態、ツールの区切りで取り込まれる steer（答えに反映、`SteerReturned` なし）、実行中の `side_question`、名前の変更が CLI の状態に出ること、前面のコマンドのバックグラウンドへの移動（`backgrounded` の Item とタスク）。
   - `live_plan_mode_anchors_and_forks_at_a_turn`: 起動時のプランモード、`proposedPlan`、プランの承認のあとにプランモードが切れること、ライブのアンカーと履歴のアンカーが一致すること、あるターンでの fork とその直前での fork（覚えている単語で確かめる）、知らないアンカーへの fork が CLI の文で断られること。
-  - `live_fast_mode`: opus の高速モード（`fastModeModels`、`fast_mode_state: on`）と、切ること。
+  - `live_fast_mode`: opus の高速モード（`fastModeModels`、`fast_mode_state: on`）と、切ること。追加の使用量を使えないアカウントでは、`on` の代わりに理由の Notice（`fastModeDisabled`、19.7）が届くことを確かめる。
+  - `live_background_shell_output_is_the_file_its_end_names`: 自分で終わるバックグラウンドの Bash の結果の出力が、CLI が終わりに示したファイル（`task_notification.output_file`）の内容（シェルの出した行）になること、動いている間は出力を流さないこと（15章）。
+  - `live_a_schedule_wakeup_is_live_until_it_fires`: `ScheduleWakeup` の起床が、結果の時点で（ターンが終わる前に）`nextRunAt` = `scheduledFor` のライブなタスクになり、ターンのあともライブで、時刻に CLI が自分で始めたターンの一覧で `completed` になること（16章。約 2 分かかる）。
   - `live_a_legacy_plan_permission_mode_is_plan_mode`: 以前の版の権限モード `plan` を持つスレッドの起動で、CLI が自分の既定の権限モードで起動してからプランモードに入り（`ModesReported { plan: true }`）、プランモードを出ると `plan` 以外の権限モードが報告されること（モデルは呼ばない。2.1.284 で確かめた）。
   - テストが作ったセッションのトランスクリプト、`session-env`、バックグラウンドタスクの出力フォルダ（`%TEMP%\claude\<プロジェクト>\<セッション ID>`）、プランモードで CLI が書いたプランのファイル（`~/.claude/plans`）は、テストの終わりに消す（途中で失敗しても消す）。
 
@@ -637,4 +663,6 @@ Claude Code はターンの外でも作業を動かす: バックグラウンド
 - オン・オフ: `apply_flag_settings {settings: {fastMode: true | false}}`。SDK では高速モードに opt-in が要り（最初の `fast_mode_disabled_reason: "sdk_opt_in_required"`）、この `fastMode` が opt-in と切り替えを兼ねる（記録 e1: `true` で次の `init` と `result` が `on`、`false` で `off` と `sdk_opt_in_required` に戻る）。対応しないモデルでは `true` でも `off`（e2）。
 - 状態: `initialize`、`system/init`、`result` の `fast_mode_state`（`off` / `cooldown` / `on`）を、変わったときに `ModesReported { fast_state }` で出す（`Thread.fastModeState`、表示だけ）。
 - `fast_mode_state` は CLI の意図で、実際に速く処理されたかではない。記録 e1 では、サーバが断って（`system/notification` `fast-mode-overage-rejected`「Fast mode disabled · usage credits exhausted」。4章で Notice になる）標準の速さで処理され（`usage.speed: "standard"`）、それでも `fast_mode_state` は `on` のままだった。利用上限の理由（`out_of_credits`）では CLI は高速モードを入れたままにし、ターンごとに知らせを繰り返す。
+- 追加の使用量（extra usage）を使えないアカウントでは、CLI は `fastMode: true` を受け付けたうえで高速モードを入れず、`init` と `result` に `fast_mode_state: "off"` と `fast_mode_disabled_reason: "extra_usage_disabled"` を出す（2026-09-30 の実機の確認。2.1.285、opus。知らせ（`system/notification`）は来ない）。アダプタは、高速モードを求めている間に、ターンの `result` が `off` とその理由（`fast_mode_disabled_reason`）を示したら、Notice（warning、code `fastModeDisabled`、「Claude Code keeps fast mode off: <理由>」）で理由を 1 回だけ知らせる（同じ理由が続く間は繰り返さない。求めていないときの `sdk_opt_in_required` は知らせない）。スレッドの `modes.fast` は利用者の選択のまま、`fastModeState` は `off` になる。再生テスト `a_fast_mode_the_cli_keeps_off_is_explained_once`（e1 の記録の最初のターンを、この確認で見た値に替えた `fast_mode_unavailable.jsonl`）。
+- 知らせるかどうかは、ターンの `result` でだけ決める。`initialize` と `system/init` は実行を始めるときの CLI の意図で、同じ実行の中で変わることがある（2026-09-30 の実機、2.1.285、opus: `init` は `off` と `extra_usage_disabled`、同じターンの `result` は `on`）。状態（`ModesReported`）はどれからも出す。再生テスト `a_fast_mode_off_only_at_the_start_of_a_turn_is_no_notice`（`fast_mode_on_within_turn.jsonl`）。
 

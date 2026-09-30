@@ -116,6 +116,7 @@ class TestEngine : AutoCloseable {
     suspend fun seed(read: ThreadReadResult, harnesses: List<Harness> = listOf(fakeHarness()), projects: List<dev.aas.android.protocol.Project> = emptyList()) {
         store.transaction { tx ->
             tx.setEpoch(server.epoch)
+            tx.setModelVersion(dev.aas.android.protocol.StoredModels.VERSION)
             tx.setCursor(WORKSPACE_STREAM, 0)
             tx.replaceHarnesses(harnesses)
             projects.forEach { tx.upsertProject(it) }

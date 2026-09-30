@@ -1,0 +1,448 @@
+# The shape of StoredModels.TYPES at StoredModels.VERSION 1 (docs/android.md 15.2).
+# Written by StoredModelsTest with AAS_UPDATE_STORED_MODELS=1; never edited, never rewritten.
+class dev.aas.android.protocol.ApprovalOption
+  id: kotlin.String
+  label: kotlin.String
+  kind: dev.aas.android.protocol.ApprovalOptionKind
+enum dev.aas.android.protocol.ApprovalOptionKind = allowOnce | allowForSession | allowAlways | deny | denyWithFeedback | abort | unknown
+union dev.aas.android.protocol.Attachment = dev.aas.android.protocol.Attachment.Image
+class dev.aas.android.protocol.Attachment.Image
+  blobId: kotlin.String
+  mime: kotlin.String
+enum dev.aas.android.protocol.BackgroundEndReason = harness | threadStopped | idleStop | daemonShutdown | systemShutdown | forcedStop | processReplaced | processExited | daemonRestarted | unknown
+class dev.aas.android.protocol.BackgroundProgress
+  lastToolName: kotlin.String?
+  toolUses: kotlin.Long?
+  tokens: kotlin.Long?
+  durationMs: kotlin.Long?
+  summary: kotlin.String?
+  workflow: List<dev.aas.android.protocol.WorkflowAgent>?
+class dev.aas.android.protocol.BackgroundResult
+  summary: kotlin.String?
+  exitCode: kotlin.Int?
+  output: kotlin.String?
+  outputTruncated: kotlin.Boolean
+  outputBlobId: kotlin.String?
+  outputOmittedBytes: kotlin.Long?
+class dev.aas.android.protocol.BackgroundTask
+  id: kotlin.String
+  threadId: kotlin.String
+  nativeId: kotlin.String
+  kind: dev.aas.android.protocol.BackgroundTaskKind
+  title: kotlin.String
+  status: dev.aas.android.protocol.BackgroundTaskStatus
+  ambient: kotlin.Boolean
+  runs: kotlin.Int
+  turnId: kotlin.String?
+  originItemId: kotlin.String?
+  parentTaskId: kotlin.String?
+  startedAt: kotlin.Long
+  endedAt: kotlin.Long?
+  endReason: dev.aas.android.protocol.BackgroundEndReason?
+  progress: dev.aas.android.protocol.BackgroundProgress?
+  result: dev.aas.android.protocol.BackgroundResult?
+  usage: dev.aas.android.protocol.BackgroundUsage?
+  stoppable: kotlin.Boolean
+  stopRequestedAt: kotlin.Long?
+  stopUnconfirmedAt: kotlin.Long?
+  nextRunAt: kotlin.Long?
+  output: kotlin.String?
+  outputTruncated: kotlin.Boolean
+class dev.aas.android.protocol.BackgroundTaskEnded
+  taskId: kotlin.String
+  title: kotlin.String
+  kind: dev.aas.android.protocol.BackgroundTaskKind
+  status: dev.aas.android.protocol.BackgroundTaskStatus
+  endedAt: kotlin.Long
+enum dev.aas.android.protocol.BackgroundTaskKind = agent | shell | workflow | monitor | remote | scheduled | other | unknown
+enum dev.aas.android.protocol.BackgroundTaskStatus = running | completed | failed | stopped | lost | unknown
+class dev.aas.android.protocol.BackgroundUsage
+  totalTokens: kotlin.Long?
+  toolUses: kotlin.Long?
+  durationMs: kotlin.Long?
+  costUsd: kotlin.Double?
+class dev.aas.android.protocol.ContextUsage
+  usedTokens: kotlin.Long
+  windowTokens: kotlin.Long
+class dev.aas.android.protocol.DiffSummary
+  files: kotlin.Int
+  insertions: kotlin.Long
+  deletions: kotlin.Long
+class dev.aas.android.protocol.EffortLevel
+  id: kotlin.String
+  label: kotlin.String
+enum dev.aas.android.protocol.ExpireReason = processExited | turnEnded | harnessCancelled | daemonRestarted | taskEnded | unknown
+class dev.aas.android.protocol.FileChange
+  path: kotlin.String
+  kind: dev.aas.android.protocol.FileChangeKind
+  movePath: kotlin.String?
+  diff: kotlin.String?
+  added: kotlin.Long?
+  removed: kotlin.Long?
+enum dev.aas.android.protocol.FileChangeKind = add | delete | update | move | unknown
+class dev.aas.android.protocol.ForkOrigin
+  threadId: kotlin.String
+  turnId: kotlin.String?
+class dev.aas.android.protocol.GitInfo
+  isRepo: kotlin.Boolean
+  branch: kotlin.String?
+  root: kotlin.String?
+class dev.aas.android.protocol.Harness
+  id: kotlin.String
+  kind: dev.aas.android.protocol.HarnessKind
+  displayName: kotlin.String
+  available: kotlin.Boolean
+  unavailableReason: kotlin.String?
+  version: kotlin.String?
+  executable: kotlin.String?
+  capabilities: dev.aas.android.protocol.HarnessCapabilities
+  models: List<dev.aas.android.protocol.Model>
+  defaultModel: kotlin.String?
+  effortLevels: List<dev.aas.android.protocol.EffortLevel>
+  permissionModes: List<dev.aas.android.protocol.PermissionMode>
+  defaultPermissionMode: kotlin.String?
+  features: dev.aas.android.protocol.HarnessFeatures
+class dev.aas.android.protocol.HarnessCapabilities
+  interrupt: kotlin.Boolean
+  steer: kotlin.Boolean
+  approvals: kotlin.Boolean
+  questions: kotlin.Boolean
+  resume: kotlin.Boolean
+  fork: kotlin.Boolean
+  images: kotlin.Boolean
+  modelSwitchLive: kotlin.Boolean
+  nativeSessions: kotlin.Boolean
+  backgroundTasks: kotlin.Boolean
+  backgroundStop: kotlin.Boolean
+class dev.aas.android.protocol.HarnessFeatures
+  forkAtTurn: kotlin.Boolean
+  forkWhileHeld: kotlin.Boolean
+  rename: kotlin.Boolean
+  sideQuestion: kotlin.Boolean
+  moveToBackground: kotlin.Boolean
+  status: kotlin.Boolean
+  projectTrust: kotlin.Boolean
+  planMode: dev.aas.android.protocol.PlanModeFeature?
+  fastModeModels: List<kotlin.String>
+enum dev.aas.android.protocol.HarnessKind = codex | claude | pi | acp | fake | unknown
+union dev.aas.android.protocol.InputPart = dev.aas.android.protocol.InputPart.Image, dev.aas.android.protocol.InputPart.Mention, dev.aas.android.protocol.InputPart.Text
+class dev.aas.android.protocol.InputPart.Image
+  blobId: kotlin.String
+class dev.aas.android.protocol.InputPart.Mention
+  path: kotlin.String
+class dev.aas.android.protocol.InputPart.Text
+  text: kotlin.String
+class dev.aas.android.protocol.Interaction
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String?
+  itemId: kotlin.String?
+  backgroundTaskId: kotlin.String?
+  status: dev.aas.android.protocol.InteractionStatus
+  createdAt: kotlin.Long
+  resolvedAt: kotlin.Long?
+  resolvedBy: kotlin.String?
+  request: dev.aas.android.protocol.InteractionRequest
+  resolution: dev.aas.android.protocol.InteractionResolution?
+  expireReason: dev.aas.android.protocol.ExpireReason?
+union dev.aas.android.protocol.InteractionRequest = dev.aas.android.protocol.InteractionRequest.Approval, dev.aas.android.protocol.InteractionRequest.Question
+class dev.aas.android.protocol.InteractionRequest.Approval
+  title: kotlin.String
+  detail: kotlin.String?
+  subject: dev.aas.android.protocol.Subject
+  options: List<dev.aas.android.protocol.ApprovalOption>
+class dev.aas.android.protocol.InteractionRequest.Question
+  title: kotlin.String
+  questions: List<dev.aas.android.protocol.Question>
+union dev.aas.android.protocol.InteractionResolution = dev.aas.android.protocol.InteractionResolution.Approval, dev.aas.android.protocol.InteractionResolution.Dismissed, dev.aas.android.protocol.InteractionResolution.Question
+class dev.aas.android.protocol.InteractionResolution.Approval
+  optionId: kotlin.String
+  feedback: kotlin.String?
+object dev.aas.android.protocol.InteractionResolution.Dismissed
+class dev.aas.android.protocol.InteractionResolution.Question
+  answers: List<dev.aas.android.protocol.QuestionAnswer>
+enum dev.aas.android.protocol.InteractionStatus = pending | resolved | expired | unknown
+union dev.aas.android.protocol.Item = dev.aas.android.protocol.Item.AgentMessage, dev.aas.android.protocol.Item.CommandExecution, dev.aas.android.protocol.Item.FileChangeItem, dev.aas.android.protocol.Item.Notice, dev.aas.android.protocol.Item.Plan, dev.aas.android.protocol.Item.ProposedPlan, dev.aas.android.protocol.Item.Reasoning, dev.aas.android.protocol.Item.ToolCall, dev.aas.android.protocol.Item.UserMessage
+class dev.aas.android.protocol.Item.AgentMessage
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String
+  status: dev.aas.android.protocol.ItemStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  text: kotlin.String
+  backgroundTaskId: kotlin.String?
+  backgroundable: kotlin.Boolean
+class dev.aas.android.protocol.Item.CommandExecution
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String
+  status: dev.aas.android.protocol.ItemStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  command: kotlin.String
+  cwd: kotlin.String?
+  output: kotlin.String
+  outputTruncated: kotlin.Boolean
+  outputBlobId: kotlin.String?
+  exitCode: kotlin.Int?
+  durationMs: kotlin.Long?
+  backgroundTaskId: kotlin.String?
+  backgroundable: kotlin.Boolean
+class dev.aas.android.protocol.Item.FileChangeItem
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String
+  status: dev.aas.android.protocol.ItemStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  changes: List<dev.aas.android.protocol.FileChange>
+  backgroundTaskId: kotlin.String?
+  backgroundable: kotlin.Boolean
+class dev.aas.android.protocol.Item.Notice
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String
+  status: dev.aas.android.protocol.ItemStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  level: dev.aas.android.protocol.NoticeLevel
+  message: kotlin.String
+  code: kotlin.String?
+  backgroundTaskId: kotlin.String?
+  backgroundable: kotlin.Boolean
+class dev.aas.android.protocol.Item.Plan
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String
+  status: dev.aas.android.protocol.ItemStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  entries: List<dev.aas.android.protocol.PlanEntry>
+  backgroundTaskId: kotlin.String?
+  backgroundable: kotlin.Boolean
+class dev.aas.android.protocol.Item.ProposedPlan
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String
+  status: dev.aas.android.protocol.ItemStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  text: kotlin.String
+  backgroundTaskId: kotlin.String?
+  backgroundable: kotlin.Boolean
+class dev.aas.android.protocol.Item.Reasoning
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String
+  status: dev.aas.android.protocol.ItemStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  text: kotlin.String
+  backgroundTaskId: kotlin.String?
+  backgroundable: kotlin.Boolean
+class dev.aas.android.protocol.Item.ToolCall
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String
+  status: dev.aas.android.protocol.ItemStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  category: dev.aas.android.protocol.ToolCategory
+  name: kotlin.String
+  title: kotlin.String
+  server: kotlin.String?
+  input: kotlinx.serialization.json.JsonElement?
+  output: kotlin.String?
+  outputTruncated: kotlin.Boolean
+  outputBlobId: kotlin.String?
+  backgroundTaskId: kotlin.String?
+  backgroundable: kotlin.Boolean
+class dev.aas.android.protocol.Item.UserMessage
+  id: kotlin.String
+  threadId: kotlin.String
+  turnId: kotlin.String
+  status: dev.aas.android.protocol.ItemStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  text: kotlin.String
+  attachments: List<dev.aas.android.protocol.Attachment>
+  mentions: List<dev.aas.android.protocol.Mention>
+  delivery: dev.aas.android.protocol.UserMessageDelivery
+  backgroundTaskId: kotlin.String?
+  backgroundable: kotlin.Boolean
+enum dev.aas.android.protocol.ItemStatus = inProgress | completed | failed | declined | interrupted | backgrounded | unknown
+class dev.aas.android.protocol.Mention
+  path: kotlin.String
+class dev.aas.android.protocol.Model
+  id: kotlin.String
+  displayName: kotlin.String
+  description: kotlin.String?
+  isDefault: kotlin.Boolean
+  effortLevels: List<kotlin.String>?
+  permissionModes: List<kotlin.String>?
+enum dev.aas.android.protocol.NoticeLevel = info | warning | error | unknown
+class dev.aas.android.protocol.Operation
+  id: kotlin.String
+  kind: dev.aas.android.protocol.OperationKind
+  status: dev.aas.android.protocol.OperationStatus
+  projectId: kotlin.String?
+  message: kotlin.String?
+  progress: kotlin.String?
+  startedAt: kotlin.Long
+  finishedAt: kotlin.Long?
+enum dev.aas.android.protocol.OperationKind = gitClone | unknown
+enum dev.aas.android.protocol.OperationStatus = running | succeeded | failed | cancelled | unknown
+class dev.aas.android.protocol.PermissionMode
+  id: kotlin.String
+  label: kotlin.String
+  description: kotlin.String?
+  isDefault: kotlin.Boolean
+class dev.aas.android.protocol.PlanEntry
+  text: kotlin.String
+  status: dev.aas.android.protocol.PlanEntryStatus
+enum dev.aas.android.protocol.PlanEntryStatus = pending | inProgress | completed | unknown
+class dev.aas.android.protocol.PlanModeFeature
+  implementPrompt: kotlin.String?
+  newThreadPreamble: kotlin.String?
+class dev.aas.android.protocol.Project
+  id: kotlin.String
+  name: kotlin.String
+  path: kotlin.String
+  createdAt: kotlin.Long
+  updatedAt: kotlin.Long
+  archived: kotlin.Boolean
+  defaults: dev.aas.android.protocol.ProjectDefaults
+  git: dev.aas.android.protocol.GitInfo
+  harnessTrust: Map<kotlin.String, kotlin.Boolean>
+class dev.aas.android.protocol.ProjectDefaults
+  harnessId: kotlin.String?
+  model: kotlin.String?
+  effort: kotlin.String?
+  permissionMode: kotlin.String?
+class dev.aas.android.protocol.Question
+  id: kotlin.String
+  header: kotlin.String?
+  prompt: kotlin.String
+  choices: List<dev.aas.android.protocol.QuestionChoice>
+  multiSelect: kotlin.Boolean
+  allowFreeText: kotlin.Boolean
+  placeholder: kotlin.String?
+class dev.aas.android.protocol.QuestionAnswer
+  questionId: kotlin.String
+  choiceIds: List<kotlin.String>
+  text: kotlin.String?
+class dev.aas.android.protocol.QuestionChoice
+  id: kotlin.String
+  label: kotlin.String
+  description: kotlin.String?
+class dev.aas.android.protocol.QueuedInput
+  id: kotlin.String
+  threadId: kotlin.String
+  createdAt: kotlin.Long
+  preview: kotlin.String
+  input: List<dev.aas.android.protocol.InputPart>
+union dev.aas.android.protocol.Subject = dev.aas.android.protocol.Subject.Command, dev.aas.android.protocol.Subject.FileChanges, dev.aas.android.protocol.Subject.Other, dev.aas.android.protocol.Subject.Permissions, dev.aas.android.protocol.Subject.Plan, dev.aas.android.protocol.Subject.Tool
+class dev.aas.android.protocol.Subject.Command
+  command: kotlin.String
+  cwd: kotlin.String?
+class dev.aas.android.protocol.Subject.FileChanges
+  changes: List<dev.aas.android.protocol.FileChange>
+class dev.aas.android.protocol.Subject.Other
+  description: kotlin.String
+class dev.aas.android.protocol.Subject.Permissions
+  description: kotlin.String
+class dev.aas.android.protocol.Subject.Plan
+  text: kotlin.String
+class dev.aas.android.protocol.Subject.Tool
+  name: kotlin.String
+  input: kotlinx.serialization.json.JsonElement?
+class dev.aas.android.protocol.Thread
+  id: kotlin.String
+  projectId: kotlin.String
+  harnessId: kotlin.String
+  title: kotlin.String
+  cwd: kotlin.String
+  workspace: dev.aas.android.protocol.Workspace
+  settings: dev.aas.android.protocol.ThreadSettings
+  status: dev.aas.android.protocol.ThreadStatus
+  pendingInteractions: kotlin.Int
+  queuedInputs: kotlin.Int
+  queuePaused: kotlin.Boolean
+  lastTurn: dev.aas.android.protocol.TurnSummary?
+  lastError: dev.aas.android.protocol.ThreadError?
+  nativeSessionId: kotlin.String?
+  forkedFrom: dev.aas.android.protocol.ForkOrigin?
+  usage: dev.aas.android.protocol.Usage
+  diffAvailable: kotlin.Boolean
+  createdAt: kotlin.Long
+  updatedAt: kotlin.Long
+  lastActivityAt: kotlin.Long
+  archived: kotlin.Boolean
+  pinned: kotlin.Boolean
+  head: kotlin.Long
+  background: dev.aas.android.protocol.ThreadBackground
+  modes: dev.aas.android.protocol.ThreadModes
+  fastModeState: kotlin.String?
+class dev.aas.android.protocol.ThreadBackground
+  running: kotlin.Int
+  lastEnded: dev.aas.android.protocol.BackgroundTaskEnded?
+class dev.aas.android.protocol.ThreadError
+  message: kotlin.String
+  kind: kotlin.String
+  at: kotlin.Long
+class dev.aas.android.protocol.ThreadModes
+  plan: kotlin.Boolean
+  fast: kotlin.Boolean
+class dev.aas.android.protocol.ThreadSettings
+  model: kotlin.String?
+  effort: kotlin.String?
+  permissionMode: kotlin.String?
+enum dev.aas.android.protocol.ThreadStatus = idle | queued | starting | ready | running | stopping | unknown
+enum dev.aas.android.protocol.ToolCategory = read | search | fetch | mcp | subagent | edit | execute | think | other | unknown
+class dev.aas.android.protocol.Turn
+  id: kotlin.String
+  threadId: kotlin.String
+  index: kotlin.Int
+  status: dev.aas.android.protocol.TurnStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+  model: kotlin.String?
+  error: dev.aas.android.protocol.TurnError?
+  usage: dev.aas.android.protocol.Usage?
+  diff: dev.aas.android.protocol.DiffSummary?
+  trigger: dev.aas.android.protocol.TurnTrigger?
+  forkable: kotlin.Boolean
+class dev.aas.android.protocol.TurnError
+  message: kotlin.String
+  kind: kotlin.String
+enum dev.aas.android.protocol.TurnStatus = running | completed | interrupted | failed | unknown
+class dev.aas.android.protocol.TurnSummary
+  id: kotlin.String
+  index: kotlin.Int
+  status: dev.aas.android.protocol.TurnStatus
+  startedAt: kotlin.Long
+  completedAt: kotlin.Long?
+enum dev.aas.android.protocol.TurnTrigger = backgroundTask | scheduled | unknown
+class dev.aas.android.protocol.Usage
+  inputTokens: kotlin.Long
+  outputTokens: kotlin.Long
+  cachedInputTokens: kotlin.Long
+  reasoningTokens: kotlin.Long
+  costUsd: kotlin.Double?
+  context: dev.aas.android.protocol.ContextUsage?
+enum dev.aas.android.protocol.UserMessageDelivery = normal | steer | unknown
+class dev.aas.android.protocol.WorkflowAgent
+  label: kotlin.String
+  phase: kotlin.String?
+  state: dev.aas.android.protocol.WorkflowAgentState
+  agentType: kotlin.String?
+  model: kotlin.String?
+  tokens: kotlin.Long?
+enum dev.aas.android.protocol.WorkflowAgentState = start | progress | done | error | unknown
+union dev.aas.android.protocol.Workspace = dev.aas.android.protocol.Workspace.Local, dev.aas.android.protocol.Workspace.Worktree
+object dev.aas.android.protocol.Workspace.Local
+class dev.aas.android.protocol.Workspace.Worktree
+  path: kotlin.String
+  branch: kotlin.String
+  baseRef: kotlin.String

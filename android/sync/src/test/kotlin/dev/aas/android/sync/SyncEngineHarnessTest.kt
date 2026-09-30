@@ -156,21 +156,42 @@ class SyncEngineHarnessTest {
         assertEquals("thr_2", created.await().thread.id)
     }
 
+    /**
+     * The server refuses although the local list says available (its harness/updated may still
+     * be on the way): the request is resent, but only on the retry delay, never in a loop. The
+     * test waits for the resends themselves and measures their spacing with the engine's own
+     * clock (not a window of wall time in which some number of sends must fit).
+     */
     @Test
-    fun whileTheWorkspaceShowsTheHarnessAvailableTheRetryDelayStillApplies() =
-        withFixture(EngineFixture(config = TEST_CONFIG.copy(outboxRetryBaseMs = 150, outboxRetryCapMs = 150))) { f ->
-            // The server refuses although the local list says available (its harness/updated
-            // may still be on the way): the request must not loop.
+    fun whileTheWorkspaceShowsTheHarnessAvailableTheRetryDelayStillApplies() {
+        val clock = object : Clock {
+            // One monotonic time base for the engine and the server's record of arrivals.
+            override fun nowMs(): Long = System.nanoTime() / 1_000_000
+
+            override fun monotonicMs(): Long = nowMs()
+        }
+        val delayMs = 150L
+        withFixture(EngineFixture(config = TEST_CONFIG.copy(outboxRetryBaseMs = delayMs, outboxRetryCapMs = delayMs), clock = clock)) { f ->
             f.server.snapshot = snapshot(codexUp)
-            f.server.onRequest = { _, msg -> if (msg.method == "turn/start") unavailable() else buildJsonObject { } }
+            val arrivals = java.util.concurrent.CopyOnWriteArrayList<Long>()
+            f.server.onRequest = { _, msg ->
+                if (msg.method == "turn/start") {
+                    arrivals += clock.nowMs()
+                    unavailable()
+                } else {
+                    buildJsonObject { }
+                }
+            }
             f.connect()
             f.awaitOnline()
             f.engine.enqueue(Methods.TurnStart, turnStart("thr_1", "hello"))
-            eventually(what = "waiting") { f.engine.outbox.value.firstOrNull()?.waitingForHarness }
-            delay(700)
-            val sends = f.sends("turn/start")
-            assertTrue(sends in 2..10, "resent on the retry delay only, not in a loop: $sends")
+            val sends = eventually(what = "two resends") { arrivals.toList().takeIf { it.size >= 3 } }
+            val gaps = sends.zipWithNext { a, b -> b - a }
+            assertTrue(gaps.all { it >= delayMs }, "resent on the retry delay only, not in a loop: $gaps")
+            assertEquals("codex", f.engine.outbox.value.single().waitingForHarness)
+            assertEquals(1, f.server.requestsFor("turn/start").map(::crid).toSet().size, "always the same clientRequestId")
         }
+    }
 
     @Test
     fun anUnavailableHarnessTheClientCannotNameIsRetriedLikeOtherFailures() = withFixture { f ->

@@ -58,6 +58,28 @@ object HarnessSettings {
         return harness.permissionModes.firstOrNull { it.id == harness.defaultPermissionMode } ?: harness.permissionModes.firstOrNull { it.isDefault }
     }
 
+    /**
+     * The permission modes [modelId] can run in (protocol.md §3.1 `Model.permissionModes`): the
+     * model's own list when it has one (by id, in the harness's order), otherwise all of the
+     * harness's modes. The app offers no other (the daemon refuses them with `invalidParams`).
+     */
+    fun permissionModes(harness: Harness?, modelId: String?): List<PermissionMode> {
+        if (harness == null) return emptyList()
+        val allowed = harness.models.firstOrNull { it.id == modelId }?.permissionModes ?: return harness.permissionModes
+        return harness.permissionModes.filter { it.id in allowed }
+    }
+
+    /**
+     * Whether [modelId] can run in the permission mode [settings] put in effect (the chosen one,
+     * else the harness default). A model without its own list runs in every mode; a mode in
+     * effect that is not known (no harness default) is left to the daemon.
+     */
+    fun offersPermission(harness: Harness?, modelId: String?, settings: ThreadSettings): Boolean {
+        val allowed = harness?.models?.firstOrNull { it.id == modelId }?.permissionModes ?: return true
+        val mode = permission(harness, settings)?.id ?: return true
+        return mode in allowed
+    }
+
     /** A permission mode other than the harness default: the app asks before switching to it. */
     fun needsConfirmation(harness: Harness?, mode: PermissionMode): Boolean {
         if (harness == null) return true
@@ -73,8 +95,10 @@ object HarnessSettings {
     fun initial(harness: Harness, defaults: ProjectDefaults): ThreadSettings {
         if (defaults.harnessId != harness.id) return ThreadSettings()
         val model = defaults.model?.takeIf { id -> harness.models.any { it.id == id } }
-        val effort = defaults.effort?.takeIf { id -> effortLevels(harness, model ?: harness.defaultModel).any { it.id == id } }
-        val permission = defaults.permissionMode?.takeIf { id -> harness.permissionModes.any { it.id == id } }
+        val modelInEffect = model ?: harness.defaultModel
+        val effort = defaults.effort?.takeIf { id -> effortLevels(harness, modelInEffect).any { it.id == id } }
+        // A mode the model does not run in (the model's list changed since) is dropped too.
+        val permission = defaults.permissionMode?.takeIf { id -> permissionModes(harness, modelInEffect).any { it.id == id } }
         return ThreadSettings(model = model, effort = effort, permissionMode = permission)
     }
 

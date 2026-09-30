@@ -498,8 +498,11 @@ fun ThreadScreen(vm: ThreadViewModel, navigator: AppNavigator) {
                 harness,
                 thread.settings,
                 allowDefaultEffort = thread.settings.effort == null,
-                onApply = { model, effort, fast ->
-                    vm.applySettings(ThreadViewModel.settingsChange(harness, thread.settings, model, effort), ThreadViewModel.fastChange(thread.modes, fast))
+                onApply = { choice ->
+                    vm.applySettings(
+                        ThreadViewModel.settingsChange(harness, thread.settings, choice.model, choice.effort, choice.permissionMode),
+                        ThreadViewModel.fastChange(thread.modes, choice.fast),
+                    )
                 },
                 onDismiss = {
                     picker = null

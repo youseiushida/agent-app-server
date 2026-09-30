@@ -383,8 +383,9 @@ async fn next_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AdapterEvent>)
 
 /// Background work through Cognition's extension, end to end against the real agent: the
 /// shell and the sub-agent become tasks (the shell's command item is backgrounded), the
-/// sub-agent is stopped while the prompt is open, the shell after the turn, and no process is
-/// left. The session is deleted afterwards.
+/// sub-agent is stopped while the prompt is open, the shell's output streams after the turn
+/// (`terminalPreview`) until it is stopped, and no process is left. The session is deleted
+/// afterwards.
 #[tokio::test]
 #[ignore]
 async fn live_background_shell_and_sub_agent_are_tasks_and_stop() {
@@ -497,6 +498,15 @@ async fn live_background_shell_and_sub_agent_are_tasks_and_stop() {
         BackgroundState::Running,
         "ping -n 300 outlives the turn"
     );
+    // While it runs, Devin's `terminalPreview` snapshots stream its output into the task.
+    while !f
+        .outputs
+        .get(&shell.key)
+        .is_some_and(|o| o.contains("127.0.0.1"))
+    {
+        let ev = next_event(&mut rx).await;
+        f.apply(ev);
+    }
     control.stop_background(&shell.key).await.unwrap();
     while !f.task(&shell.key).state.is_ended() {
         let ev = next_event(&mut rx).await;

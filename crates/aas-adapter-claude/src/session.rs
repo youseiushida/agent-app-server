@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, OnceCell, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
-use crate::background::{CRON_KEY_PREFIX, Cron, Requester, Tracker};
+use crate::background::{CRON_KEY_PREFIX, Cron, Requester, Tracker, WAKEUP_KEY_PREFIX};
 use crate::commands::{CommandCache, CommandView};
 use crate::mapping::{
     self, BackgroundEffect, PLAN_MODE, PermissionAsk, TaskList, ToolClass, ToolResult,
@@ -45,6 +45,10 @@ const LIFECYCLE_CAPABILITY: &str = "msg_lifecycle_v1";
 
 /// Prefix of the item key of a tool call (`tool:<tool_use_id>`).
 const TOOL_KEY_PREFIX: &str = "tool:";
+
+/// Code of the notice that tells the user why the CLI keeps a requested fast mode off (its
+/// `fast_mode_disabled_reason`).
+pub(crate) const FAST_MODE_DISABLED_NOTICE: &str = "fastModeDisabled";
 
 /// How the session learns that its process ended.
 pub(crate) enum ProcessLink {
@@ -113,6 +117,8 @@ pub(crate) struct SessionParams {
     /// `initialize.agentProgressSummaries` (options `agentProgressSummaries`); `None` leaves
     /// the CLI's own default.
     pub agent_progress_summaries: Option<bool>,
+    /// Upper bound of what is read of a task's output file (`policy.max_output_file_bytes`).
+    pub max_output_file_bytes: u64,
 }
 
 /// What the `initialize` control request returned.
@@ -143,6 +149,7 @@ struct Inner {
     shutdown: OnceCell<ExitInfo>,
     command_cache: CommandCache,
     agent_progress_summaries: Option<bool>,
+    max_output_file_bytes: u64,
     /// Woken when the fate of the message `send` wrote changes ([`Outgoing`]) or the output
     /// ends. One waiter at a time (the engine serializes `send`); a wake-up before the wait
     /// is kept as a permit.
@@ -174,6 +181,9 @@ struct State {
     plan_on: bool,
     /// Fast mode is requested (`apply_flag_settings {fastMode}`).
     fast_on: bool,
+    /// The reason the CLI gave for keeping fast mode off (`fast_mode_disabled_reason`) while it
+    /// was requested, last reported through a notice.
+    fast_disabled_noticed: Option<String>,
     /// Steers written into the running turn, by their uuid, until the CLI ends them.
     steers: HashMap<String, Steer>,
     /// `cancel_async_message` requests for steers the turn did not take, by request id.
@@ -375,6 +385,7 @@ impl ClaudeSession {
             shutdown: OnceCell::new(),
             command_cache: params.command_cache,
             agent_progress_summaries: params.agent_progress_summaries,
+            max_output_file_bytes: params.max_output_file_bytes,
             admission: Notify::new(),
         });
         let reader_inner = inner.clone();
@@ -437,7 +448,7 @@ impl ClaudeSession {
                 self.inner.report_permission_mode(st, mode);
             }
             if st.reported_fast_state.is_none() {
-                self.inner.report_fast_state(st, &raw);
+                self.inner.report_fast_state(st, &raw, false);
             }
             st.settings.effort.clone()
         };
@@ -678,7 +689,19 @@ impl Inner {
     /// what the CLI intends for fast mode, shown as it is (`Thread.fastModeState`). Whether a
     /// request was served fast is the API's business (`usage.speed`); a refusal comes as a
     /// `system/notification` (a notice).
-    fn report_fast_state(&self, st: &mut State, msg: &Value) {
+    ///
+    /// When fast mode is requested and the CLI keeps it off, saying why in a field of its own
+    /// (`fast_mode_disabled_reason`, e.g. `extra_usage_disabled` for an account whose extra
+    /// usage is off; recording of 2026-09-30, docs/adapters/claude.md 19.7), the reason goes to
+    /// the user as a notice ([`FAST_MODE_DISABLED_NOTICE`]): once per reason while it lasts, not
+    /// with every turn.
+    ///
+    /// The notice is decided on a turn's `result` only (`turn_result`). `initialize` and
+    /// `system/init` say what the CLI intends when a run starts, and the state can still change
+    /// within that run: the live check of 2026-09-30 saw `init` report `off` with
+    /// `extra_usage_disabled` and the same turn's `result` report `on`. The state itself is
+    /// reported from every source.
+    fn report_fast_state(&self, st: &mut State, msg: &Value, turn_result: bool) {
         let Some(state) = msg.get("fast_mode_state").and_then(Value::as_str) else {
             return;
         };
@@ -688,6 +711,25 @@ impl Inner {
                 plan: None,
                 fast_state: Some(state.to_owned()),
             });
+        }
+        if !turn_result {
+            return;
+        }
+        let reason = msg
+            .get("fast_mode_disabled_reason")
+            .and_then(Value::as_str)
+            .filter(|_| st.fast_on && state == "off");
+        match reason {
+            Some(reason) if st.fast_disabled_noticed.as_deref() != Some(reason) => {
+                st.fast_disabled_noticed = Some(reason.to_owned());
+                self.emit(AdapterEvent::Notice {
+                    level: NoticeLevel::Warning,
+                    message: format!("Claude Code keeps fast mode off: {reason}"),
+                    code: Some(FAST_MODE_DISABLED_NOTICE.into()),
+                });
+            }
+            Some(_) => {}
+            None => st.fast_disabled_noticed = None,
         }
     }
 
@@ -754,6 +796,9 @@ impl Inner {
                         });
                     }
                 }
+            }
+            "system" if msg.get("subtype").and_then(Value::as_str) == Some("task_notification") => {
+                self.on_task_notification(&msg).await
             }
             "system" => self.on_system(&msg),
             "command_lifecycle" => self.on_lifecycle(&msg),
@@ -1013,7 +1058,7 @@ impl Inner {
                 if let Some(mode) = msg.get("permissionMode").and_then(Value::as_str) {
                     self.report_permission_mode(st, mode);
                 }
-                self.report_fast_state(st, msg);
+                self.report_fast_state(st, msg, false);
                 st.commands.set_init(msg);
                 if msg.get("terminal_slash_commands").is_some() {
                     self.command_cache
@@ -1093,16 +1138,6 @@ impl Inner {
                 let changes = st.background.updated(msg);
                 self.emit_tasks(changes);
             }
-            "task_notification" => {
-                let mut st = self.state.lock();
-                let (changes, known) = st.background.notification(msg);
-                self.emit_tasks(changes);
-                if !known {
-                    self.emit(AdapterEvent::Native {
-                        payload: msg.clone(),
-                    });
-                }
-            }
             // Progress signals with no user-visible state: the result marks the turn end;
             // `control_request_progress` tells that one of our requests (a side question) is
             // being worked on, which its answer ends.
@@ -1115,6 +1150,43 @@ impl Inner {
             _ => self.emit(AdapterEvent::Native {
                 payload: msg.clone(),
             }),
+        }
+    }
+
+    /// `system/task_notification`: the end of a task's run. A shell task's output is the file
+    /// the message names (`output_file`, read here: at most `max_output_file_bytes`, the end of
+    /// a longer file); a file that cannot be read leaves the result without output, and the
+    /// user is told why.
+    async fn on_task_notification(&self, msg: &Value) {
+        let file = self.state.lock().background.output_file_of(msg);
+        let output = match file {
+            Some(path) => {
+                match crate::background::read_output_file(&path, self.max_output_file_bytes).await {
+                    Ok(output) => Some(output),
+                    Err(e) => {
+                        let task = msg.get("task_id").and_then(Value::as_str).unwrap_or("?");
+                        tracing::warn!(label = %self.label, task, file = %path.display(), error = %e, "the output file of a background task could not be read");
+                        self.emit(AdapterEvent::Notice {
+                            level: NoticeLevel::Warning,
+                            message: format!(
+                                "The output of background task {task} could not be read from {}: {e}",
+                                path.display()
+                            ),
+                            code: Some("backgroundOutputUnreadable".into()),
+                        });
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut st = self.state.lock();
+        let (changes, known) = st.background.notification(msg, output);
+        self.emit_tasks(changes);
+        if !known {
+            self.emit(AdapterEvent::Native {
+                payload: msg.clone(),
+            });
         }
     }
 
@@ -1267,6 +1339,13 @@ impl Inner {
                     }
                     _ => None,
                 };
+                if own.is_none() && !lifecycle {
+                    // A CLI without lifecycle frames does not say which commands it enqueued
+                    // itself; a run the adapter did not start is one. The CLI runs a wakeup
+                    // that comes due only while no run is going ("Jobs only fire while the
+                    // REPL is idle", its CronCreate description), as a run of its own.
+                    st.background.cli_command_started();
+                }
                 st.turn_seq += 1;
                 st.turn = Some(Turn {
                     acked: true,
@@ -1666,6 +1745,14 @@ impl Inner {
                     self.emit_tasks(background.cron_created(cron, key.clone()));
                     status = ItemStatus::Backgrounded;
                 }
+                Some(BackgroundEffect::Wakeup(wakeup)) => {
+                    let (changes, scheduled) =
+                        background.wakeup_scheduled(tool_id, wakeup, key.clone());
+                    self.emit_tasks(changes);
+                    if scheduled {
+                        status = ItemStatus::Backgrounded;
+                    }
+                }
                 Some(BackgroundEffect::CronDeleted(id)) => {
                     self.emit_tasks(background.cron_deleted(&id));
                 }
@@ -1695,7 +1782,7 @@ impl Inner {
         let withdrawals: Vec<(String, String)> = {
             let mut guard = self.state.lock();
             let st = &mut *guard;
-            self.report_fast_state(st, msg);
+            self.report_fast_state(st, msg, true);
             if !self.finish_turn(st, msg, &request_id) {
                 return;
             }
@@ -1807,8 +1894,7 @@ impl Inner {
         }
         if !turn.wakeups_listed {
             // Interrupted or failed: no list of the pending wakeups came with this end.
-            let lifecycle = st.lifecycle == Some(true);
-            let changes = st.background.turn_ended_without_list(lifecycle);
+            let changes = st.background.turn_ended_without_list();
             self.emit_tasks(changes);
         }
         let total = msg.get("total_cost_usd").and_then(Value::as_f64);
@@ -2379,7 +2465,7 @@ impl SessionControl for ClaudeSession {
     /// that is unknown or already ended, so the answer only says the request was taken; the
     /// end arrives as `task_notification`. Scheduled wakeups cannot be stopped this way.
     async fn stop_background(&self, key: &str) -> Result<(), AdapterError> {
-        if key.starts_with(CRON_KEY_PREFIX) {
+        if key.starts_with(CRON_KEY_PREFIX) || key.starts_with(WAKEUP_KEY_PREFIX) {
             return Err(AdapterError::Other(
                 "Claude Code has no request that cancels a scheduled wakeup".into(),
             ));

@@ -100,13 +100,18 @@ fun NewThreadScreen(vm: NewThreadViewModel, navigator: AppNavigator) {
     val composer by vm.composer.state.collectAsStateWithLifecycle()
     val policy = LocalAppContainer.current.policy
     var picker by rememberSaveable { mutableStateOf<PickerKind?>(null) }
+    // The model the model sheet opens with (`/model <id>` whose model needs another permission mode).
+    var pickerModel by rememberSaveable { mutableStateOf<String?>(null) }
     val imageSources = rememberImageSources(policy.maxImagesPerMessage, onPicked = vm::pickImages)
     val hasCamera = LocalContext.current.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
     LaunchedEffect(vm) {
         vm.eventFlow.collect { event ->
             when (event) {
                 is NewThreadEvent.Created -> navigator.threadCreated(event.threadId)
-                is NewThreadEvent.OpenPicker -> picker = event.kind
+                is NewThreadEvent.OpenPicker -> {
+                    pickerModel = event.model
+                    picker = event.kind
+                }
                 is NewThreadEvent.OpenImport -> navigator.importSession(event.projectId, event.harnessId)
             }
         }
@@ -247,7 +252,17 @@ fun NewThreadScreen(vm: NewThreadViewModel, navigator: AppNavigator) {
     }
     if (harness != null) {
         when (picker) {
-            PickerKind.Model, PickerKind.Effort -> ModelSheet(harness, ui.choices.settings, allowDefaultEffort = true, onApply = { model, effort, _ -> vm.setModel(model, effort) }, onDismiss = { picker = null })
+            PickerKind.Model, PickerKind.Effort -> ModelSheet(
+                harness,
+                ui.choices.settings,
+                allowDefaultEffort = true,
+                onApply = { choice -> vm.setModel(choice.model, choice.effort, choice.permissionMode) },
+                onDismiss = {
+                    picker = null
+                    pickerModel = null
+                },
+                initialModel = pickerModel,
+            )
             PickerKind.PermissionMode -> PermissionSheet(harness, ui.choices.settings, onApply = { vm.setPermission(it.id) }, onDismiss = { picker = null })
             PickerKind.Unknown, null -> Unit
         }

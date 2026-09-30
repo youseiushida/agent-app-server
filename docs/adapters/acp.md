@@ -470,7 +470,7 @@ auth_hint = "Run `devin auth login` in a terminal."
     - キャッシュから models、modes、commands が返ること
     - `session/list` と `session/load` による履歴の取り込み
     - 承認の拒否
-    - バックグラウンドの作業（`live_background_shell_and_sub_agent_are_tasks_and_stop`）: 能力の確認、シェルとサブエージェントのタスク、シェルの Item の `backgrounded`、プロンプトの間のサブエージェントの停止（`failed`）、ターンのあとのシェルの停止（終了コード付き）、すべてのタスクが自分の信号で終わること
+    - バックグラウンドの作業（`live_background_shell_and_sub_agent_are_tasks_and_stop`）: 能力の確認、シェルとサブエージェントのタスク、シェルの Item の `backgrounded`、プロンプトの間のサブエージェントの停止（`failed`）、ターンのあとにシェルの出力が `terminalPreview` から流れること（`BackgroundOutput`、2026-09-30 に確認）、ターンのあとのシェルの停止（終了コード付き）、すべてのタスクが自分の信号で終わること
     - 終了後にプロセスが残っていないこと
     - Cognition のほかの拡張（`live_forks_at_turns_rename_status_and_modes`）: 機能（features）、名前の変更とそのエコー、2つのターンの印がノードの ID まで確定すること、状態（最後のターンの統計）、`/ask` と `/code` が権限モードとして報告されステップを作らないこと、`login` / `logout` を出さないこと、ソースのプロセスが動いている（持っている）間の fork 3 通り（1つ目のターンを含む、2つ目のターンの前まで、セッション全体。どれも分岐の履歴で確かめる）、ノードを記録していない別のアダプタからの fork が持たれているソースを読めずに断られること、ソースを止めたあとの履歴の印と、同じ別のアダプタからの fork（ソースを読んで分岐する）
   - どのテストも、作ったセッションを最後に `session/delete` で消す（短命の supervised プロセスで送る）。Devin は消したセッションのロックファイル（`%APPDATA%\devin\cli\session_locks\<id>.lock`）を残す。テストは Devin の内部のファイルに触れないので、実行した人が前後の一覧を比べ、テストが作ったもの（持ち主のプロセスが終わっているもの）だけを消す。
@@ -553,7 +553,7 @@ auth_hint = "Run `devin auth login` in a terminal."
 | title | `_meta["cognition.ai/backgroundCommand"]`（なければコマンド） |
 | 起動した Item | root のターンのコマンドなら、その Item。タスクを報告してから Item を `backgrounded` で閉じる（どちらも `TurnCompleted` より前）。サブエージェントのコマンドや、ターンの外で移ったものは Item がない |
 | 親 | サブエージェントのコマンドなら、そのサブエージェント（バックグラウンドのものだけ） |
-| 途中の出力 | `cognition.ai/terminalPreview`（約1秒ごとに出力全体）はタスクの状態に取り込むだけで、イベントにしない（design.md の範囲外） |
+| 途中の出力 | `_meta["cognition.ai/terminalPreview"]: true` の更新の本文（`content` の text。約1秒ごとの出力全体）をタスクの出力として流す（`BackgroundOutput`）。前の途中経過の続きなら増えた分（`Append`）、最初のものと前の続きでないもの（記録 a1、a2、a5 の終わり近くで改行の形が変わったもの）は全体（`Replace`）。同じものは何も出さない。タスクが動いている間だけ。エンジンが流すのは `policy.max_inline_output_bytes` まで（design.md 5.6） |
 | 終わり | そのツール呼び出しの `_meta.terminal_exit`（`terminal_id` が backgroundShellId と一致するもの）、または `status: completed / failed` のうち最初に来たもの。`failed` → failed、それ以外 → completed。`result.exitCode` は `terminal_exit.exit_code`、`result.output` はその時点の出力全体。あとから届いた終わりの報告は、まだない項目（終了コードなど）を足すだけ |
 | live | 開始から終わりまで |
 | stoppable | true（`_cognition.ai/terminal/killBackgroundShell`） |
@@ -587,7 +587,7 @@ auth_hint = "Run `devin auth login` in a terminal."
 
 - 休止中のサブエージェントと動いているサブエージェントを区別しない（信号がない。16.6）。
 - サブエージェントの会話（発話・思考・ツール呼び出し）は表示しない。プロトコルの Item はターンに属し、ターンの外で動くタスクの会話を置く場所がない。root の Item に混ぜると root の発話と区別できなくなる。進捗と要約で見せる。
-- シェルの途中の出力は表示しない（16.4）。終わったときの出力全体を `result.output` に入れる。
+- シェルの途中の出力は、上限（`policy.max_inline_output_bytes`）までを流す（16.4）。終わったときの出力全体を `result.output` に入れる。
 - `run_subagent` の Item とサブエージェントのタスクは結び付けない（16.3）。
 - 前面のサブエージェントをバックグラウンドに移す操作（`_cognition.ai/subagent/background` / `foreground`）は使わない（記録で確かめた理由は 17.6。design.md 1章の範囲外）。
 - 予約した起床（D5）: 記録には現れなかった（自分からターンを始めることもない）。`scheduled` のタスクも `trigger` も出さない。

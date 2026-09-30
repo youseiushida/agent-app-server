@@ -68,7 +68,6 @@ import dev.aas.android.protocol.ThreadSettings
 import dev.aas.android.protocol.Turn
 import dev.aas.android.protocol.TurnStartResult
 import dev.aas.android.protocol.TurnStatus
-import dev.aas.android.protocol.WorkspaceSpec
 import dev.aas.android.settings.AppSettings
 import dev.aas.android.sync.NotConnectedException
 import dev.aas.android.sync.OutboxClearedException
@@ -697,6 +696,13 @@ class ThreadViewModel(
                         messages.show(UiText.of(R.string.typed_model_effort_unavailable, model.displayName, label))
                         emit(ThreadEvent.OpenPicker(kind, model = model.id))
                     }
+                    !HarnessSettings.offersPermission(harness, model.id, thread.settings) -> {
+                        // The daemon refuses a model alone that the thread's mode does not fit: the
+                        // model sheet asks for one of the model's modes and sends both together.
+                        val label = HarnessSettings.permission(harness, thread.settings)?.label ?: thread.settings.permissionMode.orEmpty()
+                        messages.show(UiText.of(R.string.typed_model_permission_unavailable, model.displayName, label))
+                        emit(ThreadEvent.OpenPicker(kind, model = model.id))
+                    }
                     else -> applySettings(settingsChange(harness, thread.settings, model.id, null))
                 }
             }
@@ -780,8 +786,9 @@ class ThreadViewModel(
 
     /**
      * 「新しいスレッドで実装」: a new thread of the same project, harness and settings (without plan
-     * mode) whose first message is the harness's preamble, a blank line and the plan. It opens
-     * once the daemon created it.
+     * mode), working where this thread works (its worktree too; [ThreadActions.newThreadWorkspace]),
+     * whose first message is the harness's preamble, a blank line and the plan. It opens once the
+     * daemon created it.
      */
     fun implementPlanInNewThread(plan: Item.ProposedPlan) {
         val ui = state.value
@@ -792,7 +799,13 @@ class ThreadViewModel(
         messages.show(UiText.of(R.string.proposed_plan_new_thread_creating))
         viewModelScope.launch {
             try {
-                val pending = threads.create(thread.projectId, thread.harnessId, thread.settings.takeIf { it != ThreadSettings() }, WorkspaceSpec.Local, input)
+                val pending = threads.create(
+                    thread.projectId,
+                    thread.harnessId,
+                    thread.settings.takeIf { it != ThreadSettings() },
+                    ThreadActions.newThreadWorkspace(thread),
+                    input,
+                )
                 events.send(ThreadEvent.OpenThread(pending.await().thread.id))
             } catch (e: CancellationException) {
                 throw e
@@ -1267,9 +1280,10 @@ class ThreadViewModel(
         private const val SAVED_DRAFT = "draft"
 
         /** The `thread/update` settings for a picker choice: only what changed. */
-        fun settingsChange(harness: Harness, current: ThreadSettings, model: String?, effort: String?): ThreadSettings = ThreadSettings(
+        fun settingsChange(harness: Harness, current: ThreadSettings, model: String?, effort: String?, permissionMode: String? = null): ThreadSettings = ThreadSettings(
             model = model.takeIf { it != null && it != HarnessSettings.model(harness, current)?.id },
             effort = effort.takeIf { it != null && it != current.effort },
+            permissionMode = permissionMode.takeIf { it != null && it != current.permissionMode },
         )
 
         /** The `thread/update` modes for the picker's fast-mode switch: only a change (`null`: unchanged, or not offered). */

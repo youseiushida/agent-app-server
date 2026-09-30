@@ -61,6 +61,10 @@ pub const NEW_THREAD_PREAMBLE: &str =
 /// ([`HarnessAdapter::upgrade_settings`]), like Claude Code's `plan`.
 pub const LEGACY_PLAN_MODE: &str = "plan";
 
+/// The fake model that runs in the permission mode `ask` only (`Model.permissionModes`), like
+/// Claude Code's Haiku, which the CLI does not offer auto mode for.
+pub const LIMITED_MODEL: &str = "fake-lite";
+
 /// Buffer of each in-memory pipe between the adapter and an in-process agent. A pure buffer
 /// size: both ends are read continuously.
 const IN_PROCESS_PIPE_BYTES: usize = 1 << 20;
@@ -208,6 +212,7 @@ impl FakeAdapter {
                     description: None,
                     is_default: true,
                     effort_levels: None,
+                    permission_modes: None,
                 },
                 Model {
                     id: "fake-slow".into(),
@@ -215,6 +220,17 @@ impl FakeAdapter {
                     description: None,
                     is_default: false,
                     effort_levels: None,
+                    permission_modes: None,
+                },
+                // Runs in some permission modes only, like Claude Code's Haiku without auto
+                // mode (`Model.permissionModes`).
+                Model {
+                    id: LIMITED_MODEL.into(),
+                    display_name: "Fake lite".into(),
+                    description: None,
+                    is_default: false,
+                    effort_levels: None,
+                    permission_modes: Some(vec!["ask".into()]),
                 },
             ],
             default_model: Some("fake-fast".into()),
@@ -651,6 +667,10 @@ struct PromptAck {
 /// the session closed) when the reader ends.
 type AckSlot = Arc<parking_lot::Mutex<Option<oneshot::Sender<PromptAck>>>>;
 
+/// Where the reader hands the answer (`Ev::SteerAck`: taken or not) to the steer that waits
+/// for it. Dropped when the reader ends.
+type SteerAckSlot = Arc<parking_lot::Mutex<Option<oneshot::Sender<bool>>>>;
+
 /// Queries (`Op::Query`) waiting for their answer, by id. Emptied (so they see the session
 /// closed) when the reader ends.
 type QuerySlots = Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<Ev>>>>;
@@ -662,6 +682,7 @@ struct FakeSession {
     model: Mutex<Option<String>>,
     modes: Mutex<ThreadModes>,
     ack: AckSlot,
+    steer_ack: SteerAckSlot,
     queries: QuerySlots,
 }
 
@@ -739,6 +760,7 @@ impl FakeSession {
             let _ = tx.send(ev);
         }
         let ack: AckSlot = Arc::new(parking_lot::Mutex::new(None));
+        let steer_ack: SteerAckSlot = Arc::new(parking_lot::Mutex::new(None));
         let queries: QuerySlots = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let session = Arc::new(FakeSession {
             writer: SharedJsonLinesWriter::new(writer.into_inner()),
@@ -747,6 +769,7 @@ impl FakeSession {
             model: Mutex::new(settings.model),
             modes: Mutex::new(modes),
             ack: ack.clone(),
+            steer_ack: steer_ack.clone(),
             queries: queries.clone(),
         });
         tokio::spawn(async move {
@@ -761,6 +784,16 @@ impl FakeSession {
                             }
                             None => {
                                 tracing::warn!("the fake agent answered a prompt nobody waits for")
+                            }
+                        },
+                        // A steer's answer comes after what the turn did before it: a returned
+                        // steer (`steerReturned`) is handed on before the waiting call returns.
+                        Ok(Ev::SteerAck { accepted }) => match steer_ack.lock().take() {
+                            Some(waiter) => {
+                                let _ = waiter.send(accepted);
+                            }
+                            None => {
+                                tracing::warn!("the fake agent answered a steer nobody waits for")
                             }
                         },
                         Ok(ev @ Ev::QueryResult { .. }) => {
@@ -805,8 +838,9 @@ impl FakeSession {
                     }
                 }
             }
-            // A prompt or query still waiting for its answer never gets one.
+            // A prompt, steer or query still waiting for its answer never gets one.
             ack.lock().take();
+            steer_ack.lock().take();
             queries.lock().clear();
             let info = exit.wait().await;
             let _ = tx.send(AdapterEvent::Exited { info });
@@ -823,6 +857,28 @@ impl FakeSession {
             .send(&op)
             .await
             .map_err(|_| AdapterError::Closed)
+    }
+
+    /// Sends a steer and waits for the agent's answer (bounded by `handshake_timeout`): a steer
+    /// that came after the turn ended is refused, like Claude's adapter refuses a message for
+    /// a turn that completed (the engine then records nothing, and the client sends it again
+    /// as a new turn).
+    async fn steer_op(&self, op: Op) -> Result<(), AdapterError> {
+        let (waiter, answer) = oneshot::channel();
+        *self.steer_ack.lock() = Some(waiter);
+        self.write(op).await?;
+        let timeout = self.policy.handshake_timeout;
+        match tokio::time::timeout(timeout, answer).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err(AdapterError::Other(
+                "the turn ended before the message could be added to it; send it as a new message"
+                    .into(),
+            )),
+            Ok(Err(_)) => Err(AdapterError::Closed),
+            Err(_) => Err(AdapterError::Protocol(format!(
+                "the fake agent did not answer the steer within {timeout:?}"
+            ))),
+        }
     }
 
     /// Asks `query` and waits for its answer (bounded by `handshake_timeout`).
@@ -865,7 +921,7 @@ fn image_paths(input: &TurnInput) -> Vec<String> {
 /// waiting `send`).
 fn map_event(ev: Ev) -> Option<AdapterEvent> {
     Some(match ev {
-        Ev::PromptAck { .. } => return None,
+        Ev::PromptAck { .. } | Ev::SteerAck { .. } => return None,
         Ev::Ready { session_id } => AdapterEvent::SessionIdentified {
             native_session_id: session_id,
         },
@@ -947,6 +1003,14 @@ fn map_event(ev: Ev) -> Option<AdapterEvent> {
         Ev::Background { task } => AdapterEvent::BackgroundTask {
             task: Box::new(task),
         },
+        Ev::BackgroundOutput { key, text, replace } => AdapterEvent::BackgroundOutput {
+            key,
+            output: if replace {
+                OutputUpdate::Replace(text)
+            } else {
+                OutputUpdate::Append(text)
+            },
+        },
     })
 }
 
@@ -976,7 +1040,7 @@ impl SessionControl for FakeSession {
     }
 
     async fn steer(&self, input: TurnInput) -> Result<(), AdapterError> {
-        self.write(Op::Steer {
+        self.steer_op(Op::Steer {
             text: input.to_plain_text(),
             images: image_paths(&input),
             message_id: None,
@@ -984,8 +1048,10 @@ impl SessionControl for FakeSession {
         .await
     }
 
+    /// Taken into the running turn, which takes it in at its next pause or returns it before
+    /// its completion (`SteerReturned`); refused when the turn is over.
     async fn steer_message(&self, message_id: &str, input: TurnInput) -> Result<(), AdapterError> {
-        self.write(Op::Steer {
+        self.steer_op(Op::Steer {
             text: input.to_plain_text(),
             images: image_paths(&input),
             message_id: Some(message_id.to_owned()),
@@ -2153,6 +2219,243 @@ mod tests {
             e,
             AdapterEvent::ItemStarted { body: ItemBody::AgentMessage { text }, .. } if text == "project trusted: no"
         )));
+    }
+
+    /// A steer is taken while the turn runs: taken in at the turn's pause, or — left unread —
+    /// returned before the turn's completion; one that comes after the turn is refused (the
+    /// engine records nothing and the message is sent again as a new turn).
+    #[tokio::test]
+    async fn steers_are_taken_returned_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FakeAdapter::in_process("fake", ctx(dir.path()));
+        let mut session = start(&adapter, dir.path()).await;
+        session
+            .control
+            .send(TurnInput::text("@await-steer\n@text done"))
+            .await
+            .unwrap();
+        session
+            .control
+            .steer_message("m1", TurnInput::text("go faster"))
+            .await
+            .unwrap();
+        let events = next_turn(&mut session.events).await;
+        assert!(events.iter().any(
+            |e| matches!(e, AdapterEvent::Notice { message, .. } if message == "steered: go faster")
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::SteerReturned { .. }))
+        );
+
+        session
+            .control
+            .send(TurnInput::text("@await-steer unread\n@text done"))
+            .await
+            .unwrap();
+        session
+            .control
+            .steer_message("m2", TurnInput::text("too late"))
+            .await
+            .unwrap();
+        let events = next_turn(&mut session.events).await;
+        let returned = events
+            .iter()
+            .position(
+                |e| matches!(e, AdapterEvent::SteerReturned { message_id } if message_id == "m2"),
+            )
+            .expect("returned");
+        assert_eq!(
+            returned + 1,
+            events.len() - 1,
+            "right before the completion"
+        );
+        assert!(!events.iter().any(
+            |e| matches!(e, AdapterEvent::Notice { message, .. } if message.contains("too late"))
+        ));
+
+        // The turn is over: a steer is refused.
+        assert!(matches!(
+            session
+                .control
+                .steer_message("m3", TurnInput::text("after"))
+                .await,
+            Err(AdapterError::Other(m)) if m.contains("send it as a new message")
+        ));
+    }
+
+    /// A shell's output streams while it runs (the launching command printed the early lines),
+    /// as appended text or as snapshots, and its end brings the whole output.
+    #[tokio::test]
+    async fn background_output_streams_while_the_task_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FakeAdapter::in_process("fake", ctx(dir.path()));
+        let mut session = start(&adapter, dir.path()).await;
+        session
+            .control
+            .send(TurnInput::text(
+                "@bg b kind=shell ms=200 output=3 early=1 make\n@bg s kind=shell ms=200 output=2 snapshots detached serve",
+            ))
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        let mut ended = 0;
+        while ended < 2 {
+            let ev = session.events.recv().await.unwrap();
+            if matches!(&ev, AdapterEvent::BackgroundTask { task } if task.state.is_ended()) {
+                ended += 1;
+            }
+            events.push(ev);
+        }
+        assert!(events.iter().any(|e| matches!(e,
+            AdapterEvent::ItemDelta { field: DeltaField::Output, text, .. } if text == "b line 1\n")));
+        let outputs = |key: &str| -> Vec<OutputUpdate> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    AdapterEvent::BackgroundOutput { key: k, output } if k == key => {
+                        Some(output.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            outputs("b"),
+            [
+                OutputUpdate::Append("b line 2\n".into()),
+                OutputUpdate::Append("b line 3\n".into())
+            ]
+        );
+        assert_eq!(
+            outputs("s"),
+            [
+                OutputUpdate::Replace("s line 1\n".into()),
+                OutputUpdate::Replace("s line 1\ns line 2\n".into())
+            ]
+        );
+        let end = |key: &str| {
+            events
+                .iter()
+                .find_map(|e| match e {
+                    AdapterEvent::BackgroundTask { task }
+                        if task.key == key && task.state.is_ended() =>
+                    {
+                        task.result.clone()
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            end("b").output.as_deref(),
+            Some("b line 1\nb line 2\nb line 3\nran make\n")
+        );
+        assert_eq!(
+            end("s").output.as_deref(),
+            Some("s line 1\ns line 2\nran serve\n")
+        );
+    }
+
+    /// `@wakeup` schedules an unstoppable wakeup launched by its item; when it comes due the
+    /// agent runs its prompt in a turn of its own marked `scheduled`, `times` times.
+    #[tokio::test]
+    async fn wakeups_run_their_prompt_when_they_come_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FakeAdapter::in_process("fake", ctx(dir.path()));
+        let mut session = start(&adapter, dir.path()).await;
+        let events = turn(&mut session, "@wakeup 50 times=2 @text woke").await;
+        let task = events
+            .iter()
+            .find_map(|e| match e {
+                AdapterEvent::BackgroundTask { task } => Some(task.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(task.key, "wakeup:k1");
+        assert!(!task.stoppable && task.next_run_at.is_some());
+        assert!(events.iter().any(|e| matches!(e,
+            AdapterEvent::ItemCompleted { key, status: ItemStatus::Backgrounded, .. } if key == "k1")));
+        // (The first run may come due before the scheduling turn's completion is read.)
+        let mut all = events.clone();
+        for _ in 0..2 {
+            let own = next_turn(&mut session.events).await;
+            assert!(own.iter().any(|e| matches!(
+                e,
+                AdapterEvent::ItemStarted {
+                    body: ItemBody::AgentMessage { .. },
+                    ..
+                }
+            )));
+            assert!(matches!(
+                own.last(),
+                Some(AdapterEvent::TurnCompleted {
+                    trigger: Some(TurnTrigger::Scheduled),
+                    ..
+                })
+            ));
+            all.extend(own);
+        }
+        // Each run completed when it came due (before the turn it started).
+        let ends: Vec<u32> = all
+            .iter()
+            .filter_map(|e| match e {
+                AdapterEvent::BackgroundTask { task }
+                    if task.key == "wakeup:k1" && task.state == BackgroundState::Completed =>
+                {
+                    Some(task.runs)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, [1, 2]);
+    }
+
+    /// `@dialog` asks after the turn's completion, naming neither an item nor a task; the answer
+    /// reaches the agent, which reports it.
+    #[tokio::test]
+    async fn dialogs_are_asked_after_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FakeAdapter::in_process("fake", ctx(dir.path()));
+        let mut session = start(&adapter, dir.path()).await;
+        let events = turn(&mut session, "@dialog Deploy now?\n@text asked").await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AdapterEvent::InteractionRequested { .. }))
+        );
+        let (request_id, item_key, background_key) = match session.events.recv().await.unwrap() {
+            AdapterEvent::InteractionRequested {
+                request_id,
+                item_key,
+                background_key,
+                request: InteractionRequest::Question { title, .. },
+            } => {
+                assert_eq!(title, "Deploy now?");
+                (request_id, item_key, background_key)
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((item_key, background_key), (None, None));
+        session
+            .control
+            .respond(
+                &request_id,
+                &InteractionResolution::Question {
+                    answers: vec![aas_protocol::types::QuestionAnswer {
+                        question_id: "choice".into(),
+                        choice_ids: vec!["yes".into()],
+                        text: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.events.recv().await.unwrap(),
+            AdapterEvent::Notice { message, .. } if message == "dialog Deploy now?: yes"
+        ));
     }
 
     /// A recorded session is what a user of the CLI on the PC leaves behind: requests are

@@ -104,7 +104,8 @@ data class NewThreadUiState(
 sealed interface NewThreadEvent {
     data class Created(val threadId: String) : NewThreadEvent
 
-    data class OpenPicker(val kind: PickerKind) : NewThreadEvent
+    /** Opens a picker; [model]: the model sheet opens with that model chosen (`/model` of one the mode does not fit). */
+    data class OpenPicker(val kind: PickerKind, val model: String? = null) : NewThreadEvent
 
     /** `/resume`: 「PC のセッションを取り込む」 of [projectId], listing [harnessId]'s sessions first. */
     data class OpenImport(val projectId: String, val harnessId: String?) : NewThreadEvent
@@ -174,6 +175,8 @@ class NewThreadViewModel(
         val blocked = when {
             harness == null || !harness.available -> SendBlock.NotLoaded
             busy -> SendBlock.Interrupting
+            // The model and mode would be refused together (the harness's lists changed since they were chosen).
+            !HarnessSettings.offersPermission(harness, HarnessSettings.model(harness, c.settings)?.id, c.settings) -> SendBlock.PermissionUnavailable
             // Uploads, and images for a harness that takes none (switched after attaching them).
             else -> SendLogic.attachmentsBlock(harness.capabilities, comp.uploading, comp.uploadFailed, comp.hasImages)
                 // A thread starts with a message (the first turn); an image alone is a message too.
@@ -254,9 +257,13 @@ class NewThreadViewModel(
         commandsFor = null
     }
 
-    /** The model sheet's choice (`null` effort: the harness default). */
-    fun setModel(model: String?, effort: String?) {
-        choices.value = choices.value.copy(settings = choices.value.settings.copy(model = model, effort = effort))
+    /**
+     * The model sheet's choice (`null` effort: the harness default). [permissionMode]: the mode
+     * chosen for a model that does not run in the one in effect (`null`: the mode stays).
+     */
+    fun setModel(model: String?, effort: String?, permissionMode: String? = null) {
+        val settings = choices.value.settings
+        choices.value = choices.value.copy(settings = settings.copy(model = model, effort = effort, permissionMode = permissionMode ?: settings.permissionMode))
     }
 
     fun setPermission(permissionMode: String) {
@@ -413,6 +420,11 @@ class NewThreadViewModel(
                 if (model == null) {
                     messages.show(UiText.of(R.string.typed_model_unknown, args))
                     viewModelScope.launch { events.send(NewThreadEvent.OpenPicker(kind)) }
+                } else if (!HarnessSettings.offersPermission(harness, model.id, settings)) {
+                    // As the model sheet does: that model with a mode it runs in, chosen there.
+                    val mode = HarnessSettings.permission(harness, settings)?.label ?: settings.permissionMode.orEmpty()
+                    messages.show(UiText.of(R.string.typed_model_permission_unavailable, model.displayName, mode))
+                    viewModelScope.launch { events.send(NewThreadEvent.OpenPicker(kind, model = model.id)) }
                 } else {
                     // An effort the new model does not offer is dropped (the harness default applies).
                     val effort = settings.effort?.takeIf { e -> HarnessSettings.effortLevels(harness, model.id).any { it.id == e } }

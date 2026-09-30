@@ -155,6 +155,12 @@ pub struct Model {
     /// Effort level ids this model accepts; absent means "all of the harness' levels".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub effort_levels: Option<Vec<String>>,
+    /// Permission mode ids (`Harness.permissionModes`) this model can run in, when the harness
+    /// says explicitly that it cannot run in all of them (e.g. Claude Code's auto mode, which
+    /// the CLI offers only for models with `supportsAutoMode`); absent means "all of the
+    /// harness' modes".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub permission_modes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -305,6 +311,10 @@ pub enum WorkspaceSpec {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         branch: Option<String>,
     },
+    /// Where thread `thread_id` of the same project works: its worktree (shared, like a fork
+    /// of that thread), or the project's folder. For a new conversation about the same working
+    /// tree (e.g. implementing a worktree thread's proposed plan in a new thread).
+    Thread { thread_id: ThreadId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -1227,6 +1237,16 @@ pub struct BackgroundTask {
     /// When the harness says the task runs next (scheduled wakeups).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub next_run_at: Option<Millis>,
+    /// What the current run printed so far, as the harness streams it explicitly (a background
+    /// shell's output): at most `policy.max_inline_output_bytes`, extended by
+    /// `backgroundTask/outputDelta`. Absent while nothing was streamed, and once the run ended
+    /// with an output of its own in `result` (the whole output, which supersedes it).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output: Option<String>,
+    /// `output` reached `policy.max_inline_output_bytes`: the rest of the run's output is not
+    /// streamed (the whole output comes with the end, in `result`, when the harness reports it).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub output_truncated: bool,
 }
 
 /// Progress a harness reports for a running task. Every value is the harness's own; a harness
@@ -1292,6 +1312,11 @@ pub struct BackgroundResult {
     pub output_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub output_blob_id: Option<BlobId>,
+    /// Bytes at the start of the task's output that were not read: the harness kept the output
+    /// in a file larger than `policy.max_output_file_bytes`, and the end of it was read
+    /// (`output` and `outputBlobId` hold that end).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output_omitted_bytes: Option<u64>,
 }
 
 /// What a task used, as the harness reports it.

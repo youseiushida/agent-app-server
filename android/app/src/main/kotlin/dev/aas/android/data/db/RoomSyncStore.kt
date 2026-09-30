@@ -75,6 +75,17 @@ class RoomSyncStore(private val db: AasDatabase) : SyncStore {
             dao.putMeta(MetaEntity(MetaKeys.EPOCH, epoch))
         }
 
+        override suspend fun modelVersion(): Int? {
+            check()
+            val text = dao.meta(MetaKeys.MODEL_VERSION) ?: return null
+            return text.toIntOrNull() ?: throw IllegalStateException("corrupt ${MetaKeys.MODEL_VERSION} value: $text")
+        }
+
+        override suspend fun setModelVersion(version: Int) {
+            check()
+            dao.putMeta(MetaEntity(MetaKeys.MODEL_VERSION, version.toString()))
+        }
+
         override suspend fun cursor(stream: String): Long? {
             check()
             return dao.cursor(stream)

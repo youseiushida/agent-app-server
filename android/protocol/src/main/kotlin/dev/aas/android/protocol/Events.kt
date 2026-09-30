@@ -92,6 +92,14 @@ sealed interface Event {
     data class BackgroundTaskUpdated(val task: BackgroundTask) : Event
 
     /**
+     * More output of a running background task, appended to its [BackgroundTask.output] (the
+     * harness streamed it explicitly). Consecutive deltas of one task may arrive merged
+     * (`seqFrom`); a later [BackgroundTaskUpdated] of the task carries everything they added.
+     */
+    @Serializable
+    data class BackgroundTaskOutputDelta(val taskId: BackgroundTaskId, val text: String) : Event
+
+    /**
      * The harness moved the thread's agent to another native session by itself (a typed command,
      * an extension): the thread's `nativeSessionId` follows it (protocol.md §3.1).
      */
@@ -137,6 +145,7 @@ sealed interface Event {
             is QueueUpdated -> "queue/updated"
             CommandsChanged -> "commands/changed"
             is BackgroundTaskUpdated -> "backgroundTask/updated"
+            is BackgroundTaskOutputDelta -> "backgroundTask/outputDelta"
             is NativeSessionChanged -> "thread/nativeSessionChanged"
             is ComposerInsert -> "composer/insert"
             is Native -> "native"
@@ -149,7 +158,8 @@ sealed interface Event {
             "interaction/closed", "harness/updated", "operation/updated", "thread/updated", "turn/started",
             "turn/completed", "turn/diffUpdated", "turn/usageUpdated", "item/started", "item/delta", "item/updated",
             "item/completed", "interaction/requested", "interaction/resolved", "interaction/expired", "queue/updated",
-            "commands/changed", "backgroundTask/updated", "thread/nativeSessionChanged", "composer/insert", "native",
+            "commands/changed", "backgroundTask/updated", "backgroundTask/outputDelta", "thread/nativeSessionChanged",
+            "composer/insert", "native",
         )
 
         fun serializerFor(type: String): KSerializer<out Event>? = when (type) {
@@ -176,6 +186,7 @@ sealed interface Event {
             "queue/updated" -> QueueUpdated.serializer()
             "commands/changed" -> CommandsChanged.serializer()
             "backgroundTask/updated" -> BackgroundTaskUpdated.serializer()
+            "backgroundTask/outputDelta" -> BackgroundTaskOutputDelta.serializer()
             "thread/nativeSessionChanged" -> NativeSessionChanged.serializer()
             "composer/insert" -> ComposerInsert.serializer()
             "native" -> Native.serializer()

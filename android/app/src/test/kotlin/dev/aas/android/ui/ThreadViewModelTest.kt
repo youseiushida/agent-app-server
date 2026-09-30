@@ -16,6 +16,7 @@ import dev.aas.android.domain.composer.SendBlock
 import dev.aas.android.domain.timeline.TimelineRow
 import dev.aas.android.notify.AppVisibility
 import dev.aas.android.protocol.AasJson
+import dev.aas.android.protocol.BackgroundTaskKind
 import dev.aas.android.protocol.BackgroundTaskStatus
 import dev.aas.android.protocol.BackgroundTaskStopParams
 import dev.aas.android.protocol.CommandListResult
@@ -165,12 +166,13 @@ class ThreadViewModelTest {
         val events = mutableListOf<ThreadEvent>()
         jobs += CoroutineScope(Dispatchers.Default).launch { vm.eventFlow.collect { events += it } }
 
-        val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running }
+        val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running && it.kind == BackgroundTaskKind.Agent }
+        val devServer = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running && it.kind == BackgroundTaskKind.Shell }
         val ui = eventually(what = "the section") { vm.state.value.takeIf { it.rows.any { r -> r is TimelineRow.BackgroundHeader } } }
-        assertEquals(TimelineRow.BackgroundHeader(running = 1, ambient = 0, ended = 2, expanded = true), ui.rows.filterIsInstance<TimelineRow.BackgroundHeader>().single())
-        assertEquals(listOf(agent.id), ui.rows.filterIsInstance<TimelineRow.BackgroundTaskRow>().map { it.task.id }, "ended tasks are folded")
+        assertEquals(TimelineRow.BackgroundHeader(running = 2, ambient = 0, ended = 2, expanded = true), ui.rows.filterIsInstance<TimelineRow.BackgroundHeader>().single())
+        assertEquals(listOf(agent.id, devServer.id), ui.rows.filterIsInstance<TimelineRow.BackgroundTaskRow>().map { it.task.id }, "ended tasks are folded")
         assertEquals(BackgroundStop.Available, ui.stopOf(agent))
-        assertEquals(listOf(agent), ui.runningTasks)
+        assertEquals(listOf(agent, devServer), ui.runningTasks)
         assertTrue(ui.keepsBackgroundOnInterrupt)
         // The approval the background agent asked names it.
         val asked = ui.pendingInteractions.single { it.backgroundTaskId != null }
@@ -206,7 +208,7 @@ class ThreadViewModelTest {
     fun aHarnessThatCannotStopOneTaskOffersNoStop() = blockingTest {
         val read = read(running = false)
         val vm = offline(read)
-        val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running }
+        val agent = read.backgroundTasks.single { it.status == BackgroundTaskStatus.Running && it.kind == BackgroundTaskKind.Agent }
         val ui = eventually(what = "the section") { vm.state.value.takeIf { it.rows.any { r -> r is TimelineRow.BackgroundTaskRow } } }
         assertEquals(BackgroundStop.None, ui.stopOf(agent))
         assertTrue(!ui.keepsBackgroundOnInterrupt)

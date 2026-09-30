@@ -48,17 +48,20 @@ class AasTestServer private constructor(
 
     /**
      * Daemon policy values for a test (the server's flags; `null`: the daemon's default):
-     * `policy.idle_process_ttl`, `background_progress_interval`, `background_stop_confirm_timeout`.
+     * `policy.idle_process_ttl`, `background_progress_interval`, `background_stop_confirm_timeout`,
+     * `max_inline_output_bytes`.
      */
     data class Policy(
         val idleProcessTtlMs: Long? = null,
         val backgroundProgressMs: Long? = null,
         val backgroundStopConfirmMs: Long? = null,
+        val maxInlineOutputBytes: Long? = null,
     ) {
         fun args(): List<String> = buildList {
             idleProcessTtlMs?.let { addAll(listOf("--idle-process-ttl-ms", it.toString())) }
             backgroundProgressMs?.let { addAll(listOf("--background-progress-ms", it.toString())) }
             backgroundStopConfirmMs?.let { addAll(listOf("--background-stop-confirm-ms", it.toString())) }
+            maxInlineOutputBytes?.let { addAll(listOf("--max-inline-output-bytes", it.toString())) }
         }
     }
 

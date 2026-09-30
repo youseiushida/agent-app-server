@@ -288,7 +288,30 @@ async fn devin_background_tasks_stop_through_the_extension_methods() {
     let shell = s.f.task("shell:1b9780").clone();
     // Devin reports a killed shell as completed with exit code 1.
     assert_eq!(shell.state, BackgroundState::Completed);
-    assert_eq!(shell.result.and_then(|r| r.exit_code), Some(1));
+    let result = shell.result.expect("the end's report");
+    assert_eq!(result.exit_code, Some(1));
+    // While it ran, its previews (the whole output so far, once a second) were streamed as
+    // the task's output: the first one whole, each later one as what it added (every preview
+    // of the recording continues the one before). The end brings the whole output.
+    let streamed = s.f.outputs.get("shell:1b9780").cloned().unwrap_or_default();
+    assert!(
+        streamed.starts_with("\n127.0.0.1") && streamed.lines().count() > 10,
+        "{streamed:?}"
+    );
+    let replaced = s
+        .f
+        .events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::BackgroundOutput { key, output: aas_harness::OutputUpdate::Replace(_) } if key == "shell:1b9780"))
+        .count();
+    assert_eq!(replaced, 1, "only the first preview replaces");
+    assert!(
+        result
+            .output
+            .as_deref()
+            .is_some_and(|o| o.starts_with(streamed.as_str())),
+        "the whole output continues what was streamed"
+    );
 
     let (_, client) = s.finish().await;
     let cancel = client

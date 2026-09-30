@@ -181,8 +181,10 @@ data class DisplayPolicy(
      */
     val dialogTaskTitles: Int = 5,
     /**
-     * Output lines of a finished background task shown in its card (the tail); the full output
-     * has its own screen. A result summary rather than a live log, so a few lines suffice.
+     * Output lines of a background task shown in its card: the newest while it runs, the last
+     * once it ended (the first when only the beginning of a long output is here). The full output
+     * has its own screen, which follows a running one; the card only tells how things stand, so a
+     * few lines suffice.
      */
     val taskOutputLines: Int = 6,
 ) {

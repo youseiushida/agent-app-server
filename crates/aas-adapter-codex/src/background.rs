@@ -320,6 +320,19 @@ impl Background {
             .contains_key(&(thread.to_owned(), item.to_owned()))
     }
 
+    /// The key of the background terminal whose process `item` of `thread` is, while its task
+    /// runs: Codex goes on sending that item's `item/commandExecution/outputDelta` (with the
+    /// turn id of the turn that started it) until the process exits.
+    pub fn running_terminal(&self, thread: &str, item: &str) -> Option<String> {
+        let key = self
+            .terminal_of_item
+            .get(&(thread.to_owned(), item.to_owned()))?;
+        self.tasks
+            .get(key)
+            .filter(|t| !t.state.is_ended())
+            .map(|t| t.key.clone())
+    }
+
     /// `item/completed` of a commandExecution item of `thread`, with the fields Codex reports.
     pub fn command_completed(
         &mut self,
@@ -355,6 +368,7 @@ impl Background {
                     summary: None,
                     exit_code,
                     output,
+                    output_omitted_bytes: None,
                 });
                 if duration_ms.is_some() {
                     task.usage
@@ -608,7 +622,8 @@ mod tests {
             Some(BackgroundOutcome {
                 summary: None,
                 exit_code: Some(-1),
-                output: Some("TICK\r\n".into())
+                output: Some("TICK\r\n".into()),
+                output_omitted_bytes: None
             })
         );
         assert_eq!(b.usage.unwrap().duration_ms, Some(18029));

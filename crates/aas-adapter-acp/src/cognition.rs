@@ -13,7 +13,9 @@
 //! * **Background shells**. An `exec` tool call whose update carries
 //!   `_meta["cognition.ai/backgroundShellId"]` keeps running after its turn; it ends with an
 //!   update of that tool call carrying `_meta.terminal_exit` whose `terminal_id` is that id
-//!   (with `exit_code`).
+//!   (with `exit_code`). While it runs, updates marked `_meta["cognition.ai/terminalPreview"]`
+//!   carry the whole output so far (about once a second); they are relayed as the task's output
+//!   (appended text when a preview continues the last one, the whole preview otherwise).
 //!
 //! They are stopped with `_cognition.ai/subagent/cancel {sessionId, agentId}` and
 //! `_cognition.ai/terminal/killBackgroundShell {sessionId, shellId}`. Both answer `{}` for any
@@ -36,7 +38,7 @@ use std::collections::HashMap;
 use aas_harness::protocol::{BackgroundProgress, BackgroundTaskKind, ItemStatus};
 use aas_harness::{
     AdapterError, AdapterEvent, BackgroundOutcome, BackgroundState, BackgroundTaskInfo,
-    BackgroundTasks,
+    BackgroundTasks, OutputUpdate,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -126,6 +128,8 @@ const SUBAGENT_COMPLETED: &str = "cognition.ai/subagent_completed";
 const BACKGROUND_SHELL_ID: &str = "cognition.ai/backgroundShellId";
 const BACKGROUND_COMMAND: &str = "cognition.ai/backgroundCommand";
 const TERMINAL_EXIT: &str = "terminal_exit";
+/// `_meta` flag of an update whose content is the running command's whole output so far.
+const TERMINAL_PREVIEW: &str = "cognition.ai/terminalPreview";
 const INPUT_TOKENS: &str = "cognition.ai/inputTokens";
 const OUTPUT_TOKENS: &str = "cognition.ai/outputTokens";
 /// `parentAgentId` of the root agent's own updates.
@@ -264,6 +268,8 @@ struct Shell {
     /// `terminal_exit` for this shell arrived.
     exited: bool,
     exit_code: Option<i32>,
+    /// The output last relayed from a preview (`None` before the first one).
+    streamed: Option<String>,
 }
 
 /// Devin's background work in one session.
@@ -577,6 +583,7 @@ impl Background {
                 state,
                 exited: false,
                 exit_code: None,
+                streamed: None,
             },
         );
         // The same update may already report the end.
@@ -599,6 +606,30 @@ impl Background {
         }
         let status = shell.state.terminal_status();
         if !shell.exited && status.is_none() {
+            // A preview of the running shell: what it printed since the last one (the first
+            // preview, or one that does not continue the last, replaces the output).
+            if f.meta
+                .as_ref()
+                .and_then(|m| m.get(TERMINAL_PREVIEW))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                let text = shell.state.output_text();
+                let update = match &shell.streamed {
+                    Some(last) if *last == text => None,
+                    Some(last) if text.starts_with(last.as_str()) => {
+                        Some(OutputUpdate::Append(text[last.len()..].to_owned()))
+                    }
+                    _ => Some(OutputUpdate::Replace(text.clone())),
+                };
+                shell.streamed = Some(text);
+                let key = shell_key(&shell.shell_id);
+                if let Some(output) = update
+                    && self.running(&key)
+                {
+                    out.push(Emit::Event(AdapterEvent::BackgroundOutput { key, output }));
+                }
+            }
             return;
         }
         let state = if status == Some(ItemStatus::Failed) {
@@ -611,6 +642,7 @@ impl Background {
             summary: None,
             exit_code: shell.exit_code,
             output: (!output.is_empty()).then_some(output),
+            output_omitted_bytes: None,
         };
         let key = shell_key(&shell.shell_id);
         if self.running(&key) {
@@ -930,16 +962,41 @@ mod tests {
             items.last(),
             Some(AdapterEvent::ItemCompleted { key, status: ItemStatus::Backgrounded, .. }) if key == "tool-t1"
         ));
-        // Output previews are the shell's, not the item's (which is closed).
-        let (r, tasks, items) = route(
+        // Output previews are the shell's, not the item's (which is closed): the first one is
+        // the whole output, a continuing one what it added, one that does not continue the
+        // last replaces it, and the same preview again adds nothing.
+        let preview = |text: &str| {
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "content": [{"type": "content", "content": {"type": "text", "text": text}}],
+                "_meta": {TERMINAL_PREVIEW: true}})
+        };
+        let output = |events: Vec<AdapterEvent>| -> Vec<OutputUpdate> {
+            events
+                .into_iter()
+                .map(|e| match e {
+                    AdapterEvent::BackgroundOutput { key, output } if key == "shell:s1" => output,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let (r, tasks, events) = route(&mut bg, &mut root, false, preview("\nPING 1"));
+        assert_eq!((r, tasks.len()), (Routed::Handled, 0));
+        assert_eq!(output(events), [OutputUpdate::Replace("\nPING 1".into())]);
+        let (_, _, events) = route(&mut bg, &mut root, false, preview("\nPING 1\nPING 2"));
+        assert_eq!(output(events), [OutputUpdate::Append("\nPING 2".into())]);
+        let (_, _, events) = route(&mut bg, &mut root, false, preview("\nPING 1\nPING 2"));
+        assert!(events.is_empty());
+        let (_, _, events) = route(&mut bg, &mut root, false, preview("\r\nPING 1"));
+        assert_eq!(output(events), [OutputUpdate::Replace("\r\nPING 1".into())]);
+        // An update that is not a preview is not output.
+        let (_, _, events) = route(
             &mut bg,
             &mut root,
             false,
             json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
-                "content": [{"type": "content", "content": {"type": "text", "text": "a"}}],
-                "_meta": {"cognition.ai/terminalPreview": true}}),
+                "content": [{"type": "content", "content": {"type": "text", "text": "a"}}]}),
         );
-        assert_eq!((r, tasks.len(), items.len()), (Routed::Handled, 0, 0));
+        assert!(events.is_empty());
         let (_, tasks, _) = route(
             &mut bg,
             &mut root,

@@ -270,6 +270,26 @@ class ThreadFeaturesViewModelTest {
         val create = AasJson.decodeFromJsonElement(Methods.ThreadCreate.params, env.requests(Methods.ThreadCreate.name).single().params!!)
         assertEquals(listOf(InputPart.Text("Implement this plan:\n\n" + plan.text)), create.input)
         assertEquals("claude", create.harnessId)
+        assertEquals(dev.aas.android.protocol.WorkspaceSpec.Local, create.workspace, "a thread in the project's folder: the folder")
+    }
+
+    /**
+     * 「新しいスレッドで実装」 of a thread in a worktree: the new thread works in that worktree
+     * (`workspace: { kind: "thread" }`, protocol.md §4), where the plan's files are.
+     */
+    @Test
+    fun implementingAWorktreeThreadsPlanInANewThreadWorksInItsWorktree() = blockingTest {
+        val read = read().let { it.copy(thread = it.thread.copy(workspace = dev.aas.android.protocol.Workspace.Worktree("C:\\wt\\a", "aas/a", "main"))) }
+        env.answers[Methods.ThreadCreate.name] = {
+            AasJson.encodeToJsonElement(Methods.ThreadCreate.result, dev.aas.android.protocol.ThreadCreateResult(read.thread.copy(id = "thr_impl")))
+        }
+        val vm = online(read)
+        val plan = vm.state.value.thread.items.filterIsInstance<Item.ProposedPlan>().single()
+        assertTrue(vm.state.value.planChoices(plan).newThread, "offered for a worktree thread too")
+        main { vm.implementPlanInNewThread(plan) }
+        assertEquals(ThreadEvent.OpenThread("thr_impl"), eventually(what = "the new thread") { events.lastOrNull() as? ThreadEvent.OpenThread })
+        val create = AasJson.decodeFromJsonElement(Methods.ThreadCreate.params, env.requests(Methods.ThreadCreate.name).single().params!!)
+        assertEquals(dev.aas.android.protocol.WorkspaceSpec.Thread(read.thread.id), create.workspace)
     }
 
     /**
@@ -535,6 +555,28 @@ class ThreadFeaturesViewModelTest {
         assertEquals(ThreadEvent.OpenPicker(PickerKind.Model, model = "small"), eventually(what = "the picker") { events.lastOrNull() as? ThreadEvent.OpenPicker })
         assertTrue(env.engine.outbox.value.none { it.method == Methods.ThreadUpdate.name }, "no model without an effort it offers")
         assertEquals("", vm.composer.textValue.text)
+    }
+
+    /**
+     * `/model <id>` of a model that does not run in the thread's permission mode
+     * (`Model.permissionModes`, Claude Code's Haiku without auto): nothing is changed (the daemon
+     * refuses a model alone that the mode does not fit); the model sheet opens with that model,
+     * where one of its modes is chosen and sent with it.
+     */
+    @Test
+    fun typedModelThatDoesNotRunInTheThreadsModeOpensThePickerForIt() = blockingTest {
+        val limited = harness.copy(models = harness.models + dev.aas.android.protocol.Model("lite", "Lite", permissionModes = listOf("ask")))
+        val read = read().let { it.copy(thread = it.thread.copy(settings = ThreadSettings(permissionMode = "full"))) }
+        env.seed(read, harnesses = listOf(limited))
+        env.startOffline()
+        eventually(what = "the workspace") { env.engine.workspace.value.harnesses.takeIf { it.isNotEmpty() } }
+        val vm = viewModel(read)
+        type(vm, "/model Lite")
+        awaitMessage(UiText.of(R.string.typed_model_permission_unavailable, "Lite", "Full access"))
+        assertEquals(ThreadEvent.OpenPicker(PickerKind.Model, model = "lite"), eventually(what = "the picker") { events.lastOrNull() as? ThreadEvent.OpenPicker })
+        assertTrue(env.engine.outbox.value.none { it.method == Methods.ThreadUpdate.name }, "no model without a mode it runs in")
+        // The sheet's choice goes as one change: the model with the mode chosen for it.
+        assertEquals(ThreadSettings(model = "lite", permissionMode = "ask"), ThreadViewModel.settingsChange(limited, read.thread.settings, "lite", null, "ask"))
     }
 
     private companion object {

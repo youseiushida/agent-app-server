@@ -14,7 +14,7 @@ use aas_harness::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::background::{Cron, Launch, task_kind};
+use crate::background::{Cron, Launch, Wakeup, task_kind};
 
 // ---------------------------------------------------------------------------------------------
 // Tools
@@ -421,6 +421,9 @@ pub enum BackgroundEffect {
     CronDeleted(String),
     /// `CronList` listed every pending wakeup (`{jobs: [...]}`).
     CronList(Vec<Cron>),
+    /// `ScheduleWakeup` replaced the pending wakeup of the dynamic loop
+    /// (`{scheduledFor, clampedDelaySeconds, wasClamped, stopped?}`).
+    Wakeup(Wakeup),
 }
 
 /// See [`BackgroundEffect`]. A failed or denied call has none.
@@ -459,6 +462,20 @@ pub fn background_effect(
             return Some(BackgroundEffect::CronList(
                 jobs.iter().filter_map(Cron::from_entry).collect(),
             ));
+        }
+        "ScheduleWakeup" => {
+            // `stopped: true`, or `scheduledFor: 0` (the loop reached its maximum age):
+            // nothing is scheduled. Either way the pending one is gone.
+            let stopped = s.get("stopped").and_then(Value::as_bool) == Some(true);
+            let scheduled_for = s
+                .get("scheduledFor")
+                .and_then(Value::as_i64)
+                .filter(|at| *at > 0 && !stopped);
+            return Some(BackgroundEffect::Wakeup(Wakeup {
+                scheduled_for,
+                prompt: str_field(input, "prompt").unwrap_or_default().to_owned(),
+                reason: str_field(input, "reason").map(str::to_owned),
+            }));
         }
         _ => {}
     }
@@ -1369,10 +1386,23 @@ pub fn effort_flag_settings(effort: Option<&str>, was_ultracode: bool) -> Value 
 }
 
 /// Models from the `initialize` response (`models[]`: `value`, `displayName`, `description`,
-/// `supportedEffortLevels`). The pseudo-model `default` is the CLI's own default. Ultracode is
-/// offered for the models that list `xhigh`: it runs at xhigh effort, and the CLI refuses it
-/// for a model without it ("Ultracode runs at xhigh effort, which <model> doesn't support").
-pub fn models_from_initialize(init: &Value) -> Vec<Model> {
+/// `supportedEffortLevels`, `supportsAutoMode`). The pseudo-model `default` is the CLI's own
+/// default. Ultracode is offered for the models that list `xhigh`: it runs at xhigh effort, and
+/// the CLI refuses it for a model without it ("Ultracode runs at xhigh effort, which <model>
+/// doesn't support").
+///
+/// `modes` are the harness's permission modes. The CLI offers its auto mode only for the models
+/// it marks `supportsAutoMode` ("Whether this model supports auto mode"; Claude Code 2.1.284
+/// leaves it out for Haiku): every other model lists the modes without `auto`
+/// (`Model.permissionModes`). A model with the mark runs in all of them.
+pub fn models_from_initialize(init: &Value, modes: &[PermissionMode]) -> Vec<Model> {
+    let without_auto: Option<Vec<String>> = modes.iter().any(|m| m.id == AUTO_MODE).then(|| {
+        modes
+            .iter()
+            .filter(|m| m.id != AUTO_MODE)
+            .map(|m| m.id.clone())
+            .collect()
+    });
     init.get("models")
         .and_then(Value::as_array)
         .into_iter()
@@ -1397,6 +1427,7 @@ pub fn models_from_initialize(init: &Value) -> Vec<Model> {
                     }
                     levels
                 });
+            let supports_auto = m.get("supportsAutoMode").and_then(Value::as_bool) == Some(true);
             Some(Model {
                 display_name: str_field(m, "displayName").unwrap_or(&id).to_owned(),
                 description: str_field(m, "description").map(str::to_owned),
@@ -1405,6 +1436,11 @@ pub fn models_from_initialize(init: &Value) -> Vec<Model> {
                     levels
                 } else {
                     Some(Vec::new())
+                },
+                permission_modes: if supports_auto {
+                    None
+                } else {
+                    without_auto.clone()
                 },
                 id,
             })
@@ -1482,6 +1518,10 @@ pub fn upgrade_settings(settings: ThreadSettings) -> UpgradedSettings {
 /// Permission modes (fixed table). `bypassPermissions` is only offered when the adapter
 /// option `allowBypassPermissions` is set; `plan` is the thread's plan mode ([`PLAN_MODE`]).
 /// The default is the CLI's `current_permission_mode` (`default` when that is `plan`).
+/// Claude Code's auto mode (a classifier approves or escalates each request), which the CLI
+/// offers only for some models (`supportsAutoMode`).
+pub const AUTO_MODE: &str = "auto";
+
 pub fn permission_modes(current: Option<&str>, allow_bypass: bool) -> Vec<PermissionMode> {
     let table: &[(&str, &str, &str)] = &[
         (
@@ -1969,7 +2009,7 @@ mod tests {
             ],
             "commands": [{"name": "compact", "description": "Compact", "argumentHint": "[instructions]"}, {"name": "", "description": ""}]
         });
-        let models = models_from_initialize(&init);
+        let models = models_from_initialize(&init, &permission_modes(None, false));
         assert_eq!(models.len(), 2);
         assert!(models[0].is_default);
         assert_eq!(models[1].effort_levels, Some(vec![]));
@@ -2143,15 +2183,39 @@ mod tests {
             background_effect("CronList", &json!({}), &list),
             Some(BackgroundEffect::CronList(jobs)) if jobs.len() == 1
         ));
-        // ScheduleWakeup names no id (recorded w1): nothing to key a task by.
+        // ScheduleWakeup names no id, but when its wakeup comes due (recorded w1).
+        let input = json!({"delaySeconds": 60, "reason": "recording test",
+            "prompt": "Reply with exactly: woke-up", "noop": false});
         let wakeup = done(
             json!({"scheduledFor": 1790596080000u64, "clampedDelaySeconds": 60,
             "wasClamped": false}),
         );
         assert_eq!(
-            background_effect("ScheduleWakeup", &json!({}), &wakeup),
-            None
+            background_effect("ScheduleWakeup", &input, &wakeup),
+            Some(BackgroundEffect::Wakeup(Wakeup {
+                scheduled_for: Some(1_790_596_080_000),
+                prompt: "Reply with exactly: woke-up".into(),
+                reason: Some("recording test".into()),
+            }))
         );
+        // `stop: true` (the shape of 2.1.283's result) and a loop past its maximum age
+        // (`scheduledFor: 0`) schedule nothing.
+        let stopped = done(json!({"scheduledFor": 0, "clampedDelaySeconds": 0,
+            "wasClamped": false, "stopped": true, "cancelledWakeups": 1}));
+        let none =
+            |r: &ToolResult, input: &Value| match background_effect("ScheduleWakeup", input, r) {
+                Some(BackgroundEffect::Wakeup(w)) => w.scheduled_for,
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(none(&stopped, &json!({"stop": true})), None);
+        let aged = done(json!({"scheduledFor": 0, "clampedDelaySeconds": 0, "wasClamped": false}));
+        assert_eq!(none(&aged, &input), None);
+        // A failed call did nothing.
+        let failed = ToolResult {
+            is_error: true,
+            ..done(json!({}))
+        };
+        assert_eq!(background_effect("ScheduleWakeup", &input, &failed), None);
     }
 
     #[test]
@@ -2391,10 +2455,64 @@ mod tests {
             json!({"effortLevel": null})
         );
         // A model without effort levels (haiku) and one without a list are not offered it.
-        let models = models_from_initialize(&json!({"models": [
-            {"value": "haiku", "supportsEffort": false, "supportedEffortLevels": null},
-            {"value": "x", "supportsEffort": true}
-        ]}));
+        let models = models_from_initialize(
+            &json!({"models": [
+                {"value": "haiku", "supportsEffort": false, "supportedEffortLevels": null},
+                {"value": "x", "supportsEffort": true}
+            ]}),
+            &permission_modes(None, false),
+        );
         assert!(!effort_levels(&models).iter().any(|l| l.id == ULTRACODE));
+    }
+
+    /// Auto mode only for the models the CLI marks `supportsAutoMode` (the shape of Claude Code
+    /// 2.1.284's `initialize.models`, recording u1): Haiku lists every mode but `auto`.
+    #[test]
+    fn auto_mode_is_offered_per_model() {
+        let init = json!({"models": [
+            {"value": "default", "resolvedModel": "claude-opus-4-6", "supportsEffort": true,
+             "supportedEffortLevels": ["low", "medium", "high", "max"], "supportsAutoMode": true},
+            {"value": "sonnet", "resolvedModel": "claude-sonnet-5", "supportsEffort": true,
+             "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"], "supportsAutoMode": true},
+            {"value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001", "displayName": "Haiku 4.5"},
+            {"value": "claude-x", "supportsAutoMode": false}
+        ]});
+        let modes = permission_modes(None, true);
+        let models = models_from_initialize(&init, &modes);
+        let by_id = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .permission_modes
+                .clone()
+        };
+        assert_eq!(by_id("default"), None);
+        assert_eq!(by_id("sonnet"), None);
+        let without_auto = Some(vec![
+            "default".to_owned(),
+            "acceptEdits".to_owned(),
+            "dontAsk".to_owned(),
+            "bypassPermissions".to_owned(),
+        ]);
+        assert_eq!(by_id("haiku"), without_auto);
+        assert_eq!(by_id("claude-x"), without_auto);
+        // The modes follow the harness's list (no bypass without the option).
+        let models = models_from_initialize(&init, &permission_modes(None, false));
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == "haiku")
+                .unwrap()
+                .permission_modes,
+            Some(vec![
+                "default".to_owned(),
+                "acceptEdits".to_owned(),
+                "dontAsk".to_owned()
+            ])
+        );
+        // Without an auto mode in the harness's list there is nothing to restrict.
+        let models = models_from_initialize(&init, &[]);
+        assert!(models.iter().all(|m| m.permission_modes.is_none()));
     }
 }

@@ -1,5 +1,6 @@
 package dev.aas.android.ui.thread
 
+import android.text.format.Formatter
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -22,10 +23,12 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -36,6 +39,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.aas.android.R
 import dev.aas.android.domain.InteractionTexts
+import dev.aas.android.domain.TaskOutput
 import dev.aas.android.domain.timeline.TimelineRow
 import dev.aas.android.protocol.BackgroundEndReason
 import dev.aas.android.protocol.BackgroundTask
@@ -75,6 +79,12 @@ object BackgroundTags {
 
     /** The chip of an item whose work goes on as [taskId]. */
     fun chip(taskId: String) = "bg-chip-$taskId"
+
+    /** The output lines in the card of one task. */
+    fun output(taskId: String) = "bg-output-$taskId"
+
+    /** The 出力の全文を表示 button of one task. */
+    fun showOutput(taskId: String) = "bg-show-output-$taskId"
 }
 
 /**
@@ -164,8 +174,9 @@ fun BackgroundEndedHeaderRow(row: TimelineRow.BackgroundEndedHeader, onToggle: (
 /**
  * One background task (docs/android.md 30): its kind, the harness's title verbatim, how long it
  * has run (or how it ended and why), the progress the harness reports (last tool, tool uses,
- * tokens, a workflow's agents with their states), the result it reported (summary, exit code,
- * the output's tail) and 停止 / 停止中…. A lost task is in the error colour.
+ * tokens, a workflow's agents with their states), its output (streamed while it runs, the whole
+ * one at the end; [TaskOutputView]), the result it reported (summary, exit code) and
+ * 停止 / 停止中…. A lost task is in the error colour.
  */
 @Composable
 fun BackgroundTaskCard(
@@ -228,22 +239,51 @@ fun BackgroundTaskCard(
                 result.exitCode?.let { code ->
                     Detail(stringResource(R.string.bg_exit_code, code), color = if (code != 0) MaterialTheme.statusColors.error else null)
                 }
-                val lines = result.output?.trimEnd('\n')?.takeIf { it.isNotEmpty() }?.split('\n').orEmpty()
-                if (lines.isNotEmpty()) {
-                    Text(
-                        lines.takeLast(display.taskOutputLines).joinToString("\n"),
-                        style = MaterialTheme.codeStyle,
-                        softWrap = false,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 2.dp),
-                    )
-                }
-                if (result.outputTruncated && result.outputBlobId == null) Detail(stringResource(R.string.item_output_truncated))
-                if (lines.size > display.taskOutputLines || result.outputBlobId != null) {
-                    TextButton(onClick = onOpenOutput) { Text(stringResource(R.string.bg_show_output)) }
-                }
             }
+            TaskOutput.of(task)?.let { output -> TaskOutputView(task.id, output, display.taskOutputLines, onOpenOutput) }
         }
+    }
+}
+
+/**
+ * A task's output in its card (monospace): while the harness streams it, its newest lines, which
+ * follow the output as it grows; the whole output once reported (its last lines, or its first
+ * ones when only the beginning is here); what cut it; and 出力の全文を表示, which follows the
+ * stream too, or reads the blob with all of it (docs/android.md 30).
+ */
+@Composable
+private fun TaskOutputView(taskId: String, output: TaskOutput, shownLines: Int, onOpenOutput: () -> Unit) {
+    // The beginning of an output cut short reads on from its start; any other shows its end.
+    val fromStart = output.blobId != null || output.cutWithoutBlob
+    val excerpt = remember(output.text, fromStart, shownLines) {
+        if (fromStart) TaskOutput.firstLines(output.text, shownLines) else TaskOutput.lastLines(output.text, shownLines)
+    }
+    if (output.live) {
+        Text(
+            stringResource(R.string.bg_output_live),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.statusColors.running,
+            modifier = Modifier.padding(start = 26.dp, top = 2.dp),
+        )
+    }
+    if (excerpt.lines.isNotEmpty()) {
+        Text(
+            excerpt.lines.joinToString("\n"),
+            style = MaterialTheme.codeStyle,
+            softWrap = false,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 2.dp).testTag(BackgroundTags.output(taskId)),
+        )
+    }
+    val context = LocalContext.current
+    output.omittedBytes?.let { Detail(stringResource(R.string.bg_output_omitted, Formatter.formatShortFileSize(context, it))) }
+    when {
+        output.streamLimitReached -> Detail(stringResource(if (output.live) R.string.bg_output_stream_limit else R.string.bg_output_stream_limit_ended))
+        output.blobId != null -> Detail(stringResource(R.string.bg_output_partial))
+        output.cutWithoutBlob -> Detail(stringResource(R.string.item_output_truncated))
+    }
+    if (output.live || output.blobId != null || excerpt.more) {
+        TextButton(onClick = onOpenOutput, modifier = Modifier.testTag(BackgroundTags.showOutput(taskId))) { Text(stringResource(R.string.bg_show_output)) }
     }
 }
 

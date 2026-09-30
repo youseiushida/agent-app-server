@@ -209,12 +209,19 @@ class SyncEngineOutboxTest {
         val small = f.engine.enqueue(Methods.TurnStart, turnStart("thr_2", "small"))
         val huge = assertFailsWith<RpcException> { f.engine.mutate(Methods.TurnStart, turnStart("thr_1", "h".repeat(20_000))) }
         assertEquals(ErrorKind.PayloadTooLarge, huge.kind)
-        f.awaitOnline()
+        // The entry fails while the closed session is still ending, when the status can still
+        // say Online: wait for the engine's count of sessions established again instead.
+        eventually(what = "the next session") { f.engine.status.value.takeIf { it.reconnects >= 1 && it.isOnline } }
+        assertTrue(f.server.connections.size >= 2, "the 1009 close ended the first connection")
         eventually(what = "the small entry answered") { f.results.firstOrNull { it.entry.clientRequestId == small && it is OutboxResult.Succeeded } }
-        delay(300)
+        // A later entry of the same thread is answered on the new connection. The outbox sends a
+        // thread's entries in order, so the entry that closed the connection is no longer ahead
+        // of it: had the new session sent it again, the server would have closed that one too.
+        assertEquals("trn_5", f.engine.mutate(Methods.TurnStart, turnStart("thr_1", "after")).turnId)
+        val after = f.server.requestsFor("turn/start").single { textOf(it.second) == "after" }
+        assertTrue(after.first >= 1, "sent on the new connection")
         assertEquals(1, f.server.oversizedFrames.size, "the frame that closed the connection was not resent")
         assertTrue(f.store.state.value.outbox.isEmpty())
-        assertTrue(f.server.connections.size >= 2, "the 1009 close ended the first connection")
     }
 
     @Test

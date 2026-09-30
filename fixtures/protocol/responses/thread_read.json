@@ -32,8 +32,10 @@
         "nativeId": "bkomsmz3d",
         "result": {
           "exitCode": 0,
-          "output": "built in 41.2s\n",
-          "outputTruncated": false
+          "output": "[4/4] bundling\nbuilt in 41.2s\n",
+          "outputBlobId": "blb_2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+          "outputOmittedBytes": 9437184,
+          "outputTruncated": true
         },
         "runs": 1,
         "startedAt": 1790000003100,
@@ -85,6 +87,22 @@
           "toolUses": 12,
           "totalTokens": 31504
         }
+      },
+      {
+        "ambient": false,
+        "id": "bgt_01K6A00000000000000000BG04",
+        "kind": "shell",
+        "nativeId": "mock_TERM_1",
+        "originItemId": "itm_01K6A00000000000000000IT08",
+        "output": "> vite\n\n  VITE ready in 412 ms\n  Local: http://localhost:5173/\n",
+        "outputTruncated": true,
+        "runs": 1,
+        "startedAt": 1790000003100,
+        "status": "running",
+        "stoppable": true,
+        "threadId": "thr_01K6A0000000000000000THR01",
+        "title": "npm run dev",
+        "turnId": "trn_01K6A0000000000000000TRN01"
       }
     ],
     "hasMoreBefore": false,

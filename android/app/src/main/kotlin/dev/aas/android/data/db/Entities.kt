@@ -13,7 +13,7 @@ import androidx.room.PrimaryKey
  * orders by are separate.
  */
 
-/** Scalar sync metadata (`epoch`, `lastSyncAt`); see [MetaKeys]. */
+/** Scalar sync metadata (`epoch`, `modelVersion`, `lastSyncAt`); see [MetaKeys]. */
 @Entity(tableName = "meta")
 data class MetaEntity(
     @PrimaryKey val key: String,
@@ -157,4 +157,11 @@ data class OutboxEntity(
 object MetaKeys {
     const val EPOCH = "epoch"
     const val LAST_SYNC_AT = "lastSyncAt"
+
+    /**
+     * `StoredModels.VERSION` of the build that stored the synced tables (docs/android.md 15.2).
+     * Absent in a database written before it was recorded: the next connection reads everything
+     * again.
+     */
+    const val MODEL_VERSION = "modelVersion"
 }

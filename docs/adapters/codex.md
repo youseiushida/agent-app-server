@@ -324,10 +324,10 @@ OpenAI Codex CLI の `codex app-server`（プロトコル v2、JSON-RPC over std
     - 読み取り専用での1ターン（コンテキストの使用量が付くこと）
     - 動いているセッションを使った commands、list、history
     - shutdown のあとに監督下のプロセスが0個になること
-  - `live_codex_background_work`: インストールされた app-server を、台本のモデル（`tests/mock_model`。127.0.0.1 の Responses API。Codex 自身の結合テストと同じ手法）と一時的な `CODEX_HOME` で動かす。**トークンを使わず**、利用者の Codex の設定・認証・セッションを読み書きしない。確認すること: 2つのコマンドがターンを越えて `Backgrounded` とタスクになること、一方を止めて `stopped`、もう一方が自分で終わって `completed`（終了コード 0、出力）、v2 のサブエージェント（タイトル `/root/worker`）の進捗、停止、そのコマンドが子のターミナル（`parent_key`）として残り、止められること、`Native` が出ないこと、shutdown のあとに監督下のプロセスが0個になること。codex-cli 0.148.0 で通ることを確かめた（2026-09-28、約45秒）。
+  - `live_codex_background_work`: インストールされた app-server を、台本のモデル（`tests/mock_model`。127.0.0.1 の Responses API。Codex 自身の結合テストと同じ手法）と一時的な `CODEX_HOME` で動かす。**トークンを使わず**、利用者の Codex の設定・認証・セッションを読み書きしない。確認すること: 2つのコマンドがターンを越えて `Backgrounded` とタスクになること、一方を止めて `stopped`、もう一方が自分で終わって `completed`（終了コード 0、出力）、それがターンのあとに出した行が `outputDelta` から追記の出力（`BackgroundOutput`）として流れたこと、v2 のサブエージェント（タイトル `/root/worker`）の進捗、停止、そのコマンドが子のターミナル（`parent_key`）として残り、止められること、`Native` が出ないこと、shutdown のあとに監督下のプロセスが0個になること。codex-cli 0.148.0 で通ることを確かめた（2026-09-28、約45秒）。
 - `live_codex_features`（`tests/live.rs`）: 同じ台本のモデルと一時的な `CODEX_HOME`（**トークンを使わない**）。確かめること: probe で bundled catalog の高速モード（`gpt-5.6-sol` など）、プランモードと高速モードで始めたスレッドの最初のターン（モデルへの要求に Plan Mode の指示と `service_tier: "priority"`）、`ProposedPlan` の本文、実装（default モード、`service_tier` なし、入力が "Implement the plan."）、名前のエコー、`/init`（入力が Codex のプロンプト）、inline review（表示用の結果だけ、「Review finished」）、状態の節、`/goal` と継続のターンでのモデルの `update_goal` による「Goal complete」、長いコマンドを待つ継続のターンの中断でゴールが paused になること（そのターンの「Goal paused」の Notice と状態の節）、2つ目の app-server からの resume が「already has an active writer」で断られ、同じスレッドの途中のターンからの fork（`lastTurnId` と `beforeTurnId`）は通り、その最初のターンで default モードを明示すること、取り込んだ履歴の印が動いていたターンの印と同じこと、`Native` が出ないこと、プロセスが残らないこと。codex-cli 0.148.0 で通ることを確かめた（2026-09-29、約11秒）。
 - `live_codex_texts_match_the_installed_binary`（`tests/live.rs`）: 14.8 の文面がインストールされた Codex のバイナリにそのままあること（Windows 版は CRLF）。プロセスは起動しない。0.148.0 で通ることを確かめた（2026-09-29）。
-- エンジンと組み合わせた実物のテスト（`tests/live_engine.rs`、`AAS_LIVE_TESTS=1 cargo test -p aas-adapter-codex --test live_engine -- --ignored`）。同じ台本のモデルで、エンジン（`aas-core`）とこのアダプタを組み合わせる。確認すること: ターンの終わりに2つのタスクが `running`、起動した Item が `backgrounded` でタスクを指すこと、`Thread.background.running` が 2、アイドルの待ち時間（1秒）の4倍待ってもプロセスが残ること（D1）、`backgroundTask/stop` で `stopped`（`endReason: harness`、-1）、もう一方が `completed`、どちらも終わるとアイドル回収でプロセスがなくなること。codex-cli 0.148.0 で通ることを確かめた（2026-09-28、約49秒）。
+- エンジンと組み合わせた実物のテスト（`tests/live_engine.rs`、`AAS_LIVE_TESTS=1 cargo test -p aas-adapter-codex --test live_engine -- --ignored`）。同じ台本のモデルで、エンジン（`aas-core`）とこのアダプタを組み合わせる。確認すること: ターンの終わりに2つのタスクが `running`、起動した Item が `backgrounded` でタスクを指すこと、`Thread.background.running` が 2、アイドルの待ち時間（1秒）の4倍待ってもプロセスが残ること（D1）、`backgroundTask/stop` で `stopped`（`endReason: harness`、Codex の報告する 0 でない終了コード。同じ止め方で -1 のときと 1 のときがある（2026-09-30））、止める前にもう一方の出力がタスクに流れていること（`output`）、もう一方が `completed` で、終わりの出力全体が流れた出力に代わること、どちらも終わるとアイドル回収でプロセスがなくなること。codex-cli 0.148.0 で通ることを確かめた（2026-09-28、約49秒。流れる出力の確認を足して 2026-09-30）。
 
 - Windows のサンドボックスと Job Object（`crates/aas-testkit/tests/codex_sandbox.rs`、`AAS_LIVE_TESTS=1 cargo test -p aas-testkit --test codex_sandbox -- --ignored`）。**モデルのトークンは使わない**（`codex sandbox` はコマンドを Codex のサンドボックスで動かすだけで、モデルとは通信しない）。12章。
 
@@ -390,7 +390,7 @@ Codex には「活動ではない」印の付いた作業はないので、`ambi
 | `turn/completed` の時点で開いている commandExecution の Item が、一覧に載っている | kind `shell`、キーはこのスレッドなら Item の id（サブエージェントのものは `<子のスレッド id>:<Item の id>`）、タイトルは一覧の `command`（エージェントが書いたコマンド。Item の `command` はシェルの呼び出しを含む）、`live: true`、`stoppable: true`、`originItemKey` はこのスレッドの Item の id（サブエージェントのものは付けず、`parentKey` にサブエージェント）。タスクを出してから、その Item を `ItemCompleted { body: None, status: Backgrounded }` で閉じる。どちらも `TurnCompleted` より前 |
 | 開いているが一覧に載っていない Item | 走っていない（承認を待っていたターンが中断されると、Codex はその Item を完了させない）。何もせず、エンジンがターンとともに閉じる。そのあとに届いた完了は出さない |
 | そのターミナルの遅れた `item/completed`（元のターン id 付き） | 終わり。`completed` → `completed`、`failed` → `failed`（こちらが terminate を求めていて Codex が受け付けていれば `stopped`）。`result` は `exitCode` と `aggregatedOutput`（長ければエンジンが blob に移す）、`usage.durationMs` は `durationMs`。`live: false`。最初の終わりだけを使う |
-| そのターミナルの `item/commandExecution/outputDelta` | 流さない（Item は閉じている） |
+| そのターミナルの `item/commandExecution/outputDelta`（元のターン id 付き。ターンのあとも、プロセスが終わるまで届く） | タスクの出力として流す（`BackgroundOutput` の `Append`。タスクが動いている間だけ。Item は閉じている）。バックグラウンドに移るまでの出力は Item のもので、エンジンはタスクの出力をその Item の出力から始める（design.md 5.6） |
 
 - 一覧を取れなかったとき（experimental API を持たない Codex の `-32600`、`-32601`、応答がない）: 今までの動作に戻す。開いている Item はエンジンがターンとともに閉じ、タスクは作らない（プロセスを保持する信号がない）。Notice（warning、`backgroundTerminalsUnavailable`）をセッションで1回だけ出す。接続が閉じているとき（プロセスの停止中）は出さない。
 
@@ -417,7 +417,7 @@ Codex には「活動ではない」印の付いた作業はないので、`ambi
 
 | タスク | 送るもの | 結果 |
 |---|---|---|
-| ターミナル | `thread/backgroundTerminals/terminate { threadId, processId }`（`processId` は一覧の値。OS の pid ではない Codex の番号） | `{terminated: true}` なら受け付け。約15ミリ秒後に `item/completed`（`failed`、-1）が届き、`stopped` になる。「止めることを求めた」印は要求を送る前に付け、断られたら外す（Codex は応答より先に完了を送ることがあるため）。`{terminated: false}` はエラー（そのプロセスはもう動いていないか、止められなかった） |
+| ターミナル | `thread/backgroundTerminals/terminate { threadId, processId }`（`processId` は一覧の値。OS の pid ではない Codex の番号） | `{terminated: true}` なら受け付け。約15ミリ秒後に `item/completed`（`failed`、-1。1 のこともある。2026-09-30 の実物のテスト）が届き、`stopped` になる。「止めることを求めた」印は要求を送る前に付け、断られたら外す（Codex は応答より先に完了を送ることがあるため）。`{terminated: false}` はエラー（そのプロセスはもう動いていないか、止められなかった） |
 | サブエージェント | 子の実行中のターンへの `turn/interrupt { threadId: 子, turnId }` | `{}` のあと `turn/completed`（interrupted）で `stopped`。子のコマンドは動き続け、子のターミナルになる（別に止める）。子のターンがまだ始まっていなければエラー |
 
 - 終わったタスクや知らないキーはエラー。応答は `policy.handshake_timeout` まで待つ。
@@ -431,7 +431,7 @@ Codex には「活動ではない」印の付いた作業はないので、`ambi
 ### 13.6 制約（範囲外は design.md §1）
 
 - **切り離されたプロセス**: `Start-Process` などでシェルから切り離された孫プロセスは、terminate では止まらない（Codex はシェル本体が終わるとターミナルの job から子孫を外す。`preserve_descendants`）。一覧にも載らないのでタスクにもならない。daemon の job（`KILL_ON_JOB_CLOSE`）には残るので、スレッドの停止（アイドル回収を含む）で必ず終わる（12章、design.md §4.1）。
-- **途中の出力**: ターンのあとの出力（`outputDelta`）は流さず、終わりの出力全体だけを `result.output` に入れる。
+- **途中の出力**: ターンのあとの出力（`outputDelta`）はタスクの出力として流す（13.2。サブエージェントのターミナルも同じ）。エンジンが流すのは `policy.max_inline_output_bytes` までで、全体は終わりの `aggregatedOutput`（`result.output`）で見る。記録 `bg_terminals.jsonl` で、ターンの `turn/completed` のあとに届いた出力（一覧を取ってターミナルと分かってから読む）がタスクの出力になることを確かめた（`tests/background.rs`）。
 - **タスク文**: v2 の子に渡したタスク文は、通知にも `thread/read` にも出ない。タイトルは agent path になる。
 - **一覧と終わりの間**: プロセスが終わってから `item/completed` が届くまでに、Codex は約 100 ミリ秒以上の出力の待ち合わせをする。その間にターンが終わって一覧を取ると、そのコマンドは一覧に載らず、エンジンがターンとともに閉じる（終了コードは付かない）。遅れて届いた完了は出さない。
 - **experimental API**: `thread/backgroundTerminals/*` は experimental。形が変わったら 13.2 の表と記録を更新する。一覧を断る Codex では 13.2 の最後のとおり今までの動作になる。

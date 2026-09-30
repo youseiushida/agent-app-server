@@ -1007,17 +1007,26 @@ async fn on_main_notification(shared: &Arc<Shared>, method: &str, params: Value)
             let Some(d) = parse::<DeltaNotification>(shared, method, &params) else {
                 return;
             };
-            let background = {
+            let (background, running) = {
                 let st = shared.state.lock();
-                st.background.is_terminal_item(&st.thread_id, &d.item_id)
+                (
+                    st.background.is_terminal_item(&st.thread_id, &d.item_id),
+                    st.background.running_terminal(&st.thread_id, &d.item_id),
+                )
             };
-            // A background terminal's item is closed; its output arrives whole with its end.
-            if !background {
-                shared.emit(AdapterEvent::ItemDelta {
+            // A background terminal's item is closed: what its process prints from then on is
+            // the task's output (streamed; the whole output comes with its end).
+            match (background, running) {
+                (false, _) => shared.emit(AdapterEvent::ItemDelta {
                     key: d.item_id,
                     field: aas_harness::DeltaField::Output,
                     text: d.delta,
-                });
+                }),
+                (true, Some(key)) => shared.emit(AdapterEvent::BackgroundOutput {
+                    key,
+                    output: aas_harness::OutputUpdate::Append(d.delta),
+                }),
+                (true, None) => {}
             }
         }
         "item/fileChange/patchUpdated" => {
@@ -1580,8 +1589,27 @@ async fn on_child_notification(shared: &Arc<Shared>, child: &str, method: &str, 
             let tasks = shared.state.lock().background.child_gone(child);
             shared.emit_tasks(tasks);
         }
-        // What a sub-agent streams (messages, reasoning, output, plans) is its own; the session
-        // shows its runs as a task (progress, usage, final answer).
+        // A command the sub-agent left running is a terminal of its own: its output is that
+        // task's (streamed like the session's own terminals).
+        "item/commandExecution/outputDelta" => {
+            let Some(d) = parse::<DeltaNotification>(shared, method, &params) else {
+                return;
+            };
+            let running = shared
+                .state
+                .lock()
+                .background
+                .running_terminal(child, &d.item_id);
+            if let Some(key) = running {
+                shared.emit(AdapterEvent::BackgroundOutput {
+                    key,
+                    output: aas_harness::OutputUpdate::Append(d.delta),
+                });
+            }
+        }
+        // What a sub-agent streams (messages, reasoning, the output of its turn's commands,
+        // plans) is its own; the session shows its runs as a task (progress, usage, final
+        // answer).
         _ => {}
     }
 }

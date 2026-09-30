@@ -12,7 +12,7 @@ use aas_adapter_fake::store::SessionStore;
 use aas_protocol::events::Event;
 use aas_testkit::client::{ClientConfig, ReliableClient};
 use aas_testkit::proc::{self, Cleanup, Proc};
-use common::{client_events, http_post, mutate};
+use common::{client_events, http_get, http_post, mutate};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -375,6 +375,133 @@ async fn background_work_keeps_the_agent_until_it_is_stopped() {
         })
     })
     .await;
+    drop(c);
+    server.ok("quit").await;
+    let status = tokio::time::timeout(STEP, server.child.wait())
+        .await
+        .expect("exits after quit")
+        .expect("exit status");
+    assert_eq!(status.code(), Some(0));
+    let survivors =
+        tokio::task::spawn_blocking(move || proc::wait_all_dead(&agents, Duration::from_secs(10)))
+            .await
+            .unwrap();
+    assert!(survivors.is_empty(), "{survivors:?}");
+}
+
+/// Through the test server (real agent processes, `--max-inline-output-bytes`): a background
+/// shell's output streams while it runs (`backgroundTask/outputDelta`), is cut at the inline
+/// limit, and its end brings the whole output in a blob; a question the agent asks outside a
+/// turn (`@dialog`) keeps the agent's process until it is answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_output_and_dialogs_through_the_real_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let agent_pids: PathBuf = state.join("agent-pids");
+    let mut cleanup = Cleanup::new();
+    cleanup.dir(&agent_pids);
+    let mut server = TestServerProcess::spawn_with(
+        &state,
+        &[
+            "--idle-process-ttl-ms",
+            "400",
+            "--max-inline-output-bytes",
+            "64",
+        ],
+    );
+    let ready = server.next_event().await;
+    let root = PathBuf::from(ready["root"].as_str().unwrap());
+    let c = client(&ready);
+    wait_connects(&c, 1).await;
+    std::fs::create_dir_all(root.join("out")).unwrap();
+    let project = mutate(
+        &c,
+        "project/open",
+        json!({"path": root.join("out").display().to_string()}),
+        STEP,
+    )
+    .await;
+    let thread = mutate(
+        &c,
+        "thread/create",
+        json!({"projectId": project["project"]["id"], "harnessId": "fake",
+            "input": [{"type": "text", "text": "@bg b kind=shell ms=300 output=6 width=20 make\n@dialog Deploy now?"}]}),
+        STEP,
+    )
+    .await;
+    let thread_id = thread["thread"]["id"].as_str().unwrap().to_owned();
+    let stream = format!("thread:{thread_id}");
+    c.subscribe(&stream);
+    // The dialog comes after the turn; the shell ends by itself.
+    c.wait_until(STEP, |s| {
+        let events = client_events(s, &stream);
+        events
+            .iter()
+            .any(|e| matches!(&e.event, Event::InteractionRequested { .. }))
+            && events.iter().any(|e| {
+                matches!(&e.event, Event::BackgroundTaskUpdated { task }
+                if task.status == aas_protocol::BackgroundTaskStatus::Completed)
+            })
+    })
+    .await;
+    let events = c.with_state(|s| client_events(s, &stream));
+    let streamed: String = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::BackgroundTaskOutputDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed.len(), 64, "cut at the inline limit: {streamed:?}");
+    // Lines of 20 bytes (`width=20`), line break included.
+    assert!(
+        streamed.starts_with("b line 1...........\nb line 2"),
+        "{streamed:?}"
+    );
+    assert!(events.iter().any(
+        |e| matches!(&e.event, Event::BackgroundTaskUpdated { task } if task.output_truncated)
+    ));
+    let read = mutate(&c, "thread/read", json!({"threadId": thread_id}), STEP).await;
+    let result = &read["backgroundTasks"][0]["result"];
+    assert_eq!(result["outputTruncated"], true, "{read}");
+    let blob = result["outputBlobId"]
+        .as_str()
+        .expect("the whole output in a blob");
+    let token = ready["token"].as_str().unwrap();
+    let (status, body) = http_get(proxy_addr(&ready), &format!("/v1/blobs/{blob}"), token).await;
+    assert_eq!(status, 200);
+    let whole = String::from_utf8(body).unwrap();
+    assert_eq!(whole.lines().count(), 7, "{whole}");
+    assert!(whole.ends_with("ran make\n"));
+    // The dialog keeps the agent however long the thread is idle.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let read = mutate(&c, "thread/read", json!({"threadId": thread_id}), STEP).await;
+    assert_eq!(read["thread"]["status"], "ready", "{read}");
+    let dialog = read["interactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["status"] == "pending")
+        .expect("the dialog")
+        .clone();
+    assert!(dialog.get("turnId").is_none() && dialog.get("backgroundTaskId").is_none());
+    mutate(
+        &c,
+        "interaction/respond",
+        json!({"interactionId": dialog["id"],
+            "resolution": {"kind": "question", "answers": [{"questionId": "choice", "choiceIds": ["no"]}]}}),
+        STEP,
+    )
+    .await;
+    // Answered: nothing keeps the agent, the idle stop follows.
+    c.wait_until(STEP, |s| {
+        client_events(s, &stream).iter().any(|e| {
+            matches!(&e.event, Event::ThreadUpdated { thread }
+                if thread.status == aas_protocol::ThreadStatus::Idle)
+        })
+    })
+    .await;
+    let agents: Vec<Proc> = proc::recorded(&agent_pids);
     drop(c);
     server.ok("quit").await;
     let status = tokio::time::timeout(STEP, server.child.wait())

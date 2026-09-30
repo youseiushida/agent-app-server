@@ -355,11 +355,19 @@ class NewThreadViewModelTest {
      * `harnessUnavailable` for `thread/create`: the creation waits (not retried on a timer) and
      * the sheet says for which harness and why; 再確認 probes it, and withdrawing the creation
      * brings the message back to the composer.
+     *
+     * Like the daemon, the scripted server has published the harness as unavailable
+     * (`harness/updated`, from the probe it runs before refusing) by the time it refuses: the
+     * creation then waits without a retry timer, so withdrawing it never meets it on the wire,
+     * and the test waits for the withdrawal's own outcome instead of a window of time.
      */
     @Test
     fun aCreationForAnUnavailableHarnessWaitsVisiblyAndCanBeWithdrawn() = blockingTest {
         env.serve(null, harnesses = listOf(harness), projects = listOf(project))
+        val unavailable = harness.copy(available = false, unavailableReason = "not logged in")
         env.answers[Methods.ThreadCreate.name] = {
+            env.server.append(WORKSPACE_STREAM, Event.HarnessUpdated(unavailable))
+            env.server.lastConnection.pushNew(WORKSPACE_STREAM)
             dev.aas.android.protocol.RpcError(
                 dev.aas.android.protocol.ErrorKind.HarnessUnavailable.code,
                 "harness fake is unavailable",
@@ -371,7 +379,7 @@ class NewThreadViewModelTest {
             )
         }
         env.answers[Methods.HarnessRefresh.name] = {
-            json(dev.aas.android.protocol.HarnessListResult.serializer(), dev.aas.android.protocol.HarnessListResult(listOf(harness.copy(available = false, unavailableReason = "not logged in"))))
+            json(dev.aas.android.protocol.HarnessListResult.serializer(), dev.aas.android.protocol.HarnessListResult(listOf(unavailable)))
         }
         env.connect()
         val vm = viewModel()
@@ -390,8 +398,13 @@ class NewThreadViewModelTest {
         assertEquals(UiText.of(R.string.harness_still_unavailable, harness.displayName, "not logged in"), refreshed.text)
 
         onMain { vm.discardCreation() }
-        eventually(what = "the draft back") { vm.composer.state.value.value.text.takeIf { it == "Build the thing" } }
-        eventually(what = "no longer waiting") { vm.state.value.takeIf { it.waiting == null && !it.creating } }
+        // The withdrawal's outcome: taken out of the outbox (it was waiting, not on the wire)...
+        val discarded = kotlinx.coroutines.withTimeout(MESSAGE_TIMEOUT_MS) { messages.messages.first() }
+        assertEquals(UiText.of(R.string.outbox_discarded), discarded.text)
+        assertTrue(env.engine.outbox.value.isEmpty())
+        // ...so its caller learns it was dropped, and the screen puts the message back.
+        kotlinx.coroutines.withTimeout(MESSAGE_TIMEOUT_MS) { vm.composer.state.first { it.value.text == "Build the thing" } }
+        kotlinx.coroutines.withTimeout(MESSAGE_TIMEOUT_MS) { vm.state.first { it.waiting == null && !it.creating } }
         assertEquals(1, env.requests(Methods.ThreadCreate.name).size, "never resent while the harness is unavailable")
     }
 

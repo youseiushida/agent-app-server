@@ -57,6 +57,7 @@ android/               Android アプリ（:protocol、:sync、:app）
 - 整形と lint（CI と同じ。警告を残さない）: `cargo fmt --all` / `cargo clippy --workspace --all-targets -- -D warnings`
 - 実物の CLI を使うテスト（トークンを消費する）: `AAS_LIVE_TESTS=1 cargo test -p <crate> -- --ignored`
 - プロトコルの golden fixtures の更新: `AAS_UPDATE_FIXTURES=1 cargo test -p aas-protocol --test fixtures`
+- アプリが端末に保存する型の形の記録（`StoredModelsTest` が読む `android\protocol\stored-models\<版>.txt`。保存する型を変えたら `StoredModels.VERSION` を上げてから、`android\` で実行する。記録済みの版は書き換えない。`docs/android.md` 15.2）: `AAS_UPDATE_STORED_MODELS=1 ./gradlew :protocol:test`
 - pi の承認ゲート拡張（TypeScript。Node.js 22.18 以上）: `node --test crates/aas-adapter-pi/extension/aas-gate.test.ts`
 - Android（`android\` で実行する）:
   - ビルドとテスト: `.\gradlew.bat :app:assembleDebug :app:assembleStaging :app:testDebugUnitTest :app:lintDebug :protocol:test :sync:test :e2e:assembleDebug`

@@ -67,7 +67,7 @@ android/               Android アプリ（:protocol、:sync、:app）
 ## 動作要件
 
 PC（daemon）
-- Windows 10 / 11（x64）
+- Windows 10 / 11（x64。確かめたのは Windows 11 だけ。下の「動作確認した環境」）
 - Rust の stable ツールチェーン（1.90 以上。`rustup` で入れる）— ビルドに使う
 - Git for Windows — 差分ビューア、worktree、clone に使う（なくても動くが、これらの機能は無効になる）
 - Tailscale for Windows
@@ -83,6 +83,23 @@ PC（daemon）
 
 アプリのビルド（任意）
 - JDK 17 と Android SDK（compileSdk 36）
+
+## 動作確認した環境
+
+作者が次の組み合わせで使い、確かめています（2026-09）。ほかの版でも動く可能性はありますが、確かめていません。
+
+| 対象 | 版 |
+|---|---|
+| PC の OS | Windows 11 Pro（25H2、10.0.26200） |
+| Claude Code | 2.1.285（実物の CLI を使うテストをこの版で通した。やりとりの記録は 2.1.283 と 2.1.284 で取った） |
+| Codex | codex-cli 0.148.0 |
+| pi | 0.85.1 |
+| Devin | Devin CLI 3000.11.3 |
+| Tailscale（PC） | 1.102.4 |
+| スマホ | Android 11（ColorOS）の実機 |
+| エミュレータ | Android 16（API 36、Google APIs、x86_64）。端末のテスト（[docs/android.md](docs/android.md) の 23章）で使う |
+
+ハーネスごとに確かめた版と、実物の CLI とのやりとりの記録は [docs/adapters/](docs/adapters/) の各文書にあります。
 
 ## ビルド
 
@@ -342,6 +359,14 @@ schtasks /Run /TN agent-app-server     # 起動し直す
 
 データ（スレッド、履歴、デバイス）は `%LOCALAPPDATA%\agent-app-server\` に残るので、更新しても消えません。
 
+**アプリと daemon は同じ版にそろえて更新します。** 先に daemon を更新し、そのあとでアプリを入れ替えてください（同時でもかまいません）。
+
+- daemon はプロトコルに追加だけを行うので、新しい daemon は古いアプリからの要求をそのまま受け付けます。
+- 逆に、アプリが新しい形の要求を送るようになった版では、古い daemon がその要求を断ります（知らないメソッドは `methodNotFound`、知らない形の引数は `invalidParams`）。アプリにはその操作の失敗として表示されます。接続の時点では食い違いが分かりません。
+- 例: worktree のスレッドのプランを「新しいスレッドで実装」すると、アプリは新しいスレッドをその worktree で動かすよう求めます（`thread/create` の `workspace: {kind: "thread"}`）。これを知らない古い daemon は `invalidParams` で断り、スレッドは作られません。
+
+詳しくは [docs/design.md](docs/design.md) の 18.5 にあります。
+
 ## Android アプリ
 
 アプリのソースは `android/` にあります。`:protocol`（ワイヤ型）と `:sync`（接続と同期）は純粋な Kotlin/JVM のモジュールで、`:app`（アプリ本体）は Android SDK が見つかったとき（`ANDROID_HOME` / `ANDROID_SDK_ROOT`、または `android\local.properties` の `sdk.dir`）だけビルドに含まれます。インストールと初回の設定は上の「4. スマホにアプリを入れる」、設計は [docs/android.md](docs/android.md) にあります。
@@ -360,6 +385,7 @@ cd android
 **スマホでできること（主なもの）**
 
 - **バックグラウンドの作業**: エージェントがターンの外で動かしている作業（Claude Code のバックグラウンドのエージェント・Bash・Workflow（ultracode）・予約した起床（`CronCreate` など）、Codex のバックグラウンドのターミナルとサブエージェント、Devin のバックグラウンドのサブエージェントとシェル）が、スレッド画面の末尾の「バックグラウンド」の区域に出ます。種類、題名、経過時間、進捗（最後のツール、ツールの回数、トークン、ワークフローのエージェントごとの状態）、終わったものは結果（要約、終了コード、出力）。
+  - シェルの出力: Codex のバックグラウンドのターミナルと Devin のシェルは、動いている間の出力がそのまま流れてきます（等幅で最新の行。「出力の全文を表示」で末尾を追いかけて表示）。流れるのは `policy.max_inline_output_bytes`（既定 64KiB）までで、それを超えた分は終わったときの出力全体で見ます。Claude Code は動いている間の出力を出さないので、終わったときに CLI が残した出力のファイルを表示します。
   - 1つずつ止めるには、そのタスクの「停止」を押します（ハーネスが止められる作業だけ。止まったことはハーネスの報告で表示が変わります）。すべてを止めるのはスレッドのメニューの「プロセスを停止」です。ターンの停止ボタンはターンだけを止め、バックグラウンドの作業は続きます。
   - 作業が動いている間、daemon はそのエージェントのプロセスを止めず（時間では止めません）、PC のスリープも抑えます。スレッドとプロジェクトの一覧には「バックグラウンドで実行中 (N)」と出ます。作業が終わると通知が届き、それを受けてエージェントが自分で始めたターンは「バックグラウンド作業の完了を受けて」と示されます。
   - 作業が求めた承認・質問は、ターンが終わった後でも届き、答えられます（答えずに作業やプロセスが終わった場合は、daemon がエージェントに辞退を返します）。
@@ -375,6 +401,37 @@ cd android
   - pi のプロジェクトの拡張やスキルを読むかは、プロジェクトごとにアプリで聞きます（自動では決めません）。
   - Codex のハーネスのコマンド: `/goal <目的>`（`clear`・`pause`・`resume` も。実行中にも送れます）、`/review [指示]`（未コミットの変更か、指示でのレビュー）、`/init`（Codex 自身の AGENTS.md のプロンプト）。Claude Code の `/review` は Claude Code 自身のコードレビューです。
   - Claude Code のスレッドでも、実行中に「今すぐ反映」（steer）で送れます。CLI はメッセージをツールの区切りで取り込み、取り込まずにターンが終わったものはキューに戻ります。
+
+## 既知の制限
+
+- **daemon は Windows 専用です。** 孤児を出さないプロセス管理（Job Object）、自動起動（タスクスケジューラ）、スリープ抑止、サインアウト・シャットダウンの扱いを Windows の仕組みで作っていて、CI も daemon のビルドとテストを Windows でだけ回しています。ほかの OS はサポートしません。
+- **CLI の内部用・実験的なインターフェースを使う機能があります。** CLI の更新で形が変わると、その機能が失敗するか使えなくなることがあります。上の「動作確認した環境」の版で確かめていて、CLI の版を上げたら記録を取り直して確かめます（[docs/adapters/](docs/adapters/)）。
+  - Claude Code: `get_status`・`get_plan`（`@internal`）と `get_usage`（実験的）→ `/status` のハーネスの節と今のプラン。隠しフラグ `--resume-session-at` → 途中のターンからの分岐（「ここから分岐」「このプロンプトを編集」）。
+  - Codex: `codex app-server` のプロトコル自体が experimental で、さらに experimental API（`initialize` の `experimentalApi`）を使う → バックグラウンドのターミナルの一覧と停止、プランモード、「このプロンプトを編集」の分岐。
+  - Devin: Cognition の非公開の拡張（ACP の仕様にない `_cognition.ai/…` のメソッドと通知、`_meta` の `cognition.ai/…` のキー）→ バックグラウンドのサブエージェントとシェル、途中のターンからの分岐、名前の変更、ハーネスの状態。
+- **Codex desktop で開いている会話は、スマホから続けられません。** Codex は 1 つの会話に書き込めるプロセスを 1 つに限るためです。desktop が会話を離してから再試行するか、新しいスレッドに分岐して続けます（上の「スマホでできること」の `/resume`）。
+- **ストアでは配布していません。** APK は自分でビルドして入れます。常用するなら、リリースビルド（R8 で縮小したもの）を自分の鍵で署名してください（鍵は JDK に入っている `keytool` で作ります。詳しくは [docs/android.md](docs/android.md) の 19.1）。
+  1. 鍵を作る。リポジトリの外に置き、PC の外にも控えておきます。
+
+     ```powershell
+     New-Item -ItemType Directory -Force "$env:APPDATA\agent-app-server\android" | Out-Null
+     keytool -genkeypair -keystore "$env:APPDATA\agent-app-server\android\release.jks" -storetype PKCS12 -alias aas-release -keyalg RSA -keysize 4096 -validity 10000
+     ```
+  2. `%USERPROFILE%\.gradle\gradle.properties`（プロジェクトの `gradle.properties` ではない）に、鍵の場所とパスワードを書く。properties の形式なので、パスの `\` と `:` はエスケープします。
+
+     ```properties
+     aasReleaseStoreFile=C\:\\Users\\<ユーザー名>\\AppData\\Roaming\\agent-app-server\\android\\release.jks
+     aasReleaseStorePassword=<キーストアのパスワード>
+     aasReleaseKeyAlias=aas-release
+     aasReleaseKeyPassword=<鍵のパスワード（PKCS12 ではキーストアのパスワードと同じ）>
+     ```
+  3. `cd android; .\gradlew.bat :app:assembleRelease` でビルドする。APK は `android\app\build\outputs\apk\release\app-release.apk` にできます（値が足りなければ、ビルドが足りない名前を挙げて失敗します）。
+  - 鍵かパスワードを失うと、同じアプリの更新として入れられなくなります（アンインストールして入れ直し、ペアリングし直す）。
+  - CI が保存する APK（artifact の `agent-app-server-debug-apk`）はデバッグビルドです（R8 なし、CI の debug の鍵で署名）。applicationId はリリースと同じ `dev.aas.android` なので、署名の違うビルドと入れ替えるにはアンインストールが要ります。
+- **Devin の前面のサブエージェントをバックグラウンドへ移す操作はありません**（Claude Code の Ctrl+B に当たるもの）。Devin の応答が、受け付けたことも移ったことも示さないためです（[docs/design.md](docs/design.md) の 1章の範囲外）。
+- **確かめたのは 1 台の PC と 1 台のスマホだけです**（上の「動作確認した環境」。ほかにエミュレータ）。Windows 10、Android 10、ほかの Android の版や機種（機種独自の電池管理を含む）では確かめていません。実機で確かめていない項目は [docs/android.md](docs/android.md) の 29章にあります。
+
+ほかに範囲外にしたもの（理由付き）は [docs/design.md](docs/design.md) の 1章にあります。
 
 ## セキュリティ
 
@@ -455,3 +512,12 @@ cd android; .\gradlew.bat :sync:test; cd ..   # RealServerTest が本物の daem
 | [docs/android.md](docs/android.md) | Android アプリの設計（モジュール、同期エンジン、画面、通知、権限、ビルド、テスト） |
 | [docs/ux/codex-desktop.md](docs/ux/codex-desktop.md) | Android アプリの UX の手本（8章がアプリでの実装） |
 | [CLAUDE.md](CLAUDE.md) | 開発規約 |
+
+## ライセンス
+
+[MIT License](LICENSE)（Copyright (c) 2026 YoseiUshida）です。
+
+次のファイルは第三者のもので、それぞれのライセンス（どれも Apache License 2.0）に従います。
+
+- `android/app/src/main/kotlin/dev/aas/android/ui/icons/`: Material Icons（The Android Open Source Project）。`material-icons-extended-android` 1.7.8 のソースから写したもの（[docs/android.md](docs/android.md) の 19章）
+- `android/gradlew`、`android/gradlew.bat`、`android/gradle/wrapper/gradle-wrapper.jar`: Gradle Wrapper

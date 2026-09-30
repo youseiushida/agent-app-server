@@ -6,6 +6,26 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.aas.android.data.db.AasDatabase
 import dev.aas.android.data.db.RoomSyncStore
 import dev.aas.android.protocol.AasJson
+import dev.aas.android.protocol.ClientInfo
+import dev.aas.android.protocol.Disposition
+import dev.aas.android.protocol.Harness
+import dev.aas.android.protocol.HarnessFeatures
+import dev.aas.android.protocol.Methods
+import dev.aas.android.protocol.PlanModeFeature
+import dev.aas.android.protocol.StoredModels
+import dev.aas.android.protocol.TurnStartResult
+import dev.aas.android.protocol.WorkspaceSnapshotResult
+import dev.aas.android.sync.Credentials
+import dev.aas.android.sync.FakeServer
+import dev.aas.android.sync.SyncEngine
+import dev.aas.android.sync.eventually
+import dev.aas.android.testing.FAST_SYNC
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import okhttp3.OkHttpClient
+import kotlin.test.assertNull
 import dev.aas.android.protocol.Thread
 import dev.aas.android.protocol.WORKSPACE_STREAM
 import dev.aas.android.sync.Samples
@@ -161,6 +181,73 @@ class RoomMigrationTest {
             }
             store.transaction { tx -> assertEquals(listOf(null, "c1"), tx.outbox().map { it.after }) }
         } finally {
+            db.close()
+        }
+    }
+
+    /**
+     * The database an older build left (schema 4, the models of the app before
+     * `StoredModels.VERSION` was recorded): its harness rows lack `features` (that build did not
+     * know them) and it records no model version. The store reports none, so the next connection
+     * reads everything again (docs/android.md 6.1, 15.2) although the epoch and the cursor match:
+     * the harness's features are back, the request the older build queued is still sent, the
+     * unread mark stays, and the version is recorded for the next start.
+     */
+    @Test
+    fun dataOfABuildBeforeModelVersionsIsReadAgainOnTheNextConnection() = runBlocking<Unit> {
+        val server = FakeServer()
+        val claude = Samples.harness("claude")
+        val features = HarnessFeatures(planMode = PlanModeFeature(implementPrompt = "Implement the plan."), rename = true)
+        val thread = Samples.thread("thr_1", head = 7, harnessId = "claude")
+        val turnStart = """{"clientRequestId":"c1","threadId":"thr_1","input":[{"type":"text","text":"日本語"}]}"""
+        createExported(4) { db ->
+            db.execSQL("INSERT INTO meta (`key`, value) VALUES ('epoch', ?)", arrayOf<Any?>(server.epoch))
+            db.execSQL("INSERT INTO cursors (stream, seq) VALUES ('$WORKSPACE_STREAM', 5)")
+            // What that build wrote for a harness: without the `features` it did not know.
+            db.execSQL("INSERT INTO harnesses (id, position, json) VALUES ('claude', 0, ?)", arrayOf<Any?>(AasJson.encodeToString(Harness.serializer(), claude)))
+            db.execSQL("INSERT INTO threads (id, json) VALUES ('thr_1', ?)", arrayOf<Any?>(AasJson.encodeToString(Thread.serializer(), thread)))
+            db.execSQL("INSERT INTO view_states (thread_id, last_viewed_head, marked_unread) VALUES ('thr_1', 3, 0)")
+            db.execSQL(
+                "INSERT INTO outbox (client_request_id, method, params, created_at, failures, last_error, next_attempt_at, waiting_for_harness, after_request_id) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                arrayOf<Any?>("c1", "turn/start", turnStart, 5L, 0, null, 0L, null, null),
+            )
+        }
+        server.snapshot = WorkspaceSnapshotResult(listOf(claude.copy(features = features)), emptyList(), listOf(thread), emptyList(), emptyList(), 9)
+        server.reportedHeads[WORKSPACE_STREAM] = 9
+        server.onRequest = { _, msg ->
+            if (msg.method == Methods.TurnStart.name) {
+                AasJson.encodeToJsonElement(TurnStartResult.serializer(), TurnStartResult(Disposition.Started, turnId = "trn_1"))
+            } else {
+                JsonObject(emptyMap())
+            }
+        }
+        val db = AasDatabase.open(context)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val store = RoomSyncStore(db)
+            assertNull(store.transaction { it.modelVersion() }, "that build recorded no model version")
+            val engine = SyncEngine(store, OkHttpClient(), scope, ClientInfo("test", "0", "jvm"), FAST_SYNC)
+            engine.start()
+            eventually(what = "the stored workspace") { engine.workspace.value.harnesses.singleOrNull() }
+            assertEquals(HarnessFeatures(), engine.workspace.value.harnesses.single().features, "what that build dropped")
+            engine.setCredentials(Credentials(server.wsUrl, "tok"))
+            eventually(what = "online") { engine.status.value.isOnline.takeIf { it } }
+
+            assertEquals(1, server.requestsFor(Methods.WorkspaceSnapshot.name).size, "read again though the epoch and the cursor match")
+            assertEquals(features, engine.workspace.value.harnesses.single().features)
+            assertEquals(true, engine.workspace.value.threads.single().unread, "the unread mark stays")
+            eventually(what = "the older build's request sent") { server.requestsFor(Methods.TurnStart.name).singleOrNull() }
+            eventually(what = "outbox empty") { engine.outbox.value.takeIf { it.isEmpty() } }
+            store.transaction { tx ->
+                assertEquals(StoredModels.VERSION, tx.modelVersion())
+                assertEquals(features, tx.harnesses().single().features)
+                assertEquals(9L, tx.cursor(WORKSPACE_STREAM))
+            }
+            engine.stop().join()
+        } finally {
+            scope.cancel()
+            server.close()
             db.close()
         }
     }

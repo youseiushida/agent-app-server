@@ -594,6 +594,7 @@ impl SessionOptions {
                         display_name: v.name,
                         description: v.description,
                         effort_levels: None,
+                        permission_modes: None,
                     })
                     .collect()
             })

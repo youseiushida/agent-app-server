@@ -1,0 +1,9 @@
+{
+  "data": {
+    "taskId": "bgt_01K6A00000000000000000BG04",
+    "text": "  hmr update /src/App.tsx"
+  },
+  "seq": 126,
+  "ts": 1790000000126,
+  "type": "backgroundTask/outputDelta"
+}

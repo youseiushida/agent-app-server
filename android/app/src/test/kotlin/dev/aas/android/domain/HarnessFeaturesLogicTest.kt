@@ -27,6 +27,7 @@ import dev.aas.android.protocol.TurnError
 import dev.aas.android.protocol.TurnStatus
 import dev.aas.android.protocol.TurnSummary
 import dev.aas.android.protocol.Workspace
+import dev.aas.android.protocol.WorkspaceSpec
 import dev.aas.android.testing.Fixtures
 import dev.aas.android.testing.TestEngine
 import dev.aas.android.ui.common.UiText
@@ -283,8 +284,12 @@ class ThreadActionsTest {
         val planning = atTurn.copy(features = atTurn.features.copy(planMode = PlanModeFeature(implementPrompt = "Implement the plan.", newThreadPreamble = "Implement this plan:")))
         val plan = Item.ProposedPlan("itm_p", thread.id, "trn_3", ItemStatus.Completed, 1, text = "1. Do it")
         assertEquals(PlanChoices(implement = true, newThread = true), ThreadActions.proposedPlan(thread, planning, plan))
-        // A thread in a worktree cannot continue there in a new thread (thread/create makes its own).
-        assertEquals(PlanChoices(implement = true, newThread = false), ThreadActions.proposedPlan(thread.copy(workspace = Workspace.Worktree("w", "b", "main")), planning, plan))
+        // A thread in a worktree too: the new thread works in that worktree (the plan is about it).
+        val inWorktree = thread.copy(workspace = Workspace.Worktree("w", "b", "main"))
+        assertEquals(PlanChoices(implement = true, newThread = true), ThreadActions.proposedPlan(inWorktree, planning, plan))
+        assertEquals(WorkspaceSpec.Thread(thread.id), ThreadActions.newThreadWorkspace(inWorktree))
+        // A thread in the project's folder: the folder, as every daemon takes it.
+        assertEquals(WorkspaceSpec.Local, ThreadActions.newThreadWorkspace(thread))
         // Not while its turn runs, not for an older turn's plan, not while it streams, not without the feature.
         assertEquals(PlanChoices.None, ThreadActions.proposedPlan(thread.copy(lastTurn = thread.lastTurn!!.copy(status = TurnStatus.Running)), planning, plan))
         assertEquals(PlanChoices.None, ThreadActions.proposedPlan(thread, planning, plan.copy(turnId = "trn_1")))

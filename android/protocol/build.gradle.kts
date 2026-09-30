@@ -22,7 +22,14 @@ sourceSets {
     }
 }
 
+// The recorded shape of each version of the stored models (StoredModelsTest, docs/android.md 15.2).
+val storedModelsDir = layout.projectDirectory.dir("stored-models")
+
 tasks.test {
     inputs.dir(fixturesDir).withPropertyName("fixtures")
     systemProperty("aas.fixtures", fixturesDir.asFile.absolutePath)
+    inputs.dir(storedModelsDir).withPropertyName("storedModels")
+    systemProperty("aas.storedModels", storedModelsDir.asFile.absolutePath)
+    // Recording a new version's shape writes into the source tree: run again whenever it is asked.
+    inputs.property("updateStoredModels", providers.environmentVariable("AAS_UPDATE_STORED_MODELS").orElse(""))
 }

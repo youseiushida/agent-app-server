@@ -53,6 +53,16 @@
     <string name="bg_exit_code">終了コード %1$d</string>
     <string name="bg_show_output">出力の全文を表示</string>
 
+    <!-- A task's output (docs/android.md 30) -->
+    <string name="bg_output_live">出力（実行中）</string>
+    <string name="bg_output_stream_limit">表示できる出力の上限に達しました。続きは作業が終わったときに表示します</string>
+    <string name="bg_output_stream_limit_ended">表示できる出力の上限に達したあとの出力は、エージェントから報告されませんでした</string>
+    <string name="bg_output_partial">出力が長いため、最初の部分を表示しています</string>
+    <string name="bg_output_omitted">出力のファイルが大きいため、最初の %1$s は読んでいません</string>
+    <string name="output_follow_latest">最新の出力へ</string>
+    <string name="output_live_note">実行中の出力です。届くたびに続きが表示されます</string>
+    <string name="output_waiting">出力を待っています</string>
+
     <string name="bg_stop">停止</string>
     <string name="bg_stop_description">「%1$s」を停止</string>
     <string name="bg_stopping">停止中…</string>

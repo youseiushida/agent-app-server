@@ -397,13 +397,32 @@ fn crid() -> String {
     format!("crid-{}", ulid::Ulid::generate())
 }
 
+/// Gives the test repository at `dir` (just initialised) an identity and LF line endings. The
+/// settings are appended to `.git/config` in one write: `git config` replaces the file through a
+/// lock file and a rename for every setting, and on Windows that rename fails when another
+/// process (a virus scanner indexing the fresh repository) has the file open at that moment.
+fn configure_test_repo(dir: &Path) {
+    use std::io::Write;
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join(".git").join("config"))
+        .expect("the repository's config");
+    config
+        .write_all(b"[user]\n\temail = t@example.com\n\tname = t\n[core]\n\tautocrlf = false\n")
+        .expect("writing the repository's config");
+}
+
 fn run_git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "git {args:?} failed");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 async fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
@@ -443,9 +462,7 @@ impl Env {
         std::fs::create_dir_all(&dir).unwrap();
         if git {
             run_git(&dir, &["init", "-q"]);
-            run_git(&dir, &["config", "user.email", "t@example.com"]);
-            run_git(&dir, &["config", "user.name", "t"]);
-            run_git(&dir, &["config", "core.autocrlf", "false"]);
+            configure_test_repo(&dir);
             std::fs::write(dir.join("README.md"), "hello\n").unwrap();
             run_git(&dir, &["add", "-A"]);
             run_git(&dir, &["commit", "-q", "-m", "init"]);

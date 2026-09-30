@@ -86,6 +86,15 @@ pub enum Event {
     /// A background task started, progressed or ended (always the whole task).
     #[serde(rename = "backgroundTask/updated")]
     BackgroundTaskUpdated { task: BackgroundTask },
+    /// More output of a running background task, appended to its `output` (the harness
+    /// streamed it explicitly). Consecutive deltas of one task may arrive merged (`seqFrom`).
+    /// A later `backgroundTask/updated` of the task carries everything its earlier deltas
+    /// added.
+    #[serde(rename = "backgroundTask/outputDelta")]
+    BackgroundTaskOutputDelta {
+        task_id: BackgroundTaskId,
+        text: String,
+    },
     /// The harness reported that the thread's agent now works in another native session than
     /// the one the thread had (the CLI switched sessions by itself). The thread's
     /// `nativeSessionId` follows it.
@@ -130,6 +139,7 @@ impl Event {
             Event::QueueUpdated { .. } => "queue/updated",
             Event::CommandsChanged {} => "commands/changed",
             Event::BackgroundTaskUpdated { .. } => "backgroundTask/updated",
+            Event::BackgroundTaskOutputDelta { .. } => "backgroundTask/outputDelta",
             Event::NativeSessionChanged { .. } => "thread/nativeSessionChanged",
             Event::ComposerInsert { .. } => "composer/insert",
             Event::Native { .. } => "native",
@@ -197,6 +207,56 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({"type": "commands/changed", "data": {}})
+        );
+    }
+
+    #[test]
+    fn background_output_delta_shape() {
+        let env = EventEnvelope {
+            seq: 12,
+            seq_from: Some(9),
+            ts: 1,
+            event: Event::BackgroundTaskOutputDelta {
+                task_id: BackgroundTaskId::from("bgt_1"),
+                text: "TICK 1\r\nTICK 2\r\n".into(),
+            },
+        };
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "seq": 12, "seqFrom": 9, "ts": 1, "type": "backgroundTask/outputDelta",
+                "data": {"taskId": "bgt_1", "text": "TICK 1\r\nTICK 2\r\n"}
+            })
+        );
+        let back: EventEnvelope = serde_json::from_value(json).unwrap();
+        assert_eq!(back, env);
+        assert_eq!(back.event.type_name(), "backgroundTask/outputDelta");
+        assert!(!back.event.is_workspace_event());
+    }
+
+    /// The workspace of another thread (`thread/create`), and the fields a newer server adds
+    /// to a task, which an older reader leaves out without failing.
+    #[test]
+    fn additive_shapes_round_trip() {
+        let spec = WorkspaceSpec::Thread {
+            thread_id: ThreadId::from("thr_1"),
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "thread", "threadId": "thr_1"})
+        );
+        assert_eq!(serde_json::from_value::<WorkspaceSpec>(json).unwrap(), spec);
+        let task = crate::examples::background_task();
+        let json = serde_json::to_value(&task).unwrap();
+        assert!(json.get("output").is_none() && json.get("outputTruncated").is_none());
+        let shell = crate::examples::running_shell();
+        let json = serde_json::to_value(&shell).unwrap();
+        assert_eq!(json["outputTruncated"], serde_json::json!(true));
+        assert_eq!(
+            serde_json::from_value::<BackgroundTask>(json).unwrap(),
+            shell
         );
     }
 }

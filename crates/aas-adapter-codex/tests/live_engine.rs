@@ -233,6 +233,15 @@ async fn live_engine_keeps_codex_background_terminals_until_they_end() {
     assert_eq!(t.status, ThreadStatus::Ready, "not idle-stopped while busy");
     assert_eq!(supervisor.running_count(), 1);
 
+    // What the short one prints after its turn streams into the task (`output`), while it runs.
+    env.wait_until(&thread.id, "the short command's streamed output", |r| {
+        task(r, "mock_TERM_1").is_some_and(|t| {
+            t.status == BackgroundTaskStatus::Running
+                && t.output.as_deref().is_some_and(|o| o.contains("TICK_S 3"))
+        })
+    })
+    .await;
+
     // The long one is stopped from the phone; the short one ends by itself.
     let long = task(&env.read(&thread.id).await, "mock_TERM_0")
         .unwrap()
@@ -262,7 +271,10 @@ async fn live_engine_keeps_codex_background_terminals_until_they_end() {
             Some(BackgroundEndReason::Harness)
         )
     );
-    assert_eq!(long.result.as_ref().and_then(|r| r.exit_code), Some(-1));
+    // The exit code is Codex's: -1 or 1 for the same terminate (codex-cli 0.148.0 reported
+    // both on this PC, 2026-09-30), never success.
+    let exit_code = long.result.as_ref().and_then(|r| r.exit_code);
+    assert!(exit_code.is_some_and(|c| c != 0), "{exit_code:?}");
     let short = task(&read, "mock_TERM_1").unwrap();
     assert_eq!(short.status, BackgroundTaskStatus::Completed);
     let result = short.result.as_ref().expect("result");
@@ -272,6 +284,11 @@ async fn live_engine_keeps_codex_background_terminals_until_they_end() {
             .output
             .as_deref()
             .is_some_and(|o| o.contains("SHORT_DONE"))
+    );
+    // The whole output Codex reported at the end supersedes the streamed one.
+    assert_eq!(
+        (short.output.as_deref(), short.output_truncated),
+        (None, false)
     );
 
     // Nothing keeps the process now: the idle stop follows.

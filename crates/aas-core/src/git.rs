@@ -678,13 +678,20 @@ mod tests {
         let program = aas_supervisor::resolve_program("git").ok()?;
         let work = dir.join("work");
         std::fs::create_dir_all(&work).unwrap();
-        for args in [
-            &["init", "-q"][..],
-            &["config", "user.email", "t@example.com"],
-            &["config", "user.name", "t"],
-            &["config", "core.autocrlf", "false"],
-        ] {
-            git_cmd(&work, args);
+        git_cmd(&work, &["init", "-q"]);
+        // One write of the settings (not a `git config` per setting, each of which replaces
+        // the file through a rename that fails on Windows while a virus scanner has it open).
+        {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(work.join(".git").join("config"))
+                .and_then(|mut f| {
+                    f.write_all(
+                        b"[user]\n\temail = t@example.com\n\tname = t\n[core]\n\tautocrlf = false\n",
+                    )
+                })
+                .expect("writing the repository's config");
         }
         std::fs::write(work.join("a.txt"), "a\n").unwrap();
         git_cmd(&work, &["add", "-A"]);

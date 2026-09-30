@@ -13,6 +13,7 @@ import dev.aas.android.protocol.InteractionStatus
 import dev.aas.android.protocol.Item
 import dev.aas.android.protocol.ItemStatus
 import dev.aas.android.protocol.OperationStatus
+import dev.aas.android.protocol.StoredModels
 import dev.aas.android.protocol.StreamBatch
 import dev.aas.android.protocol.ThreadBackground
 import dev.aas.android.protocol.ThreadReadResult
@@ -264,6 +265,39 @@ class EventApplierTest {
         assertTrue(signals.isEmpty(), "task updates are not notifications (the summary's lastEnded is): $signals")
     }
 
+    /**
+     * `backgroundTask/outputDelta` appends to the stored task's `output` (protocol.md §3.1): one
+     * after another, merged (`seqFrom`), and replaced by the next `backgroundTask/updated`, which
+     * carries the whole task. A delta of a task that is not stored only moves the cursor.
+     */
+    @Test
+    fun outputDeltasAppendToTheStoredTaskUntilTheNextUpdateReplacesIt() = test {
+        seedThread(0)
+        val shell = Samples.backgroundTask("bgt_1", kind = BackgroundTaskKind.Shell).copy(output = "> vite\n")
+        batch(stream, env(1, Event.BackgroundTaskUpdated(shell)), env(2, Event.BackgroundTaskOutputDelta("bgt_1", "ready\n")))
+        assertEquals("> vite\nready\n", store.state.value.backgroundTasks["bgt_1"]?.output)
+        // Merged deltas of a catch-up apply as one event.
+        batch(stream, env(5, Event.BackgroundTaskOutputDelta("bgt_1", "a\nb\n"), seqFrom = 3))
+        assertEquals("> vite\nready\na\nb\n", store.state.value.backgroundTasks["bgt_1"]?.output)
+        // The limit: the update carries the output so far and says that nothing more streams.
+        val limited = shell.copy(output = "> vite\nready\na\nb\nc", outputTruncated = true)
+        batch(stream, env(6, Event.BackgroundTaskUpdated(limited)))
+        assertEquals(limited, store.state.value.backgroundTasks["bgt_1"])
+        // The end with the whole output in the result: the streamed copy goes.
+        val ended = limited.copy(
+            status = BackgroundTaskStatus.Completed, endedAt = 9, output = null, outputTruncated = false,
+            result = dev.aas.android.protocol.BackgroundResult(exitCode = 0, output = "all", outputTruncated = true, outputBlobId = "blb_1", outputOmittedBytes = 10),
+        )
+        batch(stream, env(7, Event.BackgroundTaskUpdated(ended)))
+        assertEquals(ended, store.state.value.backgroundTasks["bgt_1"])
+        // A task this device does not store: nothing to append to, the cursor moves on.
+        val outcome = batch(stream, env(8, Event.BackgroundTaskOutputDelta("bgt_unknown", "x")))
+        assertEquals(listOf(8L), outcome.applied.map { it.seq })
+        assertNull(store.state.value.backgroundTasks["bgt_unknown"])
+        assertEquals(8L, store.state.value.cursors[stream])
+        assertTrue(signals.isEmpty(), "output is not a notification: $signals")
+    }
+
     @Test
     fun threadReadBringsTheTasksAndAnOlderPageNeverRollsOneBack() = test {
         seedThread(3)
@@ -434,7 +468,39 @@ class EventApplierTest {
         assertEquals(ThreadViewState(lastViewedHead = 7), s.viewStates["thr_1"], "threads present at the snapshot count as read")
         assertEquals(listOf("c1"), s.outbox.map { it.clientRequestId })
         assertEquals("e2", s.epoch)
+        assertEquals(StoredModels.VERSION, s.modelVersion, "the snapshot is stored with this build's models")
         assertIs<SyncSignal.InteractionPending>(signals.single())
+    }
+
+    /**
+     * A snapshot of the same server data read again (stored data of another model version): the
+     * threads' unread marks stay; a thread new to this device counts as read, like any snapshot.
+     */
+    @Test
+    fun aSnapshotOfTheSameDataKeepsTheUnreadMarks() = test {
+        store.transaction { tx ->
+            tx.upsertThread(Samples.thread("thr_1", head = 5))
+            tx.setViewState("thr_1", ThreadViewState(lastViewedHead = 3))
+            tx.upsertThread(Samples.thread("thr_2", head = 5))
+            tx.setViewState("thr_2", ThreadViewState(lastViewedHead = 5, markedUnread = true))
+            tx.upsertThread(Samples.thread("thr_gone"))
+            tx.setViewState("thr_gone", ThreadViewState(lastViewedHead = 1))
+        }
+        val snapshot = WorkspaceSnapshotResult(
+            emptyList(), emptyList(), listOf(Samples.thread("thr_1", head = 6), Samples.thread("thr_2", head = 5), Samples.thread("thr_new", head = 4)),
+            emptyList(), emptyList(), 20,
+        )
+        store.transaction { EventApplier.applySnapshot(it, "e1", snapshot, signals, keepViewStates = true) }
+        val s = store.state.value
+        assertEquals(
+            mapOf(
+                "thr_1" to ThreadViewState(lastViewedHead = 3),
+                "thr_2" to ThreadViewState(lastViewedHead = 5, markedUnread = true),
+                "thr_new" to ThreadViewState(lastViewedHead = 4),
+            ),
+            s.viewStates,
+        )
+        assertEquals(StoredModels.VERSION, s.modelVersion)
     }
 
     @Test

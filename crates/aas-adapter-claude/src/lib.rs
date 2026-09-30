@@ -163,6 +163,7 @@ impl ClaudeAdapter {
             max_line_bytes: self.ctx.policy.max_line_bytes,
             command_cache: self.commands.clone(),
             agent_progress_summaries: self.options()?.agent_progress_summaries,
+            max_output_file_bytes: self.ctx.policy.max_output_file_bytes,
         };
         let (session, events) =
             ClaudeSession::start(stdout, stdin, ProcessLink::Child(child.handle), params);
@@ -428,11 +429,11 @@ impl HarnessAdapter for ClaudeAdapter {
         };
         menu_from_initialize(&self.commands, &probe_dir, &raw);
         *self.fast_mode_models.lock() = mapping::fast_mode_models(&raw);
-        let models = mapping::models_from_initialize(&raw);
-        let effort_levels = mapping::effort_levels(&models);
         let current_mode = raw.get("current_permission_mode").and_then(|v| v.as_str());
         let permission_modes =
             mapping::permission_modes(current_mode, options.allow_bypass_permissions);
+        let models = mapping::models_from_initialize(&raw, &permission_modes);
+        let effort_levels = mapping::effort_levels(&models);
         HarnessInfo {
             available: true,
             unavailable_reason: None,

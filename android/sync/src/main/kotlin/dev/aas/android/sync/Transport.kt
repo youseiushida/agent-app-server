@@ -52,7 +52,7 @@ internal class WsConnection private constructor(private val tap: WireTap?) {
 
     /**
      * Completes when OkHttp reported the socket's end (`onClosed` or `onFailure`, which also
-     * follows [cancel]): the socket holds no connection any more.
+     * follows [cancel]) and the TCP socket is closed: the socket holds no connection any more.
      */
     val released: Deferred<Unit> get() = _released
 
@@ -73,15 +73,27 @@ internal class WsConnection private constructor(private val tap: WireTap?) {
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             channel.close()
-            _released.complete(Unit)
+            release(webSocket)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             channel.trySend(WsEvent.Failure(t, response?.code))
             response?.close()
             channel.close()
-            _released.complete(Unit)
+            release(webSocket)
         }
+    }
+
+    /**
+     * Reports the end once the TCP socket is closed. OkHttp calls `onFailure` (and `onClosed`)
+     * before it closes the socket itself, so a socket the peer ended (EOF, a reset) would still be
+     * open for a moment after the report, and the engine could open the next one meanwhile.
+     * Cancelling closes it now (after the engine's own [cancel] it is already closed; cancelling
+     * twice does nothing).
+     */
+    private fun release(webSocket: WebSocket) {
+        webSocket.cancel()
+        _released.complete(Unit)
     }
 
     /** Queues a text frame; `false` when the socket is closing or gone. */

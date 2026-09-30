@@ -63,6 +63,16 @@
           ],
           "id": "sonnet",
           "isDefault": false
+        },
+        {
+          "description": "Fastest for quick answers",
+          "displayName": "Haiku",
+          "effortLevels": [],
+          "id": "haiku",
+          "isDefault": false,
+          "permissionModes": [
+            "default"
+          ]
         }
       ],
       "permissionModes": [

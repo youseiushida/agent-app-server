@@ -5,10 +5,12 @@
 //!   never diverge.
 //! * After the caller commits it publishes the new heads on the [`HeadHub`]; subscribers wait
 //!   on it and then read from their own cursor, so replay and live delivery share one code path.
-//! * [`read_batch`] merges consecutive `item/delta` events of the same `(itemId, field)`.
-//!   Merging is driven only by what is already stored when the batch is read, never by timers.
+//! * [`read_batch`] merges consecutive `item/delta` events of the same `(itemId, field)`, and
+//!   consecutive `backgroundTask/outputDelta` events of the same task. Merging is driven only
+//!   by what is already stored when the batch is read, never by timers.
 //! * Sequence numbers are cursors, not a dense range: compaction deletes old deltas of
-//!   completed items (their final content lives in `item/completed`), events whose whole
+//!   completed items (their final content lives in `item/completed`), old output deltas of a
+//!   background task that a later `backgroundTask/updated` of it carries, events whose whole
 //!   content a later event of the same entity carries (for example an older
 //!   `thread/updated` or `backgroundTask/updated`), and old `native` events; a removed
 //!   thread's events are purged.
@@ -150,6 +152,13 @@ pub fn event_keys(event: &Event) -> EventKeys {
         // Every update carries the whole task, a restart (a new run) included: a later one
         // replaces it. The last update of a task stays, whatever its state.
         Event::BackgroundTaskUpdated { task } => keyed(format!("background:{}", task.id), true),
+        // A delta adds to the task's output: a later delta does not repeat it, a later
+        // `backgroundTask/updated` of the task does ([`compact_background_output`]). Its own
+        // key keeps it out of the rule for whole states (a delta after an update must not
+        // make that update look superseded).
+        Event::BackgroundTaskOutputDelta { task_id, .. } => {
+            keyed(format!("{BACKGROUND_OUTPUT_KEY}{task_id}"), false)
+        }
         // Each of these adds something no later event repeats. The transient ones
         // ([`TRANSIENT_EVENT_TYPES`]) expire by age instead.
         Event::TurnStarted { .. }
@@ -178,6 +187,10 @@ pub fn event_keys(event: &Event) -> EventKeys {
         supersedable,
     }
 }
+
+/// Prefix of the key of a background task's output deltas (`background-output:<taskId>`); the
+/// task's own updates are keyed `background:<taskId>`.
+const BACKGROUND_OUTPUT_KEY: &str = "background-output:";
 
 /// Current head of a stream (0 when the stream has no events yet).
 pub fn head(conn: &Connection, stream: &str) -> rusqlite::Result<u64> {
@@ -335,6 +348,22 @@ pub fn read_batch(
             prev.ts = ts;
             continue;
         }
+        if let Some(prev) = events.last_mut()
+            && let (
+                Event::BackgroundTaskOutputDelta {
+                    task_id: prev_task,
+                    text: prev_text,
+                },
+                Event::BackgroundTaskOutputDelta { task_id, text },
+            ) = (&mut prev.event, &event)
+            && prev_task == task_id
+        {
+            prev_text.push_str(text);
+            prev.seq_from.get_or_insert(prev.seq);
+            prev.seq = seq;
+            prev.ts = ts;
+            continue;
+        }
         events.push(EventEnvelope {
             seq,
             seq_from: None,
@@ -424,6 +453,33 @@ pub fn compact_superseded(
              LIMIT ?2",
         )?
         .query_map(params![before, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    delete_rows(tx, &rows)
+}
+
+/// Deletes up to `limit` `backgroundTask/outputDelta` events older than `before` whose task
+/// has a later `backgroundTask/updated` in the same stream: every update carries the task's
+/// whole output so far (or, once the run ended with its own output, supersedes it). Returns the
+/// number deleted; the caller repeats while it equals `limit`.
+pub fn compact_background_output(
+    tx: &Transaction<'_>,
+    before: Millis,
+    limit: usize,
+) -> rusqlite::Result<usize> {
+    let rows: Vec<(String, i64)> = tx
+        .prepare_cached(
+            "SELECT e.stream, e.seq FROM events e
+             WHERE e.type = 'backgroundTask/outputDelta' AND e.ts < ?1
+               AND EXISTS (SELECT 1 FROM events l
+                           WHERE l.stream = e.stream
+                             AND l.snapshot_key = 'background:' || substr(e.snapshot_key, ?2)
+                             AND l.seq > e.seq)
+             LIMIT ?3",
+        )?
+        .query_map(
+            params![before, BACKGROUND_OUTPUT_KEY.len() as i64 + 1, limit as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
         .collect::<rusqlite::Result<_>>()?;
     delete_rows(tx, &rows)
 }
@@ -903,6 +959,148 @@ mod tests {
             ],
             "the latest state of each task stays"
         );
+    }
+
+    fn output(task: &str, text: &str) -> Event {
+        Event::BackgroundTaskOutputDelta {
+            task_id: aas_protocol::BackgroundTaskId::from(task),
+            text: text.into(),
+        }
+    }
+
+    fn raw_types(conn: &Connection, stream: &str) -> Vec<(u64, String)> {
+        conn.prepare("SELECT seq, type FROM events WHERE stream = ?1 ORDER BY seq")
+            .unwrap()
+            .query_map([stream], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn consecutive_output_deltas_of_a_task_are_merged() {
+        let mut conn = db();
+        let tx = conn.transaction().unwrap();
+        append(
+            &tx,
+            "s",
+            1,
+            vec![
+                output("bgt_a", "TICK 1\r\n"),
+                output("bgt_a", "TICK 2\r\n"),
+                output("bgt_b", "other\n"),
+                output("bgt_a", "TICK 3\r\n"),
+                delta("itm_a", DeltaField::Output, "x"),
+                output("bgt_a", "TICK 4\r\n"),
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let batch = read_batch(
+            &conn,
+            "s",
+            0,
+            BatchLimits {
+                max_events: 100,
+                max_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let summary: Vec<(u64, Option<u64>, Event)> = batch
+            .events
+            .into_iter()
+            .map(|e| (e.seq, e.seq_from, e.event))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (2, Some(1), output("bgt_a", "TICK 1\r\nTICK 2\r\n")),
+                (3, None, output("bgt_b", "other\n")),
+                (4, None, output("bgt_a", "TICK 3\r\n")),
+                (5, None, delta("itm_a", DeltaField::Output, "x")),
+                (6, None, output("bgt_a", "TICK 4\r\n")),
+            ]
+        );
+    }
+
+    /// Output deltas go once a later update of their task carries them (and are old enough);
+    /// a delta after an update never makes that update look superseded.
+    #[test]
+    fn output_deltas_are_compacted_behind_a_later_update_of_their_task() {
+        let mut conn = db();
+        let shell = examples::running_shell();
+        let other = examples::background_task();
+        let tx = conn.transaction().unwrap();
+        append(
+            &tx,
+            "s",
+            1,
+            vec![
+                output(shell.id.as_str(), "a"),
+                output(other.id.as_str(), "b"),
+                Event::BackgroundTaskUpdated {
+                    task: shell.clone(),
+                },
+                output(shell.id.as_str(), "c"),
+            ],
+        )
+        .unwrap();
+        append(&tx, "t", 1, vec![output(shell.id.as_str(), "d")]).unwrap();
+        append(&tx, "s", 50, vec![output(other.id.as_str(), "e")]).unwrap();
+        append(
+            &tx,
+            "s",
+            50,
+            vec![Event::BackgroundTaskUpdated {
+                task: other.clone(),
+            }],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            compact_superseded(&tx, 100, 100).unwrap(),
+            0,
+            "an update followed only by deltas is still the latest state"
+        );
+        assert_eq!(compact_background_output(&tx, 20, 100).unwrap(), 2);
+        tx.commit().unwrap();
+        assert_eq!(
+            raw_types(&conn, "s"),
+            vec![
+                (3, "backgroundTask/updated".to_owned()),
+                (4, "backgroundTask/outputDelta".to_owned()),
+                (5, "backgroundTask/outputDelta".to_owned()),
+                (6, "backgroundTask/updated".to_owned()),
+            ],
+            "the deltas before each task's update go; the delta after it, and the one newer than \
+             the cutoff, stay"
+        );
+        assert_eq!(
+            raw_types(&conn, "t").len(),
+            1,
+            "another stream is independent"
+        );
+
+        // Batches: the limit is honoured.
+        let tx = conn.transaction().unwrap();
+        append(
+            &tx,
+            "u",
+            1,
+            (0..5)
+                .map(|_| output(shell.id.as_str(), "x"))
+                .chain([Event::BackgroundTaskUpdated {
+                    task: shell.clone(),
+                }])
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(compact_background_output(&tx, 20, 3).unwrap(), 3);
+        assert_eq!(compact_background_output(&tx, 20, 3).unwrap(), 2);
+        assert_eq!(compact_background_output(&tx, 20, 3).unwrap(), 0);
+        tx.commit().unwrap();
     }
 
     #[test]

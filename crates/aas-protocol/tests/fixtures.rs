@@ -104,6 +104,16 @@ fn every_fixture_round_trips_through_the_types() {
                 let msg: RpcMessage = serde_json::from_value(fixture.value.clone()).unwrap();
                 assert_eq!(msg.kind(), MessageKind::Request, "{}", fixture.path);
                 let method = msg.method.clone().unwrap();
+                // `<method>.json`, or `<method>_<variant>.json` for another shape of its params.
+                let method_file = method.replace('/', "_");
+                assert!(
+                    name == method_file
+                        || name
+                            .strip_prefix(method_file.as_str())
+                            .is_some_and(|variant| variant.len() > 1 && variant.starts_with('_')),
+                    "{}: named after another method than {method}",
+                    fixture.path
+                );
                 let parsed = ClientRequest::parse(&method, msg.params.clone())
                     .unwrap_or_else(|e| panic!("{}: {e}", fixture.path));
                 assert_eq!(

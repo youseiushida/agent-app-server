@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aas_harness::{
-    AdapterError, AdapterEvent, BackgroundTaskInfo, SessionControl, SessionHandle, SettingsApplied,
-    StartMode, StartOptions, StartRequest, TurnInput, TurnInputPart,
+    AdapterError, AdapterEvent, BackgroundTaskInfo, OutputUpdate, SessionControl, SessionHandle,
+    SettingsApplied, StartMode, StartOptions, StartRequest, TurnInput, TurnInputPart,
 };
 use aas_protocol::events::Event;
 use aas_protocol::methods::*;
@@ -449,6 +449,15 @@ impl Uow {
             && self.session_switches.is_empty()
     }
 
+    /// Stores `task` (whole state) with this commit, replacing an earlier state of it in the
+    /// same commit.
+    fn store_task(&mut self, task: BackgroundTask) {
+        match self.background.iter().position(|t| t.id == task.id) {
+            Some(pos) => self.background[pos] = task,
+            None => self.background.push(task),
+        }
+    }
+
     fn update_item(&mut self, item: Item) {
         if let Some(pos) = self.items_insert.iter().position(|i| i.id == item.id) {
             self.items_insert[pos] = item;
@@ -658,14 +667,20 @@ impl Actor {
     }
 
     /// Whether a process may be idle-reaped: nothing runs, nothing will start by itself (a
-    /// paused queue waits for the user, who may take any time), and no background task keeps
-    /// the agent busy (the harness's live set holds nothing but ambient work). Background work
-    /// is never stopped because of time (design.md §4.7).
+    /// paused queue waits for the user, who may take any time), no background task keeps the
+    /// agent busy (the harness's live set holds nothing but ambient work), and the agent waits
+    /// for no answer. Background work is never stopped because of time (design.md §4.7).
+    ///
+    /// A pending interaction outside a turn (one of the thread, like a pi extension's dialog,
+    /// or one of a background task) is a request the harness says explicitly that it waits on:
+    /// a stopped process could never take its answer, and what waits for it in the harness
+    /// would be lost. Requests of a turn cannot be pending here (no turn runs).
     fn reapable(&self) -> bool {
         self.desired_status() == ThreadStatus::Ready
             && (self.queue_len == 0 || self.row.queue_paused)
             && self.stopping.is_none()
             && self.background.busy() == 0
+            && self.pending.is_empty()
     }
 
     /// Keeps the daemon's count of busy background tasks and this thread's sleep lease in line
@@ -2154,13 +2169,23 @@ impl Actor {
                 if let Some(info) = &info {
                     validate_settings(info, &s)?;
                 }
-                Some(ThreadSettings {
+                let changes_combination = s.model.is_some() || s.permission_mode.is_some();
+                let merged = ThreadSettings {
                     model: s.model.or_else(|| self.row.settings.model.clone()),
                     effort: s.effort.or_else(|| self.row.settings.effort.clone()),
                     permission_mode: s
                         .permission_mode
                         .or_else(|| self.row.settings.permission_mode.clone()),
-                })
+                };
+                // The model and the permission mode the thread would run with must go together
+                // when the request changes either (a model that cannot run in the thread's mode
+                // needs another mode in the same request).
+                if let Some(info) = &info
+                    && changes_combination
+                {
+                    validate_model_permission_mode(info, &merged)?;
+                }
+                Some(merged)
             }
             None => None,
         };
@@ -3489,6 +3514,9 @@ impl Actor {
                 }
             }
             AdapterEvent::BackgroundTask { task } => self.background_task(*task, uow),
+            AdapterEvent::BackgroundOutput { key, output } => {
+                self.background_output(&key, output, uow)
+            }
             AdapterEvent::TurnUsage { usage } => {
                 // Recorded with the running turn and relayed as it comes, so the client sees
                 // the context occupancy grow during a long turn.
@@ -4487,6 +4515,26 @@ impl Actor {
                 let key = info.origin_item_key.as_ref()?;
                 self.turn.as_ref()?.keys.get(key).cloned()
             });
+        // What the run streamed so far stays with the run. A new run starts without output; a
+        // shell that goes on from a command of the running turn starts with what that command
+        // printed (the same process's output, when it is all inline); an end that brings the
+        // whole output replaces it (`result.output`).
+        let (output, output_truncated) = match &prev {
+            Some(v) if same_run => (v.output.clone(), v.output_truncated),
+            _ => (None, false),
+        };
+        let first_origin =
+            origin_item_id.is_some() && prev.as_ref().is_none_or(|v| v.origin_item_id.is_none());
+        let output = match output {
+            None if !output_truncated && first_origin => self.launching_output(&info),
+            other => other,
+        };
+        let (output, output_truncated) =
+            if ended && result.as_ref().is_some_and(|r| r.output.is_some()) {
+                (None, false)
+            } else {
+                (output, output_truncated)
+            };
         let parent_task_id = prev
             .as_ref()
             .and_then(|v| v.parent_task_id.clone())
@@ -4531,6 +4579,8 @@ impl Actor {
                 .filter(|_| same_run && !ended)
                 .and_then(|v| v.stop_unconfirmed_at),
             next_run_at: info.next_run_at,
+            output,
+            output_truncated,
         };
         if background::changes_summary(prev.as_ref(), &view) {
             uow.thread_changed = true;
@@ -4594,6 +4644,7 @@ impl Actor {
             return Some(BackgroundResult {
                 summary: reported.summary.clone(),
                 exit_code: reported.exit_code,
+                output_omitted_bytes: reported.output_omitted_bytes,
                 ..prev.clone()
             });
         }
@@ -4613,7 +4664,98 @@ impl Actor {
             output,
             output_truncated,
             output_blob_id,
+            output_omitted_bytes: reported.output_omitted_bytes,
         })
+    }
+
+    /// What the command that launched shell task `info` printed so far, when the task goes on
+    /// from a command item of the running turn whose output is all inline: the task's output
+    /// continues it. `None` for other tasks, and for a command whose output was cut (the task
+    /// then streams from where it goes on).
+    fn launching_output(&self, info: &BackgroundTaskInfo) -> Option<String> {
+        if info.kind != BackgroundTaskKind::Shell {
+            return None;
+        }
+        let key = info.origin_item_key.as_ref()?;
+        let open = self
+            .turn
+            .as_ref()
+            .filter(|t| t.sent)
+            .and_then(|t| t.items.get(key))?;
+        match &open.item.body {
+            ItemBody::CommandExecution { output, .. } if !open.truncated && !output.is_empty() => {
+                Some(output.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Output of the current run of a running background task
+    /// (`AdapterEvent::BackgroundOutput`). The run's first `policy.max_inline_output_bytes`
+    /// are kept with the task and relayed: appended text as `backgroundTask/outputDelta`, a
+    /// replaced output (and the moment the limit is reached, `outputTruncated`) as
+    /// `backgroundTask/updated`. What comes after the limit is not relayed; the whole output
+    /// comes with the end (`result`).
+    fn background_output(&mut self, key: &str, update: OutputUpdate, uow: &mut Uow) {
+        let max_inline = self.sh.config.policy.max_inline_output_bytes;
+        let thread = self.row.id.clone();
+        let Some(tracked) = self.background.get_mut(key) else {
+            tracing::debug!(%thread, task = key, "output of a background task this process never reported; ignored");
+            return;
+        };
+        if tracked.ended() {
+            tracing::debug!(%thread, task = key, "output of a background task that has ended; ignored");
+            return;
+        }
+        match update {
+            OutputUpdate::Append(text) => {
+                if text.is_empty() || tracked.view.output_truncated {
+                    return;
+                }
+                let current = tracked.view.output.as_deref().map_or(0, str::len);
+                let room = max_inline.saturating_sub(current);
+                let cut = if text.len() <= room {
+                    text.len()
+                } else {
+                    floor_char_boundary(&text, room)
+                };
+                let head = &text[..cut];
+                if !head.is_empty() {
+                    // Clients learn the text from the delta: what they know (`written`) grows
+                    // with it, so that nothing else looks changed.
+                    let task_id = tracked.view.id.clone();
+                    for task in std::iter::once(&mut tracked.view).chain(tracked.written.as_mut()) {
+                        task.output.get_or_insert_with(String::new).push_str(head);
+                    }
+                    uow.events.push(Event::BackgroundTaskOutputDelta {
+                        task_id,
+                        text: head.to_owned(),
+                    });
+                    if let Some(written) = &tracked.written {
+                        uow.store_task(written.clone());
+                    }
+                }
+                if cut < text.len() {
+                    tracked.view.output_truncated = true;
+                    self.write_task(key, uow);
+                }
+            }
+            OutputUpdate::Replace(text) => {
+                let (output, truncated) = if text.len() <= max_inline {
+                    (text, false)
+                } else {
+                    let cut = floor_char_boundary(&text, max_inline);
+                    (text[..cut].to_owned(), true)
+                };
+                let output = (!output.is_empty()).then_some(output);
+                if tracked.view.output == output && tracked.view.output_truncated == truncated {
+                    return;
+                }
+                tracked.view.output = output;
+                tracked.view.output_truncated = truncated;
+                self.write_task(key, uow);
+            }
+        }
     }
 
     /// Stores `text` as a blob referenced by this commit.
@@ -4654,7 +4796,7 @@ impl Actor {
         }
         tracked.written = Some(tracked.view.clone());
         tracked.written_at = Some(Instant::now());
-        uow.background.push(tracked.view.clone());
+        uow.store_task(tracked.view.clone());
         uow.events.push(Event::BackgroundTaskUpdated {
             task: tracked.view.clone(),
         });
@@ -5133,6 +5275,42 @@ pub fn validate_settings(info: &aas_harness::HarnessInfo, s: &ThreadSettings) ->
         return Err(invalid_params(format!("unknown permission mode {p}")));
     }
     Ok(())
+}
+
+/// Checks that the permission mode `settings` run with can go with their model (their own,
+/// else the harness's default): a model that lists its permission modes
+/// (`Model.permissionModes`, the harness's explicit statement, e.g. Claude Code's Haiku without
+/// auto mode) runs in those only. A thread's settings are whole (the defaults are filled in
+/// when it is created), so both values are known; a model or a mode the harness no longer
+/// lists says nothing about the combination and is left alone.
+pub fn validate_model_permission_mode(
+    info: &aas_harness::HarnessInfo,
+    settings: &ThreadSettings,
+) -> CoreResult<()> {
+    let Some(mode) = settings
+        .permission_mode
+        .as_deref()
+        .or(info.default_permission_mode.as_deref())
+    else {
+        return Ok(());
+    };
+    let Some(model) = settings
+        .model
+        .as_deref()
+        .or(info.default_model.as_deref())
+        .and_then(|id| info.models.iter().find(|m| m.id == id))
+    else {
+        return Ok(());
+    };
+    match &model.permission_modes {
+        Some(modes) if !modes.iter().any(|m| m == mode) => Err(invalid_params(format!(
+            "the permission mode {mode} is not available with the model {}",
+            model.id
+        ))
+        .with("model", model.id.clone())
+        .with("permissionMode", mode)),
+        _ => Ok(()),
+    }
 }
 
 /// Whether the model `settings` run with (their own, else the harness's default) supports fast

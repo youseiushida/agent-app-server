@@ -36,6 +36,9 @@
 //! | `@stderr <text…>` | writes `text` to the agent's stderr; `\e` in the text is the escape character (for terminal colours) |
 //! | `@late-anchor` | the turn's anchor is provisional (reported right away, not usable for forking) and settles only at the start of the agent's next turn in the same session, like CLIs that settle what a turn is branched at later |
 //! | `@settle-anchor` | settles this turn's provisional anchor now |
+//! | `@await-steer [unread]` | waits (interruptibly) until a steered message comes and takes it in (returned instead under `@refuse-steers`); `unread` leaves it unread, so that the turn returns it at its end like a message that came too late for the run |
+//! | `@wakeup <ms> [times=<n>] [prompt…]` | schedules a wakeup, like Claude Code's `ScheduleWakeup`: a scheduled task (unstoppable, `nextRunAt`) that comes due after `ms`; then the agent starts a turn by itself (trigger `scheduled`) that runs `prompt` as a scenario, `n` times in all (a run each) |
+//! | `@dialog [title…]` | right after the turn's completion, the agent asks a question that belongs to no turn and no task (like a pi extension's dialog) and reports the answer with a notice |
 //!
 //! Attached images are acknowledged with an extra message `received <n> image(s) (<bytes> bytes)`.
 //!
@@ -82,10 +85,22 @@
 //! | `unstoppable` | cannot be stopped on its own |
 //! | `stubborn` | ignores stop requests (it still dies with the agent) |
 //! | `detached` | no launching item |
+//! | `output=<n>` | each run prints `n` lines (`<key> line <i>`), evenly within the run (every 50 ms for `ms=0`), streamed as the task's output; a shell's result holds them all, then `ran <title>` |
+//! | `width=<bytes>` | pads each output line to `bytes` (with its line break) |
+//! | `early=<k>` | the first `k` of the `output` lines are printed by the launching command while the turn runs (its item's output; `kind=shell` with a launching item), the rest by the task |
+//! | `snapshots` | reports the output as snapshots of the whole output so far instead of appended text |
 //!
 //! A turn the agent starts by itself runs after the current turn; a prompt that arrives while
 //! it runs is refused with `promptAck { accepted: false, ownRun: true }` (the adapter then
 //! reports [`aas_harness::AdapterError::TurnInProgress`]).
+//!
+//! # Steers
+//!
+//! Every `steer` is answered with `steerAck`: taken into the running turn, or refused when no
+//! turn runs any more (it completed before the steer came). A turn takes steers in at its
+//! pauses (`@sleep`, streaming, waiting for an answer, `@tool`, `@await-steer`); the ones still
+//! unread when it ends are returned with `steerReturned` before its completion, like Claude
+//! Code and pi return a message the run did not take (steers without an id are taken in).
 //!
 //! # Sessions
 //!
@@ -205,6 +220,10 @@ pub enum Step {
     Stderr(String),
     LateAnchor,
     SettleAnchor,
+    /// Waits for a steer; `true`: takes it in, `false`: leaves it unread.
+    AwaitSteer(bool),
+    Wakeup(BackgroundSpec),
+    Dialog(String),
     Unknown(String),
     /// A directive whose arguments are wrong (reported as a warning notice).
     Invalid(String),
@@ -341,6 +360,22 @@ pub fn parse_script(prompt: &str) -> Vec<Step> {
             "stderr" => Step::Stderr(args.replace("\\e", "\u{1b}")),
             "late-anchor" => Step::LateAnchor,
             "settle-anchor" => Step::SettleAnchor,
+            "await-steer" => match args {
+                "" => Step::AwaitSteer(true),
+                "unread" => Step::AwaitSteer(false),
+                _ => Step::Invalid(format!(
+                    "@await-steer takes `unread` or nothing, not `{args}`"
+                )),
+            },
+            "wakeup" => match BackgroundSpec::parse_wakeup(args) {
+                Ok(spec) => Step::Wakeup(spec),
+                Err(message) => Step::Invalid(message),
+            },
+            "dialog" => Step::Dialog(if args.is_empty() {
+                "Continue?".to_owned()
+            } else {
+                args.to_owned()
+            }),
             "permission" | "effort" | "fast-state" | "rename" | "editor" => {
                 Step::Invalid(format!("@{name} needs an argument"))
             }
@@ -389,6 +424,9 @@ fn is_directive(name: &str) -> bool {
             | "stderr"
             | "late-anchor"
             | "settle-anchor"
+            | "await-steer"
+            | "wakeup"
+            | "dialog"
     )
 }
 
@@ -555,7 +593,9 @@ impl TurnRecord {
             | Ev::Backgroundable { .. }
             | Ev::Request { .. }
             | Ev::Withdraw { .. }
+            | Ev::SteerAck { .. }
             | Ev::SteerReturned { .. }
+            | Ev::BackgroundOutput { .. }
             | Ev::EditorText { .. }
             | Ev::Usage { .. }
             | Ev::TurnCompleted { .. }
@@ -776,7 +816,12 @@ where
                 own_run = true;
                 let end_tx = end_tx.clone();
                 let task = tokio::spawn(async move {
-                    let steps = vec![Step::Text(wake.text), Step::Sleep(OWN_RUN_MS)];
+                    // A wakeup runs its prompt as a scenario; other runs say what woke them.
+                    let mut steps = match wake.script {
+                        Some(script) => parse_script(&script),
+                        None => vec![Step::Text(wake.text)],
+                    };
+                    steps.push(Step::Sleep(OWN_RUN_MS));
                     if let TurnEnd::Crash(code) = run_turn(ctx, steps).await {
                         let _ = end_tx.send(TurnEnd::Crash(code));
                     }
@@ -950,13 +995,19 @@ where
                         });
                         turn_task.track(task.abort_handle());
                     }
-                    Op::Steer { text, images, message_id } => match &turn {
-                        Some(t) => {
-                            let text = if images.is_empty() { text } else { format!("{text} ({})", describe_images(&images)) };
-                            let _ = t.steer_tx.send(Steered { text, message_id });
-                        }
-                        None => { emit(&writer, Ev::Notice { level: NoticeLevel::Warning, message: "nothing to steer".into() }).await; }
-                    },
+                    Op::Steer { text, images, message_id } => {
+                        // Taken when the running turn still reads steers: it takes the steer in
+                        // or returns it before its completion. A turn that is over has closed its
+                        // channel (the steer comes back from the send).
+                        let accepted = match &turn {
+                            Some(t) => {
+                                let text = if images.is_empty() { text } else { format!("{text} ({})", describe_images(&images)) };
+                                t.steer_tx.send(Steered { text, message_id }).is_ok()
+                            }
+                            None => false,
+                        };
+                        emit(&writer, Ev::SteerAck { accepted }).await;
+                    }
                     Op::Interrupt => {
                         if let Some(t) = &turn {
                             let _ = t.interrupt_tx.send(true);
@@ -1109,6 +1160,10 @@ struct TurnCtx<W> {
     background: Arc<BackgroundRuntime>,
     /// Why the agent started this turn by itself (`None` for a prompt).
     trigger: Option<TurnTrigger>,
+    /// Questions the agent asks once the turn is over (`@dialog`), with their titles.
+    dialogs: Vec<String>,
+    /// Steers that came and were left unread (`@await-steer unread`): returned at the end.
+    unread: Vec<Steered>,
 }
 
 /// The channels and context of a new turn: for `prompt`, or one the agent starts by itself
@@ -1156,6 +1211,8 @@ fn turn_ctx<W>(
         end: end.clone(),
         background: background.clone(),
         trigger,
+        dialogs: Vec::new(),
+        unread: Vec::new(),
     };
     *item_counter += ITEM_KEYS_PER_TURN;
     (
@@ -1169,7 +1226,7 @@ fn turn_ctx<W>(
     )
 }
 
-impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
+impl<W: AsyncWrite + Unpin + Send + 'static> TurnCtx<W> {
     fn interrupted(&self) -> bool {
         *self.interrupt.borrow()
     }
@@ -1234,8 +1291,30 @@ impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
         }
     }
 
-    /// Ends the turn: saves it, reports its anchor, then its completion.
-    async fn finish(&self, status: TurnStatus, usage: Option<Usage>, error: Option<TurnError>) {
+    /// Ends the turn: saves it, reports its anchor, returns the steers it did not read, then
+    /// reports its completion, then asks what waits for the turn to be over (`@dialog`).
+    async fn finish(&mut self, status: TurnStatus, usage: Option<Usage>, error: Option<TurnError>) {
+        // No steer reaches the turn from now on (the main loop refuses them); the ones that
+        // came meanwhile go back, like a CLI returns what a run did not take.
+        self.steers.close();
+        let mut left = std::mem::take(&mut self.unread);
+        while let Ok(steered) = self.steers.try_recv() {
+            left.push(steered);
+        }
+        for Steered { text, message_id } in left {
+            match message_id {
+                Some(message_id) => {
+                    emit(&self.writer, Ev::SteerReturned { message_id }).await;
+                }
+                None => {
+                    self.steered(Steered {
+                        text,
+                        message_id: None,
+                    })
+                    .await
+                }
+            }
+        }
         if let (Some(record), Some(error)) = (&self.writer.record, &error) {
             record
                 .lock()
@@ -1268,6 +1347,11 @@ impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
             },
         )
         .await;
+        for title in std::mem::take(&mut self.dialogs) {
+            self.background
+                .ask_dialog(&self.writer.detached(), &title)
+                .await;
+        }
     }
 
     /// Sleeps unless interrupted first; drains steer messages meanwhile. Returns `false` when
@@ -1315,6 +1399,31 @@ impl<W: AsyncWrite + Unpin + Send> TurnCtx<W> {
                     )
                     .await;
                 }
+            }
+        }
+    }
+
+    /// Waits until a steered message comes and takes it in (`@await-steer`), or leaves it
+    /// unread (`take: false`). Returns `false` when the turn was interrupted first.
+    async fn await_steer(&mut self, take: bool) -> bool {
+        loop {
+            tokio::select! {
+                changed = self.interrupt.changed() => {
+                    if changed.is_err() || *self.interrupt.borrow() {
+                        return false;
+                    }
+                }
+                steered = self.steers.recv() => match steered {
+                    Some(steered) if take => {
+                        self.steered(steered).await;
+                        return true;
+                    }
+                    Some(steered) => {
+                        self.unread.push(steered);
+                        return true;
+                    }
+                    None => return !self.interrupted(),
+                },
             }
         }
     }
@@ -1886,8 +1995,17 @@ async fn run_turn<W: AsyncWrite + Unpin + Send + 'static>(
                     )
                     .await;
                 }
-                Step::Background(spec) => {
+                Step::Background(spec) | Step::Wakeup(spec) => {
                     let item = spec.launch_item.then(&mut key);
+                    // A wakeup is named after the item that scheduled it (unique in the
+                    // session, like the tool use of a `ScheduleWakeup`).
+                    let spec = match (&item, spec.script.is_some()) {
+                        (Some(k), true) => BackgroundSpec {
+                            key: format!("wakeup:{k}"),
+                            ..spec
+                        },
+                        _ => spec,
+                    };
                     if let Some(k) = &item {
                         let cwd = ctx.options.cwd.display().to_string();
                         emit(
@@ -1898,6 +2016,19 @@ async fn run_turn<W: AsyncWrite + Unpin + Send + 'static>(
                             },
                         )
                         .await;
+                        // What the command prints before it goes on in the background.
+                        let early = spec.early_output();
+                        if !early.is_empty() {
+                            emit(
+                                &w,
+                                Ev::Delta {
+                                    key: k.clone(),
+                                    field: DeltaField::Output,
+                                    text: early,
+                                },
+                            )
+                            .await;
+                        }
                     }
                     // The task is reported before its launching item is closed.
                     ctx.background.start(&w, spec, item.clone()).await;
@@ -2087,6 +2218,7 @@ async fn run_turn<W: AsyncWrite + Unpin + Send + 'static>(
                                 stoppable: true,
                                 stubborn: false,
                                 launch_item: true,
+                                ..BackgroundSpec::default()
                             };
                             ctx.background.start(&w, spec, Some(k.clone())).await;
                             emit(
@@ -2104,6 +2236,12 @@ async fn run_turn<W: AsyncWrite + Unpin + Send + 'static>(
                     open_items.retain(|x| x != &k);
                 }
                 Step::RefuseSteers => ctx.refuse_steers = true,
+                Step::AwaitSteer(take) => {
+                    if !ctx.await_steer(take).await {
+                        break 'steps TurnStatus::Interrupted;
+                    }
+                }
+                Step::Dialog(title) => ctx.dialogs.push(title),
                 Step::Trust => {
                     let trusted = ctx.state.lock().project_trusted;
                     let k = key();

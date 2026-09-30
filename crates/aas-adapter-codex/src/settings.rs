@@ -268,6 +268,7 @@ pub fn model_catalog(models: &[WireModel]) -> ModelCatalog {
             description: (!m.description.is_empty()).then(|| m.description.clone()),
             is_default: m.is_default,
             effort_levels: (!efforts.is_empty()).then_some(efforts),
+            permission_modes: None,
         });
     }
     ModelCatalog {

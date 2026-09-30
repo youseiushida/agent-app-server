@@ -69,6 +69,13 @@
 //!   task ends.
 //! * [`SessionControl::stop_background`] only asks: `Ok` means the harness accepted the request.
 //!   The end arrives as a task in a terminal state (or with `Exited`).
+//! * What a running task prints is reported with [`AdapterEvent::BackgroundOutput`], only where
+//!   the harness streams it in explicit fields of its own (a background terminal's output
+//!   deltas, a shell's output snapshots), never read from text written for people. The whole
+//!   output the harness reports at the end goes into [`BackgroundOutcome::output`]; an adapter
+//!   that reads it from a file the harness names reads at most
+//!   [`AdapterPolicy::max_output_file_bytes`] (the end of it) and says how much it left out
+//!   ([`BackgroundOutcome::output_omitted_bytes`]).
 //!
 //! # Requests the engine no longer needs answered
 //!
@@ -218,6 +225,14 @@ pub struct AdapterPolicy {
     /// the rule the engine applies to an agent that exited). Default 5: the last exception and
     /// its cause fit, and a phone can show them.
     pub stderr_excerpt_lines: usize,
+    /// Upper bound of what an adapter reads of a file in which the harness kept a background
+    /// task's output (`policy.max_output_file_bytes`; Claude Code's
+    /// `task_notification.output_file`). A longer file is read from its end (the latest output,
+    /// with the exit line the CLI appends), and the result says how much was left out.
+    /// Default 8 MiB: the whole output of builds and test runs, and hours of a development
+    /// server's log, while a file that grew without bound (a server logging for days) is
+    /// neither held in memory whole nor stored as a blob a phone would download.
+    pub max_output_file_bytes: u64,
 }
 
 impl Default for AdapterPolicy {
@@ -229,6 +244,7 @@ impl Default for AdapterPolicy {
             first_message_title_chars: 80,
             harness_title_chars: 200,
             stderr_excerpt_lines: 5,
+            max_output_file_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -587,6 +603,23 @@ pub struct BackgroundOutcome {
     /// the rest to a blob).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// Bytes at the start of the output that were not read: the harness kept the output in a
+    /// file larger than [`AdapterPolicy::max_output_file_bytes`], and `output` is its end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_omitted_bytes: Option<u64>,
+}
+
+/// More output of a running background task ([`AdapterEvent::BackgroundOutput`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "text", rename_all = "camelCase")]
+pub enum OutputUpdate {
+    /// What the task printed after everything reported before (a harness that streams
+    /// deltas).
+    Append(String),
+    /// Everything the current run printed so far, replacing what was reported before (a
+    /// harness that reports snapshots of the whole output, when a snapshot does not continue
+    /// the previous one).
+    Replace(String),
 }
 
 /// Work the harness runs outside the turn lifecycle, as the adapter knows it (whole state; see
@@ -890,6 +923,15 @@ pub enum AdapterEvent {
     /// work"). Idempotent. Boxed: the state is large next to the other events.
     BackgroundTask {
         task: Box<BackgroundTaskInfo>,
+    },
+    /// Output of the current run of the running background task `key`, as the harness streams
+    /// it explicitly (see the crate docs, "Background work"). The engine keeps the first
+    /// `policy.max_inline_output_bytes` of a run and relays them (`backgroundTask/outputDelta`);
+    /// the whole output comes with the task's end ([`BackgroundOutcome::output`]). Output of a
+    /// task the engine does not know, or that has ended, is ignored.
+    BackgroundOutput {
+        key: String,
+        output: OutputUpdate,
     },
     /// Shown to the user as a notice item.
     Notice {

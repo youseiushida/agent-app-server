@@ -47,6 +47,12 @@ enum class SendBlock {
     /** Nothing to send. */
     Empty,
 
+    /**
+     * The chosen model does not run in the chosen permission mode (`Model.permissionModes`): the
+     * daemon would refuse the thread (`invalidParams`). Choose another mode or model first.
+     */
+    PermissionUnavailable,
+
     /** A `turn/interrupt` for this thread is already waiting for its answer. */
     Interrupting,
 }

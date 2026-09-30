@@ -56,6 +56,16 @@ interface SyncTx {
 
     suspend fun setEpoch(epoch: String)
 
+    /**
+     * The [StoredModels.VERSION][dev.aas.android.protocol.StoredModels.VERSION] of the build that
+     * stored the synced data, `null` when none is recorded (before the first sync, or data stored
+     * by a build that did not record it). The engine trusts stored data only when it is this
+     * build's version; otherwise it reads everything again (docs/android.md 6.1).
+     */
+    suspend fun modelVersion(): Int?
+
+    suspend fun setModelVersion(version: Int)
+
     /** Highest applied sequence number of [stream] (the read position), or `null`. */
     suspend fun cursor(stream: String): Long?
 
@@ -70,7 +80,7 @@ interface SyncTx {
     suspend fun setLastSyncAtMs(atMs: Long)
 
     /**
-     * Deletes all synced data: epoch, cursors, last sync time, harnesses, projects, threads,
+     * Deletes all synced data: epoch, model version, cursors, last sync time, harnesses, projects, threads,
      * turns, items, interactions, background tasks, queued inputs, operations, thread metadata and
      * view states.
      * **Keeps the outbox**: requests the user made are still sent after an epoch change

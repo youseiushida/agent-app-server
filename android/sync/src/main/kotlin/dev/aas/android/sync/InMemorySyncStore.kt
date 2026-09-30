@@ -32,6 +32,7 @@ class InMemorySyncStore : SyncStore {
     /** Everything the store holds (immutable). */
     data class State(
         val epoch: String? = null,
+        val modelVersion: Int? = null,
         val cursors: Map<String, Long> = emptyMap(),
         val lastSyncAtMs: Long? = null,
         val harnesses: Map<String, Harness> = emptyMap(),
@@ -95,6 +96,10 @@ class InMemorySyncStore : SyncStore {
         override suspend fun epoch() = read { s.epoch }
 
         override suspend fun setEpoch(epoch: String) = write { it.copy(epoch = epoch) }
+
+        override suspend fun modelVersion() = read { s.modelVersion }
+
+        override suspend fun setModelVersion(version: Int) = write { it.copy(modelVersion = version) }
 
         override suspend fun cursor(stream: String) = read { s.cursors[stream] }
 

@@ -202,7 +202,14 @@ pub enum Ev {
     Withdraw {
         request_id: String,
     },
-    /// A steered message the running turn did not take (`@refuse-steers`).
+    /// Answers every `steer`: taken into the running turn (which takes it in, or returns it
+    /// with `steerReturned` before its completion), or refused because no turn runs any more
+    /// (the turn completed before the steer arrived).
+    SteerAck {
+        accepted: bool,
+    },
+    /// A steered message the running turn did not take (`@refuse-steers`, or one still unread
+    /// when the turn ended), reported before the turn's completion.
     SteerReturned {
         message_id: String,
     },
@@ -224,6 +231,15 @@ pub enum Ev {
     /// The whole state of one background task.
     Background {
         task: BackgroundTaskInfo,
+    },
+    /// Output of the current run of background task `key`: appended to what came before, or
+    /// (`replace`) the whole output so far (`@bg … snapshots`, like a harness that reports
+    /// snapshots).
+    BackgroundOutput {
+        key: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replace: bool,
     },
     /// The answer to `query` `id`.
     QueryResult {

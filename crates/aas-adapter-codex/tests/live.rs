@@ -20,9 +20,9 @@ use aas_adapter_codex::CodexAdapter;
 use aas_harness::protocol::{BackgroundTaskKind, HarnessKind, ItemBody, ItemStatus};
 use aas_harness::{
     AdapterContext, AdapterError, AdapterEvent, AdapterPolicy, BackgroundState, BackgroundTaskInfo,
-    CommandContext, ForkPoint, HarnessAdapter, HarnessConfig, SessionControl, SessionHandle,
-    StartMode, StartOptions, StartRequest, ThreadId, ThreadModes, ThreadSettings, TurnInput,
-    TurnStatus,
+    CommandContext, ForkPoint, HarnessAdapter, HarnessConfig, OutputUpdate, SessionControl,
+    SessionHandle, StartMode, StartOptions, StartRequest, ThreadId, ThreadModes, ThreadSettings,
+    TurnInput, TurnStatus,
 };
 use aas_supervisor::{StopReason, Supervisor, SupervisorPolicy};
 use mock_model::{
@@ -334,6 +334,31 @@ async fn live_codex_background_work() {
             .as_deref()
             .is_some_and(|o| o.contains("SHORT_DONE")),
         "{result:?}"
+    );
+    // While it ran after its turn, Codex streamed its output (`outputDelta` of the backgrounded
+    // terminal), reported as appended output of the task.
+    let turn_end = ev
+        .seen
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::TurnCompleted { .. }))
+        .expect("the terminals' turn ended");
+    let streamed: String = ev.seen[turn_end..]
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::BackgroundOutput { key, output } if key == "mock_TERM_1" => {
+                match output {
+                    OutputUpdate::Append(text) => Some(text.as_str()),
+                    OutputUpdate::Replace(text) => {
+                        panic!("Codex streams deltas, not snapshots: {text:?}")
+                    }
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        streamed.contains("TICK_S 20"),
+        "streamed after the turn: {streamed:?}"
     );
 
     // 2. A sub-agent runs after the parent's turn.

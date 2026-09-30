@@ -45,6 +45,15 @@ class FixturesTest {
 
     private fun methodName(file: File): String = file.nameWithoutExtension.replaceFirst('_', '/')
 
+    /**
+     * A request fixture is named `<method>.json`, or `<method>_<variant>.json` for another shape
+     * of the method's params (`aas_protocol::examples::request_variants`). Method names have one
+     * `/` and no `_`.
+     */
+    private fun requestMethodName(file: File): String = file.nameWithoutExtension.split('_', limit = 3).take(2).joinToString("/")
+
+    private fun isRequestVariant(file: File): Boolean = file.nameWithoutExtension.split('_', limit = 3).size == 3
+
     @Test
     fun theFixtureTreeHasExactlyTheKnownCategories() {
         val dirs = root.listFiles()!!.map { it.name }.toSet()
@@ -55,11 +64,13 @@ class FixturesTest {
     @Test
     fun requests() {
         val names = mutableSetOf<String>()
+        val variants = mutableSetOf<String>()
         for (file in files("requests")) {
             val msg = roundTrip(RpcMessage.serializer(), read(file), file.name)
             assertEquals(RpcMessage.Kind.Request, msg.kind, file.name)
             val method = assertNotNull(Methods.byName(msg.method!!), "${file.name}: unknown method ${msg.method}")
-            assertEquals(methodName(file), method.name)
+            assertEquals(requestMethodName(file), method.name, file.name)
+            if (isRequestVariant(file)) variants += file.name
             roundTrip(method.params, msg.params!!, "${file.name} params")
             if (method.mutating) {
                 assertTrue((msg.params as JsonObject).containsKey("clientRequestId"), "${file.name}: mutating without clientRequestId")
@@ -69,6 +80,24 @@ class FixturesTest {
             names += method.name
         }
         assertEquals(Methods.all.map { it.name }.toSet(), names, "every method has a request fixture")
+        assertEquals(REQUEST_VARIANTS, variants, "the request variants, each checked by a test of its own below")
+    }
+
+    /**
+     * `thread/create` in another thread's workspace (protocol.md §4): what 「新しいスレッドで実装」
+     * sends for a plan of a worktree thread. The daemon's fixture decodes into the shape the app
+     * builds, and the app writes it back the same way.
+     */
+    @Test
+    fun aThreadIsCreatedInAnotherThreadsWorkspace() {
+        val file = File(root, "requests/thread_create_workspaceThread.json")
+        val msg = AasJson.decodeFromJsonElement(RpcMessage.serializer(), read(file))
+        val params = roundTrip(Methods.ThreadCreate.params, msg.params!!, file.name)
+        assertEquals(WorkspaceSpec.Thread("thr_01K6A0000000000000000THR02"), params.workspace)
+        assertEquals(
+            AasJson.parseToJsonElement("""{"kind":"thread","threadId":"thr_01K6A0000000000000000THR02"}"""),
+            (msg.params as JsonObject)["workspace"],
+        )
     }
 
     @Test
@@ -174,6 +203,9 @@ class FixturesTest {
 
     companion object {
         private val CATEGORIES = setOf("requests", "responses", "errors", "events", "notifications", "http")
+
+        /** The request fixtures of another shape of a method's params (`requests/<method>_<variant>.json`). */
+        private val REQUEST_VARIANTS = setOf("thread_create_workspaceThread.json")
 
         /** The `data` fields of errors the client reads, with their typed accessors. */
         private val ERROR_DETAILS: Map<String, (RpcError) -> String?> = mapOf(

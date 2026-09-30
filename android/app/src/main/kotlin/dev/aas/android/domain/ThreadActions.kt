@@ -11,6 +11,7 @@ import dev.aas.android.protocol.Thread
 import dev.aas.android.protocol.Turn
 import dev.aas.android.protocol.TurnStatus
 import dev.aas.android.protocol.Workspace
+import dev.aas.android.protocol.WorkspaceSpec
 
 /** 「ここから分岐」 and 「このプロンプトを編集」 of a turn. */
 data class ForkChoices(val here: Boolean, val editPrompt: Boolean) {
@@ -94,9 +95,8 @@ object ThreadActions {
     /**
      * The choices of a proposed plan ([Item.ProposedPlan], `features.planMode`): on the latest
      * turn's completed plan once that turn ended. 「実装する」 with the harness's own text
-     * (`implementPrompt`); 「新しいスレッドで実装」 with its preamble (`newThreadPreamble`) for a
-     * thread in the project's folder (`thread/create` makes a new worktree or uses the folder, so
-     * a thread in a worktree cannot continue there).
+     * (`implementPrompt`); 「新しいスレッドで実装」 with its preamble (`newThreadPreamble`), in the
+     * thread's own working tree ([newThreadWorkspace]).
      */
     fun proposedPlan(thread: Thread?, harness: Harness?, item: Item.ProposedPlan): PlanChoices {
         val feature = harness?.features?.planMode ?: return PlanChoices.None
@@ -105,9 +105,18 @@ object ThreadActions {
         if (lastTurn.id != item.turnId || lastTurn.status == TurnStatus.Running || item.status != ItemStatus.Completed) return PlanChoices.None
         return PlanChoices(
             implement = feature.implementPrompt != null,
-            newThread = feature.newThreadPreamble != null && thread.workspace is Workspace.Local,
+            newThread = feature.newThreadPreamble != null,
         )
     }
+
+    /**
+     * Where the new thread implementing [thread]'s plan works: where [thread] works, since the plan
+     * was written about that working tree. The project's folder for a thread there (`local`, which
+     * every daemon takes); otherwise the thread's own workspace (`thread`: its worktree, shared
+     * like a fork's; protocol.md §4 `thread/create`).
+     */
+    fun newThreadWorkspace(thread: Thread): WorkspaceSpec =
+        if (thread.workspace is Workspace.Local) WorkspaceSpec.Local else WorkspaceSpec.Thread(thread.id)
 
     /** 裏に回す applies: the harness said this running item can move now, and it offers the move. */
     fun canMoveToBackground(harness: Harness?, item: Item): Boolean =

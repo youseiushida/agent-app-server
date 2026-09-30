@@ -110,7 +110,15 @@ data class Model(
     val displayName: String,
     val description: String? = null,
     val isDefault: Boolean = false,
+    /** Effort level ids this model accepts; absent: all of [Harness.effortLevels]. */
     val effortLevels: List<String>? = null,
+    /**
+     * Permission mode ids ([Harness.permissionModes]) this model can run in, when the harness says
+     * it cannot run in all of them (Claude Code offers auto mode only for models with
+     * `supportsAutoMode`); absent: all of the harness's modes. The daemon refuses a thread whose
+     * model and permission mode do not fit (`invalidParams`, protocol.md §3.1).
+     */
+    val permissionModes: List<String>? = null,
 )
 
 @Serializable
@@ -250,18 +258,28 @@ sealed interface WorkspaceSpec {
     @Serializable
     data class Worktree(val baseRef: String? = null, val branch: String? = null) : WorkspaceSpec
 
+    /**
+     * Where thread [threadId] of the same project works: its worktree (shared, like a fork of
+     * it) or the project's folder. A new conversation about the same working tree, e.g. a
+     * worktree thread's proposed plan implemented in a new thread (protocol.md §4 `thread/create`).
+     */
+    @Serializable
+    data class Thread(val threadId: ThreadId) : WorkspaceSpec
+
     data class Unknown(val kind: String, val raw: JsonObject) : WorkspaceSpec
 
     object Serializer : TaggedUnionSerializer<WorkspaceSpec>("WorkspaceSpec", "kind") {
         override fun tagOf(value: WorkspaceSpec) = when (value) {
             Local -> "local"
             is Worktree -> "worktree"
+            is Thread -> "thread"
             is Unknown -> null
         }
 
         override fun serializerFor(tag: String): KSerializer<out WorkspaceSpec>? = when (tag) {
             "local" -> Local.serializer()
             "worktree" -> Worktree.serializer()
+            "thread" -> Thread.serializer()
             else -> null
         }
 
@@ -440,6 +458,18 @@ data class BackgroundTask(
     val stopUnconfirmedAt: Millis? = null,
     /** When the harness says it runs next (scheduled wakeups). */
     val nextRunAt: Millis? = null,
+    /**
+     * What the current run printed so far, as the harness streams it explicitly (a background
+     * shell's output): at most the daemon's inline limit, extended by
+     * `backgroundTask/outputDelta` ([Event.BackgroundTaskOutputDelta]). Absent while nothing was
+     * streamed, and once the run ended with the whole output in [result] (which supersedes it).
+     */
+    val output: String? = null,
+    /**
+     * [output] reached the daemon's inline limit: the rest of the run is not streamed (the whole
+     * output comes with the end, in [result], when the harness reports it).
+     */
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val outputTruncated: Boolean = false,
 )
 
 /** Progress a harness reports for a running task; every value is the harness's own. */
@@ -475,6 +505,12 @@ data class BackgroundResult(
     val output: String? = null,
     val outputTruncated: Boolean = false,
     val outputBlobId: BlobId? = null,
+    /**
+     * Bytes at the start of the output that were not read: the harness kept the output in a
+     * file larger than the daemon's `max_output_file_bytes`, and its end was read ([output] and
+     * [outputBlobId] hold that end).
+     */
+    val outputOmittedBytes: Long? = null,
 )
 
 /** What a task used, as the harness reports it. */

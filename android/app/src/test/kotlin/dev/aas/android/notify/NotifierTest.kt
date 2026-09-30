@@ -98,7 +98,7 @@ class NotifierTest {
         assertEquals(ConnectionService.ACTION_RECONNECT, pending.savedIntent.action)
         assertEquals(ConnectionService::class.java.name, pending.savedIntent.component?.className)
         // Tapping the notification opens the app (which reconnects when it comes to the foreground).
-        assertTrue(shadowOf(posted.notification.contentIntent).isActivityIntent)
+        assertTrue(shadowOf(posted.notification.contentIntent).isActivity)
 
         container.notifier.cancelConnectedElsewhere()
         assertNull(active(Notifier.TAG_CONNECTED_ELSEWHERE))

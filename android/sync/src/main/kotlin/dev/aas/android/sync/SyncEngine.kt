@@ -7,6 +7,7 @@ import dev.aas.android.protocol.ClientInfo
 import dev.aas.android.protocol.CommandAction
 import dev.aas.android.protocol.Empty
 import dev.aas.android.protocol.ErrorKind
+import dev.aas.android.protocol.Event
 import dev.aas.android.protocol.Harness
 import dev.aas.android.protocol.HarnessRefreshParams
 import dev.aas.android.protocol.InitializeParams
@@ -19,6 +20,7 @@ import dev.aas.android.protocol.RpcException
 import dev.aas.android.protocol.RpcMessage
 import dev.aas.android.protocol.RpcMethod
 import dev.aas.android.protocol.ServerNotification
+import dev.aas.android.protocol.StoredModels
 import dev.aas.android.protocol.StreamBatch
 import dev.aas.android.protocol.SubscribeParams
 import dev.aas.android.protocol.SubscribeResult
@@ -75,10 +77,13 @@ import kotlin.random.Random
  *    never apply twice. A merged delta (`seqFrom..seq`) is applied as one event; one that
  *    overlaps the cursor cannot be split, so the thread is read again. A batch without events
  *    moves the cursor to its `head` (the events up to it were removed by retention).
- * 2. **Initial sync.** `initialize`; on the first run or `epochChanged`: wipe (the outbox
- *    stays), `workspace/snapshot`, subscribe from its head. Otherwise the workspace and every
- *    open thread are resubscribed from their stored cursors. Open threads without a cursor
- *    are loaded with `thread/read` and subscribed after its head. A thread that cannot be
+ * 2. **Initial sync.** `initialize`; on the first run, `epochChanged`, or stored data of
+ *    another [StoredModels.VERSION] (written by another build of the app, which kept only the
+ *    fields its classes knew): wipe (the outbox stays), `workspace/snapshot`, subscribe from its
+ *    head. Otherwise the workspace and every open thread are resubscribed from their stored
+ *    cursors, and once the session is established `harness/list` reads the daemon's harnesses
+ *    as they are now without holding anything up ([refreshHarnessList]). Open threads without a
+ *    cursor are loaded with `thread/read` and subscribed after its head. A thread that cannot be
  *    loaded fails alone ([ThreadSync.Failed]); only the workspace and the connection itself
  *    can fail the setup.
  * 3. **Outbox.** Mutations are committed to the store before their frame is sent, sent after
@@ -836,6 +841,20 @@ class SyncEngine(
         /** Stall bookkeeping (reader coroutine only): stream → cursor and since when. */
         val stallMarks = HashMap<String, StallMark>()
 
+        /**
+         * Workspace snapshots committed on this connection ([fullResync]). Changed only under
+         * [writeLock], in the write that commits the snapshot.
+         */
+        @Volatile
+        var workspaceSnapshots = 0
+
+        /**
+         * Harness id → `seq` of the last `harness/updated` this connection applied. Written under
+         * [writeLock] in the write that applies it, so a write that reads it sees exactly what is
+         * committed ([refreshHarnessList]).
+         */
+        val harnessEventSeqs: MutableMap<String, Long> = ConcurrentHashMap()
+
         private var watchdogJob: Job? = null
 
         /** The watchdog runs (the socket opened); before that the connect timeout bounds the session. */
@@ -1021,7 +1040,7 @@ class SyncEngine(
 
     private suspend fun setup(s: Session) {
         try {
-            val lastEpoch = store.transaction { it.epoch() }
+            val (lastEpoch, storedModels) = store.transaction { it.epoch() to it.modelVersion() }
             val init = try {
                 call(s, Methods.Initialize, InitializeParams(PROTOCOL_VERSION, clientInfo, lastEpoch))
             } catch (e: RpcException) {
@@ -1041,11 +1060,27 @@ class SyncEngine(
             s.startWatchdog()
             s.rpc.maxClientFrameBytes = init.policy.maxClientFrameBytes
             _status.update { it.copy(server = init.server, deviceId = init.device.id, policy = init.policy) }
-            followLock.withLock {
+            // The workspace head the resubscription reported, when the setup resumed from the
+            // stored cursors (a snapshot carries the harness list itself).
+            val resumedAt = followLock.withLock {
                 val workspaceCursor = store.transaction { it.cursor(WORKSPACE_STREAM) }
-                val fresh = lastEpoch == null || workspaceCursor == null || init.epochChanged || lastEpoch != init.server.epoch
-                if (fresh) fullResync(s) else resume(s, workspaceCursor)
+                val sameEpoch = lastEpoch != null && lastEpoch == init.server.epoch && !init.epochChanged
+                val resumed = when {
+                    !sameEpoch || workspaceCursor == null -> {
+                        fullResync(s)
+                        null
+                    }
+                    storedModels != StoredModels.VERSION -> {
+                        // Written by another build: what its classes did not know was not stored
+                        // (docs/android.md 6.1). The same server data again, so unread marks stay.
+                        log(SyncLogger.Level.Info, "the stored data has model version $storedModels, this build ${StoredModels.VERSION}: reading everything again")
+                        fullResync(s, keepViewStates = true)
+                        null
+                    }
+                    else -> resume(s, workspaceCursor)
+                }
                 s.established = true
+                resumed
             }
             val now = clock.nowMs()
             write { tx, _ -> tx.setLastSyncAtMs(now) }
@@ -1063,6 +1098,10 @@ class SyncEngine(
             }
             log(SyncLogger.Level.Info, "session established (epoch ${init.server.epoch})")
             s.scope.launch { runOutbox(s) }
+            // After the session is established, never on its way: the daemon answers
+            // `harness/list` only once its first harness probes finished (up to its handshake
+            // timeout after it started), and nothing of the session waits for that.
+            if (resumedAt != null) s.scope.launch { guarded(s) { refreshHarnessList(s, resumedAt) } }
         } catch (e: CancellationException) {
             throw e
         } catch (e: ConnectionLostException) {
@@ -1074,13 +1113,20 @@ class SyncEngine(
         }
     }
 
-    /** Wipe + snapshot + subscribe from its head, then every open thread (protocol.md §2, step 2). */
-    private suspend fun fullResync(s: Session) {
+    /**
+     * Wipe + snapshot + subscribe from its head, then every open thread (protocol.md §2, step 2).
+     * [keepViewStates]: the snapshot is of the server data the store already mirrored (only this
+     * build's reading of it changed), so the threads' unread marks are kept.
+     */
+    private suspend fun fullResync(s: Session, keepViewStates: Boolean = false) {
         val epoch = s.init!!.server.epoch
         log(SyncLogger.Level.Info, "full resync (epoch $epoch)")
         s.suspendedStreams += WORKSPACE_STREAM
         val snapshot = call(s, Methods.WorkspaceSnapshot, Empty)
-        write { tx, signals -> EventApplier.applySnapshot(tx, epoch, snapshot, signals) }
+        write { tx, signals ->
+            EventApplier.applySnapshot(tx, epoch, snapshot, signals, keepViewStates)
+            s.workspaceSnapshots++
+        }
         s.suspendedStreams -= WORKSPACE_STREAM
         s.liveThreads.clear()
         val result = subscribe(s, listOf(Subscription(WORKSPACE_STREAM, snapshot.head)))
@@ -1090,8 +1136,13 @@ class SyncEngine(
         for (threadId in openCounts.keys.toList()) loadThread(s, threadId)
     }
 
-    /** Resubscribes the workspace and the open threads from their cursors (protocol.md §2, step 3). */
-    private suspend fun resume(s: Session, workspaceCursor: Long) {
+    /**
+     * Resubscribes the workspace and the open threads from their cursors (protocol.md §2, step 3).
+     *
+     * @return the workspace's head the subscription reported, or `null` when the workspace had to
+     *   be read again ([fullResync]) instead.
+     */
+    private suspend fun resume(s: Session, workspaceCursor: Long): Long? {
         val cursors = store.transaction { it.cursors() }
         val subscriptions = mutableListOf(Subscription(WORKSPACE_STREAM, workspaceCursor))
         val needRead = mutableListOf<ThreadId>()
@@ -1101,6 +1152,9 @@ class SyncEngine(
         }
         val requested = subscriptions.associate { it.stream to it.after }
         val result = subscribe(s, subscriptions)
+        val workspaceHead = checkNotNull(result.subscriptions.firstOrNull { it.stream == WORKSPACE_STREAM }) {
+            "the server did not answer for the workspace subscription: ${result.subscriptions}"
+        }.head
         for (st in result.subscriptions) {
             s.subscribedHeads[st.stream] = st.head
             val after = requested[st.stream] ?: continue
@@ -1110,7 +1164,7 @@ class SyncEngine(
                 if (st.status != SubscriptionState.Ok || st.head < after) {
                     log(SyncLogger.Level.Warn, "workspace head ${st.head} is behind the cursor $after (${st.status}): resyncing")
                     fullResync(s)
-                    return
+                    return null
                 }
                 continue
             }
@@ -1125,6 +1179,76 @@ class SyncEngine(
             }
         }
         for (threadId in needRead) loadThread(s, threadId)
+        return workspaceHead
+    }
+
+    /**
+     * `harness/list` on a resumed connection, once it is established: the stored harnesses are
+     * replaced with the daemon's as they are now (a daemon updated or reconfigured while this
+     * device was away may list other harnesses, features or models). A snapshot (full resync)
+     * carries the list itself, so this runs only after a resumption.
+     *
+     * The session never waits for it: the daemon answers `harness/list` only once its first
+     * harness probes finished, which right after the daemon started takes as long as the slowest
+     * CLI's handshake (up to the daemon's `handshake_timeout`). Meanwhile the session is online,
+     * threads load and the outbox is sent.
+     *
+     * The workspace stream stays the source of order (the daemon publishes every change of a
+     * harness as `harness/updated`, so a harness's last event is its state), and the list is
+     * fitted into it without ever replacing a newer state with an older one:
+     * 1. The request waits until the catch-up reached [subscribedHead] (the workspace's head when
+     *    this connection subscribed), so no event older than the list arrives after it (such an
+     *    event would, e.g., bring back a harness the daemon no longer has).
+     * 2. It is sent at the cursor `c` of that moment. The daemon reads its harnesses after it got
+     *    the request, so the list includes every event up to `c`. For a harness whose
+     *    `harness/updated` with a `seq` above `c` was applied by the time the answer is written,
+     *    the stored state is kept: the list may be older than that event, and anything later
+     *    comes as an event too. Harnesses the list does not have are removed, except those.
+     * 3. A snapshot committed on this connection meanwhile (a workspace overlap) makes the list
+     *    moot: the snapshot is at least as new, and the events before its head are not delivered
+     *    again. Then nothing is written.
+     *
+     * A refusal, no answer in time or an unreadable answer is reported ([SyncStatus.lastError])
+     * and the stored list stays: the session does not depend on it. A lost connection ends it
+     * with the session.
+     */
+    private suspend fun refreshHarnessList(s: Session, subscribedHead: Long) {
+        val snapshots = s.workspaceSnapshots
+        // Every write that moves a cursor or commits a snapshot updates the status.
+        status.first { s.workspaceSnapshots != snapshots || (views.cursors[WORKSPACE_STREAM] ?: -1) >= subscribedHead }
+        if (s.workspaceSnapshots != snapshots) return
+        // No cursor only when the local data was forgotten meanwhile (unpairing): nothing to fit.
+        val requestedAt = views.cursors[WORKSPACE_STREAM] ?: return
+        val harnesses = try {
+            call(s, Methods.HarnessList, Empty).harnesses
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: ConnectionLostException) {
+            throw e
+        } catch (e: RpcException) {
+            reportError("harness/list failed: ${e.kind.wire}: ${e.error.message}", e)
+            return
+        } catch (e: CallTimeoutException) {
+            reportError("harness/list was not answered: ${e.message}", e)
+            return
+        } catch (e: IllegalArgumentException) {
+            // SerializationException is one: an answer of another shape than protocol.md's.
+            reportError("harness/list answered with an unreadable list: ${e.message}", e)
+            return
+        }
+        write { tx, _ ->
+            if (s.workspaceSnapshots != snapshots) {
+                log(SyncLogger.Level.Info, "harness/list not applied: the workspace was read again meanwhile")
+                return@write
+            }
+            val stored = tx.harnesses()
+            val newer = stored.filter { (s.harnessEventSeqs[it.id] ?: Long.MIN_VALUE) > requestedAt }.associateBy { it.id }
+            val listed = harnesses.map { it.id }.toSet()
+            val merged = harnesses.map { newer[it.id] ?: it } + newer.values.filter { it.id !in listed }
+            if (merged == stored) return@write
+            log(SyncLogger.Level.Info, "the daemon's harnesses are not the stored ones: ${merged.map { it.id }} (kept from newer events: ${newer.keys})")
+            tx.replaceHarnesses(merged)
+        }
     }
 
     /**
@@ -1266,6 +1390,10 @@ class SyncEngine(
             // An empty batch moves the cursor to the head (protocol.md §2.1): see EventApplier.
             val o = EventApplier.applyBatch(tx, batch, signals, ::warnData, liveAfter = s.subscribedHeads[batch.stream])
             if (o.cursorMoved) tx.setLastSyncAtMs(now)
+            for (env in o.applied) {
+                val e = env.event
+                if (e is Event.HarnessUpdated) s.harnessEventSeqs[e.harness.id] = env.seq
+            }
             o
         }
         val overlap = outcome.overlapAtSeq ?: return
@@ -1408,10 +1536,12 @@ class SyncEngine(
                 if (exclusive != null) break
                 val large = largeCache.getOrPut(entry.clientRequestId) { isLarge(s, entry) }
                 if (large && inFlight.isNotEmpty()) break
-                inFlight[entry.clientRequestId] = s.scope.launch {
-                    guarded(s) { sendEntry(s, entry) }
-                    outboxKick.trySend(Unit)
-                }
+                // The next pass is kicked once the send's job is complete, never from inside it: a
+                // pass that ran between such a kick and the job's completion would still count the
+                // entry in flight, find no retry to wait for, and sleep until an unrelated kick.
+                val job = s.scope.launch { guarded(s) { sendEntry(s, entry) } }
+                job.invokeOnCompletion { outboxKick.trySend(Unit) }
+                inFlight[entry.clientRequestId] = job
                 if (large) {
                     exclusive = entry.clientRequestId
                     s.largeInFlight = entry

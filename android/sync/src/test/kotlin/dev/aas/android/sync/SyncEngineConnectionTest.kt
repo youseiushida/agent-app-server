@@ -4,6 +4,8 @@ import dev.aas.android.protocol.ErrorKind
 import dev.aas.android.protocol.Event
 import dev.aas.android.protocol.WORKSPACE_STREAM
 import dev.aas.android.protocol.WorkspaceSnapshotResult
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
@@ -65,9 +67,15 @@ class SyncEngineConnectionTest {
         private fun unsupported(): Nothing = throw UnsupportedOperationException("OkHttp creates unconnected sockets")
     }
 
+    /**
+     * Every connection state from now on, in order. The collector is subscribed before this
+     * returns (undispatched) and runs in the thread that changes the status (unconfined), so no
+     * state is missed: neither those before a dispatched collector would have started, nor
+     * short-lived ones a busy collector would see replaced (a state flow keeps the latest only).
+     */
     private fun EngineFixture.recordStates(): CopyOnWriteArrayList<ConnectionState> {
         val states = CopyOnWriteArrayList<ConnectionState>()
-        scope.launch { engine.status.collect { states += it.connection } }
+        scope.launch(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) { engine.status.collect { states += it.connection } }
         return states
     }
 

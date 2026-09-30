@@ -1616,6 +1616,7 @@ impl Engine {
                 .permission_mode
                 .or(info.default_permission_mode.clone()),
         };
+        actor::validate_model_permission_mode(&info, &settings)?;
         let thread_id = ThreadId::generate();
         let input = p.input.filter(|i| !i.is_empty());
         if let Some(input) = &input {
@@ -1640,6 +1641,31 @@ impl Engine {
         let mut created_worktree = None;
         let (cwd, workspace) = match p.workspace.clone().unwrap_or_default() {
             WorkspaceSpec::Local => (project.path.clone(), Workspace::Local),
+            WorkspaceSpec::Thread { thread_id: source } => {
+                // Another thread's workspace, shared the way a fork shares it (design.md §10.2):
+                // a thread of the same project, whose worktree still exists.
+                let id = source.clone();
+                let other = self
+                    .sh
+                    .db
+                    .read(move |tx| store::get_thread(tx, &id))
+                    .await?
+                    .filter(|r| !r.removed)
+                    .ok_or_else(|| not_found("thread", &source))?;
+                if other.project_id != project.id {
+                    return Err(invalid_params(format!(
+                        "thread {source} belongs to another project"
+                    )));
+                }
+                if let Workspace::Worktree { path, .. } = &other.workspace
+                    && !Path::new(path).exists()
+                {
+                    return Err(invalid_state(format!(
+                        "the worktree of thread {source} was removed"
+                    )));
+                }
+                (other.cwd, other.workspace)
+            }
             WorkspaceSpec::Worktree { base_ref, branch } => {
                 let git = self
                     .sh

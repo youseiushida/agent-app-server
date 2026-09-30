@@ -6,14 +6,16 @@
 //! ```text
 //! aas-test-server --state-dir <dir> [--heartbeat-ms 300] [--client-timeout-ms 1500]
 //!                 [--idle-process-ttl-ms <ms>] [--background-progress-ms <ms>]
-//!                 [--background-stop-confirm-ms <ms>]
+//!                 [--background-stop-confirm-ms <ms>] [--max-inline-output-bytes <n>]
 //! ```
 //!
-//! The last three set the daemon's `policy.idle_process_ttl`, `background_progress_interval` and
-//! `background_stop_confirm_timeout` (defaults: the daemon's), so that a client test can see an
-//! idle agent stopped, coalesced progress, and an unconfirmed stop within its patience. The
-//! fake agent's background work (`@bg`, see `aas_adapter_fake::agent`) runs in the prompts
-//! like every other scenario.
+//! The last four set the daemon's `policy.idle_process_ttl`, `background_progress_interval`,
+//! `background_stop_confirm_timeout` and `max_inline_output_bytes` (defaults: the daemon's), so
+//! that a client test can see an idle agent stopped, coalesced progress, an unconfirmed stop,
+//! and output cut at the inline limit (its whole in a blob) within its patience. The fake
+//! agent's background work (`@bg`, with streamed output `output=`; wakeups `@wakeup`; questions
+//! outside turns `@dialog`, see `aas_adapter_fake::agent`) runs in the prompts like every other
+//! scenario.
 //!
 //! Output (stdout, one JSON object per line, flushed):
 //! * `{"event":"ready","wsUrl":…,"httpUrl":…,"token":…,"deviceId":…,"pairingCode":…,"root":…,"epoch":…,
@@ -61,8 +63,9 @@
 //! background, plan mode with proposed plans, fast mode with `fake-fast`, the project trust
 //! decision) and a session-switching command with an alias (`/fake-clear`, `/fake-reset`). The
 //! scenarios that exercise them (`@switch-session`, `@permission`, `@effort`, `@plan-mode`,
-//! `@proposed-plan`, `@fast-state`, `@rename`, `@editor`, `@tool`, `@refuse-steers`, `@trust`,
-//! `@stderr`) are in the directive table of `aas_adapter_fake::agent`.
+//! `@proposed-plan`, `@fast-state`, `@rename`, `@editor`, `@tool`, `@refuse-steers`,
+//! `@await-steer`, `@trust`, `@stderr`) are in the directive table of `aas_adapter_fake::agent`.
+//! The model `fake-lite` runs in the permission mode `ask` only (`Model.permissionModes`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -121,6 +124,7 @@ struct Args {
     idle_process_ttl: Option<Duration>,
     background_progress_interval: Option<Duration>,
     background_stop_confirm_timeout: Option<Duration>,
+    max_inline_output_bytes: Option<usize>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -130,6 +134,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut idle_process_ttl = None;
     let mut background_progress_interval = None;
     let mut background_stop_confirm_timeout = None;
+    let mut max_inline_output_bytes = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().with_context(|| format!("{name} needs a value"));
@@ -146,6 +151,13 @@ fn parse_args() -> anyhow::Result<Args> {
             }
             "--background-stop-confirm-ms" => {
                 background_stop_confirm_timeout = millis("--background-stop-confirm-ms")?
+            }
+            "--max-inline-output-bytes" => {
+                max_inline_output_bytes = Some(
+                    value("--max-inline-output-bytes")?
+                        .parse()
+                        .context("--max-inline-output-bytes must be a number")?,
+                )
             }
             "--state-dir" => state_dir = Some(PathBuf::from(value("--state-dir")?)),
             "--heartbeat-ms" => {
@@ -173,6 +185,7 @@ fn parse_args() -> anyhow::Result<Args> {
         idle_process_ttl,
         background_progress_interval,
         background_stop_confirm_timeout,
+        max_inline_output_bytes,
     })
 }
 
@@ -269,6 +282,9 @@ impl TestServer {
             background_stop_confirm_timeout: args
                 .background_stop_confirm_timeout
                 .unwrap_or(defaults.background_stop_confirm_timeout),
+            max_inline_output_bytes: args
+                .max_inline_output_bytes
+                .unwrap_or(defaults.max_inline_output_bytes),
             ..defaults.clone()
         };
         policy.validate().map_err(anyhow::Error::msg)?;

@@ -151,24 +151,30 @@ class TimelineTest {
     @Test
     fun theBackgroundSectionIsOpenWhileWorkRunsWithEndedTasksFolded() {
         val tasks = read.backgroundTasks
-        val running = tasks.single { it.status == BackgroundTaskStatus.Running }
+        // The agent and the dev server run (started together: by id), the build and the workflow ended.
+        val running = tasks.filter { it.status == BackgroundTaskStatus.Running }.sortedBy { it.id }
+        assertEquals(2, running.size)
         val rows = Timeline.backgroundRows(tasks, emptyMap())
         assertEquals(
             listOf(
-                TimelineRow.BackgroundHeader(running = 1, ambient = 0, ended = 2, expanded = true),
-                TimelineRow.BackgroundTaskRow(running, 0, null),
+                TimelineRow.BackgroundHeader(running = 2, ambient = 0, ended = 2, expanded = true),
+                TimelineRow.BackgroundTaskRow(running[0], 0, null),
+                TimelineRow.BackgroundTaskRow(running[1], 0, null),
                 TimelineRow.BackgroundEndedHeader(2, expanded = false),
             ),
             rows,
         )
         // Ended tasks open in the order they ended (the latest nearest the composer), with their parent named.
         val open = Timeline.backgroundRows(tasks, mapOf(Timeline.BACKGROUND_ENDED to true)).filterIsInstance<TimelineRow.BackgroundTaskRow>()
-        assertEquals(listOf("bgt_01K6A00000000000000000BG01", "bgt_01K6A00000000000000000BG03", "bgt_01K6A00000000000000000BG02"), open.map { it.task.id })
-        assertEquals("Review the reconnect logic", open[1].parentTitle)
+        assertEquals(
+            listOf("bgt_01K6A00000000000000000BG01", "bgt_01K6A00000000000000000BG04", "bgt_01K6A00000000000000000BG03", "bgt_01K6A00000000000000000BG02"),
+            open.map { it.task.id },
+        )
+        assertEquals("Review the reconnect logic", open[2].parentTitle)
         // Folded by the user: the header alone; nothing runs: folded by default.
         assertEquals(1, Timeline.backgroundRows(tasks, mapOf(Timeline.BACKGROUND_SECTION to false)).size)
         val ended = tasks.map { it.copy(status = BackgroundTaskStatus.Completed) }
-        assertEquals(listOf(TimelineRow.BackgroundHeader(0, 0, 3, expanded = false)), Timeline.backgroundRows(ended, emptyMap()))
+        assertEquals(listOf(TimelineRow.BackgroundHeader(0, 0, 4, expanded = false)), Timeline.backgroundRows(ended, emptyMap()))
         assertEquals(emptyList(), Timeline.backgroundRows(emptyList(), emptyMap()))
         assertTrue(rows.map { it.key }.toSet().size == rows.size)
     }

@@ -272,6 +272,39 @@ pub async fn http_post(addr: SocketAddr, path: &str, body: &[u8]) -> (u16, Vec<u
     (status, body)
 }
 
+/// Minimal HTTP/1.1 GET with a device token (one request per connection).
+pub async fn http_get(addr: SocketAddr, path: &str, token: &str) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read response");
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("header end");
+    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .expect("status")
+        .parse()
+        .expect("status code");
+    let mut body = buf[split + 4..].to_vec();
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        body = dechunk(&body);
+    }
+    (status, body)
+}
+
 fn dechunk(mut raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     loop {

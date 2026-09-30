@@ -1,7 +1,8 @@
 //! Retention: what is deleted, when, and how the space comes back (design.md §6.1).
 //!
 //! * Event log: deltas of completed items (`delta_retention`), events a later event of the
-//!   same entity carries in full (`superseded_event_retention`), `native` and
+//!   same entity carries in full, a background task's output deltas among them
+//!   (`superseded_event_retention`), `native` and
 //!   `composer/insert` events (`native_event_retention`). Everything is deleted in batches of
 //!   `maintenance_batch_size`, one short transaction each.
 //! * Blobs: references are recorded explicitly when a blob is attached, spilled or produced
@@ -31,7 +32,8 @@ use crate::store::{self, CleanupJob, CleanupKind, now_ms};
 pub struct MaintenanceReport {
     /// `item/delta` events of completed items deleted.
     pub deltas: usize,
-    /// Events deleted because a later event of the same entity carries their content.
+    /// Events deleted because a later event of the same entity carries their content
+    /// (background task output deltas included).
     pub superseded: usize,
     /// `native` events deleted.
     pub native: usize,
@@ -108,6 +110,18 @@ pub(crate) async fn run(sh: &Arc<Shared>) -> CoreResult<MaintenanceReport> {
     })
     .await;
     note("superseded events", r.map(|n| report.superseded = n));
+
+    // A background task's output deltas are superseded by a later update of the task (its
+    // output so far, or its end): kept as long as the other superseded events.
+    let r = in_batches(sh, batch, move |tx, limit| {
+        let deleted = aas_eventlog::compact_background_output(tx, superseded_before, limit)?;
+        Ok((deleted, deleted == limit))
+    })
+    .await;
+    note(
+        "background output deltas",
+        r.map(|n| report.superseded += n),
+    );
 
     let native_before = cutoff(policy.native_event_retention);
     for type_name in aas_eventlog::TRANSIENT_EVENT_TYPES {

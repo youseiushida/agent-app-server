@@ -92,9 +92,9 @@ daemon とクライアント（Android アプリ）の間の契約。型の実�
 
 - 購読ごとに、イベントは seq の昇順で届く。
 - seq は連続するとは限らない（圧縮による欠番がある）。クライアントは「適用済みの最大 seq」を読み取り位置として保存し、それ以下の seq のイベントは無視する。
-- 圧縮で消えるのは、後のイベントが内容をすべて持つイベントだけ（完了した Item の `item/delta`、同じ実体の後の `thread/updated` / `thread/upserted` / `project/upserted` / `harness/updated` / `operation/updated` / `queue/updated` / `commands/changed` / `backgroundTask/updated` がある古いもの、`item/completed` より前の `item/updated`、`turn/completed` より前の `turn/usageUpdated`、`interaction/closed` より前の `interaction/pending`）と、古い `native` と `composer/insert` のイベント。古い読み取り位置から追いかけても、残ったイベントを順に適用すれば同じ状態になる（クライアントはイベントで丸ごと置き換える。7章）。消すのは一定時間（既定 24 時間）より古いものだけなので、短い切断からの再接続ではイベントがそのまま届く。
+- 圧縮で消えるのは、後のイベントが内容をすべて持つイベントだけ（完了した Item の `item/delta`、同じ実体の後の `thread/updated` / `thread/upserted` / `project/upserted` / `harness/updated` / `operation/updated` / `queue/updated` / `commands/changed` / `backgroundTask/updated` がある古いもの、同じタスクの後の `backgroundTask/updated` がある `backgroundTask/outputDelta`、`item/completed` より前の `item/updated`、`turn/completed` より前の `turn/usageUpdated`、`interaction/closed` より前の `interaction/pending`）と、古い `native` と `composer/insert` のイベント。古い読み取り位置から追いかけても、残ったイベントを順に適用すれば同じ状態になる（クライアントはイベントで丸ごと置き換える。7章）。消すのは一定時間（既定 24 時間）より古いものだけなので、短い切断からの再接続ではイベントがそのまま届く。
 - 削除したスレッドのイベントは、thread ストリームごと消える（`subscribe` は `notFound`）。workspace ストリームのそのスレッドに関するイベントも消え、`thread/removed` だけが残る。
-- `seqFrom` がある場合は、`seqFrom`〜`seq` の delta を結合したもの。
+- `seqFrom` がある場合は、`seqFrom`〜`seq` の delta を結合したもの（同じ Item の同じ欄の `item/delta`、同じタスクの `backgroundTask/outputDelta`）。
 - `head` はバッチを読んだ時点のストリームの head。
 - `events` が空の `stream/batch` は、読み取り位置から `head` までに届けるイベントが残っていないことを表す（ストリームの最後のイベントが保持期間で消えた、など）。クライアントは読み取り位置を `head` に進める（適用するイベントはない）。これがないと、消えたイベントの分だけ heartbeat の head が読み取り位置より先に見え続け、再購読を繰り返すことになる。
   - サーバは、読み取り位置より後にイベントがないのに head がそれより先にあるときだけ、この空のバッチを1回送る（例: `notifications/stream_batch_empty.json`）。
@@ -152,7 +152,8 @@ type HarnessCapabilities = {
   backgroundStop: boolean;                        // 1つのバックグラウンドタスクを止められる（backgroundTask/stop）
 };
 type Model = { id: string; displayName: string; description?: string; isDefault: boolean;
-               effortLevels?: string[] };  // このモデルで使える推論量の id。なければハーネスのすべて
+               effortLevels?: string[];     // このモデルで使える推論量の id。なければハーネスのすべて
+               permissionModes?: string[] };  // このモデルで動ける権限モードの id。なければハーネスのすべて（3.1）
 type EffortLevel = { id: string; label: string };
 type PermissionMode = { id: string; label: string; description?: string; isDefault: boolean };
 
@@ -277,12 +278,15 @@ type BackgroundTask = {
   progress?: { lastToolName?: string; toolUses?: number; tokens?: number; durationMs?: number; summary?: string;
                workflow?: { label: string; phase?: string; state: "start"|"progress"|"done"|"error";
                             agentType?: string; model?: string; tokens?: number }[] };
-  result?: { summary?: string; exitCode?: number; output?: string; outputTruncated: boolean; outputBlobId?: string };
+  result?: { summary?: string; exitCode?: number; output?: string; outputTruncated: boolean; outputBlobId?: string;
+             outputOmittedBytes?: number };       // ハーネスの出力のファイルが大きすぎて読まなかった先頭のバイト数（3.1）
   usage?: { totalTokens?: number; toolUses?: number; durationMs?: number; costUsd?: number };
   stoppable: boolean;                             // backgroundTask/stop で止められる
   stopRequestedAt?: number;                       // 停止を求めてからハーネスが終わりを報告するまで
   stopUnconfirmedAt?: number;                     // policy.background_stop_confirm_timeout の間に終わりが報告されなかった
   nextRunAt?: number;                             // 次に動く時刻（予約された起床。ハーネスが報告したもの）
+  output?: string;                                // 今の run が動いている間に出した出力（ハーネスが明示的に流したもの。policy.max_inline_output_bytes まで。backgroundTask/outputDelta で伸びる。3.1）
+  outputTruncated?: boolean;                      // output が上限に達した（続きは流さない）
 };
 
 type Operation = { id: string; kind: "gitClone"; status: "running"|"succeeded"|"failed"|"cancelled";
@@ -304,7 +308,11 @@ type StatusSection = { title: string; rows: { label: string; value: string }[] }
   - ターンより長く生き、ターンをまたいで進み、同じ `nativeId` でもう一度始まることがある（`runs` が増え、`startedAt` が新しい run の開始になり、`status` が `running` に戻る）。
   - 状態が変わるたびに thread ストリームに `backgroundTask/updated` が届く（常にタスク全体。クライアントは丸ごと置き換える）。進捗（`progress` と `usage`）だけの変化は、1 つのタスクにつき `policy.background_progress_interval`（既定 1 秒）に 1 回にまとめる（最新の状態が残り、終わりなどほかの変化はすぐに届く）。
   - `status` は `running` から一度だけ終わりに移る（新しい run で `running` に戻るまで）。`completed` / `failed` / `stopped` はハーネスが報告したもの（`endReason: "harness"`）か、daemon がエージェントのプロセスを止めたもの（`stopped`、`endReason` にその理由）。`lost` は、プロセスが自分で終わった（`processExited`）か daemon が再起動した（`daemonRestarted`）ために、どう終わったか分からないもの。時間の経過でタスクを終わらせることはない。
-  - `result` はハーネスが明示的に報告したものだけ（人間向けの文から読み取らない）。`output` は `policy.max_inline_output_bytes` まで（超えた分は `outputTruncated: true` と `outputBlobId` の blob）。
+  - `result` はハーネスが明示的に報告したものだけ（人間向けの文から読み取らない）。`output` は `policy.max_inline_output_bytes` まで（超えた分は `outputTruncated: true` と `outputBlobId` の blob）。ハーネスが出力をファイルに残し、それが `policy.max_output_file_bytes`（既定 8 MiB）より大きいときは、ファイルの終わりの部分を読み、読まなかった先頭のバイト数を `outputOmittedBytes` に入れる（`output` と blob はその終わりの部分）。
+  - **動いている間の出力**（`output`、`outputTruncated`）: ハーネスが動いているタスクの出力を明示的に流すとき（Codex のバックグラウンドのターミナルの `outputDelta`、Devin のシェルの出力の途中経過。Claude Code は流さない。design.md 5.6）、今の run の出力を `policy.max_inline_output_bytes` までタスクに持つ。追記は `backgroundTask/outputDelta`（`{taskId, text}`。同じタスクの続きの delta は `seqFrom` で結合されて届く）で、クライアントはタスクの `output` の末尾に足す。ハーネスが出力を丸ごと置き換えたとき（途中経過が前の続きでないとき）と、上限に達したとき（`outputTruncated: true`。以後は流さない）は `backgroundTask/updated` で届く（常にタスク全体。`output` もその時点のもの）。
+    - バックグラウンドに移った Item のコマンドのタスクは、その Item の出力（全部 inline にあるとき）から始まる。
+    - 新しい run は出力なしから始まる。終わりにハーネスが出力全体を報告すると（`result.output`）、`output` と `outputTruncated` は外れる（全体は `result` で、長ければ blob で見る）。報告がなければ（プロセスとともに終わった、など）流れた分が残る。
+    - 上限を超えた分は、終わったときにハーネスが報告する出力全体（`result`）でだけ見える。
   - `ambient: true` のタスクは表示するが、`Thread.background.running` に数えず、プロセスを保持しない。
   - ハーネスがタスクを「動いている」と報告している間（ハーネスのライブセット）は、エージェントのプロセスを止めない（アイドル回収しない。PC のスリープも抑える）。そのためスレッドの `status` は `ready` のまま、プロセスの枠（`policy.max_running_processes`）を使い続ける。設定の変更を反映するためにプロセスの作り直しが要るとき（CLI がその場で反映できない変更や、反映に失敗した変更。design.md 5.4）、次のターンは作業が終わる（または止められる）まで入力を送らずに待ち、`code: "waitingForBackgroundWork"` の notice の Item が付く（ターンは `turn/interrupt` で取り消せる）。
 - **`Thread.background`**: `running`（`running` で `ambient` でないタスクの数）と `lastEnded`（`ambient` でないタスクの終わりのうち最後のもの。`endedAt` の順、同じなら `taskId` の順）。タスクが始まったとき、終わったとき、`ambient` が変わったときに `thread/upserted` / `thread/updated` が出る（進捗だけでは出ない）。
@@ -314,7 +322,8 @@ type StatusSection = { title: string; rows: { label: string; value: string }[] }
 - **Interaction の所属**: 承認や質問は、次のどれか 1 つに属し、それが終わると `expired` になる。
   - 求めたときに動いていたターン（`turnId`）。ターンが終わると `turnEnded`。
   - 求めたバックグラウンドタスク（`backgroundTaskId`。ハーネスが明示したとき）。ターンが終わっても残り、タスクが終わると `taskEnded`。
-  - スレッド（`turnId` も `backgroundTaskId` もない。ターンが動いていないときに、タスクを示さずに求められたもの）。プロセスが終わるまで残る。
+  - スレッド（`turnId` も `backgroundTaskId` もない。ターンが動いていないときに、タスクを示さずに求められたもの。pi の拡張のダイアログなど）。プロセスが終わるまで残る。
+  - ターンの外の Interaction（タスクとスレッドのもの）が保留中の間は、エージェントがその答えを待っているので、プロセスをアイドル回収しない（design.md 4.7）。
   - どれも、ハーネスが取り下げれば `harnessCancelled`、プロセスが終われば `processExited`。サーバが Interaction を `expired` にするとき、プロセスが動いていればエージェントにも答え（辞退）を返すので、エージェントが答えを待ち続けることはない。
 - **`Turn.error.kind`**: `agentExited`（プロセスが想定外に終了）、`adapterError`、`spawnFailed`、`resumeFailed`（スレッドのネイティブセッションを resume する起動が失敗した。ほかのプロセスがそのセッションを持っているときなど。クライアントは「再試行」を出し、ハーネスが `features.forkWhileHeld` を持つときは「新しいスレッドに分岐」（`thread/fork`）も出す）、`harnessUnavailable`、`forced`（中断に応じず強制終了）、`interrupted`（起動前に中断）、`stopped`（`thread/stop`、アーカイブ、アイドル回収）、`daemonShutdown`、`systemShutdown`（Windows のサインアウト・シャットダウン・再起動で daemon が止まった。design.md 18.8）、`daemonRestarted`、`forkOutdated`（fork の最初のターンを待つ間に元のスレッドが次のターンに進んだ。`thread/fork` の補足）、ハーネス由来の `harnessError`、`refusal`、`codex:<種別>` など。クライアントは知らない値を一般的な失敗として表示する。
   - 起動と送信の失敗（`spawnFailed`、`resumeFailed`、`harnessUnavailable`、`adapterError`）の `message` は、ハーネス（アダプタ）自身の文そのまま（daemon の英語の前置きを含まない）。stderr から来た部分は端末の制御文字を除いてある。クライアントは `kind` に応じた自分の言語の導入文を前に置いて表示する。`agentExited` の `message` は終了の様子と stderr の最後の数行（制御文字を除く）。
@@ -336,6 +345,7 @@ type StatusSection = { title: string; rows: { label: string; value: string }[] }
   - `projectTrust`: ハーネスがプロジェクト自身の資源（拡張、テンプレート、スキルなど）を、利用者がそのプロジェクトを信頼したときだけ読む。クライアントはプロジェクトごとに明示的に聞き（自動では決めない）、`project/update { harnessTrust }` で記録する。記録がなければエージェントは判断なしで起動する（ハーネス自身の保存済みの判断が使われる）。
   - `planMode`: アプリの `/plan` を出す（ない場合は出さない。同じ名前のハーネスのコマンドはハーネスのもの）。`/plan <本文>` は `thread/update { modes: { plan: true } }` のあとに本文を `turn/start` で送る。エージェントが提案したプランは `proposedPlan` の Item で届く。`implementPrompt` があれば「実装する」は `modes.plan` を `false` にしてからその文を送る。`newThreadPreamble` があれば「新しいスレッドで実装」は `thread/create` の入力を「前置き + 空行 + プランの本文」にする（プランモードは付けない）。
   - `fastModeModels`: 高速モードを持つモデル。スレッドのモデルがこの中にあるときだけ `modes.fast` を `true` にできる。
+- **モデルごとの権限モード（`Model.permissionModes`）**: ハーネスが、あるモデルではすべての権限モードで動けないと明示しているとき（Claude Code の auto モードは `supportsAutoMode` のモデルだけ。Haiku にはない）、そのモデルが動ける権限モードの id。クライアントはスレッドのモデルの一覧にない権限モードを出さない。`thread/create` と、モデルか権限モードを変える `thread/update` は、スレッドが動くモデルと権限モードの組がこの一覧に合わなければ `invalidParams`（`data.model`、`data.permissionMode`）。モデルだけを変えるとスレッドの権限モードがそのモデルにない場合は、同じ要求で権限モードも変える。
 - **`ThreadModes`**: プランモード（`plan`）と高速モード（`fast`）。`thread/update { modes }` で変える（指定したフィールドだけ）。`plan` はハーネスが自分でプランモードに入った・抜けたと報告したときにも追従する（下の「ハーネスが変えた設定」）。`fast` は利用者の選択で、ハーネスが実際にどうしたかは `Thread.fastModeState` に報告どおりに入る（Claude Code の `on` / `off` / `cooldown`。表示用）。高速モードを持たないモデルに変えると `fast` は `false` になる。
 - **ハーネスが変えた設定**: ハーネスが自分で権限モードや推論量を変えたと明示的に報告したとき（Claude Code の「このセッションは許可」による `acceptEdits`、プランの承認のあとの元のモード、Devin の `/plan`・`/ask` など）、スレッドの `settings.permissionMode` と `settings.effort`、`modes.plan` はそれに追従する（`thread/updated`）。ただし、利用者が同じ値を変えて次のターンの反映を待っているときは利用者の値が優先され、次のターンの前にエージェントへ反映される。ハーネスの一覧にない値には追従しない。モデルは追従しない（CLI が `opus` を完全な ID に解決するなど、利用者の選択を CLI の解釈で置き換えないため。ターンの `model` には報告値が入る）。
 - **ネイティブセッションの切り替わり**: ハーネスがスレッドのエージェントを自分で別のネイティブセッションに移したと報告したとき（手で打ったコマンドや拡張など）、スレッドの `nativeSessionId` はそれに追従し、`thread/nativeSessionChanged`（前と後の ID）が届く。そのとき動いているターンには `code: "nativeSessionChanged"` の notice の Item が付く。
@@ -433,7 +443,7 @@ type StatusSection = { title: string; rows: { label: string; value: string }[] }
 |---|---|---|
 | `thread/list` | `{projectId?, includeArchived?, limit?, before?:{lastActivityAt,id}}` | `{threads, hasMore}` |
 | `thread/get` | `{threadId}` | `{thread}` |
-| `thread/create` ★ | `{projectId, harnessId, settings?, workspace?:{kind:"local"}\|{kind:"worktree", baseRef?, branch?}, title?, input?:InputPart[]}` | `{thread, turnId?, disposition?}` |
+| `thread/create` ★ | `{projectId, harnessId, settings?, workspace?:{kind:"local"}\|{kind:"worktree", baseRef?, branch?}\|{kind:"thread", threadId}, title?, input?:InputPart[]}` | `{thread, turnId?, disposition?}` |
 | `thread/read` | `{threadId, beforeTurnIndex?, limitTurns?}` | `{thread, turns, items, interactions, queued, backgroundTasks, head, hasMoreBefore}` |
 | `thread/update` ★ | `{threadId, title?, settings?, pinned?, modes?:ThreadModesUpdate}` | `{thread, settingsOutcome?:"appliedLive"\|"appliesNextTurn", nativeRename?:{status:"applied"\|"pending"\|"failed", message?}}` |
 | `thread/archive` ★ | `{threadId, archived, removeWorktree?, force?}` | `{thread}` |
@@ -454,6 +464,7 @@ type StatusSection = { title: string; rows: { label: string; value: string }[] }
 - `thread/create` の補足
   - `settings` で指定しなかった値は、プロジェクトの `defaults`（`defaults.harnessId` がこのハーネスの場合だけ）、次にハーネスの既定（`defaultModel`、`defaultPermissionMode`）で埋める。値はハーネスの一覧にあるものだけ（なければ `invalidParams`）。ハーネスが以前の版で出していた形の値（Claude Code の権限モード `plan`。今はプランモード）は、先にハーネスの今の形にする（権限モードは既定、`modes.plan` はオン。design.md 9.6）。
   - 未知のハーネスは `invalidParams`、使えないハーネスは（probe し直してもなお使えなければ）`harnessUnavailable`。
+  - `thread` は、同じプロジェクトのスレッド `threadId` と同じ作業場所で動く（worktree のスレッドならその worktree を共有する。fork と同じ。design.md 10.2）。worktree のスレッドの提案されたプランを「新しいスレッドで実装」するときなど。ほかのプロジェクトのスレッドは `invalidParams`、ないスレッド（削除済みを含む）は `notFound`、worktree が削除されていれば `invalidState`。
   - `worktree` はプロジェクトが git リポジトリの場合だけ（それ以外は `invalidState`）。`branch` の既定は `aas/<スレッド ID の末尾 8 文字>`、`baseRef` の既定は `HEAD`。
   - `baseRef` はコミットに解決できる名前（ブランチ、タグ、コミット ID など）。`-` で始まるもの、空のもの、コミットに解決できないもの（存在しない名前、tree など）は、worktree もブランチも作らずに `invalidParams`。`-` で始まる `branch` も `invalidParams`。
   - `input` を指定すると、そのままターンを開始する（プロセス数が上限なら待たせる）。このとき `turnId` と `disposition: "started"` が付く。
@@ -465,6 +476,7 @@ type StatusSection = { title: string; rows: { label: string; value: string }[] }
 - `thread/update` の補足
   - `title` は空にできない。`settings` は指定したフィールドだけを変える。
   - 未知の値の `invalidParams` になるのは、`settings` で指定した値が、使えるハーネスの一覧（`models` / `effortLevels` / `permissionModes`）にないときだけ。スレッドがすでに持っている値は検査しない。ハーネスが使えない間（`available: false`）は一覧が分からないので検査せずに受け付け、次のターンで反映する（design.md 5.4）。
+  - `settings` でモデルか権限モードを変えるときは、変えた後のモデルと権限モードの組を、モデルの `permissionModes`（3.1）で確かめる（合わなければ `invalidParams`）。
   - `pinned` でピン留めする（`true`）・外す（`false`）。
   - `modes` でプランモード（`plan`）と高速モード（`fast`）を変える。`plan: true` はハーネスに `features.planMode` がなければ、`fast: true` はスレッドのモデル（この要求で変えるならその値）が `features.fastModeModels` になければ `capabilityUnsupported`（`data.capability` は `planMode` / `fastMode`）。反映の仕方は `settings` と同じ（`settingsOutcome` は両方をまとめたもの）。高速モードを持たないモデルに変えると `modes.fast` は `false` になる。
   - `title` はハーネスに `features.rename` があれば、ネイティブセッションにも付ける。結果の `nativeRename`: `applied`（動いているエージェントが受け取った）、`pending`（エージェントが動いていない。次に起動したときに付ける）、`failed`（ハーネスが断った。`message` にハーネスの文。スレッドのタイトルは変わる）。`thread/create` の `title` も、最初のエージェントの起動時に付ける。
@@ -595,6 +607,7 @@ type StatusSection = { title: string; rows: { label: string; value: string }[] }
 | `queue/updated` | `{queued:[QueuedInput]}`（キュー全体） |
 | `commands/changed` | `{}`（`command/list` を取り直す合図） |
 | `backgroundTask/updated` | `{task}`（バックグラウンドタスクの開始・進捗・終了。常にタスク全体。3.1） |
+| `backgroundTask/outputDelta` | `{taskId, text}`（動いているタスクの出力の追記。タスクの `output` の末尾に足す。3.1） |
 | `thread/nativeSessionChanged` | `{previousNativeSessionId, nativeSessionId}`（ハーネスがエージェントを別のネイティブセッションに移した。3.1） |
 | `composer/insert` | `{text}`（ハーネスが入力欄にテキストを入れるよう求めた（pi の拡張の `setEditorText` など）。クライアントは開いているスレッドの入力欄に入れる。自分で送信はしない。古い読み取り位置から追いかけて受け取ったものは、入れずに提案として出してよい） |
 | `native` | `{harnessId, payload}`（アダプタが解釈しなかった生のイベント。ターンの外で届いた通知は `payload.notice` に入る。通常は表示しない） |

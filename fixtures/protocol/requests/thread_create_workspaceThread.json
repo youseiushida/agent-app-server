@@ -1,0 +1,24 @@
+{
+  "id": 47,
+  "jsonrpc": "2.0",
+  "method": "thread/create",
+  "params": {
+    "clientRequestId": "0199a5f0-0000-7000-8000-000000000024",
+    "harnessId": "codex",
+    "input": [
+      {
+        "text": "A previous agent produced the plan below to accomplish the user's task. Implement the plan in a fresh context. Treat the plan as the source of user intent, re-read files as needed, and carry the work through implementation and verification.\n\n1. Retry the upload once on a network error.\n2. Add a test for the retry.",
+        "type": "text"
+      }
+    ],
+    "projectId": "prj_01K6A0000000000000000PRJ01",
+    "settings": {
+      "effort": "high",
+      "model": "gpt-5.5"
+    },
+    "workspace": {
+      "kind": "thread",
+      "threadId": "thr_01K6A0000000000000000THR02"
+    }
+  }
+}
